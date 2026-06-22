@@ -1,0 +1,66 @@
+severity_weight:
+  DEBUG: 0.2
+  INFO: 0.4
+  WARN: 0.8
+  WARNING: 0.8
+  ERROR: 1.2
+  FATAL: 1.5
+  UNKNOWN: 0.6
+
+component_weight:
+  kernel: 1.5
+  kubelet: 1.4
+  containerd: 1.3
+  docker: 1.2
+  kube-apiserver: 1.4
+  etcd: 1.5
+  cni: 1.2
+  csi: 1.2
+  podlog: 0.8
+  unknown: 0.6
+
+template_rules:
+  - name: oom_kill
+    match:
+      component: kernel
+      template_regex: ".*out of memory.*Killed process.*|.*Memory cgroup out of memory.*"
+    category: node_memory_pressure
+    risk_weight: 95
+    rca_hint: "节点或 cgroup 出现 OOM，优先检查内存水位、异常进程、Pod requests/limits。"
+
+  - name: kubelet_eviction
+    match:
+      component: kubelet
+      template_regex: ".*eviction.*|.*pods ranked for eviction.*"
+    category: node_resource_pressure
+    risk_weight: 90
+    rca_hint: "kubelet 出现驱逐行为，通常与 memory/disk/pid pressure 有关。"
+
+  - name: container_runtime_failed
+    match:
+      component: containerd
+      template_regex: ".*failed.*shim.*|.*OCI runtime.*failed.*|.*failed to create.*task.*"
+    category: container_runtime
+    risk_weight: 85
+    rca_hint: "容器运行时创建或启动失败，检查 containerd、runtime、镜像、cgroup、磁盘。"
+
+  - name: disk_pressure
+    match:
+      component: kubelet
+      template_regex: ".*disk pressure.*|.*image garbage collection.*|.*DiskPressure.*"
+    category: node_disk_pressure
+    risk_weight: 82
+    rca_hint: "节点磁盘压力或镜像清理异常。"
+
+  - name: api_timeout
+    match:
+      component: kube-apiserver
+      template_regex: ".*timeout.*|.*too old resource version.*|.*etcdserver.*"
+    category: control_plane
+    risk_weight: 80
+    rca_hint: "控制面或 etcd 访问异常，需要检查 apiserver/etcd 延迟和错误。"
+
+scoring:
+  window_seconds: 300
+  count_norm_divisor: 50
+  max_score: 100

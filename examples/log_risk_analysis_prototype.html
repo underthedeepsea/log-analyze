@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>日志风险分析系统原型 Demo</title>
+<style>
+:root{
+  --bg:#0f172a; --panel:#111827; --muted:#94a3b8; --text:#e5e7eb;
+  --line:#334155; --accent:#f97316; --accent2:#fb923c; --ok:#22c55e;
+  --warn:#facc15; --danger:#ef4444; --blue:#38bdf8;
+}
+*{box-sizing:border-box}
+body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;background:linear-gradient(135deg,#0f172a,#1e293b);color:var(--text)}
+header{padding:26px 34px;border-bottom:1px solid rgba(255,255,255,.08);background:rgba(15,23,42,.85);position:sticky;top:0;z-index:3;backdrop-filter:blur(10px)}
+h1{margin:0;font-size:25px;letter-spacing:.5px}
+.subtitle{margin-top:8px;color:var(--muted)}
+.main{display:grid;grid-template-columns: 310px 1fr;gap:18px;padding:22px}
+.sidebar{background:rgba(17,24,39,.72);border:1px solid rgba(255,255,255,.08);border-radius:18px;padding:16px;height:calc(100vh - 130px);position:sticky;top:104px}
+.stage{padding:12px 12px;margin:8px 0;border:1px solid rgba(255,255,255,.09);border-radius:12px;cursor:pointer;background:#0b1220;transition:.18s}
+.stage:hover,.stage.active{border-color:var(--accent);box-shadow:0 0 0 2px rgba(249,115,22,.15)}
+.stage b{display:block;font-size:14px}
+.stage span{color:var(--muted);font-size:12px}
+.content{display:grid;gap:18px}
+.card{background:rgba(17,24,39,.72);border:1px solid rgba(255,255,255,.08);border-radius:18px;padding:18px;box-shadow:0 18px 40px rgba(0,0,0,.18)}
+.card h2{margin:0 0 12px;font-size:19px}
+.arch{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.node{min-width:128px;text-align:center;padding:14px 12px;border-radius:14px;background:#0b1220;border:1px solid var(--line)}
+.node .small{font-size:12px;color:var(--muted);margin-top:4px}
+.arrow{color:var(--accent);font-weight:900;font-size:24px}
+.kpis{display:grid;grid-template-columns:repeat(4,minmax(140px,1fr));gap:12px}
+.kpi{background:#0b1220;border:1px solid var(--line);border-radius:14px;padding:14px}
+.kpi .v{font-size:25px;font-weight:800}
+.kpi .l{font-size:12px;color:var(--muted)}
+.grid2{display:grid;grid-template-columns:1.1fr .9fr;gap:18px}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th,td{text-align:left;padding:10px;border-bottom:1px solid rgba(255,255,255,.08);vertical-align:top}
+th{color:#cbd5e1;font-weight:700;background:rgba(255,255,255,.03)}
+.tag{display:inline-block;padding:3px 8px;border-radius:999px;font-size:12px;border:1px solid rgba(255,255,255,.14);background:#0b1220}
+.danger{color:#fecaca;border-color:rgba(239,68,68,.35);background:rgba(239,68,68,.12)}
+.warn{color:#fef08a;border-color:rgba(250,204,21,.35);background:rgba(250,204,21,.12)}
+.ok{color:#bbf7d0;border-color:rgba(34,197,94,.35);background:rgba(34,197,94,.12)}
+.blue{color:#bae6fd;border-color:rgba(56,189,248,.35);background:rgba(56,189,248,.12)}
+pre{white-space:pre-wrap;background:#050816;border:1px solid var(--line);padding:14px;border-radius:14px;color:#d1d5db;font-size:13px;line-height:1.5}
+.flowbox{display:grid;grid-template-columns:repeat(5,1fr);gap:10px}
+.flowstep{border-radius:14px;border:1px solid var(--line);padding:12px;background:#0b1220;min-height:130px}
+.flowstep b{display:block;color:#fff;margin-bottom:8px}
+.flowstep p{margin:0;color:var(--muted);font-size:12px;line-height:1.45}
+button{background:linear-gradient(135deg,var(--accent),var(--accent2));border:0;color:#111827;font-weight:800;padding:10px 14px;border-radius:12px;cursor:pointer}
+.timeline{border-left:2px solid var(--accent);padding-left:16px;margin-left:6px}
+.event{margin:12px 0;padding:10px;border-radius:12px;background:#0b1220;border:1px solid var(--line)}
+.event .time{color:var(--muted);font-size:12px}
+.hidden{display:none}
+@media(max-width:1050px){.main{grid-template-columns:1fr}.sidebar{position:relative;height:auto;top:0}.grid2,.flowbox{grid-template-columns:1fr}.kpis{grid-template-columns:1fr 1fr}}
+</style>
+</head>
+<body>
+<header>
+  <h1>日志风险分析系统原型 Demo</h1>
+  <div class="subtitle">目标：用 Drain3 把海量日志压缩成模板事件，再用聚合/评分/LLM 辅助发现风险机器和 RCA 证据链。</div>
+</header>
+<div class="main">
+  <aside class="sidebar">
+    <div class="stage active" data-panel="overview"><b>1. 总览</b><span>系统架构与核心指标</span></div>
+    <div class="stage" data-panel="raw"><b>2. 原始日志消费</b><span>Kafka 分区、字段规范化</span></div>
+    <div class="stage" data-panel="drain"><b>3. Drain3 模板化</b><span>模板 ID、参数、样本</span></div>
+    <div class="stage" data-panel="score"><b>4. 风险机器识别</b><span>窗口聚合与风险评分</span></div>
+    <div class="stage" data-panel="llm"><b>5. LLM RCA</b><span>限流、证据包、结论</span></div>
+  </aside>
+
+  <section class="content">
+    <div id="overview" class="panel">
+      <div class="card">
+        <h2>推荐架构</h2>
+        <div class="arch">
+          <div class="node">Log Agent<div class="small">Fluent Bit / Filebeat</div></div><div class="arrow">→</div>
+          <div class="node">Kafka Raw<div class="small">按 cluster/source/node 分区</div></div><div class="arrow">→</div>
+          <div class="node">Normalizer<div class="small">提取 node/pod/component</div></div><div class="arrow">→</div>
+          <div class="node">Drain3 Shards<div class="small">按组件维护模板模型</div></div><div class="arrow">→</div>
+          <div class="node">Feature Aggregator<div class="small">频率/突增/首现/共现</div></div><div class="arrow">→</div>
+          <div class="node">Risk + RCA<div class="small">机器评分 + LLM 摘要</div></div>
+        </div>
+      </div>
+      <div class="kpis">
+        <div class="kpi"><div class="v">1,280,000</div><div class="l">5 分钟原始日志</div></div>
+        <div class="kpi"><div class="v">4,832</div><div class="l">模板事件</div></div>
+        <div class="kpi"><div class="v">37</div><div class="l">进入 LLM 的候选窗口</div></div>
+        <div class="kpi"><div class="v">6</div><div class="l">高风险机器</div></div>
+      </div>
+      <div class="card">
+        <h2>系统的关键设计原则</h2>
+        <div class="flowbox">
+          <div class="flowstep"><b>不让 LLM 直接吃全量日志</b><p>LLM 只处理聚合后的证据包：模板、计数、突增、实体、代表样本。</p></div>
+          <div class="flowstep"><b>Drain3 前先规范化</b><p>timestamp/hostname/severity/source 作为字段，message_core 才进入 Drain3。</p></div>
+          <div class="flowstep"><b>按日志源分片建模</b><p>kubelet、kernel、containerd、业务 pod 不共用一个模板空间。</p></div>
+          <div class="flowstep"><b>风险定位到实体</b><p>node/pod/container/ns/ip/volume/device 都要进入实体解析层。</p></div>
+          <div class="flowstep"><b>RCA 输出证据链</b><p>不是只给“结论”，还要给时间线、相关模板、机器/Pod 拓扑。</p></div>
+        </div>
+      </div>
+    </div>
+
+    <div id="raw" class="panel hidden">
+      <div class="grid2">
+        <div class="card">
+          <h2>原始日志样本</h2>
+<pre>Jun 22 10:01:02 node-a kubelet[2145]: E0622 10:01:02.123456 eviction_manager.go:350] eviction manager: pods ranked for eviction
+Jun 22 10:01:03 node-a kernel: [88771.123456] Memory cgroup out of memory: Killed process 24811 (java) total-vm:2048000kB
+Jun 22 10:01:04 node-a containerd[991]: failed to create shim task: OCI runtime create failed
+2026-06-22T10:01:05Z ERROR pod=pay-api-7d6b4f-xk9p2 ns=prod msg="connection reset by peer"</pre>
+        </div>
+        <div class="card">
+          <h2>Normalizer 输出</h2>
+<pre>{
+  "cluster": "prod-a",
+  "node": "node-a",
+  "source_type": "syslog",
+  "component": "kubelet",
+  "severity": "ERROR",
+  "timestamp": "2026-06-22T10:01:02+08:00",
+  "message_core": "eviction manager: pods ranked for eviction"
+}</pre>
+        </div>
+      </div>
+    </div>
+
+    <div id="drain" class="panel hidden">
+      <div class="card">
+        <h2>Drain3 模板化结果</h2>
+        <table>
+          <thead><tr><th>template_hash</th><th>component</th><th>template</th><th>count/5m</th><th>状态</th></tr></thead>
+          <tbody>
+            <tr><td>kubelet:8f21</td><td>kubelet</td><td>eviction manager: pods ranked for eviction</td><td>182</td><td><span class="tag danger">突增</span></td></tr>
+            <tr><td>kernel:a91e</td><td>kernel</td><td>Memory cgroup out of memory: Killed process &lt;OOM_PID&gt; (*) total-vm:&lt;BYTES&gt;</td><td>47</td><td><span class="tag danger">高危</span></td></tr>
+            <tr><td>containerd:71be</td><td>containerd</td><td>failed to create shim task: OCI runtime create failed</td><td>61</td><td><span class="tag warn">异常</span></td></tr>
+            <tr><td>pod:e63c</td><td>pay-api</td><td>connection reset by peer</td><td>928</td><td><span class="tag warn">受影响</span></td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div class="card">
+        <h2>Drain3 输出如何被使用</h2>
+        <pre>每条日志不再只是一段文本，而变成：
+template_hash + template + parameters + entity + window_count + sample_raw
+
+后续分析不再按 raw message 做全文扫描，而是按 template_hash 做：
+1. 基线偏离：这个模板在 node-a 上是否突然增加？
+2. 首次出现：这个模板是否第一次在该集群出现？
+3. 共现关系：kernel OOM 是否先于 kubelet eviction 和 pod reset？
+4. 实体归因：模板主要集中在哪台 node / 哪个 namespace / 哪个 pod？</pre>
+      </div>
+    </div>
+
+    <div id="score" class="panel hidden">
+      <div class="grid2">
+        <div class="card">
+          <h2>风险机器榜</h2>
+          <table>
+            <thead><tr><th>机器</th><th>风险分</th><th>主因模板</th><th>影响面</th></tr></thead>
+            <tbody>
+              <tr><td>node-a</td><td><span class="tag danger">96</span></td><td>kernel OOM + kubelet eviction</td><td>prod/pay-api 18 Pods</td></tr>
+              <tr><td>node-c</td><td><span class="tag warn">73</span></td><td>containerd shim create failed</td><td>batch/ns-a 7 Pods</td></tr>
+              <tr><td>node-b</td><td><span class="tag warn">61</span></td><td>disk pressure warning</td><td>infra/logging</td></tr>
+              <tr><td>node-d</td><td><span class="tag ok">24</span></td><td>低频 warning</td><td>暂无明显影响</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="card">
+          <h2>风险评分模型示例</h2>
+<pre>risk(node, 5m) =
+  Σ template_weight
+  × severity_weight
+  × anomaly_score
+  × log_count_norm
+  × novelty_factor
+  × topology_impact
+
+root_candidate 加分：
+- kernel/containerd/kubelet 类模板早于 pod 错误
+- 单节点集中爆发
+- 该节点上多个 namespace/pod 同时异常</pre>
+        </div>
+      </div>
+    </div>
+
+    <div id="llm" class="panel hidden">
+      <div class="grid2">
+        <div class="card">
+          <h2>进入 LLM 的证据包</h2>
+<pre>{
+  "incident_window": "2026-06-22 10:00:00~10:05:00",
+  "candidate_entity": "node-a",
+  "risk_score": 96,
+  "top_templates": [
+    {"template": "Memory cgroup out of memory...", "count": 47, "first_seen": "10:01:03"},
+    {"template": "eviction manager: pods ranked for eviction", "count": 182},
+    {"template": "connection reset by peer", "count": 928}
+  ],
+  "representative_raw_samples": ["最多每个模板 3 条"],
+  "metrics_context": ["memory.available 下降", "container restarts 增加"],
+  "topology": ["node-a -> prod/pay-api -> 18 pods"]
+}</pre>
+        </div>
+        <div class="card">
+          <h2>LLM RCA 输出示例</h2>
+          <div class="timeline">
+            <div class="event"><div class="time">10:01:03</div><b>内核 OOM 首次出现</b><p>node-a 出现 Memory cgroup OOM，属于节点资源压力直接证据。</p></div>
+            <div class="event"><div class="time">10:01:04</div><b>kubelet eviction 激增</b><p>kubelet 开始按 eviction manager 排序驱逐 Pod，说明节点已进入资源回收路径。</p></div>
+            <div class="event"><div class="time">10:01:05</div><b>业务 Pod 连接重置</b><p>pay-api 多个 Pod 出现 connection reset，更像受害现象，不是根因。</p></div>
+          </div>
+          <p><span class="tag danger">RCA 结论</span> 高概率根因为 node-a 内存压力/OOM 导致 kubelet 驱逐和业务连接中断。建议优先检查 node-a 内存水位、异常进程、Pod requests/limits 与近期调度变更。</p>
+        </div>
+      </div>
+    </div>
+  </section>
+</div>
+<script>
+document.querySelectorAll('.stage').forEach(s=>{
+  s.addEventListener('click',()=>{
+    document.querySelectorAll('.stage').forEach(x=>x.classList.remove('active'));
+    s.classList.add('active');
+    document.querySelectorAll('.panel').forEach(p=>p.classList.add('hidden'));
+    document.getElementById(s.dataset.panel).classList.remove('hidden');
+  });
+});
+</script>
+</body>
+</html>

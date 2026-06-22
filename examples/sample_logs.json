@@ -1,0 +1,22 @@
+[
+  {"timestamp": "2026-06-18 09:00:01", "level": "INFO", "message": "Connection from 192.168.1.10 closed"},
+  {"timestamp": "2026-06-18 09:00:03", "level": "INFO", "message": "Connection from 192.168.1.22 closed"},
+  {"timestamp": "2026-06-18 09:00:05", "level": "INFO", "message": "Connection from 10.0.0.5 closed"},
+  {"timestamp": "2026-06-18 09:00:08", "level": "ERROR", "message": "User 10293 login failed after 3 attempts"},
+  {"timestamp": "2026-06-18 09:00:09", "level": "ERROR", "message": "User 88341 login failed after 5 attempts"},
+  {"timestamp": "2026-06-18 09:00:11", "level": "ERROR", "message": "User 77 login failed after 1 attempts"},
+  {"timestamp": "2026-06-18 09:00:15", "level": "WARN", "message": "Disk usage on /dev/sda1 reached 85%"},
+  {"timestamp": "2026-06-18 09:00:16", "level": "WARN", "message": "Disk usage on /dev/sdb1 reached 92%"},
+  {"timestamp": "2026-06-18 09:00:20", "level": "INFO", "message": "Request 7f3e2b1a-1234-4abc-9def-1122334455ee processed in 120ms"},
+  {"timestamp": "2026-06-18 09:00:22", "level": "INFO", "message": "Request 9a8b7c6d-5678-4fed-8aaa-998877665544 processed in 88ms"},
+  {"timestamp": "2026-06-18 09:00:25", "level": "ERROR", "message": "Failed to connect to database at 10.0.0.5:5432"},
+  {"timestamp": "2026-06-18 09:00:27", "level": "ERROR", "message": "Failed to connect to database at 10.0.0.6:5432"},
+  {"timestamp": "2026-06-18 09:00:30", "level": "INFO", "message": "Mail sent to alice@example.com successfully"},
+  {"timestamp": "2026-06-18 09:00:31", "level": "INFO", "message": "Mail sent to bob@example.com successfully"},
+  {"timestamp": "2026-06-18 09:00:35", "level": "DEBUG", "message": "Memory address 0x7ffeefbff5a8 allocated for buffer"},
+  {"timestamp": "2026-06-18 09:00:36", "level": "DEBUG", "message": "Memory address 0x55a1c2d3e4f0 allocated for buffer"},
+  {"timestamp": "2026-06-18 09:00:40", "level": "INFO", "message": "Connection from 172.16.0.99 closed"},
+  {"timestamp": "2026-06-18 09:00:42", "level": "ERROR", "message": "User 4021 login failed after 2 attempts"},
+  {"timestamp": "2026-06-18 09:00:45", "level": "WARN", "message": "Disk usage on /dev/sda1 reached 90%"},
+  {"timestamp": "2026-06-18 09:00:50", "level": "INFO", "message": "Service restarted successfully"}
+]

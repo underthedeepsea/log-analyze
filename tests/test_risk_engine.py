@@ -10,7 +10,7 @@ def test_risk_score_basic():
             "match": {"component": "kernel", "template_regex": ".*out of memory.*"},
             "risk_weight": 95,
             "category": "node_memory_pressure",
-            "rca_hint": "oom",
+            "feature_hint": "oom",
         }],
         "scoring": {"count_norm_divisor": 50, "max_score": 100},
     }
@@ -29,3 +29,5 @@ def test_risk_score_basic():
     }]
     entities = score_risk_entities(windows, rules)
     assert entities[0]["risk_score"] > 70
+    assert entities[0]["top_templates"][0]["feature_hint"] == "oom"
+    assert "rca_hint" not in entities[0]["top_templates"][0]

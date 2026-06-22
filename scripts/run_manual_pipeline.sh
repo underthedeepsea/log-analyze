@@ -11,8 +11,7 @@ python3 -m pipeline.manual_import_pipeline \
   --config configs/drain3_recommended.ini \
   --rules configs/risk_rules.yaml \
   --state-dir output/drain3_state \
-  --window-seconds 300 \
-  --mock-llm
+  --window-seconds 300
 
 echo
 echo "Summary:"

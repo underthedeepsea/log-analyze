@@ -62,7 +62,7 @@ def score_risk_entities(windows: list[Dict[str, Any]], rules: Dict[str, Any]) ->
         rule = match_template_rule(sw, rules)
         if rule:
             sw["category"] = rule.get("category")
-            sw["rca_hint"] = rule.get("rca_hint")
+            sw["feature_hint"] = rule.get("feature_hint")
             sw["rule_name"] = rule.get("name")
         scored.append(sw)
 
@@ -80,7 +80,7 @@ def score_risk_entities(windows: list[Dict[str, Any]], rules: Dict[str, Any]) ->
         bonus = min(10, max(0, len(items_sorted) - 1) * 3)
         total = min(100, round(base + bonus, 2))
 
-        hints = [x.get("rca_hint") for x in items_sorted if x.get("rca_hint")]
+        hints = [x.get("feature_hint") for x in items_sorted if x.get("feature_hint")]
         summary = hints[0] if hints else "发现异常模板，需要结合时间线、指标和原始日志进一步确认。"
 
         entities.append({

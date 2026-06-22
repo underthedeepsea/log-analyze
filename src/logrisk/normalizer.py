@@ -16,7 +16,7 @@ SYSLOG_RE = re.compile(
 KLOG_RE = re.compile(
     r"^(?P<level>[IWEF])(?P<date>\d{4})\s+"
     r"(?P<time>\d{2}:\d{2}:\d{2}\.\d{6})\s+"
-    r"(?P<thread>\d+)\s+"
+    r"(?:(?P<thread>\d+)\s+)?"
     r"(?P<src>[a-zA-Z0-9_-]+\.go:\d+)]\s*"
     r"(?P<message>.*)$"
 )

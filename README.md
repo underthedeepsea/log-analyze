@@ -1,84 +1,81 @@
-# 日志风险分析系统代码包
+# 日志风险特征分析与审批系统
 
-本代码包用于在不接 Kafka / ES 的情况下，通过人工导入日志文件验证后端全流程。
-
-## 当前链路
+本项目通过本地 JSON/JSONL 日志验证以下链路：
 
 ```text
-人工导入 JSON/JSONL 日志
-  ↓
-Normalizer 日志规范化
-  ↓
-Drain3 模板化
-  ↓
-窗口聚合
-  ↓
-风险机器评分
-  ↓
-Mock RCA
-  ↓
-输出 result.json
+日志导入 → 规范化 → Drain3 模板化 → 窗口聚合 → 风险评分 → result.json
+                                                              ↓
+人工审批台 ← Ollama 关键特征识别 ← 上传 result.json → 导出批准特征包
+                                                              ↓
+                                                    外部 RCA 专家系统
 ```
 
-## 快速运行
+项目不实现 RCA。Ollama 只识别关键日志特征，不生成根因、影响评估或处置建议。
+
+## 环境准备
 
 ```bash
-cd log-risk-analysis-code
-
 python3 -m venv .venv
 source .venv/bin/activate
-
-pip install --upgrade pip setuptools wheel
 pip install -r requirements.txt
+```
 
-export PYTHONPATH=$(pwd)/src
+## 生成风险分析结果
 
+```bash
 bash scripts/run_manual_pipeline.sh
 ```
 
-执行完成后查看：
+主要产物位于 `output/`：
+
+- `normalized_logs.json`
+- `template_events.json`
+- `template_windows.json`
+- `risk_entities.json`
+- `result.json`
+
+查看摘要：
 
 ```bash
 jq '.summary' output/result.json
-jq '.risk_entities[] | {entity_id, risk_score, risk_level, summary}' output/result.json
-jq '.rca_results[] | {risk_entity, root_cause_candidate, confidence}' output/result.json
 ```
 
-## 手动执行完整命令
+## 启动特征审批台
+
+先启动 Ollama 并确认模型存在：
 
 ```bash
-export PYTHONPATH=$(pwd)/src
-
-python3 -m pipeline.manual_import_pipeline \
-  --input examples/sample_k8s_logs.jsonl \
-  --output-dir output \
-  --config configs/drain3_recommended.ini \
-  --rules configs/risk_rules.yaml \
-  --state-dir output/drain3_state \
-  --window-seconds 300 \
-  --mock-llm
+ollama serve
+ollama pull qwen3:1.7b
 ```
 
-## 输出文件
+再启动本地 Dashboard：
 
-```text
-output/
-  normalized_logs.json
-  template_events.json
-  template_windows.json
-  risk_entities.json
-  rca_results.json
-  result.json
+```bash
+bash scripts/run_dashboard.sh
 ```
 
-## 当前阶段说明
+浏览器访问 [http://127.0.0.1:8080](http://127.0.0.1:8080)，上传 `output/result.json`。页面会立即显示风险概览，并按风险分串行调用 Ollama；实体状态和候选特征通过 SSE 实时更新，无需等待整批完成。
 
-该代码包优先用于验证后端逻辑闭环：
+默认配置可通过环境变量覆盖：
 
-- 不接 Kafka；
-- 不接 ES；
-- 不接真实 LLM；
-- 不接数据库；
-- 通过 JSON/JSONL 人工导入日志。
+```bash
+OLLAMA_MODEL=qwen3:1.7b \
+OLLAMA_HOST=http://127.0.0.1:11434 \
+DASHBOARD_PORT=8080 \
+bash scripts/run_dashboard.sh
+```
 
-等批处理链路稳定后，再把文件输入替换为 Kafka Consumer。
+## 人工审批与导出
+
+每条候选特征都可以编辑标题、摘要、重要程度、标签和审批备注，然后标记为批准或驳回。只有批准项会进入 `logrisk-feature-package-YYYY-MM-DD.json`，供人工导入外部 RCA 专家系统。
+
+发送给 Ollama 和导出的来源模板均不包含 `samples`、`raw_sample` 或原始日志。Dashboard 默认仅监听 `127.0.0.1`，上传数据和审批状态只保存在内存中。
+
+## 测试
+
+```bash
+pytest -q
+```
+
+HTTP/SSE 测试会临时绑定本机随机端口，不需要真实 Ollama；真实验收可使用 `qwen3:1.7b` 和示例 `result.json`。

@@ -26,7 +26,7 @@ template_rules:
       template_regex: ".*out of memory.*Killed process.*|.*Memory cgroup out of memory.*"
     category: node_memory_pressure
     risk_weight: 95
-    rca_hint: "节点或 cgroup 出现 OOM，优先检查内存水位、异常进程、Pod requests/limits。"
+    feature_hint: "节点或 cgroup 出现 OOM，优先关注内存水位、异常进程、Pod requests/limits。"
 
   - name: kubelet_eviction
     match:
@@ -34,7 +34,7 @@ template_rules:
       template_regex: ".*eviction.*|.*pods ranked for eviction.*"
     category: node_resource_pressure
     risk_weight: 90
-    rca_hint: "kubelet 出现驱逐行为，通常与 memory/disk/pid pressure 有关。"
+    feature_hint: "kubelet 出现驱逐行为，通常与 memory/disk/pid pressure 有关。"
 
   - name: container_runtime_failed
     match:
@@ -42,7 +42,7 @@ template_rules:
       template_regex: ".*failed.*shim.*|.*OCI runtime.*failed.*|.*failed to create.*task.*"
     category: container_runtime
     risk_weight: 85
-    rca_hint: "容器运行时创建或启动失败，检查 containerd、runtime、镜像、cgroup、磁盘。"
+    feature_hint: "容器运行时创建或启动失败，关注 containerd、runtime、镜像、cgroup、磁盘。"
 
   - name: disk_pressure
     match:
@@ -50,7 +50,7 @@ template_rules:
       template_regex: ".*disk pressure.*|.*image garbage collection.*|.*DiskPressure.*"
     category: node_disk_pressure
     risk_weight: 82
-    rca_hint: "节点磁盘压力或镜像清理异常。"
+    feature_hint: "节点磁盘压力或镜像清理异常。"
 
   - name: api_timeout
     match:
@@ -58,7 +58,7 @@ template_rules:
       template_regex: ".*timeout.*|.*too old resource version.*|.*etcdserver.*"
     category: control_plane
     risk_weight: 80
-    rca_hint: "控制面或 etcd 访问异常，需要检查 apiserver/etcd 延迟和错误。"
+    feature_hint: "控制面或 etcd 访问异常，关注 apiserver/etcd 延迟和错误。"
 
 scoring:
   window_seconds: 300

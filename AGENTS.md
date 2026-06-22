@@ -2,39 +2,36 @@
 
 ## Project Structure & Module Organization
 
-This repository is a file-driven log-risk analysis prototype. Code lives in `src/logrisk/`: `io_utils.py` handles JSON/JSONL, `normalizer.py` cleans records, `drain_miner.py` extracts templates, `aggregator.py` builds windows, `risk_engine.py` scores entities, and `rca_mock.py` produces mock RCA. `src/pipeline/manual_import_pipeline.py` orchestrates the stages.
-
-Keep configuration in `configs/`, sample inputs in `examples/`, shell entry points in `scripts/`, and pytest modules in `tests/`. The HTML prototype is a reference asset. Pipeline artifacts and Drain3 state belong in generated `output/`.
+Core Python logic lives in `src/logrisk/`: normalization, Drain3 mining, aggregation, risk scoring, Ollama feature extraction, and in-memory review jobs are separate modules. `src/pipeline/manual_import_pipeline.py` creates `result.json`; `src/pipeline/dashboard_server.py` hosts the local review application. Keep the dependency-free frontend in `frontend/index.html`, runtime configuration in `configs/`, sample inputs in `examples/`, launchers in `scripts/`, and pytest modules in `tests/`. Generated artifacts belong in `output/`.
 
 ## Build, Test, and Development Commands
-
-Set up the project with Python 3 and an isolated environment:
 
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+pytest -q
 ```
 
-- `pytest` — run the suite; `pyproject.toml` adds `src/` and discovers `tests/`.
-- `pytest tests/test_normalizer.py -v` — run one focused module.
-- `bash scripts/run_manual_pipeline.sh` — process `examples/sample_k8s_logs.jsonl` and print `output/result.json` summary; this script also requires `jq`.
-- `PYTHONPATH=src python3 -m pipeline.manual_import_pipeline --help` — inspect CLI options.
+- `bash scripts/run_manual_pipeline.sh` — generate risk-analysis artifacts from sample logs.
+- `bash scripts/run_dashboard.sh` — serve the feature review UI at `http://127.0.0.1:8080`.
+- `pytest tests/test_feature_jobs.py -v` — run a focused module.
+- `bash -n scripts/*.sh` — validate launcher syntax.
 
-There is no packaging or compilation step.
+There is no packaging, npm, or compilation step.
 
 ## Coding Style & Naming Conventions
 
-Use four-space indentation, PEP 8 spacing, type hints, and `from __future__ import annotations`. Name modules, functions, and variables with `snake_case`, classes with `PascalCase`, and constants with `UPPER_SNAKE_CASE`. Preserve stage boundaries: reusable transformations belong in `logrisk`, while CLI and file-flow orchestration belong in `pipeline`. No formatter or linter is configured, so match adjacent code and avoid unrelated reformatting.
+Use four-space indentation, PEP 8 spacing, type hints, and `from __future__ import annotations`. Use `snake_case` for Python names, `PascalCase` for classes, and `UPPER_SNAKE_CASE` for constants. Keep reusable transformations in `logrisk` and orchestration in `pipeline`. The frontend must use escaped uploaded/model text when rendering HTML. No formatter or linter is configured; match adjacent code.
 
 ## Testing Guidelines
 
-Tests use pytest and `test_<behavior>` function names. Mirror source responsibilities, such as `tests/test_risk_engine.py`. Add regression cases for malformed or incomplete records, timestamp windows, stable template hashes, rule matching, and generated pipeline summaries. Tests must be deterministic and must write temporary state outside tracked fixtures. No coverage threshold is currently configured.
+Tests use pytest and `test_<behavior>` names. Add regression coverage for malformed records, schema failures, sanitization, job transitions, HTTP routes, and export filtering. HTTP tests may bind a random loopback port and must not require a live Ollama instance. Preserve deterministic tests by injecting the extractor and using temporary output/state directories. No coverage threshold is configured.
 
-## Architecture and Configuration Constraints
+## Architecture and Security Constraints
 
-This phase intentionally excludes Kafka, Elasticsearch, databases, and real LLM calls. RCA must consume aggregated, scored evidence—not raw log streams. Do not use Drain3's incremental cluster ID as a persistent identifier; retain stable template hashes. Keep intermediate JSON artifacts because they support debugging. Treat `configs/risk_rules.yaml` as reviewed application logic: test changes to weights, regexes, or risk categories.
+This repository identifies and reviews log features; it does not implement RCA. Ollama must receive only aggregated, sanitized evidence and must never receive `samples`, `raw_sample`, or raw log streams. Only approved features may be exported for manual import into the external RCA system. Do not add Kafka, Elasticsearch, a database, external LLM services, or frontend CDNs. Bind the dashboard to `127.0.0.1` by default.
 
 ## Commit & Pull Request Guidelines
 
-There is no commit history yet. Use focused Conventional Commit subjects, for example `fix: parse nested klog prefix`. Pull requests should describe the affected stage, link issues, list verification commands, and include representative input/output when behavior changes. Never commit production logs, secrets, `.venv/`, or generated `output/` state.
+Use focused Conventional Commit subjects such as `feat: add feature approval export`. Pull requests should identify affected pipeline stages, list verification commands, link issues, and include screenshots for UI changes. Never commit production logs, secrets, `.venv/`, `.superpowers/`, caches, or generated `output/` state.

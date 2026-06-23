@@ -3,16 +3,16 @@ import pytest
 from logrisk.feature_jobs import FeatureJobError, FeatureJobManager, validate_result_document
 
 
-def entity(entity_id, score):
+def entity(entity_id, score, log_count=2, entity_type="node"):
     return {
         "window_start": "2026-06-22T10:00:00+08:00",
         "window_end": "2026-06-22T10:05:00+08:00",
         "cluster": "prod-a",
-        "entity_type": "node",
+        "entity_type": entity_type,
         "entity_id": entity_id,
         "risk_score": score,
         "risk_level": "high" if score >= 70 else "medium",
-        "top_templates": [],
+        "top_templates": [{"template_hash": f"hash-{entity_id}", "count": log_count}],
         "affected_entities": [],
     }
 
@@ -48,8 +48,20 @@ def candidate(source, title="候选特征"):
 
 def document():
     return {
-        "summary": {"total_raw_logs": 10, "total_risk_entities": 3},
-        "risk_entities": [entity("node-low", 20), entity("node-high", 90), entity("node-mid", 50)],
+        "summary": {
+            "total_raw_logs": 10,
+            "total_normalized_logs": 10,
+            "total_template_events": 10,
+            "total_template_windows": 6,
+            "total_risk_entities": 3,
+            "drain3_reduced_logs": 4,
+            "drain3_compression_ratio_percent": 40.0,
+        },
+        "risk_entities": [
+            entity("node-low", 20, log_count=2),
+            entity("node-high", 90, log_count=5),
+            entity("node-mid", 50, log_count=3),
+        ],
     }
 
 
@@ -70,12 +82,28 @@ def test_job_processes_eligible_entities_serially_by_score_and_continues_failure
     manager = FeatureJobManager(extractor=extractor, auto_start=False)
     job_id = manager.create_job(document(), model="qwen3:1.7b", min_score=40)
 
+    initial = manager.get_job(job_id)
+    assert initial["log_statistics"] == {
+        "original_logs": 10,
+        "normalized_logs": 10,
+        "template_events": 10,
+        "template_windows": 6,
+        "drain3_reduced_logs": 4,
+        "drain3_compression_ratio_percent": 40.0,
+        "eligible_logs": 8,
+        "analyzed_logs": 0,
+        "pending_logs": 8,
+        "skipped_logs": 2,
+    }
+
     manager.run_job(job_id)
     snapshot = manager.get_job(job_id)
 
     assert calls == ["node-high", "node-mid"]
     assert snapshot["status"] == "completed_with_errors"
     assert snapshot["progress"] == {"total": 2, "completed": 1, "failed": 1, "percent": 100}
+    assert snapshot["log_statistics"]["analyzed_logs"] == 3
+    assert snapshot["log_statistics"]["pending_logs"] == 5
     states = {item["entity_id"]: item["status"] for item in snapshot["entities"]}
     assert states == {"node-high": "failed", "node-mid": "completed", "node-low": "skipped"}
     assert snapshot["features"][0]["entity"]["id"] == "node-mid"
@@ -128,6 +156,17 @@ def test_review_edit_and_export_only_approved_features():
     assert package["review_statistics"] == {"total": 1, "approved": 1, "rejected": 0, "pending": 0}
     assert package["approved_features"][0]["title"] == "人工修订标题"
     assert package["approved_features"][0]["reviewer_note"] == "已核对模板"
+    assert package["approved_risk_nodes"] == [{
+        "node_id": "node-a",
+        "cluster": "prod-a",
+        "risk_score": 90,
+        "risk_level": "high",
+        "window_start": "2026-06-22T10:00:00+08:00",
+        "window_end": "2026-06-22T10:05:00+08:00",
+        "log_count": 2,
+        "approved_feature_ids": ["feature-node-a"],
+        "affected_entities": [],
+    }]
     assert "root_cause_candidate" not in package["approved_features"][0]
 
 
@@ -141,3 +180,25 @@ def test_export_requires_an_approved_feature():
 
     with pytest.raises(FeatureJobError, match="至少批准"):
         manager.export_approved(job_id)
+
+
+def test_export_excludes_nodes_without_approved_features_and_non_node_entities():
+    manager = FeatureJobManager(extractor=lambda source, **kwargs: [candidate(source)], auto_start=False)
+    job_id = manager.create_job(
+        {
+            "summary": {},
+            "risk_entities": [
+                entity("node-a", 90),
+                entity("node-b", 80),
+                entity("pod-a", 70, entity_type="pod"),
+            ],
+        },
+        model="qwen3:1.7b",
+    )
+    manager.run_job(job_id)
+    manager.update_feature(job_id, "feature-node-a", {"status": "approved"})
+    manager.update_feature(job_id, "feature-pod-a", {"status": "approved"})
+
+    package = manager.export_approved(job_id)
+
+    assert [node["node_id"] for node in package["approved_risk_nodes"]] == ["node-a"]

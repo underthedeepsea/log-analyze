@@ -16,6 +16,9 @@ def test_run_pipeline_stops_after_risk_scoring(tmp_path):
     )
 
     assert result["summary"]["total_raw_logs"] == 10
+    assert result["summary"]["total_template_windows"] == 6
+    assert result["summary"]["drain3_reduced_logs"] == 4
+    assert result["summary"]["drain3_compression_ratio_percent"] == 40.0
     assert result["risk_entities"]
     assert "rca_results" not in result
     assert not (output_dir / "rca_results.json").exists()

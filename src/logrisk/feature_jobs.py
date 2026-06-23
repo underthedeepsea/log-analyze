@@ -39,6 +39,10 @@ def validate_result_document(document: Any) -> Dict[str, Any]:
     return document
 
 
+def _entity_log_count(entity: Dict[str, Any]) -> int:
+    return sum(int(template.get("count") or 0) for template in (entity.get("top_templates") or []))
+
+
 class FeatureJobManager:
     def __init__(
         self,
@@ -74,8 +78,13 @@ class FeatureJobManager:
             records.append({
                 "entity_id": str(source.get("entity_id")),
                 "entity_type": source.get("entity_type"),
+                "cluster": source.get("cluster"),
+                "window_start": source.get("window_start"),
+                "window_end": source.get("window_end"),
                 "risk_score": score,
                 "risk_level": source.get("risk_level"),
+                "log_count": _entity_log_count(source),
+                "affected_entities": copy.deepcopy(source.get("affected_entities") or []),
                 "status": "queued" if score >= min_score else "skipped",
                 "error": None,
                 "feature_ids": [],
@@ -188,6 +197,36 @@ class FeatureJobManager:
             "percent": round(finished / total * 100) if total else 100,
         }
 
+    def _log_statistics_locked(self, job: Dict[str, Any]) -> Dict[str, int | float]:
+        summary = job["source_summary"]
+        original = int(summary.get("total_raw_logs") or sum(record["log_count"] for record in job["entities"]))
+        template_windows = int(summary.get("total_template_windows") or 0)
+        reduced = int(summary.get("drain3_reduced_logs") or max(0, original - template_windows))
+        ratio = summary.get("drain3_compression_ratio_percent")
+        if ratio is None:
+            ratio = round(reduced / original * 100, 2) if original else 0.0
+        eligible = [record for record in job["entities"] if record["status"] != "skipped"]
+        return {
+            "original_logs": original,
+            "normalized_logs": int(summary.get("total_normalized_logs") or 0),
+            "template_events": int(summary.get("total_template_events") or 0),
+            "template_windows": template_windows,
+            "drain3_reduced_logs": reduced,
+            "drain3_compression_ratio_percent": float(ratio),
+            "eligible_logs": sum(record["log_count"] for record in eligible),
+            "analyzed_logs": sum(
+                record["log_count"] for record in eligible if record["status"] == "completed"
+            ),
+            "pending_logs": sum(
+                record["log_count"]
+                for record in eligible
+                if record["status"] in {"queued", "running", "failed"}
+            ),
+            "skipped_logs": sum(
+                record["log_count"] for record in job["entities"] if record["status"] == "skipped"
+            ),
+        }
+
     def get_job(self, job_id: str) -> Dict[str, Any]:
         with self._lock:
             job = self._job(job_id)
@@ -204,6 +243,7 @@ class FeatureJobManager:
                 "min_score": job["min_score"],
                 "source_summary": copy.deepcopy(job["source_summary"]),
                 "progress": self._progress_locked(job),
+                "log_statistics": self._log_statistics_locked(job),
                 "entities": entities,
                 "features": copy.deepcopy(list(job["features"].values())),
             }
@@ -287,11 +327,50 @@ class FeatureJobManager:
                 "rejected": sum(feature["status"] == "rejected" for feature in features),
                 "pending": sum(feature["status"] == "pending" for feature in features),
             }
+            approved_ids = {feature["candidate_id"] for feature in approved}
+            nodes: Dict[tuple[str, str], Dict[str, Any]] = {}
+            for record in job["entities"]:
+                source = record["source"]
+                if source.get("entity_type") != "node":
+                    continue
+                feature_ids = sorted(approved_ids.intersection(record["feature_ids"]))
+                if not feature_ids:
+                    continue
+                key = (str(source.get("cluster") or ""), str(source.get("entity_id") or ""))
+                node = nodes.get(key)
+                if node is None:
+                    node = {
+                        "node_id": source.get("entity_id"),
+                        "cluster": source.get("cluster"),
+                        "risk_score": source.get("risk_score"),
+                        "risk_level": source.get("risk_level"),
+                        "window_start": source.get("window_start"),
+                        "window_end": source.get("window_end"),
+                        "log_count": 0,
+                        "approved_feature_ids": [],
+                        "affected_entities": [],
+                    }
+                    nodes[key] = node
+                if float(source.get("risk_score") or 0) > float(node.get("risk_score") or 0):
+                    node["risk_score"] = source.get("risk_score")
+                    node["risk_level"] = source.get("risk_level")
+                node["window_start"] = min(
+                    value for value in (node.get("window_start"), source.get("window_start")) if value
+                )
+                node["window_end"] = max(
+                    value for value in (node.get("window_end"), source.get("window_end")) if value
+                )
+                node["log_count"] += record["log_count"]
+                node["approved_feature_ids"] = sorted(set(node["approved_feature_ids"]) | set(feature_ids))
+                node["affected_entities"] = sorted(
+                    set(node["affected_entities"]) | set(source.get("affected_entities") or [])
+                )
             return {
                 "schema_version": "1.0",
                 "generated_at": _now(),
                 "source_summary": copy.deepcopy(job["source_summary"]),
                 "model": {"provider": "ollama", "name": job["model"]},
                 "review_statistics": statistics,
+                "approved_risk_nodes": sorted(nodes.values(), key=lambda item: str(item["node_id"])),
                 "approved_features": approved,
             }

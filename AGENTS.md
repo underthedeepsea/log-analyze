@@ -35,3 +35,5 @@ This repository identifies and reviews log features; it does not implement RCA. 
 ## Commit & Pull Request Guidelines
 
 Use focused Conventional Commit subjects such as `feat: add feature approval export`. Pull requests should identify affected pipeline stages, list verification commands, link issues, and include screenshots for UI changes. Never commit production logs, secrets, `.venv/`, `.superpowers/`, caches, or generated `output/` state.
+
+Every code update must also update `releas.md`. Versions use `1.<feature>.<bug>`: feature releases increment the middle number and reset the final number; bug-only releases increment the final number.

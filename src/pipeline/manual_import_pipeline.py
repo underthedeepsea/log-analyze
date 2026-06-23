@@ -44,12 +44,17 @@ def run_pipeline(
     risk_entities = score_risk_entities(template_windows, rules)
     write_json(output / "risk_entities.json", risk_entities)
 
+    reduced_logs = max(0, len(raw_records) - len(template_windows))
+    compression_ratio = round(reduced_logs / len(raw_records) * 100, 2) if raw_records else 0.0
+
     result = {
         "summary": {
             "total_raw_logs": len(raw_records),
             "total_normalized_logs": len(normalized),
             "total_template_events": len(template_events),
             "total_template_windows": len(template_windows),
+            "drain3_reduced_logs": reduced_logs,
+            "drain3_compression_ratio_percent": compression_ratio,
             "total_risk_entities": len(risk_entities),
             "critical_entities": sum(1 for x in risk_entities if x.get("risk_level") == "critical"),
             "high_entities": sum(1 for x in risk_entities if x.get("risk_level") == "high"),

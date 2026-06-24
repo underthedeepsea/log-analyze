@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-Core Python logic lives in `src/logrisk/`: normalization, Drain3 mining, aggregation, risk scoring, Ollama feature extraction, and in-memory review jobs are separate modules. `src/pipeline/manual_import_pipeline.py` creates `result.json`; `src/pipeline/dashboard_server.py` hosts the local review application. Keep the dependency-free frontend in `frontend/index.html`, runtime configuration in `configs/`, sample inputs in `examples/`, launchers in `scripts/`, and pytest modules in `tests/`. Generated artifacts belong in `output/`.
+Core Python logic lives in `src/logrisk/`: normalization, Drain3 mining, aggregation, risk scoring, approved-rule persistence, metrics, Ollama extraction, and review jobs are separate modules. `src/pipeline/manual_import_pipeline.py` creates `result.json`; `src/pipeline/dashboard_server.py` hosts the application. Keep React source in `frontend/src/`, committed runtime assets in `frontend/dist/`, configuration in `configs/`, samples in `examples/`, launchers in `scripts/`, and pytest modules in `tests/`. Generated artifacts belong in `output/`; runtime state belongs in ignored `state/`.
 
 ## Build, Test, and Development Commands
 
@@ -14,15 +14,16 @@ pytest -q
 ```
 
 - `bash scripts/run_manual_pipeline.sh` — generate risk-analysis artifacts from sample logs.
-- `bash scripts/run_dashboard.sh` — serve the feature review UI at `http://127.0.0.1:8080`.
+- `bash scripts/dashboard.sh start|stop|restart|status` — manage the local Dashboard process.
+- `bash scripts/run_dashboard.sh` — run the Dashboard in the foreground.
 - `pytest tests/test_feature_jobs.py -v` — run a focused module.
 - `bash -n scripts/*.sh` — validate launcher syntax.
 
-There is no packaging, npm, or compilation step.
+The committed pure React bundle runs without Node.js, npm, Vite, a CDN, or a compilation step.
 
 ## Coding Style & Naming Conventions
 
-Use four-space indentation, PEP 8 spacing, type hints, and `from __future__ import annotations`. Use `snake_case` for Python names, `PascalCase` for classes, and `UPPER_SNAKE_CASE` for constants. Keep reusable transformations in `logrisk` and orchestration in `pipeline`. The frontend must use escaped uploaded/model text when rendering HTML. No formatter or linter is configured; match adjacent code.
+Use four-space indentation, PEP 8 spacing, type hints, and `from __future__ import annotations`. Use `snake_case` for Python names, `PascalCase` for classes, and `UPPER_SNAKE_CASE` for constants. Keep reusable transformations in `logrisk` and orchestration in `pipeline`. React must render uploaded/model text as text nodes and never use raw HTML injection. No formatter or linter is configured; match adjacent code.
 
 ## Testing Guidelines
 

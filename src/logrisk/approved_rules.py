@@ -1,0 +1,147 @@
+from __future__ import annotations
+
+import copy
+import hashlib
+import json
+import os
+import threading
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable, Dict
+
+
+class ApprovedRuleError(RuntimeError):
+    """Raised when the approved-rule state cannot be read or written safely."""
+
+
+_PROCESS_LOCK = threading.RLock()
+
+
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _template_pairs(items: list[Dict[str, Any]]) -> list[Dict[str, str]]:
+    pairs = {
+        (str(item.get("template_hash") or "").strip(), str(item.get("category") or "").strip())
+        for item in items
+        if isinstance(item, dict) and str(item.get("template_hash") or "").strip()
+    }
+    return [
+        {"template_hash": template_hash, "category": category}
+        for template_hash, category in sorted(pairs)
+    ]
+
+
+def rule_signature(feature_type: str, sources: list[Dict[str, Any]]) -> str:
+    normalized_type = str(feature_type or "").strip().lower()
+    pairs = _template_pairs(sources)
+    if not normalized_type or not pairs:
+        raise ApprovedRuleError("批准特征缺少 feature_type 或模板 Hash，无法生成规则")
+    raw = json.dumps([normalized_type, pairs], ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+class ApprovedRuleStore:
+    def __init__(self, path: str | Path, clock: Callable[[], str] = _now) -> None:
+        self.path = Path(path)
+        self.clock = clock
+
+    def _read_locked(self) -> list[Dict[str, Any]]:
+        if not self.path.exists():
+            return []
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ApprovedRuleError(f"批准规则库无法读取: {exc}") from exc
+        if (
+            not isinstance(payload, dict)
+            or payload.get("schema_version") != "1.0"
+            or not isinstance(payload.get("rules"), list)
+            or not all(isinstance(rule, dict) for rule in payload["rules"])
+        ):
+            raise ApprovedRuleError("批准规则库结构无效")
+        return payload["rules"]
+
+    def _write_locked(self, rules: list[Dict[str, Any]]) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.path.with_name(f".{self.path.name}.{os.getpid()}.tmp")
+        payload = {"schema_version": "1.0", "rules": rules}
+        try:
+            temporary.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            os.replace(temporary, self.path)
+        except OSError as exc:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise ApprovedRuleError(f"批准规则库写入失败: {exc}") from exc
+
+    def list_rules(self) -> list[Dict[str, Any]]:
+        with _PROCESS_LOCK:
+            return copy.deepcopy(self._read_locked())
+
+    def upsert_feature(self, feature: Dict[str, Any]) -> Dict[str, Any]:
+        if not isinstance(feature, dict):
+            raise ApprovedRuleError("批准特征必须是 object")
+        signature = rule_signature(
+            str(feature.get("feature_type") or ""),
+            feature.get("source_templates") or [],
+        )
+        now = self.clock()
+        with _PROCESS_LOCK:
+            rules = self._read_locked()
+            existing = next((rule for rule in rules if rule.get("signature") == signature), None)
+            rule = {
+                "rule_id": existing.get("rule_id") if existing else f"rule-{signature[:20]}",
+                "signature": signature,
+                "feature_type": str(feature.get("feature_type") or "").strip(),
+                "title": str(feature.get("title") or "").strip(),
+                "summary": str(feature.get("summary") or "").strip(),
+                "importance": str(feature.get("importance") or "medium").strip(),
+                "tags": [str(tag).strip() for tag in (feature.get("tags") or []) if str(tag).strip()],
+                "selection_reason": str(feature.get("selection_reason") or "").strip(),
+                "components": sorted({str(item) for item in (feature.get("components") or []) if item}),
+                "template_signatures": _template_pairs(feature.get("source_templates") or []),
+                "approved_at": existing.get("approved_at") if existing else now,
+                "updated_at": now,
+                "reuse_count": int(existing.get("reuse_count") or 0) if existing else 0,
+                "last_reused_at": existing.get("last_reused_at") if existing else None,
+            }
+            if existing:
+                rules[rules.index(existing)] = rule
+            else:
+                rules.append(rule)
+            rules.sort(key=lambda item: str(item.get("rule_id")))
+            self._write_locked(rules)
+            return copy.deepcopy(rule)
+
+    def match_entity(self, entity: Dict[str, Any]) -> list[Dict[str, Any]]:
+        entity_pairs = {
+            (item["template_hash"], item["category"])
+            for item in _template_pairs(entity.get("top_templates") or [])
+        }
+        with _PROCESS_LOCK:
+            matches = []
+            for rule in self._read_locked():
+                required = {
+                    (str(item.get("template_hash") or ""), str(item.get("category") or ""))
+                    for item in (rule.get("template_signatures") or [])
+                }
+                if required and required.issubset(entity_pairs):
+                    matches.append(copy.deepcopy(rule))
+            return matches
+
+    def record_reuse(self, rule_id: str) -> Dict[str, Any]:
+        with _PROCESS_LOCK:
+            rules = self._read_locked()
+            rule = next((item for item in rules if item.get("rule_id") == rule_id), None)
+            if rule is None:
+                raise ApprovedRuleError("批准规则不存在")
+            rule["reuse_count"] = int(rule.get("reuse_count") or 0) + 1
+            rule["last_reused_at"] = self.clock()
+            self._write_locked(rules)
+            return copy.deepcopy(rule)

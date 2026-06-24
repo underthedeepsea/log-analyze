@@ -1,16 +1,20 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict
 
+from logrisk.approved_rules import ApprovedRuleStore
 from logrisk.feature_extractor_ollama import (
     DEFAULT_OLLAMA_URL,
     IMPORTANCE_LEVELS,
     extract_features_for_entity,
 )
+from logrisk.processing_metrics import ProcessingMetricsStore
 
 
 class FeatureJobError(RuntimeError):
@@ -43,13 +47,93 @@ def _entity_log_count(entity: Dict[str, Any]) -> int:
     return sum(int(template.get("count") or 0) for template in (entity.get("top_templates") or []))
 
 
+def _sanitized_templates(entity: Dict[str, Any]) -> list[Dict[str, Any]]:
+    allowed = (
+        "template_hash",
+        "component",
+        "severity",
+        "template",
+        "category",
+        "count",
+        "first_seen",
+        "last_seen",
+        "feature_hint",
+    )
+    return [
+        {key: template.get(key) for key in allowed}
+        for template in (entity.get("top_templates") or [])
+        if isinstance(template, dict)
+    ]
+
+
+def _feature_from_rule(rule: Dict[str, Any], entity: Dict[str, Any]) -> Dict[str, Any]:
+    required = {
+        (str(item.get("template_hash") or ""), str(item.get("category") or ""))
+        for item in (rule.get("template_signatures") or [])
+    }
+    sources = [
+        template
+        for template in _sanitized_templates(entity)
+        if (
+            str(template.get("template_hash") or ""),
+            str(template.get("category") or ""),
+        ) in required
+    ]
+    material = "|".join([
+        str(rule.get("rule_id") or ""),
+        str(entity.get("cluster") or ""),
+        str(entity.get("entity_type") or ""),
+        str(entity.get("entity_id") or ""),
+        str(entity.get("window_start") or ""),
+    ])
+    first_seen = [item.get("first_seen") for item in sources if item.get("first_seen")]
+    last_seen = [item.get("last_seen") for item in sources if item.get("last_seen")]
+    return {
+        "candidate_id": hashlib.sha256(material.encode("utf-8")).hexdigest()[:20],
+        "status": "approved",
+        "reviewer_note": "历史批准规则自动复用",
+        "approved_at": rule.get("approved_at"),
+        "cluster": entity.get("cluster"),
+        "entity": {"type": entity.get("entity_type"), "id": entity.get("entity_id")},
+        "window_start": entity.get("window_start"),
+        "window_end": entity.get("window_end"),
+        "risk_score": entity.get("risk_score"),
+        "risk_level": entity.get("risk_level"),
+        "affected_entities": copy.deepcopy(entity.get("affected_entities") or []),
+        "feature_type": rule.get("feature_type"),
+        "title": rule.get("title"),
+        "summary": rule.get("summary"),
+        "importance": rule.get("importance"),
+        "template_hashes": [item.get("template_hash") for item in sources],
+        "components": sorted({str(item.get("component")) for item in sources if item.get("component")}),
+        "tags": copy.deepcopy(rule.get("tags") or []),
+        "selection_reason": rule.get("selection_reason") or "命中历史人工批准规则",
+        "occurrence_count": sum(int(item.get("count") or 0) for item in sources),
+        "time_range": {
+            "first_seen": min(first_seen) if first_seen else entity.get("window_start"),
+            "last_seen": max(last_seen) if last_seen else entity.get("window_end"),
+        },
+        "source_templates": sources,
+        "provider": "approved_rule",
+        "model": None,
+        "origin": "approved_rule",
+        "rule_id": rule.get("rule_id"),
+    }
+
+
 class FeatureJobManager:
     def __init__(
         self,
         extractor: Callable[..., list[Dict[str, Any]]] = extract_features_for_entity,
+        rule_store: ApprovedRuleStore | None = None,
+        metrics_store: ProcessingMetricsStore | None = None,
+        monotonic: Callable[[], float] = time.monotonic,
         auto_start: bool = True,
     ) -> None:
         self.extractor = extractor
+        self.rule_store = rule_store
+        self.metrics_store = metrics_store
+        self.monotonic = monotonic
         self.auto_start = auto_start
         self._jobs: Dict[str, Dict[str, Any]] = {}
         self._lock = threading.RLock()
@@ -69,13 +153,17 @@ class FeatureJobManager:
             raise FeatureJobError("Ollama timeout 必须大于 0")
 
         records = []
+        initial_features: Dict[str, Dict[str, Any]] = {}
+        started_monotonic = self.monotonic()
+        processed_samples: list[tuple[float, int]] = []
         for source in sorted(
             document["risk_entities"],
             key=lambda item: float(item.get("risk_score") or 0),
             reverse=True,
         ):
             score = float(source.get("risk_score") or 0)
-            records.append({
+            matches = self.rule_store.match_entity(source) if self.rule_store and score >= min_score else []
+            record = {
                 "entity_id": str(source.get("entity_id")),
                 "entity_type": source.get("entity_type"),
                 "cluster": source.get("cluster"),
@@ -85,11 +173,21 @@ class FeatureJobManager:
                 "risk_level": source.get("risk_level"),
                 "log_count": _entity_log_count(source),
                 "affected_entities": copy.deepcopy(source.get("affected_entities") or []),
-                "status": "queued" if score >= min_score else "skipped",
+                "status": "rule_matched" if matches else ("queued" if score >= min_score else "skipped"),
                 "error": None,
                 "feature_ids": [],
+                "matched_rule_ids": [str(rule.get("rule_id")) for rule in matches],
+                "llm_counted": False,
                 "source": copy.deepcopy(source),
-            })
+            }
+            for rule in matches:
+                feature = _feature_from_rule(rule, source)
+                initial_features[feature["candidate_id"]] = feature
+                record["feature_ids"].append(feature["candidate_id"])
+                self.rule_store.record_reuse(str(rule["rule_id"]))
+            if matches:
+                processed_samples.append((started_monotonic, record["log_count"]))
+            records.append(record)
 
         job_id = uuid.uuid4().hex
         condition = threading.Condition(self._lock)
@@ -105,11 +203,21 @@ class FeatureJobManager:
                 "min_score": float(min_score),
                 "source_summary": copy.deepcopy(document.get("summary") or {}),
                 "entities": records,
-                "features": {},
+                "features": initial_features,
                 "events": [],
+                "started_monotonic": started_monotonic,
+                "processed_samples": processed_samples,
                 "condition": condition,
             }
             self._emit_locked(self._jobs[job_id], "job_created")
+            for record in records:
+                if record["status"] == "rule_matched":
+                    self._emit_locked(
+                        self._jobs[job_id],
+                        "entity_rule_matched",
+                        entity_id=record["entity_id"],
+                        rule_ids=record["matched_rule_ids"],
+                    )
 
         if self.auto_start:
             threading.Thread(target=self.run_job, args=(job_id,), daemon=True).start()
@@ -147,6 +255,10 @@ class FeatureJobManager:
         for record in records:
             with self._lock:
                 record["status"] = "running"
+                if not record["llm_counted"]:
+                    if self.metrics_store:
+                        self.metrics_store.add_llm_logs(record["log_count"])
+                    record["llm_counted"] = True
                 self._emit_locked(job, "entity_started", entity_id=record["entity_id"])
             try:
                 features = self.extractor(
@@ -158,11 +270,13 @@ class FeatureJobManager:
                 with self._lock:
                     record["feature_ids"] = []
                     for feature in features:
+                        feature.setdefault("origin", "ollama")
                         candidate_id = feature["candidate_id"]
                         job["features"][candidate_id] = copy.deepcopy(feature)
                         record["feature_ids"].append(candidate_id)
                     record["status"] = "completed"
                     record["error"] = None
+                    job["processed_samples"].append((self.monotonic(), record["log_count"]))
                     self._emit_locked(
                         job,
                         "entity_completed",
@@ -173,6 +287,7 @@ class FeatureJobManager:
                 with self._lock:
                     record["status"] = "failed"
                     record["error"] = str(exc)
+                    job["processed_samples"].append((self.monotonic(), record["log_count"]))
                     self._emit_locked(job, "entity_failed", entity_id=record["entity_id"], error=str(exc))
 
         with self._lock:
@@ -186,7 +301,9 @@ class FeatureJobManager:
 
     def _progress_locked(self, job: Dict[str, Any]) -> Dict[str, int]:
         eligible = [record for record in job["entities"] if record["status"] != "skipped"]
-        completed = sum(record["status"] == "completed" for record in eligible)
+        ollama_completed = sum(record["status"] == "completed" for record in eligible)
+        rule_matched = sum(record["status"] == "rule_matched" for record in eligible)
+        completed = ollama_completed + rule_matched
         failed = sum(record["status"] == "failed" for record in eligible)
         finished = completed + failed
         total = len(eligible)
@@ -195,6 +312,8 @@ class FeatureJobManager:
             "completed": completed,
             "failed": failed,
             "percent": round(finished / total * 100) if total else 100,
+            "rule_matched": rule_matched,
+            "ollama_completed": ollama_completed,
         }
 
     def _log_statistics_locked(self, job: Dict[str, Any]) -> Dict[str, int | float]:
@@ -215,7 +334,9 @@ class FeatureJobManager:
             "drain3_compression_ratio_percent": float(ratio),
             "eligible_logs": sum(record["log_count"] for record in eligible),
             "analyzed_logs": sum(
-                record["log_count"] for record in eligible if record["status"] == "completed"
+                record["log_count"]
+                for record in eligible
+                if record["status"] in {"completed", "rule_matched"}
             ),
             "pending_logs": sum(
                 record["log_count"]
@@ -225,6 +346,36 @@ class FeatureJobManager:
             "skipped_logs": sum(
                 record["log_count"] for record in job["entities"] if record["status"] == "skipped"
             ),
+            "reused_logs": sum(
+                record["log_count"] for record in eligible if record["status"] == "rule_matched"
+            ),
+            "ollama_logs": sum(
+                record["log_count"] for record in eligible if record["status"] == "completed"
+            ),
+        }
+
+    def _live_metrics_locked(self, job: Dict[str, Any]) -> Dict[str, int | float]:
+        now = self.monotonic()
+        elapsed = max(0.0, now - float(job["started_monotonic"]))
+        samples = job["processed_samples"]
+        processed_logs = sum(int(count) for _, count in samples)
+        rolling_logs = sum(int(count) for timestamp, count in samples if timestamp >= now - 60)
+        current_rate = processed_logs / elapsed if elapsed > 0 else 0.0
+        rolling_duration = min(60.0, elapsed)
+        rolling_rate = rolling_logs / rolling_duration if rolling_duration > 0 else 0.0
+        pending_logs = sum(
+            record["log_count"]
+            for record in job["entities"]
+            if record["status"] in {"queued", "running"}
+        )
+        rule_matched = [record for record in job["entities"] if record["status"] == "rule_matched"]
+        return {
+            "today_llm_logs": self.metrics_store.today_llm_logs() if self.metrics_store else 0,
+            "saved_llm_calls": len(rule_matched),
+            "saved_llm_logs": sum(record["log_count"] for record in rule_matched),
+            "processing_logs_per_second": round(current_rate, 2),
+            "rolling_60s_logs_per_second": round(rolling_rate, 2),
+            "eta_seconds": round(pending_logs / current_rate) if current_rate > 0 else (None if pending_logs else 0),
         }
 
     def get_job(self, job_id: str) -> Dict[str, Any]:
@@ -244,6 +395,7 @@ class FeatureJobManager:
                 "source_summary": copy.deepcopy(job["source_summary"]),
                 "progress": self._progress_locked(job),
                 "log_statistics": self._log_statistics_locked(job),
+                "live_metrics": self._live_metrics_locked(job),
                 "entities": entities,
                 "features": copy.deepcopy(list(job["features"].values())),
             }
@@ -288,7 +440,7 @@ class FeatureJobManager:
         with self._lock:
             job = self._job(job_id)
             try:
-                feature = job["features"][candidate_id]
+                feature = copy.deepcopy(job["features"][candidate_id])
             except KeyError as exc:
                 raise FeatureJobError("候选特征不存在") from exc
 
@@ -311,8 +463,20 @@ class FeatureJobManager:
                     raise FeatureJobError("字段 status 无效")
                 feature["status"] = changes["status"]
                 feature["approved_at"] = _now() if changes["status"] == "approved" else None
+                if changes["status"] == "approved" and self.rule_store:
+                    rule = self.rule_store.upsert_feature(feature)
+                    feature["rule_id"] = rule["rule_id"]
+            job["features"][candidate_id] = feature
             self._emit_locked(job, "feature_updated", candidate_id=candidate_id, status=feature["status"])
             return copy.deepcopy(feature)
+
+    def list_rules(self) -> list[Dict[str, Any]]:
+        return self.rule_store.list_rules() if self.rule_store else []
+
+    def get_system_metrics(self) -> Dict[str, int]:
+        return {
+            "today_llm_logs": self.metrics_store.today_llm_logs() if self.metrics_store else 0,
+        }
 
     def export_approved(self, job_id: str) -> Dict[str, Any]:
         with self._lock:

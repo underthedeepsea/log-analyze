@@ -54,8 +54,12 @@ def candidate(source):
 
 @pytest.fixture
 def dashboard(tmp_path):
-    frontend = tmp_path / "index.html"
+    frontend = tmp_path / "dist" / "index.html"
+    frontend.parent.mkdir()
     frontend.write_text("<!doctype html><title>Feature Dashboard</title>", encoding="utf-8")
+    assets = frontend.parent / "assets"
+    assets.mkdir()
+    (assets / "app.js").write_text("console.log('app')", encoding="utf-8")
     manager = FeatureJobManager(
         extractor=lambda source, **kwargs: [candidate(source)],
         auto_start=True,
@@ -66,6 +70,11 @@ def dashboard(tmp_path):
         manager=manager,
         frontend_path=frontend,
         ollama_checker=lambda: {"online": True, "models": ["qwen3:1.7b"]},
+        input_analyzer=lambda rows: {
+            "summary": {"total_raw_logs": len(rows)},
+            "risk_entities": [],
+            "top_templates": [],
+        },
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -156,3 +165,53 @@ def test_invalid_upload_and_unknown_route_return_json_errors(dashboard):
     assert invalid.value.code == 400
     assert json.load(invalid.value)["error"]
     assert missing.value.code == 404
+
+
+def test_plain_text_analysis_endpoint(dashboard):
+    base_url, _ = dashboard
+
+    status, payload, _ = request_json(
+        base_url + "/api/inputs/analyze",
+        "POST",
+        {"filename": "events.log", "content": "error one\n\nerror two"},
+    )
+
+    assert status == 200
+    assert payload["result"]["summary"]["total_raw_logs"] == 2
+
+
+def test_rule_list_route(dashboard):
+    base_url, _ = dashboard
+
+    status, payload, _ = request_json(base_url + "/api/rules")
+
+    assert status == 200
+    assert payload == {"rules": []}
+
+
+def test_system_metrics_route_returns_daily_llm_volume(dashboard):
+    base_url, _ = dashboard
+
+    status, payload, _ = request_json(base_url + "/api/metrics")
+
+    assert status == 200
+    assert payload == {"today_llm_logs": 0}
+
+
+def test_serves_bundled_asset_with_correct_content_type(dashboard):
+    base_url, _ = dashboard
+
+    with urlopen(base_url + "/assets/app.js", timeout=3) as response:
+        body = response.read().decode()
+
+    assert "javascript" in response.headers["Content-Type"]
+    assert "console.log" in body
+
+
+def test_static_asset_path_cannot_escape_frontend_directory(dashboard):
+    base_url, _ = dashboard
+
+    with pytest.raises(HTTPError) as invalid:
+        urlopen(base_url + "/assets/../index.html", timeout=3)
+
+    assert invalid.value.code == 404

@@ -1,0 +1,5 @@
+Jun 23 10:00:00 node-a kernel: Out of memory: Killed process 2481 (java)
+Jun 23 10:00:01 node-a kernel: Out of memory: Killed process 2510 (java)
+Jun 23 10:00:04 node-b kubelet: eviction manager: nodefs.available is below threshold
+Jun 23 10:00:07 node-b kubelet: eviction manager: attempting to reclaim ephemeral-storage
+Jun 23 10:00:10 node-c containerd: failed to create shim task: context deadline exceeded

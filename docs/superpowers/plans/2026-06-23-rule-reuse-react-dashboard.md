@@ -4,9 +4,9 @@
 
 **Goal:** Persist globally approved log-feature rules, skip Ollama for future matches, accept raw text logs, replace the Dashboard with the approved React V3 design, and add reliable process controls.
 
-**Architecture:** Add small file-backed stores for approved rules and daily metrics, then inject them into `FeatureJobManager`. Refactor the existing pipeline so HTTP uploads and CLI files share the same parser and analysis path. Serve a committed Vite/React production bundle from the dependency-free Python HTTP server; Node.js is required only when rebuilding frontend assets.
+**Architecture:** Add small file-backed stores for approved rules and daily metrics, then inject them into `FeatureJobManager`. Refactor the existing pipeline so HTTP uploads and CLI files share the same parser and analysis path. Serve committed pure React static files from the Python HTTP server without Vite, a CDN, or a runtime build step.
 
-**Tech Stack:** Python 3 standard library, Drain3, pytest, React 18, Vite, CSS, Bash, SSE.
+**Tech Stack:** Python 3 standard library, Drain3, pytest, React 18, CSS, Bash, SSE.
 
 ---
 
@@ -18,8 +18,8 @@
 - Modify `src/pipeline/manual_import_pipeline.py`: reusable in-memory analysis entrypoint.
 - Modify `src/logrisk/feature_jobs.py`: rule reuse, persisted approvals, and live metrics.
 - Modify `src/pipeline/dashboard_server.py`: upload analysis, rule listing, and static bundle serving.
-- Replace `frontend/index.html` with `frontend/index.html` as Vite's source entry; create `frontend/src/` modules and commit `frontend/dist/`.
-- Create `frontend/package.json`, `frontend/package-lock.json`, and `frontend/vite.config.js`.
+- Replace `frontend/index.html` with the pure React static entry; create `frontend/src/` files and commit `frontend/dist/` with vendored React/ReactDOM.
+- Create `frontend/package.json` and `frontend/package-lock.json` only to document vendored React versions.
 - Create `scripts/dashboard.sh`; retain `scripts/run_dashboard.sh` as a foreground wrapper.
 - Add focused pytest modules and update release documentation to `1.2.0`.
 
@@ -343,18 +343,9 @@ git commit -m "feat: expose text analysis and rule APIs"
 **Files:**
 - Create: `frontend/package.json`
 - Create: `frontend/package-lock.json`
-- Create: `frontend/vite.config.js`
 - Replace: `frontend/index.html`
-- Create: `frontend/src/main.jsx`
-- Create: `frontend/src/App.jsx`
-- Create: `frontend/src/api.js`
+- Create: `frontend/src/app.js`
 - Create: `frontend/src/styles.css`
-- Create: `frontend/src/components/Sidebar.jsx`
-- Create: `frontend/src/components/MetricsGrid.jsx`
-- Create: `frontend/src/components/LiveProcessing.jsx`
-- Create: `frontend/src/components/Workspace.jsx`
-- Create: `frontend/src/components/ReviewEditor.jsx`
-- Create: `frontend/src/components/RuleLibrary.jsx`
 - Create: `frontend/dist/index.html`
 - Create: `frontend/dist/assets/*`
 - Replace: `tests/test_frontend_contract.py`
@@ -363,7 +354,7 @@ git commit -m "feat: expose text analysis and rule APIs"
 
 ```python
 def test_react_source_has_all_workspaces():
-    source = Path("frontend/src/App.jsx").read_text()
+    source = Path("frontend/src/app.js").read_text()
     for label in ("特征总览", "识别队列", "人工审批", "批准规则库", "导出记录"):
         assert label in source
 
@@ -385,18 +376,16 @@ Run: `pytest tests/test_frontend_contract.py -q`
 
 Expected: React source and dist files do not exist.
 
-- [ ] **Step 3: Scaffold the local React build**
+- [ ] **Step 3: Vendor the local React runtime**
 
 ```json
 {
   "private": true,
-  "scripts": {"build": "vite build", "dev": "vite --host 127.0.0.1"},
-  "dependencies": {"react": "18.3.1", "react-dom": "18.3.1"},
-  "devDependencies": {"@vitejs/plugin-react": "4.3.4", "vite": "6.0.7"}
+  "dependencies": {"react": "18.3.1", "react-dom": "18.3.1"}
 }
 ```
 
-Use functional components and hooks. `api.js` owns JSON requests, SSE subscription, export downloads, and explicit error parsing. `App.jsx` owns current workspace, uploaded result, active job snapshot, selected feature, rule list, and Ollama status.
+Use functional components and hooks in `frontend/src/app.js`, rendered through locally vendored React UMD files. The application owns JSON requests, SSE subscription, exports, current workspace, uploaded result, active job snapshot, selected feature, rule list, and Ollama status.
 
 - [ ] **Step 4: Implement the V3 design and behavior**
 
@@ -409,19 +398,16 @@ Use functional components and hooks. `api.js` owns JSON requests, SSE subscripti
 
 Implement the approved white/light-gray/orange layout, circular pulsing reuse benefit, animated progress scan, Drain3 flow, 60-second speed SVG, ETA, rule badges, file picker accepting `.json,.jsonl,.txt,.log`, review editing, export, retry, responsive navigation, loading/empty/error states, and text-only React rendering. Show rules read-only with signature, approval/reuse timestamps, and reuse count.
 
-- [ ] **Step 5: Install, build, and verify the committed production bundle**
+- [ ] **Step 5: Refresh and verify the committed static runtime**
 
 Run:
 
 ```bash
-cd frontend
-npm install
-npm run build
-cd ..
+npm --prefix frontend install --omit=dev
 pytest tests/test_frontend_contract.py -q
 ```
 
-Expected: Vite build succeeds, `frontend/dist/assets/` contains local hashed JS/CSS, and contract tests pass.
+Expected: `frontend/dist/assets/` contains local React, ReactDOM, application JS, and CSS files, and contract tests pass. Normal startup does not run npm.
 
 - [ ] **Step 6: Commit React source and bundle**
 
@@ -543,4 +529,3 @@ In the in-app browser, verify desktop and narrow layouts; upload `examples/sampl
 git add README.md AGENTS.md CODEX_WORK_GUIDE_LOG_RISK_ANALYSIS.md releas.md examples/sample_plain_logs.log tests/test_frontend_contract.py
 git commit -m "docs: release version 1.2.0"
 ```
-

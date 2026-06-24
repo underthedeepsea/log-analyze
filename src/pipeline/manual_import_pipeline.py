@@ -11,45 +11,31 @@ from logrisk.normalizer import normalize_records
 from logrisk.risk_engine import load_rules, score_risk_entities
 
 
-def run_pipeline(
-    input_path: str,
-    output_dir: str,
+def _process_records(
+    records: list[Dict[str, Any]],
     config_path: str,
     rules_path: str,
     state_dir: str,
     window_seconds: int = 300,
-) -> Dict[str, Any]:
-    output = Path(output_dir)
-    output.mkdir(parents=True, exist_ok=True)
-
-    raw_records = read_json_or_jsonl(input_path)
-
-    normalized = normalize_records(raw_records)
-    write_json(output / "normalized_logs.json", normalized)
-
+) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    normalized = normalize_records(records)
     template_events = mine_template_events(
         normalized,
         config_path=config_path,
         state_dir=state_dir,
     )
-    write_json(output / "template_events.json", template_events)
-
     template_windows = aggregate_template_events(
         template_events,
         window_seconds=window_seconds,
     )
-    write_json(output / "template_windows.json", template_windows)
-
     rules = load_rules(rules_path)
     risk_entities = score_risk_entities(template_windows, rules)
-    write_json(output / "risk_entities.json", risk_entities)
-
-    reduced_logs = max(0, len(raw_records) - len(template_windows))
-    compression_ratio = round(reduced_logs / len(raw_records) * 100, 2) if raw_records else 0.0
+    reduced_logs = max(0, len(records) - len(template_windows))
+    compression_ratio = round(reduced_logs / len(records) * 100, 2) if records else 0.0
 
     result = {
         "summary": {
-            "total_raw_logs": len(raw_records),
+            "total_raw_logs": len(records),
             "total_normalized_logs": len(normalized),
             "total_template_events": len(template_events),
             "total_template_windows": len(template_windows),
@@ -61,20 +47,57 @@ def run_pipeline(
         },
         "risk_entities": risk_entities,
         "top_templates": sorted(template_windows, key=lambda x: x.get("count", 0), reverse=True)[:20],
-        "debug_files": {
-            "normalized_logs": str(output / "normalized_logs.json"),
-            "template_events": str(output / "template_events.json"),
-            "template_windows": str(output / "template_windows.json"),
-            "risk_entities": str(output / "risk_entities.json"),
-        },
     }
+    return result, {
+        "normalized_logs": normalized,
+        "template_events": template_events,
+        "template_windows": template_windows,
+        "risk_entities": risk_entities,
+    }
+
+
+def analyze_records(
+    records: list[Dict[str, Any]],
+    config_path: str,
+    rules_path: str,
+    state_dir: str,
+    window_seconds: int = 300,
+) -> Dict[str, Any]:
+    result, _ = _process_records(records, config_path, rules_path, state_dir, window_seconds)
+    return result
+
+
+def run_pipeline(
+    input_path: str,
+    output_dir: str,
+    config_path: str,
+    rules_path: str,
+    state_dir: str,
+    window_seconds: int = 300,
+) -> Dict[str, Any]:
+    output = Path(output_dir)
+    output.mkdir(parents=True, exist_ok=True)
+    raw_records = read_json_or_jsonl(input_path)
+    result, artifacts = _process_records(
+        raw_records,
+        config_path,
+        rules_path,
+        state_dir,
+        window_seconds,
+    )
+    debug_files = {}
+    for name, value in artifacts.items():
+        path = output / f"{name}.json"
+        write_json(path, value)
+        debug_files[name] = str(path)
+    result["debug_files"] = debug_files
     write_json(output / "result.json", result)
     return result
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="人工导入日志文件，验证 Drain3 + 风险评分后端流程")
-    parser.add_argument("--input", required=True, help="输入日志文件，支持 .json 或 .jsonl")
+    parser.add_argument("--input", required=True, help="输入日志文件，支持 .json、.jsonl、.txt 或 .log")
     parser.add_argument("--output-dir", default="output", help="输出目录")
     parser.add_argument("--config", default="configs/drain3_recommended.ini", help="Drain3 配置文件")
     parser.add_argument("--rules", default="configs/risk_rules.yaml", help="风险评分规则文件")

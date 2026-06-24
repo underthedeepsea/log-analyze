@@ -1,6 +1,8 @@
 import pytest
 
+from logrisk.approved_rules import ApprovedRuleStore
 from logrisk.feature_jobs import FeatureJobError, FeatureJobManager, validate_result_document
+from logrisk.processing_metrics import ProcessingMetricsStore
 
 
 def entity(entity_id, score, log_count=2, entity_type="node"):
@@ -94,6 +96,8 @@ def test_job_processes_eligible_entities_serially_by_score_and_continues_failure
         "analyzed_logs": 0,
         "pending_logs": 8,
         "skipped_logs": 2,
+        "reused_logs": 0,
+        "ollama_logs": 0,
     }
 
     manager.run_job(job_id)
@@ -101,7 +105,14 @@ def test_job_processes_eligible_entities_serially_by_score_and_continues_failure
 
     assert calls == ["node-high", "node-mid"]
     assert snapshot["status"] == "completed_with_errors"
-    assert snapshot["progress"] == {"total": 2, "completed": 1, "failed": 1, "percent": 100}
+    assert snapshot["progress"] == {
+        "total": 2,
+        "completed": 1,
+        "failed": 1,
+        "percent": 100,
+        "rule_matched": 0,
+        "ollama_completed": 1,
+    }
     assert snapshot["log_statistics"]["analyzed_logs"] == 3
     assert snapshot["log_statistics"]["pending_logs"] == 5
     states = {item["entity_id"]: item["status"] for item in snapshot["entities"]}
@@ -202,3 +213,123 @@ def test_export_excludes_nodes_without_approved_features_and_non_node_entities()
     package = manager.export_approved(job_id)
 
     assert [node["node_id"] for node in package["approved_risk_nodes"]] == ["node-a"]
+
+
+def reusable_entity(entity_id="node-a", cluster="prod-a"):
+    value = entity(entity_id, 90, log_count=8)
+    value["cluster"] = cluster
+    value["top_templates"] = [{
+        "template_hash": "hash-oom",
+        "category": "memory",
+        "component": "kernel",
+        "template": "Out of memory: Killed process <*>",
+        "count": 8,
+        "first_seen": value["window_start"],
+        "last_seen": value["window_end"],
+    }]
+    return value
+
+
+def reusable_candidate(source):
+    value = candidate(source, title="已批准的 OOM 特征")
+    value["feature_type"] = "resource_pressure"
+    value["template_hashes"] = ["hash-oom"]
+    value["source_templates"] = [dict(source["top_templates"][0])]
+    value["status"] = "approved"
+    return value
+
+
+def test_matching_rule_skips_extractor_and_uses_current_entity_facts(tmp_path):
+    calls = []
+    store = ApprovedRuleStore(tmp_path / "rules.json")
+    store.upsert_feature(reusable_candidate(reusable_entity("seed-node")))
+    manager = FeatureJobManager(
+        extractor=lambda source, **kwargs: calls.append(source) or [],
+        rule_store=store,
+        auto_start=False,
+    )
+    current = reusable_entity("new-node", cluster="another-cluster")
+
+    job_id = manager.create_job(
+        {"summary": {"total_raw_logs": 8}, "risk_entities": [current]},
+        model="qwen3:1.7b",
+    )
+    manager.run_job(job_id)
+    snapshot = manager.get_job(job_id)
+
+    assert calls == []
+    assert snapshot["status"] == "completed"
+    assert snapshot["entities"][0]["status"] == "rule_matched"
+    assert snapshot["progress"] == {
+        "total": 1,
+        "completed": 1,
+        "failed": 0,
+        "percent": 100,
+        "rule_matched": 1,
+        "ollama_completed": 0,
+    }
+    reused = snapshot["features"][0]
+    assert reused["status"] == "approved"
+    assert reused["origin"] == "approved_rule"
+    assert reused["entity"] == {"type": "node", "id": "new-node"}
+    assert reused["cluster"] == "another-cluster"
+    assert reused["occurrence_count"] == 8
+    assert reused["source_templates"][0]["template_hash"] == "hash-oom"
+
+
+def test_approving_ollama_feature_persists_reusable_rule(tmp_path):
+    store = ApprovedRuleStore(tmp_path / "rules.json")
+    source = reusable_entity("node-a")
+    manager = FeatureJobManager(
+        extractor=lambda record, **kwargs: [reusable_candidate(record) | {"status": "pending"}],
+        rule_store=store,
+        auto_start=False,
+    )
+    job_id = manager.create_job(
+        {"summary": {}, "risk_entities": [source]},
+        model="qwen3:1.7b",
+    )
+    manager.run_job(job_id)
+
+    manager.update_feature(job_id, "feature-node-a", {"status": "approved"})
+
+    rules = store.list_rules()
+    assert len(rules) == 1
+    assert rules[0]["feature_type"] == "resource_pressure"
+    assert rules[0]["template_signatures"] == [
+        {"template_hash": "hash-oom", "category": "memory"}
+    ]
+
+
+def test_snapshot_reports_daily_llm_volume_speed_eta_and_reuse_savings(tmp_path):
+    current = {"seconds": 100.0}
+    metrics = ProcessingMetricsStore(tmp_path / "metrics.json")
+    rules = ApprovedRuleStore(tmp_path / "rules.json")
+    rules.upsert_feature(reusable_candidate(reusable_entity("seed")))
+
+    manager = FeatureJobManager(
+        extractor=lambda source, **kwargs: [candidate(source)],
+        rule_store=rules,
+        metrics_store=metrics,
+        monotonic=lambda: current["seconds"],
+        auto_start=False,
+    )
+    unmatched = entity("node-new", 80, log_count=4)
+    matched = reusable_entity("node-reused")
+    job_id = manager.create_job(
+        {"summary": {"total_raw_logs": 12}, "risk_entities": [matched, unmatched]},
+        model="qwen3:1.7b",
+    )
+    current["seconds"] = 104.0
+    manager.run_job(job_id)
+    current["seconds"] = 108.0
+
+    snapshot = manager.get_job(job_id)
+    live = snapshot["live_metrics"]
+
+    assert live["today_llm_logs"] == 4
+    assert live["saved_llm_calls"] == 1
+    assert live["saved_llm_logs"] == 8
+    assert live["processing_logs_per_second"] == 1.5
+    assert live["rolling_60s_logs_per_second"] == 1.5
+    assert live["eta_seconds"] == 0

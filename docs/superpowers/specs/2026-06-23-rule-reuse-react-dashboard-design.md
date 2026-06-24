@@ -51,7 +51,7 @@ Daily LLM volume is persisted atomically in `state/processing_metrics.json`, key
 
 ## React Frontend
 
-Use React with a small Vite development setup. Source lives under `frontend/src/`; the self-contained production bundle is committed under `frontend/dist/`. React and ReactDOM are bundled locally—there are no frontend CDNs. Normal Dashboard startup serves `frontend/dist/index.html` and does not require Node.js or npm.
+Use pure React static files without Vite. Source lives under `frontend/src/`; the self-contained runtime is committed under `frontend/dist/`. React and ReactDOM are vendored locally—there are no frontend CDNs or runtime build steps. Normal Dashboard startup serves `frontend/dist/index.html` and does not require Node.js or npm.
 
 The approved V3 design uses:
 

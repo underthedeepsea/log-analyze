@@ -119,8 +119,8 @@ def test_release_docs_describe_current_bugfix_version():
     readme = Path("README.md").read_text(encoding="utf-8")
     agents = Path("AGENTS.md").read_text(encoding="utf-8")
 
-    assert "## 1.6.0 - 2026-07-01" in release
-    assert "当前版本：`1.6.0`" in readme
+    assert "## 1.8.0 - 2026-07-01" in release
+    assert "当前版本：`1.8.0`" in readme
     assert "Every code update must also update `releas.md`" in agents
     assert "dashboard.sh restart" in readme
     assert ".txt" in readme

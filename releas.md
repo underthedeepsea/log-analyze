@@ -6,6 +6,18 @@
 - 仅修复 Bug 时提升最后一位，例如 `1.2.0 → 1.2.1`；
 - 每次代码更新必须同步更新本文件。
 
+## 1.8.0 - 2026-07-01
+
+### Added
+
+- 新增 AI Harness Evidence Builder，统一构建发送给模型的脱敏证据包和稳定 evidence hash。
+- 新增 Model Client 抽象、本地 Ollama Provider 和测试用 Mock Provider。
+
+### Changed
+
+- Ollama 特征识别改为复用 Evidence Builder 和 Model Client，保留原有提取接口、JSON Schema、低温度和 trace 行为。
+- 模型 HTTP 调用从 `feature_extractor_ollama.py` 拆出，后续可继续扩展其他 provider。
+
 ## 1.6.0 - 2026-07-01
 
 ### Added

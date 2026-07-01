@@ -76,7 +76,7 @@ def test_generate_features_sanitizes_evidence_and_owns_source_facts(monkeypatch)
         captured["timeout"] = timeout
         return response([model_feature()])
 
-    monkeypatch.setattr("logrisk.feature_extractor_ollama.urlopen", fake_urlopen)
+    monkeypatch.setattr("logrisk.ai_harness.providers.ollama.urlopen", fake_urlopen)
 
     result = generate_feature_candidates([entity()], model="qwen3:1.7b", timeout=15)
 
@@ -109,7 +109,7 @@ def test_generate_features_uses_prompt_registry_and_writes_trace(monkeypatch, tm
         captured["body"] = json.loads(request.data)
         return response([model_feature()])
 
-    monkeypatch.setattr("logrisk.feature_extractor_ollama.urlopen", fake_urlopen)
+    monkeypatch.setattr("logrisk.ai_harness.providers.ollama.urlopen", fake_urlopen)
     monkeypatch.setattr(
         "logrisk.feature_extractor_ollama.PROMPT_REGISTRY",
         PromptRegistry(prompt_dir),
@@ -142,7 +142,7 @@ def test_trace_write_failure_does_not_fail_extraction(monkeypatch, tmp_path):
             raise OSError("disk full")
 
     monkeypatch.setattr(
-        "logrisk.feature_extractor_ollama.urlopen",
+        "logrisk.ai_harness.providers.ollama.urlopen",
         lambda *args, **kwargs: response([model_feature()]),
     )
     monkeypatch.setattr("logrisk.feature_extractor_ollama.PROMPT_REGISTRY", PromptRegistry(prompt_dir))
@@ -153,7 +153,7 @@ def test_trace_write_failure_does_not_fail_extraction(monkeypatch, tmp_path):
 
 def test_candidate_id_is_stable(monkeypatch):
     monkeypatch.setattr(
-        "logrisk.feature_extractor_ollama.urlopen",
+        "logrisk.ai_harness.providers.ollama.urlopen",
         lambda *args, **kwargs: response([model_feature()]),
     )
 
@@ -165,7 +165,7 @@ def test_candidate_id_is_stable(monkeypatch):
 
 def test_entities_below_threshold_do_not_call_ollama(monkeypatch):
     monkeypatch.setattr(
-        "logrisk.feature_extractor_ollama.urlopen",
+        "logrisk.ai_harness.providers.ollama.urlopen",
         lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("must not call")),
     )
 
@@ -175,7 +175,7 @@ def test_entities_below_threshold_do_not_call_ollama(monkeypatch):
 def test_unknown_template_hash_is_rejected(monkeypatch):
     invalid = {**model_feature(), "template_hashes": ["invented"]}
     monkeypatch.setattr(
-        "logrisk.feature_extractor_ollama.urlopen",
+        "logrisk.ai_harness.providers.ollama.urlopen",
         lambda *args, **kwargs: response([invalid]),
     )
 
@@ -195,7 +195,7 @@ def test_unknown_template_hash_is_rejected(monkeypatch):
 def test_invalid_feature_shape_is_rejected(monkeypatch, changes):
     invalid = {**model_feature(), **changes}
     monkeypatch.setattr(
-        "logrisk.feature_extractor_ollama.urlopen",
+        "logrisk.ai_harness.providers.ollama.urlopen",
         lambda *args, **kwargs: response([invalid]),
     )
 

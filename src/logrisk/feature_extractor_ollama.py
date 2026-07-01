@@ -2,17 +2,20 @@ from __future__ import annotations
 
 import hashlib
 import json
-import socket
 import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict
-from urllib.error import HTTPError, URLError
-from urllib.parse import urlparse
-from urllib.request import Request, urlopen
 
+from logrisk.ai_harness.evidence_builder import (
+    build_feature_evidence,
+    evidence_hash,
+    sanitized_templates,
+)
+from logrisk.ai_harness.model_client import ModelClient, ModelClientError
 from logrisk.ai_harness.prompt_registry import PromptRegistry, PromptTemplate
+from logrisk.ai_harness.providers.ollama import OllamaModelClient
 from logrisk.ai_harness.trace_logger import AITraceLogger
 
 
@@ -64,47 +67,10 @@ class FeatureExtractionError(RuntimeError):
 
 
 def _validate_base_url(base_url: str) -> str:
-    normalized = base_url.rstrip("/")
-    parsed = urlparse(normalized)
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        raise FeatureExtractionError("Ollama URL 必须是有效的 http 或 https 地址")
-    return normalized
-
-
-def _sanitized_templates(entity: Dict[str, Any]) -> list[Dict[str, Any]]:
-    allowed = (
-        "template_hash",
-        "component",
-        "severity",
-        "template",
-        "category",
-        "count",
-        "first_seen",
-        "last_seen",
-        "feature_hint",
-    )
-    return [
-        {key: template.get(key) for key in allowed}
-        for template in (entity.get("top_templates") or [])
-    ]
-
-
-def _evidence_for_entity(entity: Dict[str, Any]) -> Dict[str, Any]:
-    return {
-        "window_start": entity.get("window_start"),
-        "window_end": entity.get("window_end"),
-        "cluster": entity.get("cluster"),
-        "entity": {"type": entity.get("entity_type"), "id": entity.get("entity_id")},
-        "risk_score": entity.get("risk_score"),
-        "risk_level": entity.get("risk_level"),
-        "affected_entities": entity.get("affected_entities") or [],
-        "templates": _sanitized_templates(entity),
-    }
-
-
-def _evidence_hash(evidence: Dict[str, Any]) -> str:
-    raw = json.dumps(evidence, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+    try:
+        return OllamaModelClient._validate_base_url(base_url)
+    except ModelClientError as exc:
+        raise FeatureExtractionError(str(exc)) from exc
 
 
 def _write_trace(
@@ -132,7 +98,7 @@ def _write_trace(
             "prompt_path": prompt.path,
             "provider": provider,
             "model": model,
-            "input_evidence_hash": _evidence_hash(evidence),
+            "input_evidence_hash": evidence_hash(evidence),
             "input_evidence": evidence,
             "raw_output": raw_output,
             "parsed_output": parsed_output or {},
@@ -217,7 +183,7 @@ def _attach_source_facts(
 ) -> Dict[str, Any]:
     source_by_hash = {
         str(template.get("template_hash")): template
-        for template in _sanitized_templates(entity)
+        for template in sanitized_templates(entity)
     }
     sources = [source_by_hash[template_hash] for template_hash in feature["template_hashes"]]
     first_seen = [source.get("first_seen") for source in sources if source.get("first_seen")]
@@ -251,61 +217,44 @@ def _request_features(
     model: str,
     base_url: str,
     timeout: float,
+    model_client: ModelClient | None = None,
 ) -> tuple[list[Dict[str, Any]], str | None]:
-    evidence = _evidence_for_entity(entity)
+    evidence = build_feature_evidence(entity)
     prompt = PROMPT_REGISTRY.load(FEATURE_PROMPT_ID)
-    body = {
-        "model": model,
-        "stream": False,
-        "format": FEATURE_RESPONSE_SCHEMA,
-        "options": {"temperature": 0},
-        "messages": [
-            {"role": "system", "content": prompt.content},
-            {"role": "user", "content": json.dumps(evidence, ensure_ascii=False, separators=(",", ":"))},
-        ],
-    }
-    request = Request(
-        f"{base_url}/api/chat",
-        data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
-        headers={"Content-Type": "application/json", "Accept": "application/json"},
-        method="POST",
-    )
+    messages = [
+        {"role": "system", "content": prompt.content},
+        {"role": "user", "content": json.dumps(evidence, ensure_ascii=False, separators=(",", ":"))},
+    ]
+    client = model_client or OllamaModelClient(base_url)
     start = time.perf_counter()
     try:
-        with urlopen(request, timeout=timeout) as response:
-            raw_response = response.read()
-    except HTTPError as exc:
-        details = exc.read().decode("utf-8", errors="replace")
-        _write_trace(prompt=prompt, evidence=evidence, provider="ollama", model=model, raw_output=details, parsed_output=None, validation_result={"valid": False, "errors": [f"HTTP {exc.code}"], "warnings": []}, latency_ms=int((time.perf_counter() - start) * 1000), status="model_failed")
-        raise FeatureExtractionError(f"Ollama HTTP {exc.code}: {details}") from exc
-    except (URLError, TimeoutError, socket.timeout) as exc:
-        _write_trace(prompt=prompt, evidence=evidence, provider="ollama", model=model, raw_output=str(exc), parsed_output=None, validation_result={"valid": False, "errors": ["connection_failed"], "warnings": []}, latency_ms=int((time.perf_counter() - start) * 1000), status="model_failed")
-        raise FeatureExtractionError(f"无法连接 Ollama: {exc}") from exc
-
-    try:
-        payload = json.loads(raw_response)
-        content = payload["message"]["content"]
-        model_output = json.loads(content)
-    except (json.JSONDecodeError, UnicodeDecodeError, KeyError, TypeError) as exc:
+        model_output = client.generate_json(
+            messages,
+            FEATURE_RESPONSE_SCHEMA,
+            model=model,
+            timeout=timeout,
+            options={"temperature": 0},
+        )
+    except ModelClientError as exc:
         _write_trace(
             prompt=prompt,
             evidence=evidence,
             provider="ollama",
             model=model,
-            raw_output=raw_response.decode("utf-8", errors="replace"),
+            raw_output=exc.raw_output,
             parsed_output=None,
-            validation_result={"valid": False, "errors": ["invalid_structured_response"], "warnings": []},
+            validation_result={"valid": False, "errors": [str(exc)], "warnings": []},
             latency_ms=int((time.perf_counter() - start) * 1000),
-            status="parse_failed",
+            status=exc.status,
         )
-        raise FeatureExtractionError("Ollama 返回了无效的结构化特征响应") from exc
+        raise FeatureExtractionError(str(exc)) from exc
     if not isinstance(model_output, dict) or not isinstance(model_output.get("features"), list):
         _write_trace(
             prompt=prompt,
             evidence=evidence,
             provider="ollama",
             model=model,
-            raw_output=content,
+            raw_output=json.dumps(model_output, ensure_ascii=False),
             parsed_output=model_output if isinstance(model_output, dict) else {},
             validation_result={"valid": False, "errors": ["missing_features"], "warnings": []},
             latency_ms=int((time.perf_counter() - start) * 1000),
@@ -326,7 +275,7 @@ def _request_features(
             evidence=evidence,
             provider="ollama",
             model=model,
-            raw_output=content,
+            raw_output=json.dumps(model_output, ensure_ascii=False),
             parsed_output=model_output,
             validation_result={"valid": False, "errors": [str(exc)], "warnings": []},
             latency_ms=int((time.perf_counter() - start) * 1000),
@@ -338,7 +287,7 @@ def _request_features(
         evidence=evidence,
         provider="ollama",
         model=model,
-        raw_output=content,
+        raw_output=json.dumps(model_output, ensure_ascii=False),
         parsed_output=model_output,
         validation_result={"valid": True, "errors": [], "warnings": []},
         latency_ms=int((time.perf_counter() - start) * 1000),
@@ -352,6 +301,7 @@ def extract_features_for_entity(
     model: str,
     base_url: str = DEFAULT_OLLAMA_URL,
     timeout: float = 120,
+    model_client: ModelClient | None = None,
 ) -> list[Dict[str, Any]]:
     if not model or not model.strip():
         raise FeatureExtractionError("必须指定 Ollama 模型")
@@ -359,7 +309,7 @@ def extract_features_for_entity(
         raise FeatureExtractionError("Ollama timeout 必须大于 0")
     normalized_url = _validate_base_url(base_url)
     model_name = model.strip()
-    features, trace_id = _request_features(entity, model_name, normalized_url, timeout)
+    features, trace_id = _request_features(entity, model_name, normalized_url, timeout, model_client)
     attached = [_attach_source_facts(entity, feature, model_name) for feature in features]
     for feature in attached:
         feature["prompt_id"] = FEATURE_PROMPT_ID
@@ -373,10 +323,11 @@ def generate_feature_candidates(
     base_url: str = DEFAULT_OLLAMA_URL,
     timeout: float = 120,
     min_score: float = 40,
+    model_client: ModelClient | None = None,
 ) -> list[Dict[str, Any]]:
     results = []
     for entity in entities:
         if float(entity.get("risk_score") or 0) < min_score:
             continue
-        results.extend(extract_features_for_entity(entity, model, base_url, timeout))
+        results.extend(extract_features_for_entity(entity, model, base_url, timeout, model_client))
     return results

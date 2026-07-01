@@ -3,13 +3,24 @@ from __future__ import annotations
 import hashlib
 import json
 import socket
+import time
+import uuid
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Dict
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
+from logrisk.ai_harness.prompt_registry import PromptRegistry, PromptTemplate
+from logrisk.ai_harness.trace_logger import AITraceLogger
+
 
 DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
+FEATURE_PROMPT_ID = "feature_extract_v2_compact_en"
+ROOT = Path(__file__).resolve().parents[2]
+PROMPT_REGISTRY = PromptRegistry(ROOT / "prompts", ROOT / "configs" / "ai_harness.yaml")
+TRACE_LOGGER = AITraceLogger()
 IMPORTANCE_LEVELS = {"critical", "high", "medium", "low"}
 
 FEATURE_RESPONSE_SCHEMA = {
@@ -89,6 +100,50 @@ def _evidence_for_entity(entity: Dict[str, Any]) -> Dict[str, Any]:
         "affected_entities": entity.get("affected_entities") or [],
         "templates": _sanitized_templates(entity),
     }
+
+
+def _evidence_hash(evidence: Dict[str, Any]) -> str:
+    raw = json.dumps(evidence, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _write_trace(
+    *,
+    prompt: PromptTemplate,
+    evidence: Dict[str, Any],
+    provider: str,
+    model: str,
+    raw_output: str,
+    parsed_output: Dict[str, Any] | None,
+    validation_result: Dict[str, Any],
+    latency_ms: int,
+    status: str,
+) -> str | None:
+    trace_id = str(uuid.uuid4())
+    try:
+        TRACE_LOGGER.append({
+            "trace_id": trace_id,
+            "job_id": None,
+            "candidate_id": None,
+            "entity_type": evidence.get("entity", {}).get("type"),
+            "entity_id": evidence.get("entity", {}).get("id"),
+            "prompt_id": prompt.prompt_id,
+            "prompt_hash": prompt.sha256,
+            "prompt_path": prompt.path,
+            "provider": provider,
+            "model": model,
+            "input_evidence_hash": _evidence_hash(evidence),
+            "input_evidence": evidence,
+            "raw_output": raw_output,
+            "parsed_output": parsed_output or {},
+            "validation_result": validation_result,
+            "latency_ms": latency_ms,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "status": status,
+        })
+        return trace_id
+    except Exception:
+        return None
 
 
 def _string(value: Any, field: str) -> str:
@@ -196,22 +251,16 @@ def _request_features(
     model: str,
     base_url: str,
     timeout: float,
-) -> list[Dict[str, Any]]:
+) -> tuple[list[Dict[str, Any]], str | None]:
     evidence = _evidence_for_entity(entity)
+    prompt = PROMPT_REGISTRY.load(FEATURE_PROMPT_ID)
     body = {
         "model": model,
         "stream": False,
         "format": FEATURE_RESPONSE_SCHEMA,
         "options": {"temperature": 0},
         "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "你是日志特征识别器，不是 RCA 系统。只识别值得提交给外部 RCA 专家的关键日志特征。"
-                    "禁止输出根因、影响评估、处置建议或虚构证据。每个特征必须引用输入中真实存在的 template_hash。"
-                    "使用中文并严格输出给定 JSON Schema。"
-                ),
-            },
+            {"role": "system", "content": prompt.content},
             {"role": "user", "content": json.dumps(evidence, ensure_ascii=False, separators=(",", ":"))},
         ],
     }
@@ -221,13 +270,16 @@ def _request_features(
         headers={"Content-Type": "application/json", "Accept": "application/json"},
         method="POST",
     )
+    start = time.perf_counter()
     try:
         with urlopen(request, timeout=timeout) as response:
             raw_response = response.read()
     except HTTPError as exc:
         details = exc.read().decode("utf-8", errors="replace")
+        _write_trace(prompt=prompt, evidence=evidence, provider="ollama", model=model, raw_output=details, parsed_output=None, validation_result={"valid": False, "errors": [f"HTTP {exc.code}"], "warnings": []}, latency_ms=int((time.perf_counter() - start) * 1000), status="model_failed")
         raise FeatureExtractionError(f"Ollama HTTP {exc.code}: {details}") from exc
     except (URLError, TimeoutError, socket.timeout) as exc:
+        _write_trace(prompt=prompt, evidence=evidence, provider="ollama", model=model, raw_output=str(exc), parsed_output=None, validation_result={"valid": False, "errors": ["connection_failed"], "warnings": []}, latency_ms=int((time.perf_counter() - start) * 1000), status="model_failed")
         raise FeatureExtractionError(f"无法连接 Ollama: {exc}") from exc
 
     try:
@@ -235,8 +287,30 @@ def _request_features(
         content = payload["message"]["content"]
         model_output = json.loads(content)
     except (json.JSONDecodeError, UnicodeDecodeError, KeyError, TypeError) as exc:
+        _write_trace(
+            prompt=prompt,
+            evidence=evidence,
+            provider="ollama",
+            model=model,
+            raw_output=raw_response.decode("utf-8", errors="replace"),
+            parsed_output=None,
+            validation_result={"valid": False, "errors": ["invalid_structured_response"], "warnings": []},
+            latency_ms=int((time.perf_counter() - start) * 1000),
+            status="parse_failed",
+        )
         raise FeatureExtractionError("Ollama 返回了无效的结构化特征响应") from exc
     if not isinstance(model_output, dict) or not isinstance(model_output.get("features"), list):
+        _write_trace(
+            prompt=prompt,
+            evidence=evidence,
+            provider="ollama",
+            model=model,
+            raw_output=content,
+            parsed_output=model_output if isinstance(model_output, dict) else {},
+            validation_result={"valid": False, "errors": ["missing_features"], "warnings": []},
+            latency_ms=int((time.perf_counter() - start) * 1000),
+            status="validation_failed",
+        )
         raise FeatureExtractionError("Ollama 特征响应缺少 features 数组")
 
     known_hashes = {
@@ -244,7 +318,33 @@ def _request_features(
         for template in evidence["templates"]
         if template.get("template_hash")
     }
-    return [_validate_model_feature(feature, known_hashes) for feature in model_output["features"]]
+    try:
+        features = [_validate_model_feature(feature, known_hashes) for feature in model_output["features"]]
+    except FeatureExtractionError as exc:
+        _write_trace(
+            prompt=prompt,
+            evidence=evidence,
+            provider="ollama",
+            model=model,
+            raw_output=content,
+            parsed_output=model_output,
+            validation_result={"valid": False, "errors": [str(exc)], "warnings": []},
+            latency_ms=int((time.perf_counter() - start) * 1000),
+            status="validation_failed",
+        )
+        raise
+    trace_id = _write_trace(
+        prompt=prompt,
+        evidence=evidence,
+        provider="ollama",
+        model=model,
+        raw_output=content,
+        parsed_output=model_output,
+        validation_result={"valid": True, "errors": [], "warnings": []},
+        latency_ms=int((time.perf_counter() - start) * 1000),
+        status="success",
+    )
+    return features, trace_id
 
 
 def extract_features_for_entity(
@@ -259,8 +359,12 @@ def extract_features_for_entity(
         raise FeatureExtractionError("Ollama timeout 必须大于 0")
     normalized_url = _validate_base_url(base_url)
     model_name = model.strip()
-    features = _request_features(entity, model_name, normalized_url, timeout)
-    return [_attach_source_facts(entity, feature, model_name) for feature in features]
+    features, trace_id = _request_features(entity, model_name, normalized_url, timeout)
+    attached = [_attach_source_facts(entity, feature, model_name) for feature in features]
+    for feature in attached:
+        feature["prompt_id"] = FEATURE_PROMPT_ID
+        feature["trace_id"] = trace_id
+    return attached
 
 
 def generate_feature_candidates(

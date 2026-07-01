@@ -39,7 +39,12 @@ start_dashboard() {
   fi
   rm -f "$PID_FILE"
   cd "$ROOT_DIR"
-  nohup bash -c 'dashboard_command' >> "$LOG_FILE" 2>&1 &
+  nohup "$PYTHON" -m pipeline.dashboard_server \
+    --host "${DASHBOARD_HOST:-127.0.0.1}" \
+    --port "${DASHBOARD_PORT:-8080}" \
+    --model "${OLLAMA_MODEL:-qwen3:1.7b}" \
+    --ollama-url "${OLLAMA_HOST:-http://127.0.0.1:11434}" \
+    --ollama-timeout "${OLLAMA_TIMEOUT:-120}" >> "$LOG_FILE" 2>&1 &
   local pid=$!
   echo "$pid" > "$PID_FILE"
   sleep 0.4
@@ -80,9 +85,6 @@ status_dashboard() {
   echo "Dashboard 未运行"
   return 1
 }
-
-export -f dashboard_command
-export PYTHON ROOT_DIR DASHBOARD_HOST DASHBOARD_PORT OLLAMA_MODEL OLLAMA_HOST OLLAMA_TIMEOUT
 
 case "${1:-start}" in
   start) start_dashboard ;;

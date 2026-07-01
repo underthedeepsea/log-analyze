@@ -198,6 +198,39 @@ def test_system_metrics_route_returns_daily_llm_volume(dashboard):
     assert payload == {"today_llm_logs": 0}
 
 
+def test_ai_harness_prompt_and_trace_routes(dashboard):
+    base_url, _ = dashboard
+
+    status, prompts, _ = request_json(base_url + "/api/ai-harness/prompts")
+    status2, traces, _ = request_json(base_url + "/api/ai-harness/traces?limit=5")
+    status3, harness, _ = request_json(base_url + "/api/ai-harness/status")
+
+    assert status == 200
+    assert prompts["current_prompt_id"] == "feature_extract_v2_compact_en"
+    assert prompts["items"][0]["prompt_id"] == "feature_extract_v1"
+    assert "prompt_hash" in prompts["items"][0]
+    assert status2 == 200
+    assert "items" in traces
+    assert status3 == 200
+    assert harness["trace_enabled"] is True
+
+
+def test_ai_harness_prompt_update_route_records_history(dashboard):
+    base_url, _ = dashboard
+
+    detail_status, before, _ = request_json(base_url + "/api/ai-harness/prompts/feature_extract_v1")
+    patch_status, updated, _ = request_json(
+        base_url + "/api/ai-harness/prompts/feature_extract_v1",
+        "PATCH",
+        {"content": before["content"] + "\n# test edit", "note": "测试编辑"},
+    )
+
+    assert detail_status == 200
+    assert patch_status == 200
+    assert updated["content"].endswith("# test edit")
+    assert updated["history"][0]["note"] == "测试编辑"
+
+
 def test_serves_bundled_asset_with_correct_content_type(dashboard):
     base_url, _ = dashboard
 

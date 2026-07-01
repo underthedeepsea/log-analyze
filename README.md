@@ -1,6 +1,6 @@
 # 日志风险特征分析与审批系统
 
-当前版本：`1.2.1`。变更记录见 [`releas.md`](releas.md)。
+当前版本：`1.6.0`。变更记录见 [`releas.md`](releas.md)。
 
 本项目在本机完成日志规范化、Drain3 模板化、风险评分、规则复用、Ollama 特征识别与人工审批。项目不实现 RCA；原始日志不会直接发送给 Ollama。
 
@@ -17,10 +17,18 @@ Ollama 特征识别 → 人工审批 → 外部 RCA 专家系统
 
 ## 环境准备
 
+依赖环境固定放在项目根目录的 `.venv/`，启动脚本会优先使用 `.venv/bin/python`。`.venv/` 已被 Git 忽略，不会提交到仓库；如果目录丢失，按下面命令重建即可。
+
 ```bash
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
+```
+
+确认依赖可用：
+
+```bash
+.venv/bin/python -c "import drain3; print('venv ok')"
 ```
 
 前端是已提交到 `frontend/dist/` 的纯 React 静态应用，不依赖前端构建工具或 CDN，普通启动不需要 Node.js，也不需要编译。

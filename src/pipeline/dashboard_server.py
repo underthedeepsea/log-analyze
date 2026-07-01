@@ -14,8 +14,10 @@ from urllib.error import URLError
 from urllib.parse import parse_qs, urlparse
 from urllib.request import urlopen
 
+from logrisk.ai_harness.prompt_registry import PromptRegistry, PromptTemplate
+from logrisk.ai_harness.trace_logger import AITraceLogger
 from logrisk.approved_rules import ApprovedRuleError, ApprovedRuleStore
-from logrisk.feature_extractor_ollama import DEFAULT_OLLAMA_URL
+from logrisk.feature_extractor_ollama import DEFAULT_OLLAMA_URL, FEATURE_PROMPT_ID
 from logrisk.feature_jobs import FeatureJobError, FeatureJobManager
 from logrisk.input_parser import parse_log_content
 from logrisk.processing_metrics import ProcessingMetricsError, ProcessingMetricsStore
@@ -62,6 +64,8 @@ def build_server(
     server.default_model = default_model  # type: ignore[attr-defined]
     server.default_ollama_url = default_ollama_url  # type: ignore[attr-defined]
     server.default_timeout = default_timeout  # type: ignore[attr-defined]
+    server.prompt_registry = PromptRegistry(root / "prompts", root / "configs" / "ai_harness.yaml", state_root / "prompt_versions.json")  # type: ignore[attr-defined]
+    server.trace_logger = AITraceLogger(state_root / "ai_traces.jsonl")  # type: ignore[attr-defined]
     server.ollama_checker = ollama_checker or (  # type: ignore[attr-defined]
         lambda: check_ollama(default_ollama_url)
     )
@@ -139,6 +143,27 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if path == "/api/metrics":
                 self._json(HTTPStatus.OK, self.server.manager.get_system_metrics())  # type: ignore[attr-defined]
                 return
+            if path == "/api/ai-harness/status":
+                self._json(HTTPStatus.OK, self._ai_harness_status())
+                return
+            if path == "/api/ai-harness/prompts":
+                self._json(HTTPStatus.OK, self._prompt_list())
+                return
+            match = re.fullmatch(r"/api/ai-harness/prompts/([A-Za-z0-9_-]+)", path)
+            if match:
+                self._json(HTTPStatus.OK, self._prompt_detail(match.group(1)))
+                return
+            if path == "/api/ai-harness/traces":
+                self._json(HTTPStatus.OK, self._trace_list(query))
+                return
+            match = re.fullmatch(r"/api/ai-harness/traces/([A-Za-z0-9_-]+)", path)
+            if match:
+                trace = self.server.trace_logger.get_trace(match.group(1))  # type: ignore[attr-defined]
+                if not trace:
+                    self._json(HTTPStatus.NOT_FOUND, {"error": "Trace 不存在"})
+                    return
+                self._json(HTTPStatus.OK, self._with_prompt_content(trace))
+                return
             match = re.fullmatch(r"/api/jobs/([a-f0-9]+)", path)
             if match:
                 self._json(HTTPStatus.OK, self.server.manager.get_job(match.group(1)))  # type: ignore[attr-defined]
@@ -207,6 +232,16 @@ class DashboardHandler(BaseHTTPRequestHandler):
         path, _ = self._route_parts()
         try:
             payload = self._read_json()
+            match = re.fullmatch(r"/api/ai-harness/prompts/([A-Za-z0-9_-]+)", path)
+            if match:
+                if not isinstance(payload, dict):
+                    raise FeatureJobError("请求体必须是 JSON object")
+                content = payload.get("content")
+                if not isinstance(content, str) or not content.strip():
+                    raise FeatureJobError("Prompt 内容不能为空")
+                self.server.prompt_registry.update(match.group(1), content, str(payload.get("note") or ""))  # type: ignore[attr-defined]
+                self._json(HTTPStatus.OK, self._prompt_detail(match.group(1)))
+                return
             match = re.fullmatch(r"/api/jobs/([a-f0-9]+)/features/([A-Za-z0-9_-]+)", path)
             if not match:
                 self._json(HTTPStatus.NOT_FOUND, {"error": "资源不存在"})
@@ -228,6 +263,71 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(body)
+
+    def _prompt_meta(self, prompt: PromptTemplate) -> dict[str, Any]:
+        traces = self.server.trace_logger.list_traces(prompt_id=prompt.prompt_id, limit=200)  # type: ignore[attr-defined]
+        return {
+            "prompt_id": prompt.prompt_id,
+            "display_name": prompt.display_name or prompt.prompt_id,
+            "description": prompt.description or "",
+            "analysis_type": prompt.analysis_type,
+            "status": prompt.status,
+            "is_default": prompt.is_default,
+            "prompt_hash": prompt.sha256,
+            "path": prompt.path,
+            "version": prompt.version,
+            "used_by_models": sorted({str(item.get("model")) for item in traces if item.get("model")}),
+            "last_used_at": traces[0].get("created_at") if traces else None,
+            "created_at": None,
+            "updated_at": None,
+        }
+
+    def _prompt_list(self) -> dict[str, Any]:
+        prompts = self.server.prompt_registry.list_prompts()  # type: ignore[attr-defined]
+        return {"current_prompt_id": FEATURE_PROMPT_ID, "items": [self._prompt_meta(prompt) for prompt in prompts]}
+
+    def _prompt_detail(self, prompt_id: str) -> dict[str, Any]:
+        prompt = self.server.prompt_registry.load(prompt_id)  # type: ignore[attr-defined]
+        detail = self._prompt_meta(prompt)
+        detail["content"] = prompt.content
+        detail["history"] = self.server.prompt_registry.history(prompt_id)  # type: ignore[attr-defined]
+        detail["recent_traces"] = self._compact_traces(self.server.trace_logger.list_traces(prompt_id=prompt_id, limit=10))  # type: ignore[attr-defined]
+        return detail
+
+    def _ai_harness_status(self) -> dict[str, Any]:
+        summary = self.server.trace_logger.summary_today()  # type: ignore[attr-defined]
+        return {
+            "trace_enabled": self.server.trace_logger.enabled,  # type: ignore[attr-defined]
+            "trace_path": str(self.server.trace_logger.path),  # type: ignore[attr-defined]
+            "current_prompt_id": FEATURE_PROMPT_ID,
+            **summary,
+        }
+
+    def _compact_traces(self, traces: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        fields = ("trace_id", "job_id", "entity_type", "entity_id", "prompt_id", "prompt_hash", "provider", "model", "status", "latency_ms", "created_at")
+        return [{key: item.get(key) for key in fields} for item in traces]
+
+    def _trace_list(self, query: dict[str, list[str]]) -> dict[str, Any]:
+        limit = int(query.get("limit", ["50"])[0])
+        traces = self.server.trace_logger.list_traces(  # type: ignore[attr-defined]
+            job_id=query.get("job_id", [None])[0],
+            trace_id=query.get("trace_id", [None])[0],
+            status=query.get("status", [None])[0],
+            prompt_id=query.get("prompt_id", [None])[0],
+            limit=limit,
+        )
+        return {"items": self._compact_traces(traces)}
+
+    def _with_prompt_content(self, trace: dict[str, Any]) -> dict[str, Any]:
+        result = dict(trace)
+        prompt_id = str(trace.get("prompt_id") or FEATURE_PROMPT_ID)
+        try:
+            prompt = self.server.prompt_registry.load(prompt_id)  # type: ignore[attr-defined]
+            result.setdefault("prompt_path", prompt.path)
+            result["prompt_content"] = prompt.content
+        except FileNotFoundError:
+            result["prompt_content"] = ""
+        return result
 
     def _serve_asset(self, request_path: str) -> None:
         asset_root = (self.server.frontend_path.parent / "assets").resolve()  # type: ignore[attr-defined]

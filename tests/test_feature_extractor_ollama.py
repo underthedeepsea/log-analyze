@@ -2,6 +2,8 @@ import json
 
 import pytest
 
+from logrisk.ai_harness.prompt_registry import PromptRegistry
+from logrisk.ai_harness.trace_logger import AITraceLogger
 from logrisk.feature_extractor_ollama import FeatureExtractionError, generate_feature_candidates
 
 
@@ -94,6 +96,59 @@ def test_generate_features_sanitizes_evidence_and_owns_source_facts(monkeypatch)
     assert "samples" not in feature["source_templates"][0]
     assert feature["status"] == "pending"
     assert feature["model"] == "qwen3:1.7b"
+
+
+def test_generate_features_uses_prompt_registry_and_writes_trace(monkeypatch, tmp_path):
+    prompt_dir = tmp_path / "prompts"
+    prompt_dir.mkdir()
+    (prompt_dir / "feature_extract_v2_compact_en.md").write_text("custom feature prompt", encoding="utf-8")
+    trace_path = tmp_path / "ai_traces.jsonl"
+    captured = {}
+
+    def fake_urlopen(request, timeout):
+        captured["body"] = json.loads(request.data)
+        return response([model_feature()])
+
+    monkeypatch.setattr("logrisk.feature_extractor_ollama.urlopen", fake_urlopen)
+    monkeypatch.setattr(
+        "logrisk.feature_extractor_ollama.PROMPT_REGISTRY",
+        PromptRegistry(prompt_dir),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        "logrisk.feature_extractor_ollama.TRACE_LOGGER",
+        AITraceLogger(trace_path),
+        raising=False,
+    )
+
+    generate_feature_candidates([entity()], model="qwen3:1.7b")
+
+    assert captured["body"]["messages"][0]["content"] == "custom feature prompt"
+    trace = json.loads(trace_path.read_text(encoding="utf-8"))
+    assert trace["prompt_id"] == "feature_extract_v2_compact_en"
+    assert trace["provider"] == "ollama"
+    assert trace["model"] == "qwen3:1.7b"
+    assert trace["parsed_output"]["features"][0]["title"] == "节点内存耗尽"
+    assert len(trace["input_evidence_hash"]) == 64
+
+
+def test_trace_write_failure_does_not_fail_extraction(monkeypatch, tmp_path):
+    prompt_dir = tmp_path / "prompts"
+    prompt_dir.mkdir()
+    (prompt_dir / "feature_extract_v2_compact_en.md").write_text("custom feature prompt", encoding="utf-8")
+
+    class BrokenLogger:
+        def append(self, trace):
+            raise OSError("disk full")
+
+    monkeypatch.setattr(
+        "logrisk.feature_extractor_ollama.urlopen",
+        lambda *args, **kwargs: response([model_feature()]),
+    )
+    monkeypatch.setattr("logrisk.feature_extractor_ollama.PROMPT_REGISTRY", PromptRegistry(prompt_dir))
+    monkeypatch.setattr("logrisk.feature_extractor_ollama.TRACE_LOGGER", BrokenLogger())
+
+    assert generate_feature_candidates([entity()], model="qwen3:1.7b")[0]["title"] == "节点内存耗尽"
 
 
 def test_candidate_id_is_stable(monkeypatch):

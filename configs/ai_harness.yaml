@@ -1,0 +1,28 @@
+prompt_dir: prompts
+trace:
+  enabled: true
+  path: state/ai_traces.jsonl
+defaults:
+  feature_extract: feature_extract_v2_compact_en
+prompts:
+  - prompt_id: feature_extract_v1
+    display_name: 日志特征识别 v1
+    description: 用于从风险实体证据包中识别可复用异常特征
+    analysis_type: feature_extract
+    status: active
+    is_default: false
+    version: v1
+  - prompt_id: feature_extract_v2_compact_en
+    display_name: 日志特征识别 v2 Compact
+    description: compact for 小参数模型
+    analysis_type: feature_extract
+    status: active
+    is_default: true
+    version: v2
+  - prompt_id: feature_extract_v2_strict_en
+    display_name: 日志特征识别 v2 Strict
+    description: for 大参数模型
+    analysis_type: feature_extract
+    status: active
+    is_default: false
+    version: v2

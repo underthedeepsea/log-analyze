@@ -8,15 +8,65 @@
 
 ## 1.10.0 - 2026-07-02
 
+本次版本包含 `1.8.0` 之后的全部更新：`1.9.0` 与 `1.10.0`。
+
 ### Added
 
-- 新增 `AI 分析观测` 页面，展示任务级 AI 进度、阶段状态、规则生成漏斗、最近事件流和实体级诊断表。
-- 新增观测 API：`/api/ai-harness/observability/summary`、`/api/ai-harness/jobs/{job_id}/progress`、`/api/ai-harness/jobs/{job_id}/events` 和最近事件接口。
-- 识别队列新增“查看 AI 观测”入口，观测页支持跳转 AI Trace、人工审批和批准规则库。
+- 新增 `AI 分析观测` 页面：`/ai-observability`。
+- 左侧工作区新增 `AI 分析观测` 导航入口。
+- 新增任务级 AI 分析观测能力：
+  - 当前运行任务；
+  - 进入 AI 分析实体数；
+  - 模型成功率；
+  - 候选特征生成数；
+  - Schema / Evaluator 拦截数；
+  - 正常完成但无特征数量。
+- 新增当前任务阶段进度：
+  - 任务创建；
+  - 实体筛选；
+  - 规则复用；
+  - Evidence 构造；
+  - Prompt 加载；
+  - 模型调用；
+  - JSON 解析；
+  - Schema 校验；
+  - Evaluator；
+  - 候选特征；
+  - 人工审批；
+  - 规则沉淀。
+- 新增规则生成漏斗，用于解释风险实体到最终规则数量减少的路径。
+- 新增最近 AI 事件流，用于查看 Job 分析过程中的关键事件。
+- 新增实体级 AI 分析状态表，可区分规则复用、模型调用中、模型失败、解析失败、Schema 失败、Evaluator 拦截、无关键特征、已生成候选、等待审批、已批准和已驳回。
+- Prompt 详情新增概览、Prompt 内容、关联调用和版本信息 Tab。
+- Trace 详情新增概览、Evidence、Prompt、模型输出和校验结果 Tab。
+- AI 调用追踪页新增 `job_id`、`trace_id`、`status` 和 `prompt_id` 过滤。
+- 新增 AI 观测接口：
+  - `GET /api/ai-harness/observability/summary`；
+  - `GET /api/ai-harness/jobs/{job_id}/progress`；
+  - `GET /api/ai-harness/jobs/{job_id}/events`；
+  - `GET /api/ai-harness/events/recent`。
+- 识别队列新增 `查看 AI 观测`。
+- AI 观测页支持跳转 AI Trace、人工审批和批准规则库。
+- Prompt 详情可查看关联 Trace，Trace 详情可查看对应 Prompt、模型输出和校验结果。
 
 ### Changed
 
-- Dashboard 支持直接访问 `/ai-observability`，运行中观测页每 2 秒刷新，完成后停止轮询。
+- Dashboard 支持直接访问 `/prompts`、`/ai-traces` 和 `/ai-observability`。
+- 运行中的 AI 观测页每 2 秒刷新，已完成任务自动停止轮询。
+- README 当前版本更新为 `1.10.0`。
+- `releas.md` 补齐 `1.9.0` 与 `1.10.0` 记录。
+
+### Fixed
+
+- 修复前端选择 Prompt 后未传入实际 Ollama 特征识别链路的问题。
+- Trace 记录新增 `job_id`，识别队列可按 Job 准确查看关联 AI 调用。
+
+### Verified
+
+- `pytest -q`：88 passed。
+- 前端 JS 语法检查通过。
+- Shell 脚本语法检查通过。
+- 浏览器验证 `/ai-observability` 页面可正常打开并展示布局。
 
 ## 1.9.0 - 2026-07-02
 

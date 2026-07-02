@@ -1,5 +1,5 @@
 # Repository Guidelines
-
+DO NOT send optional commentary
 ## Project Structure & Module Organization
 
 Core Python logic lives in `src/logrisk/`: normalization, Drain3 mining, aggregation, risk scoring, approved-rule persistence, metrics, Ollama extraction, and review jobs are separate modules. `src/pipeline/manual_import_pipeline.py` creates `result.json`; `src/pipeline/dashboard_server.py` hosts the application. Keep React source in `frontend/src/`, committed runtime assets in `frontend/dist/`, configuration in `configs/`, samples in `examples/`, launchers in `scripts/`, and pytest modules in `tests/`. Generated artifacts belong in `output/`; runtime state belongs in ignored `state/`.

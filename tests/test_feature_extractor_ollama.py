@@ -132,6 +132,35 @@ def test_generate_features_uses_prompt_registry_and_writes_trace(monkeypatch, tm
     assert len(trace["input_evidence_hash"]) == 64
 
 
+def test_generate_features_uses_selected_prompt_and_records_job_id(monkeypatch, tmp_path):
+    prompt_dir = tmp_path / "prompts"
+    prompt_dir.mkdir()
+    (prompt_dir / "feature_extract_v2_strict_en.md").write_text("strict prompt", encoding="utf-8")
+    trace_path = tmp_path / "ai_traces.jsonl"
+    captured = {}
+
+    def fake_urlopen(request, timeout):
+        captured["body"] = json.loads(request.data)
+        return response([model_feature()])
+
+    monkeypatch.setattr("logrisk.ai_harness.providers.ollama.urlopen", fake_urlopen)
+    monkeypatch.setattr("logrisk.feature_extractor_ollama.PROMPT_REGISTRY", PromptRegistry(prompt_dir))
+    monkeypatch.setattr("logrisk.feature_extractor_ollama.TRACE_LOGGER", AITraceLogger(trace_path))
+
+    result = generate_feature_candidates(
+        [entity()],
+        model="qwen3:1.7b",
+        prompt_id="feature_extract_v2_strict_en",
+        job_id="job-123",
+    )
+
+    trace = json.loads(trace_path.read_text(encoding="utf-8"))
+    assert captured["body"]["messages"][0]["content"] == "strict prompt"
+    assert result[0]["prompt_id"] == "feature_extract_v2_strict_en"
+    assert trace["prompt_id"] == "feature_extract_v2_strict_en"
+    assert trace["job_id"] == "job-123"
+
+
 def test_trace_write_failure_does_not_fail_extraction(monkeypatch, tmp_path):
     prompt_dir = tmp_path / "prompts"
     prompt_dir.mkdir()

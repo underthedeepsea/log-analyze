@@ -145,6 +145,26 @@ def test_failed_entity_can_be_retried():
     assert snapshot["features"][0]["candidate_id"] == "feature-node-a"
 
 
+def test_job_passes_selected_prompt_and_job_id_to_extractor():
+    calls = []
+
+    def extractor(source, **kwargs):
+        calls.append(kwargs)
+        return [candidate(source)]
+
+    manager = FeatureJobManager(extractor=extractor, auto_start=False)
+    job_id = manager.create_job(
+        {"summary": {}, "risk_entities": [entity("node-a", 90)]},
+        model="qwen3:1.7b",
+        prompt_id="feature_extract_v2_strict_en",
+    )
+    manager.run_job(job_id)
+
+    assert calls[0]["prompt_id"] == "feature_extract_v2_strict_en"
+    assert calls[0]["job_id"] == job_id
+    assert manager.get_job(job_id)["prompt_id"] == "feature_extract_v2_strict_en"
+
+
 def test_review_edit_and_export_only_approved_features():
     manager = FeatureJobManager(extractor=lambda source, **kwargs: [candidate(source)], auto_start=False)
     result = {"summary": {"total_raw_logs": 1}, "risk_entities": [entity("node-a", 90)]}

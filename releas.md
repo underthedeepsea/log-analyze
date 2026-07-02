@@ -6,6 +6,31 @@
 - 仅修复 Bug 时提升最后一位，例如 `1.2.0 → 1.2.1`；
 - 每次代码更新必须同步更新本文件。
 
+## 1.10.0 - 2026-07-02
+
+### Added
+
+- 新增 `AI 分析观测` 页面，展示任务级 AI 进度、阶段状态、规则生成漏斗、最近事件流和实体级诊断表。
+- 新增观测 API：`/api/ai-harness/observability/summary`、`/api/ai-harness/jobs/{job_id}/progress`、`/api/ai-harness/jobs/{job_id}/events` 和最近事件接口。
+- 识别队列新增“查看 AI 观测”入口，观测页支持跳转 AI Trace、人工审批和批准规则库。
+
+### Changed
+
+- Dashboard 支持直接访问 `/ai-observability`，运行中观测页每 2 秒刷新，完成后停止轮询。
+
+## 1.9.0 - 2026-07-02
+
+### Added
+
+- 补齐 M1.5 AI Harness UI：Prompt 详情和 Trace 详情支持分 Tab 查看。
+- AI 调用追踪页新增 `job_id`、`trace_id`、`status` 和 `prompt_id` 过滤。
+- Dashboard 支持直接访问 `/prompts` 和 `/ai-traces`。
+
+### Fixed
+
+- 修复前端选择 Prompt 后未传入实际 Ollama 特征识别链路的问题。
+- Trace 记录新增任务 ID，识别队列可按 Job 准确查看关联 AI 调用。
+
 ## 1.8.0 - 2026-07-01
 
 ### Added

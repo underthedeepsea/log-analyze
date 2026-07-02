@@ -130,6 +130,8 @@ def test_generate_features_uses_prompt_registry_and_writes_trace(monkeypatch, tm
     assert trace["model"] == "qwen3:1.7b"
     assert trace["parsed_output"]["features"][0]["title"] == "节点内存耗尽"
     assert len(trace["input_evidence_hash"]) == 64
+    assert trace["evaluator_result"]["passed"] is True
+    assert trace["status"] == "success"
 
 
 def test_generate_features_uses_selected_prompt_and_records_job_id(monkeypatch, tmp_path):
@@ -210,6 +212,29 @@ def test_unknown_template_hash_is_rejected(monkeypatch):
 
     with pytest.raises(FeatureExtractionError, match="未知 template_hash"):
         generate_feature_candidates([entity()], model="qwen3:1.7b")
+
+
+def test_evaluator_rejects_forbidden_rca_claim_and_records_trace(monkeypatch, tmp_path):
+    prompt_dir = tmp_path / "prompts"
+    prompt_dir.mkdir()
+    (prompt_dir / "feature_extract_v2_compact_en.md").write_text("custom feature prompt", encoding="utf-8")
+    trace_path = tmp_path / "ai_traces.jsonl"
+    invalid = {**model_feature(), "summary": "根因是节点内存不足，建议重启"}
+
+    monkeypatch.setattr(
+        "logrisk.ai_harness.providers.ollama.urlopen",
+        lambda *args, **kwargs: response([invalid]),
+    )
+    monkeypatch.setattr("logrisk.feature_extractor_ollama.PROMPT_REGISTRY", PromptRegistry(prompt_dir))
+    monkeypatch.setattr("logrisk.feature_extractor_ollama.TRACE_LOGGER", AITraceLogger(trace_path))
+
+    with pytest.raises(FeatureExtractionError, match="Evaluator"):
+        generate_feature_candidates([entity()], model="qwen3:1.7b")
+
+    trace = json.loads(trace_path.read_text(encoding="utf-8"))
+    assert trace["status"] == "evaluator_failed"
+    assert trace["evaluator_result"]["passed"] is False
+    assert "建议重启" in trace["evaluator_result"]["errors"][0]
 
 
 @pytest.mark.parametrize(

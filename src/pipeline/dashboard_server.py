@@ -319,7 +319,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         }
 
     def _compact_traces(self, traces: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        fields = ("trace_id", "job_id", "entity_type", "entity_id", "prompt_id", "prompt_hash", "provider", "model", "status", "latency_ms", "created_at")
+        fields = ("trace_id", "job_id", "entity_type", "entity_id", "prompt_id", "prompt_hash", "provider", "model", "status", "latency_ms", "created_at", "evaluator_result")
         return [{key: item.get(key) for key in fields} for item in traces]
 
     def _trace_list(self, query: dict[str, list[str]]) -> dict[str, Any]:
@@ -344,33 +344,98 @@ class DashboardHandler(BaseHTTPRequestHandler):
             result["prompt_content"] = ""
         return result
 
-    def _feature_status_for_entity(self, snapshot: dict[str, Any], entity: dict[str, Any]) -> tuple[str, int, str | None, str | None]:
+    def _feature_status_for_entity(self, snapshot: dict[str, Any], entity: dict[str, Any], trace: dict[str, Any] | None = None) -> dict[str, Any]:
         features = [
             feature for feature in snapshot.get("features", [])
             if feature.get("entity", {}).get("id") == entity.get("entity_id")
         ]
         trace_id = next((feature.get("trace_id") for feature in features if feature.get("trace_id")), None)
+        trace_id = trace_id or (trace or {}).get("trace_id")
+        evaluator_result = next((feature.get("evaluator_result") for feature in features if feature.get("evaluator_result")), None) or (trace or {}).get("evaluator_result")
+        evaluator_status = "skipped"
+        if evaluator_result:
+            evaluator_status = "failed" if not evaluator_result.get("passed") else ("warning" if evaluator_result.get("warnings") else "passed")
+        result = {
+            "status": "pending",
+            "candidate_count": len(features),
+            "failure_reason": None,
+            "trace_id": trace_id,
+            "model_status": "pending",
+            "parse_status": "skipped",
+            "schema_status": "skipped",
+            "evaluator_status": evaluator_status,
+            "evaluator_result": evaluator_result,
+        }
         if entity.get("status") == "rule_matched":
-            return "reused_rule", len(features), "命中历史规则，跳过 LLM", trace_id
+            result.update({"status": "reused_rule", "failure_reason": "命中历史规则，跳过 LLM", "model_status": "skipped"})
+            return result
         if entity.get("status") == "running":
-            return "model_running", len(features), None, trace_id
+            result.update({"status": "model_running", "model_status": "running"})
+            return result
         if entity.get("status") == "failed":
             reason = str(entity.get("error") or "模型服务返回错误，AI 分析失败。")
             lowered = reason.lower()
-            status = "model_timeout" if "timeout" in lowered or "超时" in reason else ("parse_failed" if "json" in lowered or "解析" in reason else "model_failed")
-            return status, len(features), reason, trace_id
+            status = "evaluator_failed" if evaluator_status == "failed" or reason.startswith("Evaluator") else ("model_timeout" if "timeout" in lowered or "超时" in reason else ("parse_failed" if "json" in lowered or "解析" in reason else "model_failed"))
+            result.update({
+                "status": status,
+                "failure_reason": self._evaluator_reason(evaluator_result) or reason,
+                "model_status": "success" if status == "evaluator_failed" else ("timeout" if status == "model_timeout" else "failed"),
+                "parse_status": "passed" if status == "evaluator_failed" else ("failed" if status == "parse_failed" else "skipped"),
+                "schema_status": "passed" if status == "evaluator_failed" else "skipped",
+            })
+            return result
         if entity.get("status") in {"queued", "skipped"}:
-            return ("pending" if entity.get("status") == "queued" else "skipped"), len(features), None, trace_id
+            result.update({"status": "pending" if entity.get("status") == "queued" else "skipped", "model_status": "pending" if entity.get("status") == "queued" else "skipped"})
+            return result
         if not features:
-            return "no_feature", 0, "AI 正常完成，但未识别到关键特征", trace_id
+            result.update({"status": "no_feature", "candidate_count": 0, "failure_reason": "AI 正常完成，但未识别到关键特征", "model_status": "success", "parse_status": "passed", "schema_status": "passed"})
+            return result
         if any(feature.get("status") == "approved" for feature in features):
-            return "approved", len(features), None, trace_id
+            result.update({"status": "approved"})
         if all(feature.get("status") == "rejected" for feature in features):
-            return "rejected", len(features), "候选特征已被人工驳回", trace_id
-        return "waiting_review", len(features), None, trace_id
+            result.update({"status": "rejected", "failure_reason": "候选特征已被人工驳回"})
+        if result["status"] == "pending":
+            result["status"] = "waiting_review"
+        result.update({"model_status": "success", "parse_status": "passed", "schema_status": "passed"})
+        return result
+
+    def _evaluator_reason(self, evaluator_result: dict[str, Any] | None) -> str | None:
+        errors = evaluator_result.get("errors") if isinstance(evaluator_result, dict) else None
+        if not errors:
+            return None
+        suffix = f"；另有 {len(errors) - 1} 个错误" if len(errors) > 1 else ""
+        return str(errors[0]) + suffix
+
+    def _evaluator_stats(self, traces: list[dict[str, Any]], features: list[dict[str, Any]]) -> dict[str, Any]:
+        source = traces if traces else features
+        results = [
+            item.get("evaluator_result")
+            for item in source
+            if isinstance(item.get("evaluator_result"), dict)
+            and (not traces or item.get("status") in {"success", "evaluator_failed"})
+        ]
+        total = len(results)
+        failed_results = [result for result in results if not result.get("passed")]
+        errors = [str(error) for result in failed_results for error in result.get("errors", [])]
+        return {
+            "total": total,
+            "passed": sum(bool(result.get("passed")) for result in results),
+            "failed": len(failed_results),
+            "warnings": sum(1 for result in results if result.get("warnings")),
+            "pass_rate": round(sum(bool(result.get("passed")) for result in results) / total, 4) if total else 0,
+            "evidence_reference_errors": sum("template_hash" in error or "component" in error or "entity" in error for error in errors),
+            "forbidden_claim_errors": sum("禁止表达" in error or "RCA" in error or "建议" in error for error in errors),
+        }
 
     def _observability_progress(self, job_id: str) -> dict[str, Any]:
         snapshot = self.server.manager.get_job(job_id)  # type: ignore[attr-defined]
+        traces = self.server.trace_logger.list_traces(job_id=job_id, limit=200)  # type: ignore[attr-defined]
+        trace_by_entity = {
+            str(trace.get("entity_id")): trace
+            for trace in traces
+            if trace.get("entity_id")
+        }
+        evaluator = self._evaluator_stats(traces, snapshot.get("features", []))
         entities = []
         counts = {
             "risk_entities_total": len(snapshot.get("entities", [])),
@@ -384,15 +449,20 @@ class DashboardHandler(BaseHTTPRequestHandler):
             "approved_rules": sum(feature.get("status") == "approved" for feature in snapshot.get("features", [])),
             "failed": 0,
             "no_feature": 0,
+            "evaluator_total": evaluator["total"],
+            "evaluator_passed": evaluator["passed"],
+            "evaluator_failed": evaluator["failed"],
+            "evidence_reference_error_count": evaluator["evidence_reference_errors"],
+            "forbidden_claim_count": evaluator["forbidden_claim_errors"],
         }
         for entity in snapshot.get("entities", []):
-            status, candidate_count, reason, trace_id = self._feature_status_for_entity(snapshot, entity)
+            state = self._feature_status_for_entity(snapshot, entity, trace_by_entity.get(str(entity.get("entity_id"))))
+            status = state["status"]
             counts["rule_reused"] += status == "reused_rule"
             counts["ai_required"] += status != "reused_rule" and status != "skipped"
             counts["model_success"] += status in {"no_feature", "waiting_review", "candidate_generated", "approved", "rejected"}
             counts["parse_success"] += status not in {"model_timeout", "model_failed", "parse_failed", "pending", "skipped"}
             counts["schema_passed"] += status not in {"model_timeout", "model_failed", "parse_failed", "schema_failed", "pending", "skipped"}
-            counts["evaluator_passed"] += status in {"no_feature", "waiting_review", "candidate_generated", "approved", "rejected"}
             counts["failed"] += status in {"model_timeout", "model_failed", "parse_failed", "schema_failed", "evaluator_failed"}
             counts["no_feature"] += status == "no_feature"
             entities.append({
@@ -400,10 +470,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 "entity_id": entity.get("entity_id"),
                 "risk_score": entity.get("risk_score"),
                 "reused_rule": status == "reused_rule",
-                "status": "candidate_generated" if status == "waiting_review" and candidate_count else status,
-                "trace_id": trace_id,
-                "candidate_count": candidate_count,
-                "failure_reason": reason,
+                "status": "candidate_generated" if status == "waiting_review" and state["candidate_count"] else status,
+                "trace_id": state["trace_id"],
+                "candidate_count": state["candidate_count"],
+                "failure_reason": state["failure_reason"],
+                "model_status": state["model_status"],
+                "parse_status": state["parse_status"],
+                "schema_status": state["schema_status"],
+                "evaluator_status": state["evaluator_status"],
+                "evaluator_result": state["evaluator_result"],
             })
         current = next((item for item in entities if item["status"] in {"model_running", "pending"}), None)
         processed = sum(item["status"] not in {"pending", "skipped"} for item in entities)
@@ -438,8 +513,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
             "model_success_rate": round(success / total_ai, 4) if total_ai else 0,
             "candidate_feature_count": int(summary.get("candidate_features") or 0),
             "schema_failed_count": failed,
-            "evaluator_failed_count": 0,
+            "evaluator_failed_count": int(summary.get("evaluator_failed") or 0),
             "no_feature_count": int(summary.get("no_feature") or 0),
+            "evaluator": {
+                "total": int(summary.get("evaluator_total") or 0),
+                "passed": int(summary.get("evaluator_passed") or 0),
+                "failed": int(summary.get("evaluator_failed") or 0),
+                "warnings": sum(1 for item in progress.get("entities", []) if item.get("evaluator_status") == "warning"),
+                "pass_rate": round((int(summary.get("evaluator_passed") or 0) / int(summary.get("evaluator_total") or 1)), 4) if int(summary.get("evaluator_total") or 0) else 0,
+                "evidence_reference_errors": int(summary.get("evidence_reference_error_count") or 0),
+                "forbidden_claim_errors": int(summary.get("forbidden_claim_count") or 0),
+            },
         }
 
     def _observability_event(self, event: dict[str, Any]) -> dict[str, Any]:
@@ -450,7 +534,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             "entity_rule_matched": ("rule_reuse", "success", "命中历史规则，跳过 LLM"),
             "entity_started": ("model_call", "running", "开始调用模型"),
             "entity_completed": ("feature_generation", "success", f"生成 {event.get('feature_count', 0)} 个候选特征"),
-            "entity_failed": ("model_call", "failed", str(event.get("error") or "AI 分析失败")),
+            "entity_failed": ("evaluator" if str(event.get("error") or "").startswith("Evaluator") else "model_call", "failed", str(event.get("error") or "AI 分析失败")),
             "feature_updated": ("manual_review", "success", f"人工审批更新为 {event.get('status')}"),
             "job_completed": ("rule_persist", "success", "任务完成"),
             "entity_queued": ("retry", "running", "实体已重新排队"),

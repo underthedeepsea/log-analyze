@@ -47,6 +47,15 @@ def test_ai_harness_pages_and_routes_are_present():
         "版本信息",
         "模型输出",
         "校验结果",
+        "Evaluator 结果",
+        "进入 Evaluator",
+        "Evaluator 拦截",
+        "证据引用错误",
+        "RCA / 建议越界",
+        "质量门禁通过率",
+        "质量门禁：已通过",
+        "evaluator_result",
+        "evaluator_status",
         "traceFilters",
         "job_id",
         "trace_id",
@@ -140,8 +149,8 @@ def test_release_docs_describe_current_bugfix_version():
     readme = Path("README.md").read_text(encoding="utf-8")
     agents = Path("AGENTS.md").read_text(encoding="utf-8")
 
-    assert "## 1.10.0 - 2026-07-02" in release
-    assert "当前版本：`1.10.0`" in readme
+    assert "## 1.11.0 - 2026-07-02" in release
+    assert "当前版本：`1.11.0`" in readme
     assert "Every code update must also update `releas.md`" in agents
     assert "dashboard.sh restart" in readme
     assert ".txt" in readme

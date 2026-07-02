@@ -6,6 +6,22 @@
 - 仅修复 Bug 时提升最后一位，例如 `1.2.0 → 1.2.1`；
 - 每次代码更新必须同步更新本文件。
 
+## 1.11.0 - 2026-07-02
+
+### Added
+
+- 新增 M4 Output Evaluator，模型输出通过基础字段校验后继续执行质量门禁。
+- Evaluator 拦截不存在的 `template_hash`、`component`、实体引用、非法 `feature_type`、空标题/摘要和 RCA/处置建议越界表达。
+- AI Trace 新增 `evaluator_result`，记录 passed、errors、warnings、score 和逐规则结果。
+- AI 分析观测新增进入 Evaluator、Evaluator 通过/拦截、证据引用错误、RCA / 建议越界和质量门禁通过率。
+- Trace 详情新增 “Evaluator 结果” Tab，人工审批候选特征展示质量门禁通过标识。
+
+### Changed
+
+- Ollama 特征识别在 Evaluator 未通过时终止该实体分析，不把被拦截结果送入人工审批。
+- 观测接口的实体状态新增 model、schema、evaluator 状态和拦截原因。
+- README 当前版本更新为 `1.11.0`。
+
 ## 1.10.0 - 2026-07-02
 
 本次版本包含 `1.8.0` 之后的全部更新：`1.9.0` 与 `1.10.0`。

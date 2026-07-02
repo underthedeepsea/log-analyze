@@ -13,6 +13,7 @@ from logrisk.ai_harness.evidence_builder import (
     evidence_hash,
     sanitized_templates,
 )
+from logrisk.ai_harness.evaluator import evaluate_feature_output
 from logrisk.ai_harness.model_client import ModelClient, ModelClientError
 from logrisk.ai_harness.prompt_registry import PromptRegistry, PromptTemplate
 from logrisk.ai_harness.providers.ollama import OllamaModelClient
@@ -83,6 +84,7 @@ def _write_trace(
     raw_output: str,
     parsed_output: Dict[str, Any] | None,
     validation_result: Dict[str, Any],
+    evaluator_result: Dict[str, Any] | None = None,
     latency_ms: int,
     status: str,
 ) -> str | None:
@@ -104,6 +106,7 @@ def _write_trace(
             "raw_output": raw_output,
             "parsed_output": parsed_output or {},
             "validation_result": validation_result,
+            "evaluator_result": evaluator_result or {"passed": False, "errors": [], "warnings": [], "score": 0.0, "rule_results": []},
             "latency_ms": latency_ms,
             "created_at": datetime.now(timezone.utc).isoformat(),
             "status": status,
@@ -221,7 +224,7 @@ def _request_features(
     model_client: ModelClient | None = None,
     prompt_id: str = FEATURE_PROMPT_ID,
     job_id: str | None = None,
-) -> tuple[list[Dict[str, Any]], str | None]:
+) -> tuple[list[Dict[str, Any]], str | None, Dict[str, Any]]:
     evidence = build_feature_evidence(entity)
     prompt = PROMPT_REGISTRY.load(prompt_id)
     messages = [
@@ -288,6 +291,33 @@ def _request_features(
             status="validation_failed",
         )
         raise
+    evaluator_results = [
+        evaluate_feature_output(feature=feature, entity=entity, evidence=evidence)
+        for feature in features
+    ]
+    failed_evaluations = [result for result in evaluator_results if not result.get("passed")]
+    evaluator_summary = {
+        "passed": not failed_evaluations,
+        "errors": [error for result in failed_evaluations for error in result.get("errors", [])],
+        "warnings": [warning for result in evaluator_results for warning in result.get("warnings", [])],
+        "score": min((float(result.get("score") or 0.0) for result in evaluator_results), default=1.0),
+        "rule_results": [rule for result in evaluator_results for rule in result.get("rule_results", [])],
+    }
+    if failed_evaluations:
+        _write_trace(
+            prompt=prompt,
+            evidence=evidence,
+            provider="ollama",
+            model=model,
+            job_id=job_id,
+            raw_output=json.dumps(model_output, ensure_ascii=False),
+            parsed_output=model_output,
+            validation_result={"valid": True, "errors": [], "warnings": []},
+            evaluator_result=evaluator_summary,
+            latency_ms=int((time.perf_counter() - start) * 1000),
+            status="evaluator_failed",
+        )
+        raise FeatureExtractionError("Evaluator 拦截模型输出: " + (evaluator_summary["errors"][0] if evaluator_summary["errors"] else "质量门禁未通过"))
     trace_id = _write_trace(
         prompt=prompt,
         evidence=evidence,
@@ -297,10 +327,11 @@ def _request_features(
         raw_output=json.dumps(model_output, ensure_ascii=False),
         parsed_output=model_output,
         validation_result={"valid": True, "errors": [], "warnings": []},
+        evaluator_result=evaluator_summary,
         latency_ms=int((time.perf_counter() - start) * 1000),
         status="success",
     )
-    return features, trace_id
+    return features, trace_id, evaluator_summary
 
 
 def extract_features_for_entity(
@@ -319,11 +350,12 @@ def extract_features_for_entity(
     normalized_url = _validate_base_url(base_url)
     model_name = model.strip()
     selected_prompt = prompt_id or FEATURE_PROMPT_ID
-    features, trace_id = _request_features(entity, model_name, normalized_url, timeout, model_client, selected_prompt, job_id)
+    features, trace_id, evaluator_result = _request_features(entity, model_name, normalized_url, timeout, model_client, selected_prompt, job_id)
     attached = [_attach_source_facts(entity, feature, model_name) for feature in features]
     for feature in attached:
         feature["prompt_id"] = selected_prompt
         feature["trace_id"] = trace_id
+        feature["evaluator_result"] = evaluator_result
     return attached
 
 

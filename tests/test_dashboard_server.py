@@ -8,6 +8,7 @@ from urllib.request import Request, urlopen
 import pytest
 
 from logrisk.ai_harness.prompt_registry import PromptRegistry
+from logrisk.ai_harness.trace_logger import AITraceLogger
 from logrisk.feature_jobs import FeatureJobManager
 from pipeline.dashboard_server import build_server
 
@@ -52,6 +53,9 @@ def candidate(source):
         "source_templates": [{"template_hash": "hash", "template": "OOM", "count": 2}],
         "provider": "ollama",
         "model": "qwen3:1.7b",
+        "trace_id": f"trace-{source['entity_id']}",
+        "prompt_id": "feature_extract_v2_compact_en",
+        "evaluator_result": {"passed": True, "errors": [], "warnings": [], "score": 1.0, "rule_results": []},
     }
 
 
@@ -86,6 +90,7 @@ def dashboard(tmp_path):
         Path("configs") / "ai_harness.yaml",
         tmp_path / "state" / "prompt_versions.json",
     )
+    server.trace_logger = AITraceLogger(tmp_path / "state" / "ai_traces.jsonl")  # type: ignore[attr-defined]
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     base_url = f"http://127.0.0.1:{server.server_address[1]}"
@@ -206,6 +211,28 @@ def test_system_metrics_route_returns_daily_llm_volume(dashboard):
 
     assert status == 200
     assert payload == {"today_llm_logs": 0}
+
+
+def test_observability_progress_exposes_evaluator_status(dashboard):
+    base_url, _ = dashboard
+    _, created, _ = request_json(base_url + "/api/jobs", "POST", {
+        "result": {"summary": {}, "risk_entities": [entity()]},
+        "model": "qwen3:1.7b",
+    })
+    job_id = created["job_id"]
+    for _ in range(50):
+        _, progress, _ = request_json(base_url + f"/api/ai-harness/jobs/{job_id}/progress")
+        if progress["status"].startswith("completed"):
+            break
+
+    status, summary, _ = request_json(base_url + "/api/ai-harness/observability/summary")
+
+    assert progress["summary"]["evaluator_total"] == 1
+    assert progress["summary"]["evaluator_passed"] == 1
+    assert progress["entities"][0]["evaluator_status"] == "passed"
+    assert progress["entities"][0]["evaluator_result"]["score"] == 1.0
+    assert status == 200
+    assert summary["evaluator"]["passed"] == 1
 
 
 def test_ai_harness_prompt_and_trace_routes(dashboard):

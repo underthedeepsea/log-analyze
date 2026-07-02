@@ -1,6 +1,6 @@
 # 日志风险特征分析与审批系统
 
-当前版本：`1.10.0`。变更记录见 [`releas.md`](releas.md)。
+当前版本：`1.11.0`。变更记录见 [`releas.md`](releas.md)。
 
 本项目在本机完成日志规范化、Drain3 模板化、风险评分、规则复用、Ollama 特征识别与人工审批。项目不实现 RCA；原始日志不会直接发送给 Ollama。
 
@@ -68,7 +68,7 @@ Dashboard 实时显示 Drain3 压缩量、当日 LLM 关联日志量、处理速
 
 ## AI Harness
 
-Dashboard 提供 `/ai-observability`、`/prompts` 和 `/ai-traces` 三个轻量 Harness 页面。AI 分析观测展示任务阶段、规则生成漏斗、事件流和实体级失败原因；Prompt 管理保留当前版本编辑和历史版本查看；AI Trace 可按 Job、Trace、状态和 Prompt 过滤，便于审计每次 Ollama 调用。
+Dashboard 提供 `/ai-observability`、`/prompts` 和 `/ai-traces` 三个轻量 Harness 页面。AI 分析观测展示任务阶段、规则生成漏斗、Evaluator 质量门禁、事件流和实体级失败原因；Prompt 管理保留当前版本编辑和历史版本查看；AI Trace 可按 Job、Trace、状态和 Prompt 过滤，便于审计每次 Ollama 调用。
 
 ## 安全与导出
 

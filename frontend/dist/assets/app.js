@@ -104,7 +104,7 @@
     return query ? "?" + query : "?limit=50";
   }
   const analysisLabels = { feature_extract: "日志特征识别", rca_analysis: "RCA 证据分析", rule_generate: "规则候选生成", false_positive_review: "误报复核", risk_summary: "风险摘要生成" };
-  const traceStatus = { success: "成功", validation_failed: "校验失败", parse_failed: "解析失败", model_failed: "调用失败", trace_failed: "Trace 异常" };
+  const traceStatus = { success: "成功", validation_failed: "校验失败", evaluator_failed: "Evaluator 拦截", parse_failed: "解析失败", model_failed: "调用失败", trace_failed: "Trace 异常" };
   const promptFieldHelp = {
     prompt_id: "Prompt 文件名去掉 .md 后的唯一标识，分析任务会按它加载内容。",
     display_name: "给人工看的名称，用于区分不同 Prompt 版本。",
@@ -184,7 +184,7 @@
             key: feature.candidate_id,
             onClick: function () { props.onSelect(feature.candidate_id); },
           }, h("div", null, h("b", null, feature.title), h("span", null,
-            (feature.entity && feature.entity.id || "unknown") + " · " + feature.summary), h("small", null, feature.trace_id ? "来源：" + (feature.prompt_id || "feature_extract_v2_compact_en") + " · " + (feature.model || "—") + " · " + shortHash(feature.trace_id) : "来源：历史数据 / 未记录 Trace")),
+            (feature.entity && feature.entity.id || "unknown") + " · " + feature.summary), h("small", null, "质量门禁：" + (feature.evaluator_result && feature.evaluator_result.passed ? "已通过" : "未记录") + (feature.trace_id ? " · 来源：" + (feature.prompt_id || "feature_extract_v2_compact_en") + " · " + (feature.model || "—") + " · " + shortHash(feature.trace_id) : " · 来源：历史数据 / 未记录 Trace"))),
           h("span", { className: "status-chip " + feature.status },
             feature.origin === "approved_rule" ? "规则复用" : feature.status));
         })
@@ -229,7 +229,7 @@
       return h("label", null, label, type === "textarea" ? h("textarea", controlProps) : h("input", controlProps));
     }
     function save(status) { props.onSave(Object.assign({}, draft, { tags: draft.tags.split(",").map(function (tag) { return tag.trim(); }).filter(Boolean), status: status })); }
-    return h("section", { className: "surface review-editor" }, h("div", { className: "surface-head" }, h("b", null, "人工审批"), h("span", null, props.feature.origin === "approved_rule" ? "来自批准规则库" : "来自 Ollama")), h("div", { className: "editor-body" }, field("特征标题", "title"), field("特征摘要", "summary", "textarea"), field("标签（逗号分隔）", "tags"), field("审批备注", "reviewer_note", "textarea"), h("div", { className: "fact-box" }, "实体 " + (props.feature.entity && props.feature.entity.id || "") + " · 风险分 " + props.feature.risk_score + " · 出现 " + props.feature.occurrence_count + " 次", h("br"), props.feature.trace_id ? "来源 " + (props.feature.prompt_id || "feature_extract_v2_compact_en") + " · " + (props.feature.model || "—") + " · " + props.feature.trace_id : "来源：历史数据 / 未记录 Trace"), props.feature.trace_id && h("button", { className: "text-button trace-link", onClick: function () { props.onOpenTrace(props.feature.trace_id); } }, "查看 AI Trace"), h("div", { className: "editor-actions" }, h("button", { className: "reject-button", onClick: function () { save("rejected"); } }, "驳回"), h("button", { className: "primary-button", onClick: function () { save("approved"); } }, "批准并写入规则库"))));
+    return h("section", { className: "surface review-editor" }, h("div", { className: "surface-head" }, h("b", null, "人工审批"), h("span", null, props.feature.origin === "approved_rule" ? "来自批准规则库" : "来自 Ollama")), h("div", { className: "editor-body" }, field("特征标题", "title"), field("特征摘要", "summary", "textarea"), field("标签（逗号分隔）", "tags"), field("审批备注", "reviewer_note", "textarea"), h("div", { className: "fact-box" }, "质量门禁：已通过", h("br"), "Evaluator Score：" + (props.feature.evaluator_result && props.feature.evaluator_result.score != null ? props.feature.evaluator_result.score : "—"), h("br"), "实体 " + (props.feature.entity && props.feature.entity.id || "") + " · 风险分 " + props.feature.risk_score + " · 出现 " + props.feature.occurrence_count + " 次", h("br"), props.feature.trace_id ? "来源 " + (props.feature.prompt_id || "feature_extract_v2_compact_en") + " · " + (props.feature.model || "—") + " · " + props.feature.trace_id : "来源：历史数据 / 未记录 Trace"), props.feature.trace_id && h("button", { className: "text-button trace-link", onClick: function () { props.onOpenTrace(props.feature.trace_id); } }, "查看 AI Trace"), h("div", { className: "editor-actions" }, h("button", { className: "reject-button", onClick: function () { save("rejected"); } }, "驳回"), h("button", { className: "primary-button", onClick: function () { save("approved"); } }, "批准并写入规则库"))));
   }
 
   function PromptManagement(props) {
@@ -306,12 +306,13 @@
     const item = props.item;
     const [tab, setTab] = useState("overview");
     return h(React.Fragment, null,
-      h(Tabs, { active: tab, onChange: setTab, items: [["overview", "概览"], ["evidence", "Evidence"], ["prompt", "Prompt"], ["output", "模型输出"], ["validation", "校验结果"]] }),
+      h(Tabs, { active: tab, onChange: setTab, items: [["overview", "概览"], ["evidence", "Evidence"], ["prompt", "Prompt"], ["output", "模型输出"], ["validation", "校验结果"], ["evaluator", "Evaluator 结果"]] }),
       tab === "overview" && h(CodeBlock, { value: { trace_id: item.trace_id, job_id: item.job_id, candidate_id: item.candidate_id, entity_type: item.entity_type, entity_id: item.entity_id, provider: item.provider, model: item.model, prompt_id: item.prompt_id, prompt_hash: item.prompt_hash, input_evidence_hash: item.input_evidence_hash, latency_ms: item.latency_ms, created_at: item.created_at, status: item.status } }),
       tab === "evidence" && h(CodeBlock, { value: item.input_evidence || "当前 trace 未保存完整 evidence，仅保存 hash。" }),
       tab === "prompt" && h(CodeBlock, { value: { prompt_id: item.prompt_id, prompt_hash: item.prompt_hash, prompt_path: item.prompt_path, prompt_content: item.prompt_content || "当前接口未返回 Prompt 内容。" } }),
       tab === "output" && h(CodeBlock, { value: { raw_output: item.raw_output, parsed_output: item.parsed_output } }),
-      tab === "validation" && h(CodeBlock, { value: item.validation_result }));
+      tab === "validation" && h(CodeBlock, { value: item.validation_result }),
+      tab === "evaluator" && h(CodeBlock, { value: item.evaluator_result || { passed: false, errors: [], warnings: [], score: 0, rule_results: [] } }));
   }
 
   function Drawer(props) {
@@ -341,6 +342,7 @@
       ["模型成功返回", funnel.model_success || 0],
       ["Schema 通过", funnel.schema_passed || 0],
       ["Evaluator 通过", funnel.evaluator_passed || 0],
+      ["Evaluator 拦截", funnel.evaluator_failed || 0],
       ["候选特征", funnel.candidate_features || 0],
       ["已批准规则", funnel.approved_rules || 0],
     ];
@@ -358,8 +360,12 @@
         h(Metric, { label: "当前运行任务", value: summary.running_jobs || 0, tone: "orange" }),
         h(Metric, { label: "进入 AI 分析实体", value: summary.ai_required || 0 }),
         h(Metric, { label: "模型成功率", value: Math.round((summary.model_success_rate || 0) * 1000) / 10 + "%", tone: "green" }),
+        h(Metric, { label: "进入 Evaluator", value: summary.evaluator && summary.evaluator.total || 0 }),
+        h(Metric, { label: "Evaluator 拦截", value: summary.evaluator && summary.evaluator.failed || 0, tone: "red" }),
+        h(Metric, { label: "证据引用错误", value: summary.evaluator && summary.evaluator.evidence_reference_errors || 0 }),
+        h(Metric, { label: "RCA / 建议越界", value: summary.evaluator && summary.evaluator.forbidden_claim_errors || 0 }),
+        h(Metric, { label: "质量门禁通过率", value: Math.round(((summary.evaluator && summary.evaluator.pass_rate) || 0) * 1000) / 10 + "%", tone: "green" }),
         h(Metric, { label: "候选特征生成", value: summary.candidate_feature_count || 0, tone: "orange" }),
-        h(Metric, { label: "Schema / Evaluator 拦截", value: (summary.schema_failed_count || 0) + (summary.evaluator_failed_count || 0) }),
         h(Metric, { label: "正常完成但无特征", value: summary.no_feature_count || 0 })),
       h("section", { className: "surface obs-progress" }, h("div", { className: "surface-head" }, h("b", null, "当前任务阶段"), h("span", null, progress.job_id + " · " + progress.status)),
         h("div", { className: "obs-tags" }, h("span", null, progress.source_file || "上传结果"), h("span", null, "模型 " + (progress.model || "—")), h("span", null, "Prompt " + (progress.prompt_id || "—")), h("span", null, "轮询刷新 2s")),
@@ -380,11 +386,11 @@
             return h("article", { className: "event-row " + event.status, key: event.event_id + event.created_at }, h("time", null, event.created_at ? new Date(event.created_at).toLocaleTimeString() : "—"), h("div", null, h("b", null, title), h("span", null, event.message)), event.trace_id && h("button", { className: "text-button", onClick: function () { props.onOpenTrace(event.trace_id); } }, "查看 Trace"));
           })))),
       h("section", { className: "surface obs-table" }, h("div", { className: "surface-head" }, h("b", null, "实体级 AI 分析状态"), h("span", null, "区分没跑完、失败、拦截、无特征、等待审批")),
-        h("div", { className: "entity-ai-head" }, "实体", "风险分", "规则复用", "AI 状态", "候选特征", "失败 / 说明原因", "Trace", "操作"),
+        h("div", { className: "entity-ai-head" }, "实体", "风险分", "模型", "Schema", "Evaluator", "候选特征", "拦截 / 说明原因", "Trace", "操作"),
         (progress.entities || []).length === 0 && h("div", { className: "empty-state" }, "暂无实体分析状态"),
         (progress.entities || []).map(function (entity) {
           const canReview = entity.status === "candidate_generated" || entity.status === "waiting_review";
-          return h("div", { className: "entity-ai-row", key: entity.entity_type + entity.entity_id }, h("span", null, entity.entity_type + "/" + entity.entity_id), h("b", null, entity.risk_score || "—"), h("span", null, entity.reused_rule ? "是" : "否"), h("span", { className: "status-chip " + entity.status }, obsStatusText[entity.status] || entity.status), h("span", null, entity.candidate_count || 0), h("span", null, entity.failure_reason || "—"), entity.trace_id ? h("button", { className: "text-button", onClick: function () { props.onOpenTrace(entity.trace_id); } }, "查看 Trace") : h("span", null, "—"), h("button", { className: "text-button", onClick: canReview ? props.onReview : (entity.reused_rule ? props.onRules : props.onRefresh) }, canReview ? "去审批" : (entity.reused_rule ? "查看规则" : "查看进度")));
+          return h("div", { className: "entity-ai-row", key: entity.entity_type + entity.entity_id }, h("span", null, entity.entity_type + "/" + entity.entity_id), h("b", null, entity.risk_score || "—"), h("span", null, entity.model_status || "—"), h("span", null, entity.schema_status || "—"), h("span", { className: "status-chip " + (entity.evaluator_status || "skipped") }, entity.evaluator_status === "passed" ? "通过" : (entity.evaluator_status === "failed" ? "拦截" : (entity.evaluator_status === "warning" ? "通过，有警告" : "未执行"))), h("span", null, entity.candidate_count || 0), h("span", null, entity.failure_reason || "—"), entity.trace_id ? h("button", { className: "text-button", onClick: function () { props.onOpenTrace(entity.trace_id); } }, "查看 Trace") : h("span", null, "—"), h("button", { className: "text-button", onClick: canReview ? props.onReview : (entity.reused_rule ? props.onRules : props.onRefresh) }, canReview ? "去审批" : (entity.reused_rule ? "查看规则" : "查看进度")));
         })));
   }
 

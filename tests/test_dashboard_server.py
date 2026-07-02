@@ -1,10 +1,13 @@
 import json
+import shutil
 import threading
+from pathlib import Path
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 import pytest
 
+from logrisk.ai_harness.prompt_registry import PromptRegistry
 from logrisk.feature_jobs import FeatureJobManager
 from pipeline.dashboard_server import build_server
 
@@ -75,6 +78,13 @@ def dashboard(tmp_path):
             "risk_entities": [],
             "top_templates": [],
         },
+    )
+    prompt_dir = tmp_path / "prompts"
+    shutil.copytree(Path("prompts"), prompt_dir)
+    server.prompt_registry = PromptRegistry(  # type: ignore[attr-defined]
+        prompt_dir,
+        Path("configs") / "ai_harness.yaml",
+        tmp_path / "state" / "prompt_versions.json",
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -229,6 +239,58 @@ def test_ai_harness_prompt_update_route_records_history(dashboard):
     assert patch_status == 200
     assert updated["content"].endswith("# test edit")
     assert updated["history"][0]["note"] == "测试编辑"
+
+
+def test_create_job_route_forwards_prompt_id(dashboard):
+    base_url, manager = dashboard
+
+    _, created, _ = request_json(base_url + "/api/jobs", "POST", {
+        "result": {"summary": {}, "risk_entities": [entity()]},
+        "model": "qwen3:1.7b",
+        "prompt_id": "feature_extract_v2_strict_en",
+    })
+
+    _, snapshot, _ = request_json(base_url + f"/api/jobs/{created['job_id']}")
+    assert snapshot["prompt_id"] == "feature_extract_v2_strict_en"
+    assert manager.get_job(created["job_id"])["prompt_id"] == "feature_extract_v2_strict_en"
+
+
+def test_serves_frontend_for_ai_harness_routes(dashboard):
+    base_url, _ = dashboard
+
+    for path in ("/prompts", "/ai-traces", "/ai-observability"):
+        with urlopen(base_url + path, timeout=3) as response:
+            html = response.read().decode()
+        assert "Feature Dashboard" in html
+
+
+def test_ai_observability_routes_summarize_job_progress_and_events(dashboard):
+    base_url, _ = dashboard
+
+    _, created, _ = request_json(base_url + "/api/jobs", "POST", {
+        "result": {"summary": {"total_raw_logs": 10, "total_template_windows": 6}, "risk_entities": [entity()]},
+        "model": "qwen3:1.7b",
+    })
+    job_id = created["job_id"]
+    for _ in range(50):
+        _, snapshot, _ = request_json(base_url + f"/api/jobs/{job_id}")
+        if snapshot["features"]:
+            break
+
+    status, summary, _ = request_json(base_url + "/api/ai-harness/observability/summary")
+    progress_status, progress, _ = request_json(base_url + f"/api/ai-harness/jobs/{job_id}/progress")
+    events_status, events, _ = request_json(base_url + f"/api/ai-harness/jobs/{job_id}/events")
+
+    assert status == 200
+    assert summary["current_job_id"] == job_id
+    assert summary["candidate_feature_count"] == 1
+    assert progress_status == 200
+    assert progress["job_id"] == job_id
+    assert progress["summary"]["risk_entities_total"] == 1
+    assert progress["entities"][0]["status"] in {"candidate_generated", "waiting_review"}
+    assert events_status == 200
+    assert events["items"][0]["job_id"] == job_id
+    assert "stage" in events["items"][0]
 
 
 def test_serves_bundled_asset_with_correct_content_type(dashboard):

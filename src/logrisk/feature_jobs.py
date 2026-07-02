@@ -11,6 +11,7 @@ from typing import Any, Callable, Dict
 from logrisk.approved_rules import ApprovedRuleStore
 from logrisk.feature_extractor_ollama import (
     DEFAULT_OLLAMA_URL,
+    FEATURE_PROMPT_ID,
     IMPORTANCE_LEVELS,
     extract_features_for_entity,
 )
@@ -145,6 +146,7 @@ class FeatureJobManager:
         min_score: float = 40,
         base_url: str = DEFAULT_OLLAMA_URL,
         timeout: float = 120,
+        prompt_id: str = FEATURE_PROMPT_ID,
     ) -> str:
         validate_result_document(document)
         if not isinstance(model, str) or not model.strip():
@@ -200,6 +202,7 @@ class FeatureJobManager:
                 "model": model.strip(),
                 "base_url": base_url,
                 "timeout": float(timeout),
+                "prompt_id": str(prompt_id or FEATURE_PROMPT_ID),
                 "min_score": float(min_score),
                 "source_summary": copy.deepcopy(document.get("summary") or {}),
                 "entities": records,
@@ -266,6 +269,8 @@ class FeatureJobManager:
                     model=job["model"],
                     base_url=job["base_url"],
                     timeout=job["timeout"],
+                    prompt_id=job["prompt_id"],
+                    job_id=job["job_id"],
                 )
                 with self._lock:
                     record["feature_ids"] = []
@@ -391,6 +396,7 @@ class FeatureJobManager:
                 "created_at": job["created_at"],
                 "completed_at": job["completed_at"],
                 "model": job["model"],
+                "prompt_id": job["prompt_id"],
                 "min_score": job["min_score"],
                 "source_summary": copy.deepcopy(job["source_summary"]),
                 "progress": self._progress_locked(job),
@@ -399,6 +405,11 @@ class FeatureJobManager:
                 "entities": entities,
                 "features": copy.deepcopy(list(job["features"].values())),
             }
+
+    def list_jobs(self) -> list[Dict[str, Any]]:
+        with self._lock:
+            job_ids = sorted(self._jobs, key=lambda item: self._jobs[item]["created_at"], reverse=True)
+        return [self.get_job(job_id) for job_id in job_ids]
 
     def wait_for_events(
         self,
@@ -412,6 +423,11 @@ class FeatureJobManager:
                 job["condition"].wait(timeout)
             events = copy.deepcopy(job["events"][cursor:])
             return events, len(job["events"])
+
+    def list_events(self, job_id: str, limit: int = 100) -> list[Dict[str, Any]]:
+        with self._lock:
+            job = self._job(job_id)
+            return copy.deepcopy(job["events"][-max(1, min(int(limit), 200)):])
 
     def retry_entity(self, job_id: str, entity_id: str, start: bool = True) -> None:
         with self._lock:

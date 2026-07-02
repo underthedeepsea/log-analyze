@@ -120,7 +120,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         path, query = self._route_parts()
         try:
-            if path == "/":
+            if path in {"/", "/prompts", "/ai-traces", "/ai-observability"}:
                 self._serve_frontend()
                 return
             if path.startswith("/assets/"):
@@ -145,6 +145,20 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/ai-harness/status":
                 self._json(HTTPStatus.OK, self._ai_harness_status())
+                return
+            if path == "/api/ai-harness/observability/summary":
+                self._json(HTTPStatus.OK, self._observability_summary())
+                return
+            if path == "/api/ai-harness/events/recent":
+                self._json(HTTPStatus.OK, self._observability_recent_events(query))
+                return
+            match = re.fullmatch(r"/api/ai-harness/jobs/([a-f0-9]+)/progress", path)
+            if match:
+                self._json(HTTPStatus.OK, self._observability_progress(match.group(1)))
+                return
+            match = re.fullmatch(r"/api/ai-harness/jobs/([a-f0-9]+)/events", path)
+            if match:
+                self._json(HTTPStatus.OK, self._observability_events(match.group(1), query))
                 return
             if path == "/api/ai-harness/prompts":
                 self._json(HTTPStatus.OK, self._prompt_list())
@@ -205,6 +219,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     min_score=float(payload.get("min_score", 40)),
                     base_url=payload.get("ollama_url") or self.server.default_ollama_url,  # type: ignore[attr-defined]
                     timeout=float(payload.get("timeout", self.server.default_timeout)),  # type: ignore[attr-defined]
+                    prompt_id=payload.get("prompt_id") or FEATURE_PROMPT_ID,
                 )
                 self._json(HTTPStatus.ACCEPTED, {"job_id": job_id})
                 return
@@ -328,6 +343,144 @@ class DashboardHandler(BaseHTTPRequestHandler):
         except FileNotFoundError:
             result["prompt_content"] = ""
         return result
+
+    def _feature_status_for_entity(self, snapshot: dict[str, Any], entity: dict[str, Any]) -> tuple[str, int, str | None, str | None]:
+        features = [
+            feature for feature in snapshot.get("features", [])
+            if feature.get("entity", {}).get("id") == entity.get("entity_id")
+        ]
+        trace_id = next((feature.get("trace_id") for feature in features if feature.get("trace_id")), None)
+        if entity.get("status") == "rule_matched":
+            return "reused_rule", len(features), "命中历史规则，跳过 LLM", trace_id
+        if entity.get("status") == "running":
+            return "model_running", len(features), None, trace_id
+        if entity.get("status") == "failed":
+            reason = str(entity.get("error") or "模型服务返回错误，AI 分析失败。")
+            lowered = reason.lower()
+            status = "model_timeout" if "timeout" in lowered or "超时" in reason else ("parse_failed" if "json" in lowered or "解析" in reason else "model_failed")
+            return status, len(features), reason, trace_id
+        if entity.get("status") in {"queued", "skipped"}:
+            return ("pending" if entity.get("status") == "queued" else "skipped"), len(features), None, trace_id
+        if not features:
+            return "no_feature", 0, "AI 正常完成，但未识别到关键特征", trace_id
+        if any(feature.get("status") == "approved" for feature in features):
+            return "approved", len(features), None, trace_id
+        if all(feature.get("status") == "rejected" for feature in features):
+            return "rejected", len(features), "候选特征已被人工驳回", trace_id
+        return "waiting_review", len(features), None, trace_id
+
+    def _observability_progress(self, job_id: str) -> dict[str, Any]:
+        snapshot = self.server.manager.get_job(job_id)  # type: ignore[attr-defined]
+        entities = []
+        counts = {
+            "risk_entities_total": len(snapshot.get("entities", [])),
+            "rule_reused": 0,
+            "ai_required": 0,
+            "model_success": 0,
+            "parse_success": 0,
+            "schema_passed": 0,
+            "evaluator_passed": 0,
+            "candidate_features": len(snapshot.get("features", [])),
+            "approved_rules": sum(feature.get("status") == "approved" for feature in snapshot.get("features", [])),
+            "failed": 0,
+            "no_feature": 0,
+        }
+        for entity in snapshot.get("entities", []):
+            status, candidate_count, reason, trace_id = self._feature_status_for_entity(snapshot, entity)
+            counts["rule_reused"] += status == "reused_rule"
+            counts["ai_required"] += status != "reused_rule" and status != "skipped"
+            counts["model_success"] += status in {"no_feature", "waiting_review", "candidate_generated", "approved", "rejected"}
+            counts["parse_success"] += status not in {"model_timeout", "model_failed", "parse_failed", "pending", "skipped"}
+            counts["schema_passed"] += status not in {"model_timeout", "model_failed", "parse_failed", "schema_failed", "pending", "skipped"}
+            counts["evaluator_passed"] += status in {"no_feature", "waiting_review", "candidate_generated", "approved", "rejected"}
+            counts["failed"] += status in {"model_timeout", "model_failed", "parse_failed", "schema_failed", "evaluator_failed"}
+            counts["no_feature"] += status == "no_feature"
+            entities.append({
+                "entity_type": entity.get("entity_type"),
+                "entity_id": entity.get("entity_id"),
+                "risk_score": entity.get("risk_score"),
+                "reused_rule": status == "reused_rule",
+                "status": "candidate_generated" if status == "waiting_review" and candidate_count else status,
+                "trace_id": trace_id,
+                "candidate_count": candidate_count,
+                "failure_reason": reason,
+            })
+        current = next((item for item in entities if item["status"] in {"model_running", "pending"}), None)
+        processed = sum(item["status"] not in {"pending", "skipped"} for item in entities)
+        total = max(1, counts["ai_required"])
+        return {
+            "job_id": snapshot["job_id"],
+            "status": "partial_failed" if snapshot["status"] == "completed_with_errors" else snapshot["status"],
+            "created_at": snapshot["created_at"],
+            "updated_at": snapshot.get("completed_at"),
+            "model": snapshot["model"],
+            "prompt_id": snapshot["prompt_id"],
+            "source_file": snapshot.get("source_summary", {}).get("source_file"),
+            "current_stage": "model_call" if current else "candidate_features",
+            "current_message": f"正在分析第 {min(processed + 1, total)} / {total} 个风险实体" if current else "AI 分析已结束，等待人工审批或规则沉淀",
+            "summary": counts,
+            "entities": entities,
+        }
+
+    def _observability_summary(self) -> dict[str, Any]:
+        jobs = self.server.manager.list_jobs()  # type: ignore[attr-defined]
+        current = next((job for job in jobs if job["status"] in {"queued", "running"}), jobs[0] if jobs else None)
+        progress = self._observability_progress(current["job_id"]) if current else {"summary": {}, "entities": []}
+        summary = progress.get("summary", {})
+        failed = sum(item.get("status") in {"model_timeout", "model_failed", "parse_failed", "schema_failed", "evaluator_failed"} for item in progress.get("entities", []))
+        success = int(summary.get("model_success") or 0)
+        total_ai = int(summary.get("ai_required") or 0)
+        return {
+            "running_jobs": sum(job["status"] in {"queued", "running"} for job in jobs),
+            "current_job_id": current["job_id"] if current else None,
+            "today_ai_calls": self.server.trace_logger.summary_today().get("today_calls", 0),  # type: ignore[attr-defined]
+            "ai_required": total_ai,
+            "model_success_rate": round(success / total_ai, 4) if total_ai else 0,
+            "candidate_feature_count": int(summary.get("candidate_features") or 0),
+            "schema_failed_count": failed,
+            "evaluator_failed_count": 0,
+            "no_feature_count": int(summary.get("no_feature") or 0),
+        }
+
+    def _observability_event(self, event: dict[str, Any]) -> dict[str, Any]:
+        event_type = str(event.get("type") or "")
+        stage_map = {
+            "job_created": ("job_created", "success", "任务已创建"),
+            "job_started": ("entity_filter", "running", "任务开始"),
+            "entity_rule_matched": ("rule_reuse", "success", "命中历史规则，跳过 LLM"),
+            "entity_started": ("model_call", "running", "开始调用模型"),
+            "entity_completed": ("feature_generation", "success", f"生成 {event.get('feature_count', 0)} 个候选特征"),
+            "entity_failed": ("model_call", "failed", str(event.get("error") or "AI 分析失败")),
+            "feature_updated": ("manual_review", "success", f"人工审批更新为 {event.get('status')}"),
+            "job_completed": ("rule_persist", "success", "任务完成"),
+            "entity_queued": ("retry", "running", "实体已重新排队"),
+        }
+        stage, status, message = stage_map.get(event_type, ("unknown", "success", event_type))
+        return {
+            "event_id": str(event.get("sequence", "")),
+            "job_id": event.get("job_id"),
+            "entity_id": event.get("entity_id"),
+            "entity_type": event.get("entity_type"),
+            "stage": stage,
+            "status": status,
+            "message": message,
+            "trace_id": event.get("trace_id"),
+            "created_at": event.get("timestamp"),
+            "extra": {key: value for key, value in event.items() if key not in {"sequence", "type", "timestamp", "job_id", "entity_id", "entity_type", "trace_id"}},
+        }
+
+    def _observability_events(self, job_id: str, query: dict[str, list[str]]) -> dict[str, Any]:
+        limit = int(query.get("limit", ["100"])[0])
+        events = self.server.manager.list_events(job_id, limit=limit)  # type: ignore[attr-defined]
+        return {"items": [self._observability_event(event) for event in reversed(events)]}
+
+    def _observability_recent_events(self, query: dict[str, list[str]]) -> dict[str, Any]:
+        limit = int(query.get("limit", ["100"])[0])
+        items = []
+        for job in self.server.manager.list_jobs():  # type: ignore[attr-defined]
+            items.extend(self.server.manager.list_events(job["job_id"], limit=limit))  # type: ignore[attr-defined]
+        items.sort(key=lambda event: str(event.get("timestamp") or ""), reverse=True)
+        return {"items": [self._observability_event(event) for event in items[: max(1, min(limit, 200))]]}
 
     def _serve_asset(self, request_path: str) -> None:
         asset_root = (self.server.frontend_path.parent / "assets").resolve()  # type: ignore[attr-defined]

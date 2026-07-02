@@ -79,6 +79,7 @@ def _write_trace(
     evidence: Dict[str, Any],
     provider: str,
     model: str,
+    job_id: str | None,
     raw_output: str,
     parsed_output: Dict[str, Any] | None,
     validation_result: Dict[str, Any],
@@ -89,7 +90,7 @@ def _write_trace(
     try:
         TRACE_LOGGER.append({
             "trace_id": trace_id,
-            "job_id": None,
+            "job_id": job_id,
             "candidate_id": None,
             "entity_type": evidence.get("entity", {}).get("type"),
             "entity_id": evidence.get("entity", {}).get("id"),
@@ -218,9 +219,11 @@ def _request_features(
     base_url: str,
     timeout: float,
     model_client: ModelClient | None = None,
+    prompt_id: str = FEATURE_PROMPT_ID,
+    job_id: str | None = None,
 ) -> tuple[list[Dict[str, Any]], str | None]:
     evidence = build_feature_evidence(entity)
-    prompt = PROMPT_REGISTRY.load(FEATURE_PROMPT_ID)
+    prompt = PROMPT_REGISTRY.load(prompt_id)
     messages = [
         {"role": "system", "content": prompt.content},
         {"role": "user", "content": json.dumps(evidence, ensure_ascii=False, separators=(",", ":"))},
@@ -241,6 +244,7 @@ def _request_features(
             evidence=evidence,
             provider="ollama",
             model=model,
+            job_id=job_id,
             raw_output=exc.raw_output,
             parsed_output=None,
             validation_result={"valid": False, "errors": [str(exc)], "warnings": []},
@@ -254,6 +258,7 @@ def _request_features(
             evidence=evidence,
             provider="ollama",
             model=model,
+            job_id=job_id,
             raw_output=json.dumps(model_output, ensure_ascii=False),
             parsed_output=model_output if isinstance(model_output, dict) else {},
             validation_result={"valid": False, "errors": ["missing_features"], "warnings": []},
@@ -275,6 +280,7 @@ def _request_features(
             evidence=evidence,
             provider="ollama",
             model=model,
+            job_id=job_id,
             raw_output=json.dumps(model_output, ensure_ascii=False),
             parsed_output=model_output,
             validation_result={"valid": False, "errors": [str(exc)], "warnings": []},
@@ -287,6 +293,7 @@ def _request_features(
         evidence=evidence,
         provider="ollama",
         model=model,
+        job_id=job_id,
         raw_output=json.dumps(model_output, ensure_ascii=False),
         parsed_output=model_output,
         validation_result={"valid": True, "errors": [], "warnings": []},
@@ -302,6 +309,8 @@ def extract_features_for_entity(
     base_url: str = DEFAULT_OLLAMA_URL,
     timeout: float = 120,
     model_client: ModelClient | None = None,
+    prompt_id: str = FEATURE_PROMPT_ID,
+    job_id: str | None = None,
 ) -> list[Dict[str, Any]]:
     if not model or not model.strip():
         raise FeatureExtractionError("必须指定 Ollama 模型")
@@ -309,10 +318,11 @@ def extract_features_for_entity(
         raise FeatureExtractionError("Ollama timeout 必须大于 0")
     normalized_url = _validate_base_url(base_url)
     model_name = model.strip()
-    features, trace_id = _request_features(entity, model_name, normalized_url, timeout, model_client)
+    selected_prompt = prompt_id or FEATURE_PROMPT_ID
+    features, trace_id = _request_features(entity, model_name, normalized_url, timeout, model_client, selected_prompt, job_id)
     attached = [_attach_source_facts(entity, feature, model_name) for feature in features]
     for feature in attached:
-        feature["prompt_id"] = FEATURE_PROMPT_ID
+        feature["prompt_id"] = selected_prompt
         feature["trace_id"] = trace_id
     return attached
 
@@ -324,10 +334,12 @@ def generate_feature_candidates(
     timeout: float = 120,
     min_score: float = 40,
     model_client: ModelClient | None = None,
+    prompt_id: str = FEATURE_PROMPT_ID,
+    job_id: str | None = None,
 ) -> list[Dict[str, Any]]:
     results = []
     for entity in entities:
         if float(entity.get("risk_score") or 0) < min_score:
             continue
-        results.extend(extract_features_for_entity(entity, model, base_url, timeout, model_client))
+        results.extend(extract_features_for_entity(entity, model, base_url, timeout, model_client, prompt_id, job_id))
     return results

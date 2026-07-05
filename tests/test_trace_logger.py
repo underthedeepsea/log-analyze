@@ -25,9 +25,13 @@ def test_trace_logger_lists_filters_and_skips_bad_lines(tmp_path):
     assert [item["trace_id"] for item in logger.list_traces()] == ["new", "old"]
     assert logger.list_traces(job_id="job-a")[0]["trace_id"] == "old"
     assert logger.list_traces(status="model_failed")[0]["trace_id"] == "new"
+    logger.append({"trace_id": "prompt-old", "prompt_id": "p3", "prompt_hash": "old", "created_at": "2026-07-02T00:02:00Z"})
+    logger.append({"trace_id": "prompt-new", "prompt_id": "p3", "prompt_hash": "new", "created_at": "2026-07-02T00:03:00Z"})
+    assert [item["trace_id"] for item in logger.list_traces(prompt_id="p3", prompt_hash="new")] == ["prompt-new"]
     assert logger.get_trace("old")["job_id"] == "job-a"
     assert logger.summary_today(now="2026-07-01T12:00:00Z") == {
         "today_calls": 2,
+        "cache_hits": 0,
         "success_rate": 0.5,
         "avg_latency_ms": 200,
     }

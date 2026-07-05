@@ -57,13 +57,14 @@ prompts:
     assert default.prompt_id == "feature_extract_v1"
 
 
-def test_repo_default_uses_compact_v2_prompt():
+def test_repo_default_uses_compact_strict_json_v3_prompt():
     registry = PromptRegistry("prompts", "configs/ai_harness.yaml")
 
     default = registry.get_default("feature_extract")
     prompts = {prompt.prompt_id: prompt for prompt in registry.list_prompts()}
 
-    assert default.prompt_id == "feature_extract_v2_compact_en"
+    assert default.prompt_id == "feature_extract_v3_compact_strict_json_en"
+    assert prompts["feature_extract_v3_compact_strict_json_en"].description == "compact strict JSON for 小参数模型"
     assert prompts["feature_extract_v2_compact_en"].description == "compact for 小参数模型"
     assert prompts["feature_extract_v2_strict_en"].description == "for 大参数模型"
 

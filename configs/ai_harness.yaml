@@ -3,7 +3,7 @@ trace:
   enabled: true
   path: state/ai_traces.jsonl
 defaults:
-  feature_extract: feature_extract_v2_compact_en
+  feature_extract: feature_extract_v3_compact_strict_json_en
 prompts:
   - prompt_id: feature_extract_v1
     display_name: 日志特征识别 v1
@@ -17,7 +17,7 @@ prompts:
     description: compact for 小参数模型
     analysis_type: feature_extract
     status: active
-    is_default: true
+    is_default: false
     version: v2
   - prompt_id: feature_extract_v2_strict_en
     display_name: 日志特征识别 v2 Strict
@@ -26,3 +26,10 @@ prompts:
     status: active
     is_default: false
     version: v2
+  - prompt_id: feature_extract_v3_compact_strict_json_en
+    display_name: 日志特征识别 v3 Compact Strict JSON
+    description: compact strict JSON for 小参数模型
+    analysis_type: feature_extract
+    status: active
+    is_default: true
+    version: v3

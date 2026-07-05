@@ -14,17 +14,22 @@ from urllib.error import URLError
 from urllib.parse import parse_qs, urlparse
 from urllib.request import urlopen
 
+from logrisk.ai_harness.model_profile import ModelProfileRegistry
 from logrisk.ai_harness.prompt_registry import PromptRegistry, PromptTemplate
 from logrisk.ai_harness.trace_logger import AITraceLogger
 from logrisk.approved_rules import ApprovedRuleError, ApprovedRuleStore
 from logrisk.feature_extractor_ollama import DEFAULT_OLLAMA_URL, FEATURE_PROMPT_ID
-from logrisk.feature_jobs import FeatureJobError, FeatureJobManager
+from logrisk.feature_jobs import FeatureJobError, FeatureJobManager, _cache_enabled_default
+from logrisk.input_jobs import InputJobConfig, InputJobStore
 from logrisk.input_parser import parse_log_content
+from logrisk.large_file_pipeline import run_large_file_pipeline
 from logrisk.processing_metrics import ProcessingMetricsError, ProcessingMetricsStore
+from logrisk.upload_sessions import UploadConfig, UploadSessionStore
 from pipeline.manual_import_pipeline import analyze_records
 
 
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
+MAX_LARGE_UPLOAD_BYTES = 500 * 1024 * 1024
 DEFAULT_MODEL = "qwen3:1.7b"
 
 
@@ -65,7 +70,10 @@ def build_server(
     server.default_ollama_url = default_ollama_url  # type: ignore[attr-defined]
     server.default_timeout = default_timeout  # type: ignore[attr-defined]
     server.prompt_registry = PromptRegistry(root / "prompts", root / "configs" / "ai_harness.yaml", state_root / "prompt_versions.json")  # type: ignore[attr-defined]
+    server.model_profiles = ModelProfileRegistry(root / "configs" / "model_profiles.yaml")  # type: ignore[attr-defined]
     server.trace_logger = AITraceLogger(state_root / "ai_traces.jsonl")  # type: ignore[attr-defined]
+    server.upload_store = UploadSessionStore(UploadConfig(upload_dir=state_root / "uploads"))  # type: ignore[attr-defined]
+    server.input_jobs = InputJobStore(InputJobConfig(output_dir=root / "output" / "uploads"))  # type: ignore[attr-defined]
     server.ollama_checker = ollama_checker or (  # type: ignore[attr-defined]
         lambda: check_ollama(default_ollama_url)
     )
@@ -81,7 +89,39 @@ def build_server(
             )
 
     server.input_analyzer = input_analyzer or default_input_analyzer  # type: ignore[attr-defined]
+
+    def run_input_job(input_job_id: str) -> None:
+        store = server.input_jobs  # type: ignore[attr-defined]
+        job = store.get_job(input_job_id)
+        job.update({"status": "running", "stage": "reading", "started_at": _now()})
+        store.write_job(input_job_id, job)
+        try:
+            result = run_large_file_pipeline(
+                input_job_id=input_job_id,
+                input_path=job["source_path"],
+                filename=job["filename"],
+                config_path=root / "configs" / "drain3_recommended.ini",
+                rules_path=root / "configs" / "risk_rules.yaml",
+                state_dir=state_root / "dashboard_drain3_large" / input_job_id,
+                progress_callback=lambda progress: store.write_progress(input_job_id, progress),
+            )
+            store.write_result(input_job_id, result)
+            job.update({"status": "completed", "stage": "completed", "completed_at": _now(), "error": None})
+            store.write_job(input_job_id, job)
+            store.write_progress(input_job_id, {"input_job_id": input_job_id, "status": "completed", "stage": "completed", "progress": 1.0, "risk_entities": len(result.get("risk_entities") or [])})
+        except Exception as exc:
+            job.update({"status": "failed", "stage": "failed", "completed_at": _now(), "error": str(exc)})
+            store.write_job(input_job_id, job)
+            store.write_progress(input_job_id, {"input_job_id": input_job_id, "status": "failed", "stage": "failed", "progress": 1.0, "error": str(exc)})
+
+    server.run_input_job = run_input_job  # type: ignore[attr-defined]
     return server
+
+
+def _now() -> str:
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).isoformat()
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
@@ -113,6 +153,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             raise FeatureJobError("请求体不是有效 JSON") from exc
 
+    def _read_bytes(self, max_bytes: int) -> bytes:
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError as exc:
+            raise FeatureJobError("Content-Length 无效") from exc
+        if length > max_bytes:
+            raise FeatureJobError("上传分片超过限制")
+        return self.rfile.read(length)
+
     def _route_parts(self) -> tuple[str, dict[str, list[str]]]:
         parsed = urlparse(self.path)
         return parsed.path, parse_qs(parsed.query)
@@ -120,7 +169,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         path, query = self._route_parts()
         try:
-            if path in {"/", "/prompts", "/ai-traces", "/ai-observability"}:
+            if path in {"/", "/prompts", "/ai-traces", "/ai-observability", "/model-profiles"}:
                 self._serve_frontend()
                 return
             if path.startswith("/assets/"):
@@ -131,6 +180,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "default_model": self.server.default_model,  # type: ignore[attr-defined]
                     "default_ollama_url": self.server.default_ollama_url,  # type: ignore[attr-defined]
                     "default_timeout": self.server.default_timeout,  # type: ignore[attr-defined]
+                    "ai_cache_enabled": _cache_enabled_default(),
                     "max_upload_bytes": MAX_UPLOAD_BYTES,
                 })
                 return
@@ -145,6 +195,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/ai-harness/status":
                 self._json(HTTPStatus.OK, self._ai_harness_status())
+                return
+            if path == "/api/ai-harness/model-profiles":
+                self._json(HTTPStatus.OK, self._model_profiles())
                 return
             if path == "/api/ai-harness/observability/summary":
                 self._json(HTTPStatus.OK, self._observability_summary())
@@ -169,6 +222,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/ai-harness/traces":
                 self._json(HTTPStatus.OK, self._trace_list(query))
+                return
+            match = re.fullmatch(r"/api/input-jobs/([A-Za-z0-9_-]+)", path)
+            if match:
+                self._json(HTTPStatus.OK, self.server.input_jobs.get_progress(match.group(1)))  # type: ignore[attr-defined]
+                return
+            match = re.fullmatch(r"/api/input-jobs/([A-Za-z0-9_-]+)/result", path)
+            if match:
+                result = self.server.input_jobs.get_result(match.group(1))  # type: ignore[attr-defined]
+                self._json(HTTPStatus.OK, {"result_path": str(self.server.input_jobs.result_path(match.group(1))), "result": result})  # type: ignore[attr-defined]
                 return
             match = re.fullmatch(r"/api/ai-harness/traces/([A-Za-z0-9_-]+)", path)
             if match:
@@ -210,6 +272,48 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 result = self.server.input_analyzer(records)  # type: ignore[attr-defined]
                 self._json(HTTPStatus.OK, {"result": result})
                 return
+            if path == "/api/uploads":
+                if not isinstance(payload, dict):
+                    raise FeatureJobError("请求体必须是 JSON object")
+                manifest = self.server.upload_store.create(  # type: ignore[attr-defined]
+                    filename=str(payload.get("filename") or "upload.log"),
+                    size_bytes=int(payload.get("size_bytes") or 0),
+                    chunk_size_bytes=int(payload.get("chunk_size_bytes") or 0) or None,
+                )
+                self._json(HTTPStatus.OK, {
+                    "upload_id": manifest["upload_id"],
+                    "chunk_size_bytes": manifest["chunk_size_bytes"],
+                    "total_chunks": manifest["total_chunks"],
+                    "max_upload_bytes": MAX_LARGE_UPLOAD_BYTES,
+                    "status": manifest["status"],
+                })
+                return
+            match = re.fullmatch(r"/api/uploads/([A-Za-z0-9_-]+)/complete", path)
+            if match:
+                manifest = self.server.upload_store.complete(upload_id=match.group(1), final_sha256=payload.get("sha256") if isinstance(payload, dict) else None)  # type: ignore[attr-defined]
+                self._json(HTTPStatus.OK, {"upload_id": manifest["upload_id"], "status": manifest["status"], "path": str(self.server.upload_store.source_path(match.group(1)))})  # type: ignore[attr-defined]
+                return
+            if path == "/api/inputs/analyze-upload":
+                if not isinstance(payload, dict):
+                    raise FeatureJobError("请求体必须是 JSON object")
+                upload_id = str(payload.get("upload_id") or "")
+                manifest = self.server.upload_store.get(upload_id)  # type: ignore[attr-defined]
+                if manifest.get("status") != "completed":
+                    raise FeatureJobError("上传尚未完成")
+                job = self.server.input_jobs.create(  # type: ignore[attr-defined]
+                    upload_id=upload_id,
+                    filename=str(payload.get("filename") or manifest.get("safe_filename") or "upload.log"),
+                    source_path=str(self.server.upload_store.source_path(upload_id)),  # type: ignore[attr-defined]
+                )
+                threading.Thread(target=self.server.run_input_job, args=(job["input_job_id"],), daemon=True).start()  # type: ignore[attr-defined]
+                self._json(HTTPStatus.ACCEPTED, job)
+                return
+            if path == "/api/ai-harness/model-profiles":
+                if not isinstance(payload, dict):
+                    raise FeatureJobError("请求体必须是 JSON object")
+                profile = self.server.model_profiles.save(payload)  # type: ignore[attr-defined]
+                self._json(HTTPStatus.OK, profile.public_dict())
+                return
             if path == "/api/jobs":
                 if not isinstance(payload, dict):
                     raise FeatureJobError("请求体必须是 JSON object")
@@ -220,6 +324,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     base_url=payload.get("ollama_url") or self.server.default_ollama_url,  # type: ignore[attr-defined]
                     timeout=float(payload.get("timeout", self.server.default_timeout)),  # type: ignore[attr-defined]
                     prompt_id=payload.get("prompt_id") or FEATURE_PROMPT_ID,
+                    cache_enabled=payload.get("cache_enabled", None),
+                    model_profile_id=payload.get("model_profile_id"),
+                    retry_count=int(payload.get("retry_count", 0)),
                 )
                 self._json(HTTPStatus.ACCEPTED, {"job_id": job_id})
                 return
@@ -241,6 +348,33 @@ class DashboardHandler(BaseHTTPRequestHandler):
         except (FeatureJobError, ApprovedRuleError, ProcessingMetricsError) as exc:
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
         except (TypeError, ValueError) as exc:
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+
+    def do_PUT(self) -> None:
+        path, _ = self._route_parts()
+        try:
+            match = re.fullmatch(r"/api/uploads/([A-Za-z0-9_-]+)/chunks/([0-9]+)", path)
+            if not match:
+                self._json(HTTPStatus.NOT_FOUND, {"error": "资源不存在"})
+                return
+            data = self._read_bytes(MAX_UPLOAD_BYTES)
+            manifest = self.server.upload_store.append_chunk(  # type: ignore[attr-defined]
+                upload_id=match.group(1),
+                index=int(match.group(2)),
+                data=data,
+                chunk_sha256=self.headers.get("X-Chunk-SHA256"),
+            )
+            received = len(manifest.get("received_chunks") or [])
+            total = int(manifest["total_chunks"])
+            self._json(HTTPStatus.OK, {
+                "upload_id": manifest["upload_id"],
+                "chunk_index": int(match.group(2)),
+                "received": True,
+                "received_chunks": received,
+                "total_chunks": total,
+                "progress": received / total if total else 1.0,
+            })
+        except (FeatureJobError, KeyError, ValueError, OSError) as exc:
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
 
     def do_PATCH(self) -> None:
@@ -280,7 +414,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def _prompt_meta(self, prompt: PromptTemplate) -> dict[str, Any]:
-        traces = self.server.trace_logger.list_traces(prompt_id=prompt.prompt_id, limit=200)  # type: ignore[attr-defined]
+        traces = self.server.trace_logger.list_traces(prompt_id=prompt.prompt_id, prompt_hash=prompt.sha256, limit=200)  # type: ignore[attr-defined]
         return {
             "prompt_id": prompt.prompt_id,
             "display_name": prompt.display_name or prompt.prompt_id,
@@ -306,7 +440,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         detail = self._prompt_meta(prompt)
         detail["content"] = prompt.content
         detail["history"] = self.server.prompt_registry.history(prompt_id)  # type: ignore[attr-defined]
-        detail["recent_traces"] = self._compact_traces(self.server.trace_logger.list_traces(prompt_id=prompt_id, limit=10))  # type: ignore[attr-defined]
+        detail["recent_traces"] = self._compact_traces(self.server.trace_logger.list_traces(prompt_id=prompt_id, prompt_hash=prompt.sha256, limit=10))  # type: ignore[attr-defined]
         return detail
 
     def _ai_harness_status(self) -> dict[str, Any]:
@@ -318,8 +452,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
             **summary,
         }
 
+    def _model_profiles(self) -> dict[str, Any]:
+        registry = self.server.model_profiles  # type: ignore[attr-defined]
+        return {
+            "default_profile_id": registry.default_profile_id,
+            "profiles": [profile.public_dict() for profile in registry.list_enabled()],
+        }
+
     def _compact_traces(self, traces: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        fields = ("trace_id", "job_id", "entity_type", "entity_id", "prompt_id", "prompt_hash", "provider", "model", "status", "latency_ms", "created_at", "evaluator_result")
+        fields = ("trace_id", "job_id", "entity_type", "entity_id", "prompt_id", "prompt_hash", "provider", "model", "model_profile_id", "parameter_size", "thinking_enabled", "context_budget", "evidence_build_meta", "status", "latency_ms", "created_at", "evaluator_result")
         return [{key: item.get(key) for key in fields} for item in traces]
 
     def _trace_list(self, query: dict[str, list[str]]) -> dict[str, Any]:
@@ -365,12 +506,22 @@ class DashboardHandler(BaseHTTPRequestHandler):
             "schema_status": "skipped",
             "evaluator_status": evaluator_status,
             "evaluator_result": evaluator_result,
+            "model_profile_id": (trace or {}).get("model_profile_id"),
+            "parameter_size": (trace or {}).get("parameter_size"),
+            "thinking_enabled": (trace or {}).get("thinking_enabled"),
+            "context_budget": (trace or {}).get("context_budget") or {},
+            "evidence_build_meta": (trace or {}).get("evidence_build_meta") or {},
         }
         if entity.get("status") == "rule_matched":
             result.update({"status": "reused_rule", "failure_reason": "命中历史规则，跳过 LLM", "model_status": "skipped"})
             return result
         if entity.get("status") == "running":
             result.update({"status": "model_running", "model_status": "running"})
+            return result
+        if entity.get("cache_hit"):
+            result.update({"status": "cache_hit", "failure_reason": "命中 AI Cache，跳过模型调用", "model_status": "cached", "parse_status": "passed", "schema_status": "passed"})
+            if features:
+                result["status"] = "waiting_review"
             return result
         if entity.get("status") == "failed":
             reason = str(entity.get("error") or "模型服务返回错误，AI 分析失败。")
@@ -440,6 +591,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         counts = {
             "risk_entities_total": len(snapshot.get("entities", [])),
             "rule_reused": 0,
+            "cache_hit": 0,
             "ai_required": 0,
             "model_success": 0,
             "parse_success": 0,
@@ -459,6 +611,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             state = self._feature_status_for_entity(snapshot, entity, trace_by_entity.get(str(entity.get("entity_id"))))
             status = state["status"]
             counts["rule_reused"] += status == "reused_rule"
+            counts["cache_hit"] += bool(entity.get("cache_hit"))
             counts["ai_required"] += status != "reused_rule" and status != "skipped"
             counts["model_success"] += status in {"no_feature", "waiting_review", "candidate_generated", "approved", "rejected"}
             counts["parse_success"] += status not in {"model_timeout", "model_failed", "parse_failed", "pending", "skipped"}
@@ -479,6 +632,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 "schema_status": state["schema_status"],
                 "evaluator_status": state["evaluator_status"],
                 "evaluator_result": state["evaluator_result"],
+                "model_profile_id": state["model_profile_id"],
+                "parameter_size": state["parameter_size"],
+                "thinking_enabled": state["thinking_enabled"],
+                "context_budget": state["context_budget"],
+                "evidence_build_meta": state["evidence_build_meta"],
             })
         current = next((item for item in entities if item["status"] in {"model_running", "pending"}), None)
         processed = sum(item["status"] not in {"pending", "skipped"} for item in entities)
@@ -490,6 +648,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             "updated_at": snapshot.get("completed_at"),
             "model": snapshot["model"],
             "prompt_id": snapshot["prompt_id"],
+            "model_profile_id": snapshot.get("model_profile_id"),
+            "model_profile": self._profile_summary(snapshot.get("model_profile_id")),
             "source_file": snapshot.get("source_summary", {}).get("source_file"),
             "current_stage": "model_call" if current else "candidate_features",
             "current_message": f"正在分析第 {min(processed + 1, total)} / {total} 个风险实体" if current else "AI 分析已结束，等待人工审批或规则沉淀",
@@ -509,6 +669,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             "running_jobs": sum(job["status"] in {"queued", "running"} for job in jobs),
             "current_job_id": current["job_id"] if current else None,
             "today_ai_calls": self.server.trace_logger.summary_today().get("today_calls", 0),  # type: ignore[attr-defined]
+            "cache_hit_count": int(summary.get("cache_hit") or 0),
             "ai_required": total_ai,
             "model_success_rate": round(success / total_ai, 4) if total_ai else 0,
             "candidate_feature_count": int(summary.get("candidate_features") or 0),
@@ -524,6 +685,22 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 "evidence_reference_errors": int(summary.get("evidence_reference_error_count") or 0),
                 "forbidden_claim_errors": int(summary.get("forbidden_claim_count") or 0),
             },
+            "model_profile": progress.get("model_profile") or self._profile_summary(None),
+        }
+
+    def _profile_summary(self, profile_id: str | None) -> dict[str, Any]:
+        try:
+            profile = self.server.model_profiles.get(profile_id)  # type: ignore[attr-defined]
+        except Exception:
+            return {}
+        return {
+            "profile_id": profile.profile_id,
+            "model": profile.model,
+            "parameter_size": profile.parameter_size,
+            "thinking_enabled": profile.thinking.enabled,
+            "max_templates": profile.evidence_budget.max_templates,
+            "max_evidence_chars": profile.evidence_budget.max_evidence_chars,
+            "default_prompt_id": profile.default_prompt_id,
         }
 
     def _observability_event(self, event: dict[str, Any]) -> dict[str, Any]:
@@ -532,7 +709,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
             "job_created": ("job_created", "success", "任务已创建"),
             "job_started": ("entity_filter", "running", "任务开始"),
             "entity_rule_matched": ("rule_reuse", "success", "命中历史规则，跳过 LLM"),
+            "entity_cache_hit": ("ai_cache", "success", "命中 AI Cache，跳过模型调用"),
             "entity_started": ("model_call", "running", "开始调用模型"),
+            "entity_retrying": ("model_call", "running", f"模型输出异常，自动重试第 {event.get('attempt', 0)} / {event.get('retry_count', 0)} 次"),
             "entity_completed": ("feature_generation", "success", f"生成 {event.get('feature_count', 0)} 个候选特征"),
             "entity_failed": ("evaluator" if str(event.get("error") or "").startswith("Evaluator") else "model_call", "failed", str(event.get("error") or "AI 分析失败")),
             "feature_updated": ("manual_review", "success", f"人工审批更新为 {event.get('status')}"),

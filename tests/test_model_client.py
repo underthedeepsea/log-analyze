@@ -65,6 +65,86 @@ def test_ollama_model_client_posts_non_streaming_json_schema_request():
     assert captured["body"]["options"] == {"temperature": 0}
 
 
+def test_ollama_model_client_merges_options_with_temperature_default():
+    captured = {}
+
+    def fake_urlopen(request, timeout):
+        captured["body"] = json.loads(request.data)
+
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return json.dumps({"message": {"content": json.dumps({"features": []})}}).encode()
+
+        return Response()
+
+    OllamaModelClient("http://127.0.0.1:11434", opener=fake_urlopen).generate_json(
+        [],
+        SCHEMA,
+        model="qwen3:1.7b",
+        timeout=9,
+        options={"think": False, "num_predict": 1200},
+    )
+
+    assert captured["body"]["options"] == {"temperature": 0, "think": False, "num_predict": 1200}
+
+
+def test_ollama_model_client_accepts_markdown_fenced_json_response():
+    def fake_urlopen(request, timeout):
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return json.dumps({
+                    "message": {"content": "```json\n{\"features\": []}\n```"},
+                }).encode()
+
+        return Response()
+
+    result = OllamaModelClient("http://127.0.0.1:11434", opener=fake_urlopen).generate_json(
+        [],
+        SCHEMA,
+        model="qwen3.5:4b-mlx",
+        timeout=9,
+    )
+
+    assert result == {"features": []}
+
+
+def test_ollama_model_client_still_rejects_explanatory_text_around_json():
+    def fake_urlopen(request, timeout):
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return json.dumps({
+                    "message": {"content": "Here is JSON:\n{\"features\": []}"},
+                }).encode()
+
+        return Response()
+
+    with pytest.raises(ModelClientError, match="无效的结构化响应"):
+        OllamaModelClient("http://127.0.0.1:11434", opener=fake_urlopen).generate_json(
+            [],
+            SCHEMA,
+            model="qwen3.5:4b-mlx",
+            timeout=9,
+        )
+
+
 def test_ollama_model_client_rejects_bad_base_url():
     with pytest.raises(ModelClientError, match="有效的 http 或 https 地址"):
         OllamaModelClient("file:///tmp/ollama.sock")

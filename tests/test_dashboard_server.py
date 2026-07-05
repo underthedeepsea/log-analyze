@@ -1,4 +1,5 @@
 import json
+import time
 import shutil
 import threading
 from pathlib import Path
@@ -8,6 +9,7 @@ from urllib.request import Request, urlopen
 import pytest
 
 from logrisk.ai_harness.prompt_registry import PromptRegistry
+from logrisk.ai_harness.model_profile import ModelProfileRegistry
 from logrisk.ai_harness.trace_logger import AITraceLogger
 from logrisk.feature_jobs import FeatureJobManager
 from pipeline.dashboard_server import build_server
@@ -54,7 +56,7 @@ def candidate(source):
         "provider": "ollama",
         "model": "qwen3:1.7b",
         "trace_id": f"trace-{source['entity_id']}",
-        "prompt_id": "feature_extract_v2_compact_en",
+        "prompt_id": "feature_extract_v3_compact_strict_json_en",
         "evaluator_result": {"passed": True, "errors": [], "warnings": [], "score": 1.0, "rule_results": []},
     }
 
@@ -91,6 +93,9 @@ def dashboard(tmp_path):
         tmp_path / "state" / "prompt_versions.json",
     )
     server.trace_logger = AITraceLogger(tmp_path / "state" / "ai_traces.jsonl")  # type: ignore[attr-defined]
+    profile_config = tmp_path / "model_profiles.yaml"
+    shutil.copyfile(Path("configs") / "model_profiles.yaml", profile_config)
+    server.model_profiles = ModelProfileRegistry(profile_config)  # type: ignore[attr-defined]
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     base_url = f"http://127.0.0.1:{server.server_address[1]}"
@@ -195,6 +200,47 @@ def test_plain_text_analysis_endpoint(dashboard):
     assert payload["result"]["summary"]["total_raw_logs"] == 2
 
 
+def test_large_upload_routes_create_input_job_and_result(dashboard):
+    base_url, _ = dashboard
+    content = b"error one\nerror two\n"
+
+    status, session, _ = request_json(base_url + "/api/uploads", "POST", {
+        "filename": "messages",
+        "size_bytes": len(content),
+        "chunk_size_bytes": 8,
+    })
+    upload_id = session["upload_id"]
+    for index, start in enumerate(range(0, len(content), 8)):
+        request = Request(
+            base_url + f"/api/uploads/{upload_id}/chunks/{index}",
+            data=content[start:start + 8],
+            method="PUT",
+            headers={"Content-Type": "application/octet-stream"},
+        )
+        with urlopen(request, timeout=3) as response:
+            chunk = json.load(response)
+        assert chunk["received"] is True
+    complete_status, completed, _ = request_json(base_url + f"/api/uploads/{upload_id}/complete", "POST", {})
+    job_status, job, _ = request_json(base_url + "/api/inputs/analyze-upload", "POST", {
+        "upload_id": upload_id,
+        "filename": "messages",
+    })
+
+    for _ in range(50):
+        _, progress, _ = request_json(base_url + f"/api/input-jobs/{job['input_job_id']}")
+        if progress["status"] == "completed":
+            break
+        time.sleep(0.02)
+    result_status, result, _ = request_json(base_url + f"/api/input-jobs/{job['input_job_id']}/result")
+
+    assert status == 200
+    assert complete_status == 200
+    assert completed["status"] == "completed"
+    assert job_status == 202
+    assert result_status == 200
+    assert result["result"]["summary"]["total_raw_logs"] == 2
+
+
 def test_rule_list_route(dashboard):
     base_url, _ = dashboard
 
@@ -211,6 +257,45 @@ def test_system_metrics_route_returns_daily_llm_volume(dashboard):
 
     assert status == 200
     assert payload == {"today_llm_logs": 0}
+
+
+def test_config_route_exposes_ai_cache_flag(dashboard):
+    base_url, _ = dashboard
+
+    status, payload, _ = request_json(base_url + "/api/config")
+
+    assert status == 200
+    assert payload["ai_cache_enabled"] is True
+
+
+def test_model_profiles_route_exposes_default_profile(dashboard):
+    base_url, _ = dashboard
+
+    status, payload, _ = request_json(base_url + "/api/ai-harness/model-profiles")
+
+    assert status == 200
+    assert payload["default_profile_id"] == "qwen3_1_7b_fast"
+    assert payload["profiles"][0]["thinking_enabled"] is False
+    assert payload["profiles"][0]["evidence_budget"]["max_templates"] == 6
+
+
+def test_model_profiles_route_creates_profile(dashboard):
+    base_url, _ = dashboard
+
+    status, payload, _ = request_json(base_url + "/api/ai-harness/model-profiles", "POST", {
+        "profile_id": "custom_fast",
+        "display_name": "Custom Fast",
+        "provider": "ollama",
+        "model": "qwen3.5:4b-mlx",
+        "default_prompt_id": "feature_extract_v3_compact_strict_json_en",
+        "thinking_enabled": False,
+        "evidence_budget": {"max_templates": 4, "max_template_chars": 180, "max_affected_entities": 10, "max_evidence_chars": 6000},
+    })
+    _, listed, _ = request_json(base_url + "/api/ai-harness/model-profiles")
+
+    assert status == 200
+    assert payload["profile_id"] == "custom_fast"
+    assert any(item["profile_id"] == "custom_fast" for item in listed["profiles"])
 
 
 def test_observability_progress_exposes_evaluator_status(dashboard):
@@ -243,7 +328,7 @@ def test_ai_harness_prompt_and_trace_routes(dashboard):
     status3, harness, _ = request_json(base_url + "/api/ai-harness/status")
 
     assert status == 200
-    assert prompts["current_prompt_id"] == "feature_extract_v2_compact_en"
+    assert prompts["current_prompt_id"] == "feature_extract_v3_compact_strict_json_en"
     assert prompts["items"][0]["prompt_id"] == "feature_extract_v1"
     assert "prompt_hash" in prompts["items"][0]
     assert status2 == 200
@@ -282,10 +367,38 @@ def test_create_job_route_forwards_prompt_id(dashboard):
     assert manager.get_job(created["job_id"])["prompt_id"] == "feature_extract_v2_strict_en"
 
 
+def test_create_job_route_forwards_model_profile_id(dashboard):
+    base_url, manager = dashboard
+
+    _, created, _ = request_json(base_url + "/api/jobs", "POST", {
+        "result": {"summary": {}, "risk_entities": [entity()]},
+        "model": "qwen3:1.7b",
+        "model_profile_id": "qwen3_1_7b_fast",
+    })
+
+    _, snapshot, _ = request_json(base_url + f"/api/jobs/{created['job_id']}")
+    assert snapshot["model_profile_id"] == "qwen3_1_7b_fast"
+    assert manager.get_job(created["job_id"])["model_profile_id"] == "qwen3_1_7b_fast"
+
+
+def test_create_job_route_forwards_retry_count(dashboard):
+    base_url, manager = dashboard
+
+    _, created, _ = request_json(base_url + "/api/jobs", "POST", {
+        "result": {"summary": {}, "risk_entities": [entity()]},
+        "model": "qwen3:1.7b",
+        "retry_count": 2,
+    })
+
+    _, snapshot, _ = request_json(base_url + f"/api/jobs/{created['job_id']}")
+    assert snapshot["retry_count"] == 2
+    assert manager.get_job(created["job_id"])["retry_count"] == 2
+
+
 def test_serves_frontend_for_ai_harness_routes(dashboard):
     base_url, _ = dashboard
 
-    for path in ("/prompts", "/ai-traces", "/ai-observability"):
+    for path in ("/prompts", "/ai-traces", "/ai-observability", "/model-profiles"):
         with urlopen(base_url + path, timeout=3) as response:
             html = response.read().decode()
         assert "Feature Dashboard" in html
@@ -313,6 +426,7 @@ def test_ai_observability_routes_summarize_job_progress_and_events(dashboard):
     assert summary["candidate_feature_count"] == 1
     assert progress_status == 200
     assert progress["job_id"] == job_id
+    assert progress["model_profile"]["profile_id"] == "qwen3_1_7b_fast"
     assert progress["summary"]["risk_entities_total"] == 1
     assert progress["entities"][0]["status"] in {"candidate_generated", "waiting_review"}
     assert events_status == 200

@@ -98,6 +98,7 @@ def test_job_processes_eligible_entities_serially_by_score_and_continues_failure
         "skipped_logs": 2,
         "reused_logs": 0,
         "ollama_logs": 0,
+        "cache_hit_logs": 0,
     }
 
     manager.run_job(job_id)
@@ -113,6 +114,7 @@ def test_job_processes_eligible_entities_serially_by_score_and_continues_failure
         "rule_matched": 0,
         "ollama_completed": 1,
     }
+
     assert snapshot["log_statistics"]["analyzed_logs"] == 3
     assert snapshot["log_statistics"]["pending_logs"] == 5
     states = {item["entity_id"]: item["status"] for item in snapshot["entities"]}
@@ -121,6 +123,22 @@ def test_job_processes_eligible_entities_serially_by_score_and_continues_failure
     events, cursor = manager.wait_for_events(job_id, 0, timeout=0)
     assert cursor == len(events)
     assert [event["type"] for event in events][-1] == "job_completed"
+
+
+def test_job_forwards_model_profile_id_to_extractor():
+    captured = {}
+
+    def extractor(source, **kwargs):
+        captured.update(kwargs)
+        return [candidate(source)]
+
+    manager = FeatureJobManager(extractor=extractor, auto_start=False)
+    job_id = manager.create_job(document(), model="qwen3:1.7b", model_profile_id="qwen3_1_7b_fast")
+
+    manager.run_job(job_id)
+
+    assert captured["model_profile_id"] == "qwen3_1_7b_fast"
+    assert manager.get_job(job_id)["model_profile_id"] == "qwen3_1_7b_fast"
 
 
 def test_failed_entity_can_be_retried():
@@ -143,6 +161,32 @@ def test_failed_entity_can_be_retried():
     snapshot = manager.get_job(job_id)
     assert snapshot["entities"][0]["status"] == "completed"
     assert snapshot["features"][0]["candidate_id"] == "feature-node-a"
+
+
+def test_job_retries_transient_extractor_failure_before_marking_failed():
+    attempts = {"count": 0}
+
+    def extractor(source, **kwargs):
+        attempts["count"] += 1
+        if attempts["count"] == 1:
+            raise RuntimeError("missing tags")
+        return [candidate(source)]
+
+    manager = FeatureJobManager(extractor=extractor, auto_start=False)
+    job_id = manager.create_job(
+        {"summary": {}, "risk_entities": [entity("node-a", 90)]},
+        model="qwen3:1.7b",
+        retry_count=1,
+    )
+    manager.run_job(job_id)
+
+    snapshot = manager.get_job(job_id)
+    events = manager.list_events(job_id)
+
+    assert attempts["count"] == 2
+    assert snapshot["retry_count"] == 1
+    assert snapshot["entities"][0]["status"] == "completed"
+    assert [event["type"] for event in events if event["type"] == "entity_retrying"] == ["entity_retrying"]
 
 
 def test_job_passes_selected_prompt_and_job_id_to_extractor():
@@ -353,3 +397,25 @@ def test_snapshot_reports_daily_llm_volume_speed_eta_and_reuse_savings(tmp_path)
     assert live["processing_logs_per_second"] == 1.5
     assert live["rolling_60s_logs_per_second"] == 1.5
     assert live["eta_seconds"] == 0
+
+
+def test_job_reports_cache_hit_event_and_savings():
+    def extractor(source, **kwargs):
+        return [candidate(source) | {"cache_hit": True}]
+
+    manager = FeatureJobManager(extractor=extractor, auto_start=False)
+    job_id = manager.create_job(
+        {"summary": {}, "risk_entities": [entity("node-a", 90, log_count=7)]},
+        model="qwen3:1.7b",
+    )
+    manager.run_job(job_id)
+
+    snapshot = manager.get_job(job_id)
+    events = manager.list_events(job_id)
+
+    assert [event["type"] for event in events if event["type"] == "entity_cache_hit"] == ["entity_cache_hit"]
+    assert snapshot["entities"][0]["cache_hit"] is True
+    assert snapshot["live_metrics"]["cache_hit_calls"] == 1
+    assert snapshot["live_metrics"]["cache_hit_logs"] == 7
+    assert snapshot["live_metrics"]["saved_llm_calls"] == 1
+    assert snapshot["live_metrics"]["saved_llm_logs"] == 7

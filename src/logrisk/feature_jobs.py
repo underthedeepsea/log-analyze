@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import os
 import threading
 import time
 import uuid
@@ -24,6 +25,10 @@ class FeatureJobError(RuntimeError):
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _cache_enabled_default() -> bool:
+    return os.environ.get("AI_CACHE_ENABLED", "1").lower() not in {"0", "false", "no", "off"}
 
 
 def validate_result_document(document: Any) -> Dict[str, Any]:
@@ -147,12 +152,21 @@ class FeatureJobManager:
         base_url: str = DEFAULT_OLLAMA_URL,
         timeout: float = 120,
         prompt_id: str = FEATURE_PROMPT_ID,
+        cache_enabled: bool | None = None,
+        model_profile_id: str | None = None,
+        retry_count: int = 0,
     ) -> str:
         validate_result_document(document)
         if not isinstance(model, str) or not model.strip():
             raise FeatureJobError("必须指定 Ollama 模型")
         if timeout <= 0:
             raise FeatureJobError("Ollama timeout 必须大于 0")
+        try:
+            normalized_retry_count = int(retry_count)
+        except (TypeError, ValueError) as exc:
+            raise FeatureJobError("自动重试次数必须是非负整数") from exc
+        if normalized_retry_count < 0:
+            raise FeatureJobError("自动重试次数必须是非负整数")
 
         records = []
         initial_features: Dict[str, Dict[str, Any]] = {}
@@ -180,6 +194,7 @@ class FeatureJobManager:
                 "feature_ids": [],
                 "matched_rule_ids": [str(rule.get("rule_id")) for rule in matches],
                 "llm_counted": False,
+                "cache_hit": False,
                 "source": copy.deepcopy(source),
             }
             for rule in matches:
@@ -203,6 +218,9 @@ class FeatureJobManager:
                 "base_url": base_url,
                 "timeout": float(timeout),
                 "prompt_id": str(prompt_id or FEATURE_PROMPT_ID),
+                "model_profile_id": model_profile_id,
+                "cache_enabled": _cache_enabled_default() if cache_enabled is None else bool(cache_enabled),
+                "retry_count": normalized_retry_count,
                 "min_score": float(min_score),
                 "source_summary": copy.deepcopy(document.get("summary") or {}),
                 "entities": records,
@@ -258,21 +276,43 @@ class FeatureJobManager:
         for record in records:
             with self._lock:
                 record["status"] = "running"
-                if not record["llm_counted"]:
-                    if self.metrics_store:
-                        self.metrics_store.add_llm_logs(record["log_count"])
-                    record["llm_counted"] = True
                 self._emit_locked(job, "entity_started", entity_id=record["entity_id"])
             try:
-                features = self.extractor(
-                    copy.deepcopy(record["source"]),
-                    model=job["model"],
-                    base_url=job["base_url"],
-                    timeout=job["timeout"],
-                    prompt_id=job["prompt_id"],
-                    job_id=job["job_id"],
-                )
+                retry_count = int(job.get("retry_count") or 0)
+                for attempt in range(retry_count + 1):
+                    try:
+                        features = self.extractor(
+                            copy.deepcopy(record["source"]),
+                            model=job["model"],
+                            base_url=job["base_url"],
+                            timeout=job["timeout"],
+                            prompt_id=job["prompt_id"],
+                            job_id=job["job_id"],
+                            cache_enabled=job["cache_enabled"],
+                            model_profile_id=job.get("model_profile_id"),
+                        )
+                        break
+                    except Exception as exc:
+                        if attempt >= retry_count:
+                            raise
+                        with self._lock:
+                            record["error"] = str(exc)
+                            self._emit_locked(
+                                job,
+                                "entity_retrying",
+                                entity_id=record["entity_id"],
+                                attempt=attempt + 1,
+                                retry_count=retry_count,
+                                error=str(exc),
+                            )
                 with self._lock:
+                    record["cache_hit"] = any(feature.get("cache_hit") for feature in features)
+                    if record["cache_hit"]:
+                        self._emit_locked(job, "entity_cache_hit", entity_id=record["entity_id"])
+                    elif not record["llm_counted"]:
+                        if self.metrics_store:
+                            self.metrics_store.add_llm_logs(record["log_count"])
+                        record["llm_counted"] = True
                     record["feature_ids"] = []
                     for feature in features:
                         feature.setdefault("origin", "ollama")
@@ -290,6 +330,10 @@ class FeatureJobManager:
                     )
             except Exception as exc:
                 with self._lock:
+                    if not record["llm_counted"]:
+                        if self.metrics_store:
+                            self.metrics_store.add_llm_logs(record["log_count"])
+                        record["llm_counted"] = True
                     record["status"] = "failed"
                     record["error"] = str(exc)
                     job["processed_samples"].append((self.monotonic(), record["log_count"]))
@@ -355,7 +399,10 @@ class FeatureJobManager:
                 record["log_count"] for record in eligible if record["status"] == "rule_matched"
             ),
             "ollama_logs": sum(
-                record["log_count"] for record in eligible if record["status"] == "completed"
+                record["log_count"] for record in eligible if record["status"] == "completed" and not record.get("cache_hit")
+            ),
+            "cache_hit_logs": sum(
+                record["log_count"] for record in eligible if record.get("cache_hit")
             ),
         }
 
@@ -374,10 +421,13 @@ class FeatureJobManager:
             if record["status"] in {"queued", "running"}
         )
         rule_matched = [record for record in job["entities"] if record["status"] == "rule_matched"]
+        cache_hit = [record for record in job["entities"] if record.get("cache_hit")]
         return {
             "today_llm_logs": self.metrics_store.today_llm_logs() if self.metrics_store else 0,
-            "saved_llm_calls": len(rule_matched),
-            "saved_llm_logs": sum(record["log_count"] for record in rule_matched),
+            "cache_hit_calls": len(cache_hit),
+            "cache_hit_logs": sum(record["log_count"] for record in cache_hit),
+            "saved_llm_calls": len(rule_matched) + len(cache_hit),
+            "saved_llm_logs": sum(record["log_count"] for record in rule_matched + cache_hit),
             "processing_logs_per_second": round(current_rate, 2),
             "rolling_60s_logs_per_second": round(rolling_rate, 2),
             "eta_seconds": round(pending_logs / current_rate) if current_rate > 0 else (None if pending_logs else 0),
@@ -397,6 +447,8 @@ class FeatureJobManager:
                 "completed_at": job["completed_at"],
                 "model": job["model"],
                 "prompt_id": job["prompt_id"],
+                "model_profile_id": job.get("model_profile_id"),
+                "retry_count": job.get("retry_count", 0),
                 "min_score": job["min_score"],
                 "source_summary": copy.deepcopy(job["source_summary"]),
                 "progress": self._progress_locked(job),

@@ -2,6 +2,7 @@ import json
 
 import pytest
 
+from logrisk.ai_harness.cache import AICache
 from logrisk.ai_harness.prompt_registry import PromptRegistry
 from logrisk.ai_harness.trace_logger import AITraceLogger
 from logrisk.feature_extractor_ollama import FeatureExtractionError, generate_feature_candidates
@@ -68,6 +69,11 @@ def model_feature():
     }
 
 
+@pytest.fixture(autouse=True)
+def isolated_ai_cache(monkeypatch, tmp_path):
+    monkeypatch.setattr("logrisk.feature_extractor_ollama.AI_CACHE", AICache(tmp_path / "ai_cache.json"))
+
+
 def test_generate_features_sanitizes_evidence_and_owns_source_facts(monkeypatch):
     captured = {}
 
@@ -101,7 +107,7 @@ def test_generate_features_sanitizes_evidence_and_owns_source_facts(monkeypatch)
 def test_generate_features_uses_prompt_registry_and_writes_trace(monkeypatch, tmp_path):
     prompt_dir = tmp_path / "prompts"
     prompt_dir.mkdir()
-    (prompt_dir / "feature_extract_v2_compact_en.md").write_text("custom feature prompt", encoding="utf-8")
+    (prompt_dir / "feature_extract_v3_compact_strict_json_en.md").write_text("custom feature prompt", encoding="utf-8")
     trace_path = tmp_path / "ai_traces.jsonl"
     captured = {}
 
@@ -125,13 +131,126 @@ def test_generate_features_uses_prompt_registry_and_writes_trace(monkeypatch, tm
 
     assert captured["body"]["messages"][0]["content"] == "custom feature prompt"
     trace = json.loads(trace_path.read_text(encoding="utf-8"))
-    assert trace["prompt_id"] == "feature_extract_v2_compact_en"
+    assert trace["prompt_id"] == "feature_extract_v3_compact_strict_json_en"
     assert trace["provider"] == "ollama"
     assert trace["model"] == "qwen3:1.7b"
     assert trace["parsed_output"]["features"][0]["title"] == "节点内存耗尽"
     assert len(trace["input_evidence_hash"]) == 64
     assert trace["evaluator_result"]["passed"] is True
     assert trace["status"] == "success"
+
+
+def test_generate_features_uses_model_profile_budget_thinking_and_trace(monkeypatch, tmp_path):
+    prompt_dir = tmp_path / "prompts"
+    prompt_dir.mkdir()
+    (prompt_dir / "feature_extract_v3_compact_strict_json_en.md").write_text("profile prompt", encoding="utf-8")
+    profile_path = tmp_path / "profiles.yaml"
+    profile_path.write_text(
+        """
+default_profile_id: tiny
+profiles:
+  tiny:
+    provider: ollama
+    model: qwen3:1.7b
+    display_name: Tiny
+    parameter_size: 1.7b
+    context_window_tokens: 8192
+    recommended_input_tokens: 4500
+    max_output_tokens: 1200
+    default_prompt_id: feature_extract_v3_compact_strict_json_en
+    thinking:
+      enabled: false
+    evidence_budget:
+      max_templates: 1
+      max_template_chars: 10
+      max_affected_entities: 1
+      max_evidence_chars: 8000
+    options:
+      temperature: 0
+""",
+        encoding="utf-8",
+    )
+    trace_path = tmp_path / "ai_traces.jsonl"
+    captured = {}
+    payload = entity()
+    payload["affected_entities"] = ["pay-api-1", "pay-api-2"]
+    payload["top_templates"].append({
+        "template_hash": "disk-hash",
+        "component": "kernel",
+        "severity": "ERROR",
+        "template": "Disk pressure",
+        "category": "node_disk_pressure",
+        "count": 1,
+    })
+
+    def fake_urlopen(request, timeout):
+        captured["body"] = json.loads(request.data)
+        return response([model_feature()])
+
+    monkeypatch.setattr("logrisk.ai_harness.providers.ollama.urlopen", fake_urlopen)
+    monkeypatch.setattr("logrisk.feature_extractor_ollama.PROMPT_REGISTRY", PromptRegistry(prompt_dir))
+    monkeypatch.setattr("logrisk.feature_extractor_ollama.TRACE_LOGGER", AITraceLogger(trace_path))
+
+    result = generate_feature_candidates([payload], model_profile_id="tiny", profile_config_path=profile_path)
+
+    trace = json.loads(trace_path.read_text(encoding="utf-8"))
+    sent_evidence = json.loads(captured["body"]["messages"][1]["content"])
+    assert captured["body"]["model"] == "qwen3:1.7b"
+    assert captured["body"]["options"]["think"] is False
+    assert len(sent_evidence["templates"]) == 1
+    assert result[0]["model_profile_id"] == "tiny"
+    assert trace["model_profile_id"] == "tiny"
+    assert trace["thinking_enabled"] is False
+    assert trace["context_budget"]["max_templates"] == 1
+    assert trace["evidence_build_meta"]["truncated"] is True
+
+
+def test_generate_features_reuses_cache_without_calling_model(monkeypatch, tmp_path):
+    prompt_dir = tmp_path / "prompts"
+    prompt_dir.mkdir()
+    (prompt_dir / "feature_extract_v3_compact_strict_json_en.md").write_text("custom feature prompt", encoding="utf-8")
+    trace_path = tmp_path / "ai_traces.jsonl"
+    cache = AICache(tmp_path / "ai_cache.json")
+    calls = {"count": 0}
+
+    def fake_urlopen(request, timeout):
+        calls["count"] += 1
+        return response([model_feature()])
+
+    monkeypatch.setattr("logrisk.ai_harness.providers.ollama.urlopen", fake_urlopen)
+    monkeypatch.setattr("logrisk.feature_extractor_ollama.PROMPT_REGISTRY", PromptRegistry(prompt_dir))
+    monkeypatch.setattr("logrisk.feature_extractor_ollama.TRACE_LOGGER", AITraceLogger(trace_path))
+    monkeypatch.setattr("logrisk.feature_extractor_ollama.AI_CACHE", cache)
+
+    first = generate_feature_candidates([entity()], model="qwen3:1.7b")
+    second = generate_feature_candidates([entity()], model="qwen3:1.7b")
+
+    traces = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
+    assert calls["count"] == 1
+    assert first[0]["candidate_id"] == second[0]["candidate_id"]
+    assert first[0].get("cache_hit") is False
+    assert second[0].get("cache_hit") is True
+    assert traces[1]["status"] == "cache_hit"
+
+
+def test_cache_can_be_disabled(monkeypatch, tmp_path):
+    prompt_dir = tmp_path / "prompts"
+    prompt_dir.mkdir()
+    (prompt_dir / "feature_extract_v3_compact_strict_json_en.md").write_text("custom feature prompt", encoding="utf-8")
+    calls = {"count": 0}
+
+    def fake_urlopen(request, timeout):
+        calls["count"] += 1
+        return response([model_feature()])
+
+    monkeypatch.setattr("logrisk.ai_harness.providers.ollama.urlopen", fake_urlopen)
+    monkeypatch.setattr("logrisk.feature_extractor_ollama.PROMPT_REGISTRY", PromptRegistry(prompt_dir))
+    monkeypatch.setattr("logrisk.feature_extractor_ollama.AI_CACHE", AICache(tmp_path / "ai_cache.json"))
+
+    generate_feature_candidates([entity()], model="qwen3:1.7b", cache_enabled=False)
+    generate_feature_candidates([entity()], model="qwen3:1.7b", cache_enabled=False)
+
+    assert calls["count"] == 2
 
 
 def test_generate_features_uses_selected_prompt_and_records_job_id(monkeypatch, tmp_path):
@@ -166,7 +285,7 @@ def test_generate_features_uses_selected_prompt_and_records_job_id(monkeypatch, 
 def test_trace_write_failure_does_not_fail_extraction(monkeypatch, tmp_path):
     prompt_dir = tmp_path / "prompts"
     prompt_dir.mkdir()
-    (prompt_dir / "feature_extract_v2_compact_en.md").write_text("custom feature prompt", encoding="utf-8")
+    (prompt_dir / "feature_extract_v3_compact_strict_json_en.md").write_text("custom feature prompt", encoding="utf-8")
 
     class BrokenLogger:
         def append(self, trace):
@@ -217,7 +336,7 @@ def test_unknown_template_hash_is_rejected(monkeypatch):
 def test_evaluator_rejects_forbidden_rca_claim_and_records_trace(monkeypatch, tmp_path):
     prompt_dir = tmp_path / "prompts"
     prompt_dir.mkdir()
-    (prompt_dir / "feature_extract_v2_compact_en.md").write_text("custom feature prompt", encoding="utf-8")
+    (prompt_dir / "feature_extract_v3_compact_strict_json_en.md").write_text("custom feature prompt", encoding="utf-8")
     trace_path = tmp_path / "ai_traces.jsonl"
     invalid = {**model_feature(), "summary": "根因是节点内存不足，建议重启"}
 

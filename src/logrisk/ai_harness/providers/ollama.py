@@ -10,6 +10,24 @@ from urllib.request import Request, urlopen
 from logrisk.ai_harness.model_client import ModelClientError
 
 
+def _parse_content_json(content: str) -> dict[str, Any]:
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError:
+        text = content.strip()
+        if text.startswith("```"):
+            lines = text.splitlines()
+            if lines and lines[0].strip() in {"```", "```json", "```JSON"} and lines[-1].strip() == "```":
+                parsed = json.loads("\n".join(lines[1:-1]).strip())
+            else:
+                raise
+        else:
+            raise
+    if not isinstance(parsed, dict):
+        raise TypeError("Ollama content JSON must be object")
+    return parsed
+
+
 class OllamaModelClient:
     def __init__(
         self,
@@ -37,11 +55,12 @@ class OllamaModelClient:
         timeout: float,
         options: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        request_options = {"temperature": 0, **(options or {})}
         body = {
             "model": model,
             "stream": False,
             "format": schema,
-            "options": options or {"temperature": 0},
+            "options": request_options,
             "messages": messages,
         }
         request = Request(
@@ -66,7 +85,7 @@ class OllamaModelClient:
         try:
             payload = json.loads(raw_response)
             content = payload["message"]["content"]
-            parsed = json.loads(content)
+            parsed = _parse_content_json(content)
         except (json.JSONDecodeError, UnicodeDecodeError, KeyError, TypeError) as exc:
             raw = raw_response.decode("utf-8", errors="replace")
             raise ModelClientError(
@@ -74,10 +93,4 @@ class OllamaModelClient:
                 raw_output=raw,
                 status="parse_failed",
             ) from exc
-        if not isinstance(parsed, dict):
-            raise ModelClientError(
-                "Ollama 返回了无效的结构化响应",
-                raw_output=content,
-                status="parse_failed",
-            )
         return parsed

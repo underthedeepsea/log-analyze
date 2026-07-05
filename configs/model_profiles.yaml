@@ -1,0 +1,97 @@
+default_profile_id: qwen3_1_7b_fast
+profiles:
+  qwen3_1_7b_fast:
+    enabled: true
+    provider: ollama
+    model: qwen3:1.7b
+    display_name: Qwen3 1.7B 快速特征识别
+    parameter_size: 1.7b
+    context_window_tokens: 8192
+    recommended_input_tokens: 4500
+    max_output_tokens: 1200
+    default_prompt_id: feature_extract_v3_compact_strict_json_en
+    json_reliability: medium
+    reasoning_capacity: low
+    thinking:
+      enabled: false
+      provider_option_name: think
+      unsupported_behavior: ignore
+    evidence_budget:
+      max_templates: 6
+      max_template_chars: 220
+      max_affected_entities: 20
+      max_evidence_chars: 8000
+    options:
+      temperature: 0
+
+  qwen3_5_4b_mlx:
+    enabled: true
+    provider: ollama
+    model: qwen3.5:4b-mlx
+    display_name: Qwen3.5 4B MLX 平衡模式
+    parameter_size: 4b
+    context_window_tokens: 16384
+    recommended_input_tokens: 9000
+    max_output_tokens: 900
+    default_prompt_id: feature_extract_v3_compact_strict_json_en
+    json_reliability: medium
+    reasoning_capacity: medium
+    thinking:
+      enabled: false
+      provider_option_name: think
+      unsupported_behavior: ignore
+    evidence_budget:
+      max_templates: 8
+      max_template_chars: 280
+      max_affected_entities: 35
+      max_evidence_chars: 12000
+    options:
+      temperature: 0
+
+  qwen3_6_35b_a3b:
+    enabled: true
+    provider: ollama
+    model: qwen3.6:35b-a3b
+    display_name: Qwen3.6 35B-A3B 高质量特征提取
+    parameter_size: 35b-a3b
+    context_window_tokens: 32768
+    recommended_input_tokens: 14000
+    max_output_tokens: 2000
+    default_prompt_id: feature_extract_v3_compact_strict_json_en
+    json_reliability: high
+    reasoning_capacity: medium
+    thinking:
+      enabled: true
+      provider_option_name: think
+      unsupported_behavior: ignore
+    evidence_budget:
+      max_templates: 10
+      max_template_chars: 350
+      max_affected_entities: 50
+      max_evidence_chars: 18000
+    options:
+      temperature: 0
+
+  deepseek_v4_flash:
+    enabled: true
+    provider: ollama
+    model: deepseek-v4:flash
+    display_name: DeepSeek V4 Flash 快速高质量特征提取
+    parameter_size: flash
+    context_window_tokens: 32768
+    recommended_input_tokens: 14000
+    max_output_tokens: 2000
+    default_prompt_id: feature_extract_v3_compact_strict_json_en
+    json_reliability: high
+    reasoning_capacity: high
+    thinking:
+      enabled: true
+      provider_option_name: think
+      unsupported_behavior: ignore
+    evidence_budget:
+      max_templates: 12
+      max_template_chars: 380
+      max_affected_entities: 60
+      max_evidence_chars: 20000
+    options:
+      temperature: 0

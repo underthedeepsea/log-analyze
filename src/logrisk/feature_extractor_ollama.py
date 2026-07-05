@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict
 
+from logrisk.ai_harness.cache import AICache, cache_signature
 from logrisk.ai_harness.evidence_builder import (
     build_feature_evidence,
     evidence_hash,
@@ -15,16 +16,19 @@ from logrisk.ai_harness.evidence_builder import (
 )
 from logrisk.ai_harness.evaluator import evaluate_feature_output
 from logrisk.ai_harness.model_client import ModelClient, ModelClientError
+from logrisk.ai_harness.model_profile import ModelProfile, ModelProfileRegistry
 from logrisk.ai_harness.prompt_registry import PromptRegistry, PromptTemplate
 from logrisk.ai_harness.providers.ollama import OllamaModelClient
 from logrisk.ai_harness.trace_logger import AITraceLogger
 
 
 DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
-FEATURE_PROMPT_ID = "feature_extract_v2_compact_en"
+FEATURE_PROMPT_ID = "feature_extract_v3_compact_strict_json_en"
 ROOT = Path(__file__).resolve().parents[2]
 PROMPT_REGISTRY = PromptRegistry(ROOT / "prompts", ROOT / "configs" / "ai_harness.yaml")
+MODEL_PROFILES = ModelProfileRegistry(ROOT / "configs" / "model_profiles.yaml")
 TRACE_LOGGER = AITraceLogger()
+AI_CACHE = AICache(ROOT / "state" / "ai_cache.json")
 IMPORTANCE_LEVELS = {"critical", "high", "medium", "low"}
 
 FEATURE_RESPONSE_SCHEMA = {
@@ -87,6 +91,9 @@ def _write_trace(
     evaluator_result: Dict[str, Any] | None = None,
     latency_ms: int,
     status: str,
+    model_profile: ModelProfile | None = None,
+    evidence_meta: Any | None = None,
+    model_options: dict[str, Any] | None = None,
 ) -> str | None:
     trace_id = str(uuid.uuid4())
     try:
@@ -101,6 +108,15 @@ def _write_trace(
             "prompt_path": prompt.path,
             "provider": provider,
             "model": model,
+            "model_profile_id": model_profile.profile_id if model_profile else None,
+            "parameter_size": model_profile.parameter_size if model_profile else None,
+            "context_window_tokens": model_profile.context_window_tokens if model_profile else None,
+            "recommended_input_tokens": model_profile.recommended_input_tokens if model_profile else None,
+            "max_output_tokens": model_profile.max_output_tokens if model_profile else None,
+            "thinking_enabled": model_profile.thinking.enabled if model_profile else None,
+            "model_options": model_options or {},
+            "context_budget": model_profile.evidence_budget.__dict__ if model_profile else {},
+            "evidence_build_meta": evidence_meta.__dict__ if evidence_meta else {},
             "input_evidence_hash": evidence_hash(evidence),
             "input_evidence": evidence,
             "raw_output": raw_output,
@@ -222,39 +238,68 @@ def _request_features(
     base_url: str,
     timeout: float,
     model_client: ModelClient | None = None,
-    prompt_id: str = FEATURE_PROMPT_ID,
+    prompt_id: str | None = None,
     job_id: str | None = None,
-) -> tuple[list[Dict[str, Any]], str | None, Dict[str, Any]]:
-    evidence = build_feature_evidence(entity)
+    cache_enabled: bool = True,
+    model_profile: ModelProfile | None = None,
+) -> tuple[list[Dict[str, Any]], str | None, Dict[str, Any], bool]:
     prompt = PROMPT_REGISTRY.load(prompt_id)
+    if model_profile:
+        evidence, evidence_meta = build_feature_evidence(
+            entity,
+            budget=model_profile.evidence_budget,
+            model_profile_id=model_profile.profile_id,
+            return_meta=True,
+        )
+        model_options = model_profile.build_model_options()
+    else:
+        evidence, evidence_meta = build_feature_evidence(entity, return_meta=True)
+        model_options = {"temperature": 0}
+    signature = cache_signature(
+        evidence_hash(evidence),
+        prompt.sha256,
+        "ollama",
+        model,
+        model_profile.thinking.enabled if model_profile else None,
+    )
     messages = [
         {"role": "system", "content": prompt.content},
         {"role": "user", "content": json.dumps(evidence, ensure_ascii=False, separators=(",", ":"))},
     ]
-    client = model_client or OllamaModelClient(base_url)
     start = time.perf_counter()
-    try:
-        model_output = client.generate_json(
-            messages,
-            FEATURE_RESPONSE_SCHEMA,
-            model=model,
-            timeout=timeout,
-            options={"temperature": 0},
-        )
-    except ModelClientError as exc:
-        _write_trace(
-            prompt=prompt,
-            evidence=evidence,
-            provider="ollama",
-            model=model,
-            job_id=job_id,
-            raw_output=exc.raw_output,
-            parsed_output=None,
-            validation_result={"valid": False, "errors": [str(exc)], "warnings": []},
-            latency_ms=int((time.perf_counter() - start) * 1000),
-            status=exc.status,
-        )
-        raise FeatureExtractionError(str(exc)) from exc
+    cache_hit = False
+    model_output = AI_CACHE.get(signature) if cache_enabled else None
+    if model_output is None:
+        client = model_client or OllamaModelClient(base_url)
+        try:
+            model_output = client.generate_json(
+                messages,
+                FEATURE_RESPONSE_SCHEMA,
+                model=model,
+                timeout=timeout,
+                options=model_options,
+            )
+        except ModelClientError as exc:
+            _write_trace(
+                prompt=prompt,
+                evidence=evidence,
+                provider="ollama",
+                model=model,
+                job_id=job_id,
+                raw_output=exc.raw_output,
+                parsed_output=None,
+                validation_result={"valid": False, "errors": [str(exc)], "warnings": []},
+                latency_ms=int((time.perf_counter() - start) * 1000),
+                status=exc.status,
+                model_profile=model_profile,
+                evidence_meta=evidence_meta,
+                model_options=model_options,
+            )
+            raise FeatureExtractionError(str(exc)) from exc
+    else:
+        cache_hit = True
+        # ponytail: cache stores model JSON only; validation/evaluator still run below.
+
     if not isinstance(model_output, dict) or not isinstance(model_output.get("features"), list):
         _write_trace(
             prompt=prompt,
@@ -267,6 +312,9 @@ def _request_features(
             validation_result={"valid": False, "errors": ["missing_features"], "warnings": []},
             latency_ms=int((time.perf_counter() - start) * 1000),
             status="validation_failed",
+            model_profile=model_profile,
+            evidence_meta=evidence_meta,
+            model_options=model_options,
         )
         raise FeatureExtractionError("Ollama 特征响应缺少 features 数组")
 
@@ -289,6 +337,9 @@ def _request_features(
             validation_result={"valid": False, "errors": [str(exc)], "warnings": []},
             latency_ms=int((time.perf_counter() - start) * 1000),
             status="validation_failed",
+            model_profile=model_profile,
+            evidence_meta=evidence_meta,
+            model_options=model_options,
         )
         raise
     evaluator_results = [
@@ -316,6 +367,9 @@ def _request_features(
             evaluator_result=evaluator_summary,
             latency_ms=int((time.perf_counter() - start) * 1000),
             status="evaluator_failed",
+            model_profile=model_profile,
+            evidence_meta=evidence_meta,
+            model_options=model_options,
         )
         raise FeatureExtractionError("Evaluator 拦截模型输出: " + (evaluator_summary["errors"][0] if evaluator_summary["errors"] else "质量门禁未通过"))
     trace_id = _write_trace(
@@ -329,49 +383,81 @@ def _request_features(
         validation_result={"valid": True, "errors": [], "warnings": []},
         evaluator_result=evaluator_summary,
         latency_ms=int((time.perf_counter() - start) * 1000),
-        status="success",
+        status="cache_hit" if cache_hit else "success",
+        model_profile=model_profile,
+        evidence_meta=evidence_meta,
+        model_options=model_options,
     )
-    return features, trace_id, evaluator_summary
+    if cache_enabled and not cache_hit:
+        AI_CACHE.set(signature, model_output)
+    return features, trace_id, evaluator_summary, cache_hit
 
 
 def extract_features_for_entity(
     entity: Dict[str, Any],
-    model: str,
+    model: str | None = None,
     base_url: str = DEFAULT_OLLAMA_URL,
     timeout: float = 120,
     model_client: ModelClient | None = None,
     prompt_id: str = FEATURE_PROMPT_ID,
     job_id: str | None = None,
+    cache_enabled: bool = True,
+    model_profile_id: str | None = None,
+    profile_config_path: str | Path | None = None,
 ) -> list[Dict[str, Any]]:
-    if not model or not model.strip():
+    registry = ModelProfileRegistry(profile_config_path) if profile_config_path else MODEL_PROFILES
+    profile = registry.get(model_profile_id)
+    resolved_model = model or profile.model
+    if not resolved_model or not resolved_model.strip():
         raise FeatureExtractionError("必须指定 Ollama 模型")
     if timeout <= 0:
         raise FeatureExtractionError("Ollama timeout 必须大于 0")
     normalized_url = _validate_base_url(base_url)
-    model_name = model.strip()
-    selected_prompt = prompt_id or FEATURE_PROMPT_ID
-    features, trace_id, evaluator_result = _request_features(entity, model_name, normalized_url, timeout, model_client, selected_prompt, job_id)
+    model_name = resolved_model.strip()
+    selected_prompt = prompt_id or profile.default_prompt_id or FEATURE_PROMPT_ID
+    features, trace_id, evaluator_result, cache_hit = _request_features(
+        entity, model_name, normalized_url, timeout, model_client, selected_prompt, job_id, cache_enabled, profile
+    )
     attached = [_attach_source_facts(entity, feature, model_name) for feature in features]
     for feature in attached:
         feature["prompt_id"] = selected_prompt
         feature["trace_id"] = trace_id
         feature["evaluator_result"] = evaluator_result
+        feature["cache_hit"] = cache_hit
+        feature["model_profile_id"] = profile.profile_id
+        feature["parameter_size"] = profile.parameter_size
+        feature["thinking_enabled"] = profile.thinking.enabled
+        feature["context_budget"] = profile.evidence_budget.__dict__
     return attached
 
 
 def generate_feature_candidates(
     entities: list[Dict[str, Any]],
-    model: str,
+    model: str | None = None,
     base_url: str = DEFAULT_OLLAMA_URL,
     timeout: float = 120,
     min_score: float = 40,
     model_client: ModelClient | None = None,
-    prompt_id: str = FEATURE_PROMPT_ID,
+    prompt_id: str | None = None,
     job_id: str | None = None,
+    cache_enabled: bool = True,
+    model_profile_id: str | None = None,
+    profile_config_path: str | Path | None = None,
 ) -> list[Dict[str, Any]]:
     results = []
     for entity in entities:
         if float(entity.get("risk_score") or 0) < min_score:
             continue
-        results.extend(extract_features_for_entity(entity, model, base_url, timeout, model_client, prompt_id, job_id))
+        results.extend(extract_features_for_entity(
+            entity,
+            model,
+            base_url,
+            timeout,
+            model_client,
+            prompt_id,
+            job_id,
+            cache_enabled,
+            model_profile_id,
+            profile_config_path,
+        ))
     return results

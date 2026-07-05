@@ -14,7 +14,7 @@ def source_text() -> str:
 
 def test_react_source_has_all_workspaces():
     source = source_text()
-    for label in ("特征总览", "识别队列", "AI 调用追踪", "Prompt 管理", "人工审批", "批准规则库", "导出记录"):
+    for label in ("特征总览", "识别队列", "AI 调用追踪", "Prompt 管理", "模型画像", "人工审批", "批准规则库", "导出记录"):
         assert label in source
 
 
@@ -24,12 +24,22 @@ def test_ai_harness_pages_and_routes_are_present():
         "/api/ai-harness/status",
         "/api/ai-harness/prompts",
         "/api/ai-harness/traces",
+        "/api/ai-harness/model-profiles",
         "/api/ai-harness/observability/summary",
         "/api/ai-harness/jobs/",
         "savePrompt",
         "function PromptManagement",
         "function AITracePage",
         "function AIObservabilityPage",
+        "function ModelProfilesPage",
+        "模型画像与上下文预算",
+        "新增 Profile",
+        "保存 Profile",
+        "saveModelProfile",
+        "Thinking OFF",
+        "Context Budget",
+        "model_profile_id",
+        "evidence_build_meta",
         "AI 分析观测",
         "规则生成漏斗",
         "最近 AI 事件流",
@@ -53,6 +63,7 @@ def test_ai_harness_pages_and_routes_are_present():
         "证据引用错误",
         "RCA / 建议越界",
         "质量门禁通过率",
+        "AI Cache 命中",
         "质量门禁：已通过",
         "evaluator_result",
         "evaluator_status",
@@ -62,7 +73,9 @@ def test_ai_harness_pages_and_routes_are_present():
         "history.pushState",
         "pathToView",
         "Prompt ",
-        "feature_extract_v2_compact_en",
+        "feature_extract_v3_compact_strict_json_en",
+        "重试次数",
+        "retry_count",
     ):
         assert text in source
 
@@ -74,6 +87,7 @@ def test_v3_metrics_and_animations_are_present():
         "今日 LLM 分析日志",
         "分析速度",
         "规则复用收益",
+        "Cache 命中",
         "跳过 LLM",
     ):
         assert text in source
@@ -83,8 +97,14 @@ def test_v3_metrics_and_animations_are_present():
 
 def test_upload_accepts_result_and_raw_log_formats():
     source = source_text()
-    for suffix in (".json", ".jsonl", ".txt", ".log"):
-        assert suffix in source
+    assert "accept:" not in source
+    assert "Linux messages / syslog 无后缀文件也支持上传" in source
+    assert "/api/uploads" in source
+    assert "/api/inputs/analyze-upload" in source
+    assert "/api/input-jobs/" in source
+    assert "file.size > INLINE_MAX_BYTES" in source
+    assert "上传进度" in source
+    assert "预处理阶段" in source
     assert "/api/inputs/analyze" in source
     assert "/api/metrics" in source
 
@@ -149,8 +169,8 @@ def test_release_docs_describe_current_bugfix_version():
     readme = Path("README.md").read_text(encoding="utf-8")
     agents = Path("AGENTS.md").read_text(encoding="utf-8")
 
-    assert "## 1.11.0 - 2026-07-02" in release
-    assert "当前版本：`1.11.0`" in readme
+    assert "## 1.12.0 - 2026-07-05" in release
+    assert "当前版本：`1.12.0`" in readme
     assert "Every code update must also update `releas.md`" in agents
     assert "dashboard.sh restart" in readme
     assert ".txt" in readme

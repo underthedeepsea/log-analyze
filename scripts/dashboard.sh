@@ -29,7 +29,9 @@ is_running() {
   pid="$(read_pid || true)"
   [[ "$pid" =~ ^[0-9]+$ ]] || return 1
   kill -0 "$pid" 2>/dev/null || return 1
-  ps -p "$pid" -o command= 2>/dev/null | grep -q "pipeline.dashboard_server"
+  local command
+  command="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+  [[ "$command" == *"pipeline.dashboard_server"* ]]
 }
 
 start_dashboard() {

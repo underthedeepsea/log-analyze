@@ -38,6 +38,7 @@ class AITraceLogger:
         trace_id: str | None = None,
         status: str | None = None,
         prompt_id: str | None = None,
+        prompt_hash: str | None = None,
         limit: int = 50,
     ) -> list[dict[str, Any]]:
         traces = self._read()
@@ -49,6 +50,8 @@ class AITraceLogger:
             traces = [item for item in traces if item.get("status") == status]
         if prompt_id:
             traces = [item for item in traces if item.get("prompt_id") == prompt_id]
+        if prompt_hash:
+            traces = [item for item in traces if item.get("prompt_hash") == prompt_hash]
         traces.sort(key=lambda item: str(item.get("created_at") or ""), reverse=True)
         return traces[: max(1, min(int(limit), 200))]
 
@@ -59,11 +62,13 @@ class AITraceLogger:
     def summary_today(self, now: str | None = None) -> dict[str, Any]:
         today = (now or datetime.now(timezone.utc).isoformat())[:10]
         traces = [item for item in self._read() if str(item.get("created_at") or "")[:10] == today]
-        calls = len(traces)
-        successes = sum(item.get("status") == "success" for item in traces)
-        latencies = [int(item.get("latency_ms") or 0) for item in traces]
+        model_traces = [item for item in traces if item.get("status") != "cache_hit"]
+        calls = len(model_traces)
+        successes = sum(item.get("status") == "success" for item in model_traces)
+        latencies = [int(item.get("latency_ms") or 0) for item in model_traces]
         return {
             "today_calls": calls,
+            "cache_hits": len(traces) - calls,
             "success_rate": round(successes / calls, 3) if calls else 0,
             "avg_latency_ms": round(sum(latencies) / calls) if calls else 0,
         }

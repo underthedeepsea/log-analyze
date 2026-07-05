@@ -6,6 +6,43 @@
 - 仅修复 Bug 时提升最后一位，例如 `1.2.0 → 1.2.1`；
 - 每次代码更新必须同步更新本文件。
 
+## 1.12.0 - 2026-07-05
+
+### Added
+
+- 新增 AI Cache / Dedup：同一 evidence hash、Prompt hash、provider 和模型组合重复分析时复用 `state/ai_cache.json`。
+- 新增 `entity_cache_hit` Job 事件，AI 观测页和事件流展示 Cache 命中。
+- Dashboard 指标新增 AI Cache 命中次数、命中日志量和合并后的节省 Ollama 调用收益。
+- 新增 `AI_CACHE_ENABLED=0` 开关，便于调试 Prompt 或模型时临时关闭缓存。
+- 新增模型画像与上下文预算：`configs/model_profiles.yaml` 支持按模型参数量、上下文窗口、默认 Prompt、Thinking 开关和 Evidence Budget 配置 Ollama 调用。
+- 新增“模型画像”页面，展示当前 Profile、Thinking ON/OFF、Context Budget 和最终调用配置预览。
+- 模型画像页新增“新增 Profile”和“保存 Profile”，支持复制现有配置并写回本地 `configs/model_profiles.yaml`。
+- 内置 Profile 调整为用户指定的 `qwen3.5:4b-mlx`、`qwen3:1.7b`、`qwen3.6:35b-a3b` 和 `deepseek-v4:flash`。
+- AI 分析观测和 Trace 详情新增 `model_profile_id`、Thinking 状态、Evidence 预算与裁剪元数据。
+- 新增 `feature_extract_v3_compact_strict_json_en` Prompt，并作为默认日志特征识别模板，强化 `tags` 与 `selection_reason` 必填约束。
+- 新建分析支持配置自动重试次数，模型单次返回缺字段、无效 JSON 或 Evaluator 拦截时可按配置重试该风险实体。
+- 新增 10MB+ 大日志文件上传链路：前端自动分片上传，后端落盘到 `state/uploads/`，并通过异步 input job 生成 `output/uploads/{input_job_id}/result.json`。
+- 新增大文件预处理进度展示，显示分片上传进度、后端预处理阶段和已解析记录数。
+
+### Changed
+
+- Cache 命中仍会重新执行 schema 校验和 Evaluator，只跳过模型调用，不跳过质量门禁。
+- 当日 LLM 关联日志量只统计真实进入模型的日志量，不把 Cache 命中计入模型调用。
+- Ollama 调用会合并 Profile 生成的 options，默认向 Qwen3 小模型传入 `think: false`、`temperature: 0` 和 `num_predict`。
+- AI Cache signature 纳入 Thinking 开关，避免 Thinking ON/OFF 结果混用。
+- `qwen3.5:4b-mlx` Profile 的 `num_predict` 从 1600 下调到 900，减少小模型冗长输出导致的结构化失败风险。
+- 默认 Profile Prompt 切换到 `feature_extract_v3_compact_strict_json_en`，历史 v2 compact/strict 仍保留为可选模板。
+- 小文件上传仍走原 `/api/inputs/analyze`，10MB 以上文件改走 `/api/uploads`、`/api/inputs/analyze-upload` 和 `/api/input-jobs/{id}`。
+- README 当前版本更新为 `1.12.0`。
+
+### Fixed
+
+- 修复 `dashboard.sh status` 在服务已运行时可能误判“未运行”的问题。
+- 兼容 Ollama 返回的 Markdown fenced JSON：仅当 `message.content` 是完整 ```json 包裹的 JSON 对象时剥离外壳，字段校验和 Evaluator 仍照常执行。
+- 修复模型偶发遗漏 `tags` / `selection_reason` 时只能整实体失败的问题：任务会先按配置自动重试，最终仍不通过才标记失败。
+- 修复 Prompt 详情“关联调用”按 `prompt_id` 误关联历史版本 Trace 的问题；现在只统计当前 Prompt hash 的调用。
+- 修复前端上传文件选择器限制后缀的问题；现在可直接选择 Linux `messages`、`syslog` 等无后缀日志文件。
+
 ## 1.11.0 - 2026-07-02
 
 ### Added

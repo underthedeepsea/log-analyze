@@ -365,6 +365,37 @@ def test_approving_ollama_feature_persists_reusable_rule(tmp_path):
     ]
 
 
+def test_approving_feature_persists_rule_lineage(tmp_path):
+    store = ApprovedRuleStore(tmp_path / "rules.json")
+    source = reusable_entity("node-a")
+
+    def extractor(record, **kwargs):
+        return [reusable_candidate(record) | {
+            "status": "pending",
+            "trace_id": "trace-123",
+            "prompt_id": "feature_extract_v3_compact_strict_json_en",
+            "prompt_hash": "prompt-sha",
+            "provider": "ollama",
+            "model": "qwen3:1.7b",
+            "evidence_hash": "evidence-sha",
+        }]
+
+    manager = FeatureJobManager(extractor=extractor, rule_store=store, auto_start=False)
+    job_id = manager.create_job({"summary": {}, "risk_entities": [source]}, model="qwen3:1.7b")
+    manager.run_job(job_id)
+
+    manager.update_feature(job_id, "feature-node-a", {"status": "approved"})
+    package = manager.export_approved(job_id)
+
+    lineage = store.list_rules()[0]["lineage"]
+    assert lineage["job_id"] == job_id
+    assert lineage["candidate_id"] == "feature-node-a"
+    assert lineage["trace_id"] == "trace-123"
+    assert lineage["prompt_hash"] == "prompt-sha"
+    assert lineage["evidence_hash"] == "evidence-sha"
+    assert package["approved_features"][0]["lineage"] == lineage
+
+
 def test_snapshot_reports_daily_llm_volume_speed_eta_and_reuse_savings(tmp_path):
     current = {"seconds": 100.0}
     metrics = ProcessingMetricsStore(tmp_path / "metrics.json")

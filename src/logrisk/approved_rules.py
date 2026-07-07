@@ -42,6 +42,20 @@ def rule_signature(feature_type: str, sources: list[Dict[str, Any]]) -> str:
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+def _lineage(feature: Dict[str, Any]) -> Dict[str, str]:
+    aliases = {
+        "evidence_hash": ("evidence_hash", "input_evidence_hash"),
+    }
+    fields = ("job_id", "candidate_id", "trace_id", "prompt_id", "prompt_hash", "provider", "model", "evidence_hash")
+    lineage = {}
+    for field in fields:
+        keys = aliases.get(field, (field,))
+        value = next((feature.get(key) for key in keys if feature.get(key)), None)
+        if value:
+            lineage[field] = str(value)
+    return lineage
+
+
 class ApprovedRuleStore:
     def __init__(self, path: str | Path, clock: Callable[[], str] = _now) -> None:
         self.path = Path(path)
@@ -111,6 +125,11 @@ class ApprovedRuleStore:
                 "reuse_count": int(existing.get("reuse_count") or 0) if existing else 0,
                 "last_reused_at": existing.get("last_reused_at") if existing else None,
             }
+            lineage = _lineage(feature)
+            if lineage:
+                rule["lineage"] = lineage
+            elif existing and isinstance(existing.get("lineage"), dict):
+                rule["lineage"] = copy.deepcopy(existing["lineage"])
             if existing:
                 rules[rules.index(existing)] = rule
             else:

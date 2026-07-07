@@ -532,8 +532,11 @@ class FeatureJobManager:
                 feature["status"] = changes["status"]
                 feature["approved_at"] = _now() if changes["status"] == "approved" else None
                 if changes["status"] == "approved" and self.rule_store:
+                    feature["job_id"] = job["job_id"]
                     rule = self.rule_store.upsert_feature(feature)
                     feature["rule_id"] = rule["rule_id"]
+                    if rule.get("lineage"):
+                        feature["lineage"] = copy.deepcopy(rule["lineage"])
             job["features"][candidate_id] = feature
             self._emit_locked(job, "feature_updated", candidate_id=candidate_id, status=feature["status"])
             return copy.deepcopy(feature)

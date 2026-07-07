@@ -224,6 +224,11 @@
   function FeatureEvidence(props) {
     const feature = props.feature;
     const templates = feature && feature.source_templates || [];
+    const [selectedTemplateIndex, setSelectedTemplateIndex] = useState(0);
+    useEffect(function () {
+      setSelectedTemplateIndex(0);
+      props.onSelectTemplate && props.onSelectTemplate(templates[0] || null);
+    }, [feature && feature.candidate_id]);
     return h("section", { className: "surface evidence-panel" },
       h("div", { className: "surface-head" }, h("b", null, "特征日志证据"), h("span", null, templates.length + " 个模板")),
       h("div", { className: "evidence-body" },
@@ -233,7 +238,7 @@
         templates.map(function (template, index) {
           const firstSeen = template.first_seen || feature.window_start || "—";
           const lastSeen = template.last_seen || feature.window_end || "—";
-          return h("article", { className: "evidence-template", key: (template.template_hash || "template") + "-" + index },
+          return h("button", { className: "evidence-template " + (selectedTemplateIndex === index ? "active" : ""), key: (template.template_hash || "template") + "-" + index, onClick: function () { setSelectedTemplateIndex(index); props.onSelectTemplate && props.onSelectTemplate(template); } },
             h("div", { className: "evidence-meta" },
               h("span", null, template.component || "unknown"),
               h("span", null, template.category || "unknown"),
@@ -247,18 +252,37 @@
     );
   }
 
+  function reviewDraftFromFeature(feature, selectedTemplate) {
+    if (!feature) return null;
+    if (!selectedTemplate || !selectedTemplate.template_hash) {
+      return { title: feature.title || "", summary: feature.summary || "", importance: feature.importance || "medium", tags: (feature.tags || []).join(", "), reviewer_note: feature.reviewer_note || "" };
+    }
+    const component = selectedTemplate.component || "unknown";
+    const category = selectedTemplate.category || selectedTemplate.severity || "日志";
+    const template = selectedTemplate.template || "暂无模板文本";
+    const tags = Array.from(new Set([component, selectedTemplate.severity, selectedTemplate.category].filter(Boolean)));
+    return {
+      title: component + " " + category + " 特征日志",
+      summary: "检测到 " + component + " 组件的 " + category + " 日志模板：" + template,
+      importance: feature.importance || "medium",
+      tags: tags.join(", "),
+      reviewer_note: "基于当前证据模板生成审批草稿：" + selectedTemplate.template_hash,
+    };
+  }
+
   function ReviewEditor(props) {
     const [draft, setDraft] = useState(null);
+    const selectedTemplate = props.selectedTemplate || {};
     useEffect(function () {
-      setDraft(props.feature ? { title: props.feature.title || "", summary: props.feature.summary || "", importance: props.feature.importance || "medium", tags: (props.feature.tags || []).join(", "), reviewer_note: props.feature.reviewer_note || "" } : null);
-    }, [props.feature]);
+      setDraft(reviewDraftFromFeature(props.feature, props.selectedTemplate));
+    }, [props.feature, props.selectedTemplate]);
     if (!props.feature || !draft) return h("section", { className: "surface review-editor empty-state" }, "选择一条特征进行人工审批");
     function field(label, key, type) {
       const controlProps = { value: draft[key], onChange: function (event) { setDraft(Object.assign({}, draft, { [key]: event.target.value })); } };
       return h("label", null, label, type === "textarea" ? h("textarea", controlProps) : h("input", controlProps));
     }
     function save(status) { props.onSave(Object.assign({}, draft, { tags: draft.tags.split(",").map(function (tag) { return tag.trim(); }).filter(Boolean), status: status })); }
-    return h("section", { className: "surface review-editor" }, h("div", { className: "surface-head" }, h("b", null, "人工审批"), h("span", null, props.feature.origin === "approved_rule" ? "来自批准规则库" : "来自 Ollama")), h("div", { className: "editor-body" }, field("特征标题", "title"), field("特征摘要", "summary", "textarea"), field("标签（逗号分隔）", "tags"), field("审批备注", "reviewer_note", "textarea"), h("div", { className: "fact-box" }, "质量门禁：已通过", h("br"), "Evaluator Score：" + (props.feature.evaluator_result && props.feature.evaluator_result.score != null ? props.feature.evaluator_result.score : "—"), h("br"), "实体 " + (props.feature.entity && props.feature.entity.id || "") + " · 风险分 " + props.feature.risk_score + " · 出现 " + props.feature.occurrence_count + " 次", h("br"), props.feature.trace_id ? "来源 " + (props.feature.prompt_id || "feature_extract_v3_compact_strict_json_en") + " · " + (props.feature.model || "—") + " · " + props.feature.trace_id : "来源：历史数据 / 未记录 Trace"), props.feature.trace_id && h("button", { className: "text-button trace-link", onClick: function () { props.onOpenTrace(props.feature.trace_id); } }, "查看 AI Trace"), h("div", { className: "editor-actions" }, h("button", { className: "reject-button", onClick: function () { save("rejected"); } }, "驳回"), h("button", { className: "primary-button", onClick: function () { save("approved"); } }, "批准并写入规则库"))));
+    return h("section", { className: "surface review-editor" }, h("div", { className: "surface-head" }, h("b", null, "人工审批"), h("span", null, props.feature.origin === "approved_rule" ? "来自批准规则库" : "来自 Ollama")), h("div", { className: "editor-body" }, field("特征标题", "title"), field("特征摘要", "summary", "textarea"), field("标签（逗号分隔）", "tags"), field("审批备注", "reviewer_note", "textarea"), h("div", { className: "fact-box" }, "当前证据模板：", selectedTemplate.template_hash || "—", h("br"), "组件 " + (selectedTemplate.component || "—") + " · 类别 " + (selectedTemplate.category || "—") + " · 次数 " + (selectedTemplate.count || 0), h("br"), selectedTemplate.template || "暂无模板文本"), h("div", { className: "fact-box" }, "质量门禁：已通过", h("br"), "Evaluator Score：" + (props.feature.evaluator_result && props.feature.evaluator_result.score != null ? props.feature.evaluator_result.score : "—"), h("br"), "实体 " + (props.feature.entity && props.feature.entity.id || "") + " · 风险分 " + props.feature.risk_score + " · 出现 " + props.feature.occurrence_count + " 次", h("br"), props.feature.trace_id ? "来源 " + (props.feature.prompt_id || "feature_extract_v3_compact_strict_json_en") + " · " + (props.feature.model || "—") + " · " + props.feature.trace_id : "来源：历史数据 / 未记录 Trace"), props.feature.trace_id && h("button", { className: "text-button trace-link", onClick: function () { props.onOpenTrace(props.feature.trace_id); } }, "查看 AI Trace"), h("div", { className: "editor-actions" }, h("button", { className: "reject-button", onClick: function () { save("rejected"); } }, "驳回"), h("button", { className: "primary-button", onClick: function () { save("approved"); } }, "批准并写入规则库"))));
   }
 
   function PromptManagement(props) {
@@ -508,6 +532,7 @@
     const [traceFilters, setTraceFilters] = useState(traceFiltersFromSearch(window.location.search));
     const [drawer, setDrawer] = useState({ type: null, item: null });
     const [selectedId, setSelectedId] = useState(null), [busy, setBusy] = useState(false), [error, setError] = useState("");
+    const [selectedTemplate, setSelectedTemplate] = useState(null);
     const [uploadProgress, setUploadProgress] = useState(null), [preprocessProgress, setPreprocessProgress] = useState(null);
     const events = useRef(null);
     const selected = useMemo(function () { return snapshot && snapshot.features && snapshot.features.find(function (feature) { return feature.candidate_id === selectedId; }) || null; }, [snapshot, selectedId]);
@@ -583,8 +608,8 @@
         view === "modelProfiles" && h(ModelProfilesPage, { profiles: modelProfiles, selectedProfileId: modelProfileId, onSelect: function (profile) { setModelProfileId(profile.profile_id); setModel(profile.model || model); setPromptId(profile.default_prompt_id || promptId); }, onSave: saveModelProfile }),
         view === "review" && h("section", { className: "approval-workspace" },
           h(FeatureList, { features: snapshot && snapshot.features || [], selectedId: selectedId, onSelect: setSelectedId }),
-          h(FeatureEvidence, { feature: selected }),
-          h(ReviewEditor, { feature: selected, onSave: save, onOpenTrace: openTrace })),
+          h(FeatureEvidence, { feature: selected, onSelectTemplate: setSelectedTemplate }),
+          h(ReviewEditor, { feature: selected, selectedTemplate: selectedTemplate, onSave: save, onOpenTrace: openTrace })),
         view === "rules" && h(RuleLibrary, { rules: rules }),
         view === "export" && h("section", { className: "surface export-surface" }, h("h2", null, "导出记录"), h("p", null, "导出包只包含人工批准或历史规则复用的脱敏特征，不包含原始日志和 RCA 结论。"), h("button", { className: "primary-button", disabled: !jobId || !(snapshot && snapshot.features || []).some(function (feature) { return feature.status === "approved"; }), onClick: function () { api.exportApproved(jobId).catch(function (reason) { setError(reason.message); }); } }, "导出已批准特征 JSON"))),
       h(Drawer, { title: drawer.type === "prompt" ? "Prompt 详情" : "Trace 详情", subtitle: drawer.item && (drawer.item.prompt_id || drawer.item.trace_id), item: drawer.item, onClose: function () { setDrawer({ type: null, item: null }); } }, drawerContent));

@@ -1,0 +1,31 @@
+{
+  "name": "normal_warning_false_positive",
+  "input_entity": {
+    "window_start": "2026-07-07T14:00:00+08:00",
+    "window_end": "2026-07-07T14:05:00+08:00",
+    "cluster": "prod-a",
+    "entity_type": "node",
+    "entity_id": "node-d",
+    "risk_score": 42,
+    "risk_level": "medium",
+    "affected_entities": [],
+    "top_templates": [
+      {
+        "template_hash": "normal-warning-001",
+        "component": "kernel",
+        "severity": "INFO",
+        "template": "usbcore registered new interface driver",
+        "category": "normal_driver_registration",
+        "count": 2,
+        "first_seen": "2026-07-07T14:00:30+08:00",
+        "last_seen": "2026-07-07T14:02:30+08:00"
+      }
+    ]
+  },
+  "expected": {
+    "must_include_feature_type": [],
+    "must_include_template_keywords": [],
+    "must_not_claim": ["根因是", "建议重启", "故障"],
+    "expected_entity_id": "node-d"
+  }
+}

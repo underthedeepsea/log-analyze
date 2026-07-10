@@ -1,0 +1,31 @@
+{
+  "name": "oom_eviction_node_pressure",
+  "input_entity": {
+    "window_start": "2026-07-07T10:00:00+08:00",
+    "window_end": "2026-07-07T10:05:00+08:00",
+    "cluster": "prod-a",
+    "entity_type": "node",
+    "entity_id": "node-a",
+    "risk_score": 96,
+    "risk_level": "critical",
+    "affected_entities": ["pod/pay-api-1"],
+    "top_templates": [
+      {
+        "template_hash": "oom-evict-001",
+        "component": "kernel",
+        "severity": "ERROR",
+        "template": "Memory cgroup out of memory, pod eviction triggered",
+        "category": "node_memory_pressure",
+        "count": 4,
+        "first_seen": "2026-07-07T10:01:00+08:00",
+        "last_seen": "2026-07-07T10:04:00+08:00"
+      }
+    ]
+  },
+  "expected": {
+    "must_include_feature_type": ["node_memory_pressure"],
+    "must_include_template_keywords": ["out of memory", "eviction"],
+    "must_not_claim": ["etcd", "network root cause", "建议重启"],
+    "expected_entity_id": "node-a"
+  }
+}

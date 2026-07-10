@@ -1,6 +1,6 @@
 # 日志风险特征分析与审批系统
 
-当前版本：`1.13.0`。变更记录见 [`releas.md`](releas.md)。
+当前版本：`1.14.0`。变更记录见 [`releas.md`](releas.md)。
 
 本项目在本机完成日志规范化、Drain3 模板化、风险评分、规则复用、Ollama 特征识别与人工审批。项目不实现 RCA；原始日志不会直接发送给 Ollama。
 
@@ -60,7 +60,7 @@ bash scripts/dashboard.sh stop
 
 访问 [http://127.0.0.1:8080](http://127.0.0.1:8080)。日志写入 `state/dashboard.log`，PID 写入 `state/dashboard.pid`。兼容的前台方式为 `bash scripts/run_dashboard.sh`。可通过 `OLLAMA_MODEL`、`OLLAMA_HOST`、`OLLAMA_TIMEOUT`、`DASHBOARD_HOST` 和 `DASHBOARD_PORT` 覆盖默认配置。
 
-Dashboard 上传 10MB 以内文件时继续使用 inline 分析；超过 10MB 时自动使用 1MB 分片上传到 `state/uploads/`，后端创建异步 input job 并把结果写入 `output/uploads/{input_job_id}/result.json`。默认单文件上限为 500MB，支持 `.log`、`.txt`、`.jsonl`、`.ndjson`、`.gz` 和 Linux `messages` 这类无后缀文本日志。
+Dashboard 上传 10MB 以内文件时继续使用 inline 分析；超过 10MB 时自动使用 1MB 分片上传到 `state/uploads/`，后端创建异步 input job 并把结果写入 `output/uploads/{input_job_id}/result.json`。默认单文件上限为 500MB，支持 `.log`、`.txt`、`.jsonl`、`.ndjson`、`.gz` 和 Linux `messages` 这类无后缀文本日志。大文件 Drain3 会按“集群 + 节点 + 来源 + 组件”安全分区，并使用最多 CPU 核数的独立进程并行处理；同一分区保持原始顺序。结果摘要包含 `drain3_parallel`、`drain3_worker_count` 与 `drain3_partition_count`；只有一个分区时会自动串行处理，以保持在线模板学习语义。
 
 AI Cache 默认启用，缓存文件为 `state/ai_cache.json`。同一 evidence hash、Prompt hash、provider、模型和 Thinking 开关再次分析时会跳过 Ollama；调试模型或 Prompt 时可用 `AI_CACHE_ENABLED=0 bash scripts/dashboard.sh restart` 临时关闭。
 
@@ -79,6 +79,16 @@ Dashboard 提供 `/ai-observability`、`/prompts`、`/model-profiles` 和 `/ai-t
 批准规则会记录 Rule Lineage：来源 `job_id`、`candidate_id`、`trace_id`、Prompt、模型、provider 和 evidence hash 会随规则持久化，便于后续审计规则从哪次 AI 分析沉淀而来。旧版无 lineage 的规则仍可继续匹配和复用。
 
 人工审批页的“特征日志证据”支持逐条选择脱敏模板；切换模板时，标题、摘要、标签和审批备注会同步生成当前证据的审批草稿，仍可由人工编辑后批准。
+
+## AI Eval Runner
+
+M7 新增本地回归评估能力。默认用例位于 `eval_cases/`，覆盖 OOM 驱逐、containerd runtime 失败、磁盘压力、Pod 业务错误和普通 warning 误报控制。运行：
+
+```bash
+OLLAMA_MODEL=qwen3:1.7b .venv/bin/python -m logrisk.ai_eval.runner
+```
+
+结果写入 `output/eval_results.json`，包含 `pass_rate`、`json_valid_rate`、`schema_valid_rate`、`template_reference_accuracy` 和 `forbidden_claim_count`。自动化测试使用 fake extractor，不要求 CI 启动 Ollama。
 
 ## 安全与导出
 

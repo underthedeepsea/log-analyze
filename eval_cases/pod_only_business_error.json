@@ -1,0 +1,31 @@
+{
+  "name": "pod_only_business_error",
+  "input_entity": {
+    "window_start": "2026-07-07T13:00:00+08:00",
+    "window_end": "2026-07-07T13:05:00+08:00",
+    "cluster": "prod-a",
+    "entity_type": "pod",
+    "entity_id": "pay-api-7",
+    "risk_score": 61,
+    "risk_level": "medium",
+    "affected_entities": [],
+    "top_templates": [
+      {
+        "template_hash": "business-error-001",
+        "component": "pay-api",
+        "severity": "ERROR",
+        "template": "payment business validation failed with code <NUM>",
+        "category": "business_error",
+        "count": 12,
+        "first_seen": "2026-07-07T13:00:10+08:00",
+        "last_seen": "2026-07-07T13:04:50+08:00"
+      }
+    ]
+  },
+  "expected": {
+    "must_include_feature_type": ["business_error"],
+    "must_include_template_keywords": ["business validation failed"],
+    "must_not_claim": ["节点故障", "node root cause", "建议扩容"],
+    "expected_entity_id": "pay-api-7"
+  }
+}

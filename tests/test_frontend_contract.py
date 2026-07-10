@@ -105,6 +105,9 @@ def test_upload_accepts_result_and_raw_log_formats():
     assert "file.size > INLINE_MAX_BYTES" in source
     assert "上传进度" in source
     assert "预处理阶段" in source
+    assert "Drain3 分片" in source
+    assert "drain3_partitions_completed" in source
+    assert "drain3_partitions_total" in source
     assert "/api/inputs/analyze" in source
     assert "/api/metrics" in source
 
@@ -179,8 +182,8 @@ def test_release_docs_describe_current_bugfix_version():
     readme = Path("README.md").read_text(encoding="utf-8")
     agents = Path("AGENTS.md").read_text(encoding="utf-8")
 
-    assert "## 1.13.0 - 2026-07-06" in release
-    assert "当前版本：`1.13.0`" in readme
+    assert "## 1.14.0 - 2026-07-07" in release
+    assert "当前版本：`1.14.0`" in readme
     assert "Every code update must also update `releas.md`" in agents
     assert "dashboard.sh restart" in readme
     assert ".txt" in readme

@@ -1,0 +1,31 @@
+{
+  "name": "containerd_runtime_failed",
+  "input_entity": {
+    "window_start": "2026-07-07T11:00:00+08:00",
+    "window_end": "2026-07-07T11:05:00+08:00",
+    "cluster": "prod-a",
+    "entity_type": "node",
+    "entity_id": "node-b",
+    "risk_score": 88,
+    "risk_level": "high",
+    "affected_entities": ["pod/order-api-2"],
+    "top_templates": [
+      {
+        "template_hash": "containerd-failed-001",
+        "component": "containerd",
+        "severity": "ERROR",
+        "template": "failed to create container task: runtime failed to start",
+        "category": "container_runtime_failure",
+        "count": 6,
+        "first_seen": "2026-07-07T11:00:30+08:00",
+        "last_seen": "2026-07-07T11:04:30+08:00"
+      }
+    ]
+  },
+  "expected": {
+    "must_include_feature_type": ["container_runtime_failure"],
+    "must_include_template_keywords": ["runtime failed", "container"],
+    "must_not_claim": ["根因是", "建议重启"],
+    "expected_entity_id": "node-b"
+  }
+}

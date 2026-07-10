@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Callable, Dict
 
 from logrisk.aggregator import aggregate_template_events
 from logrisk.drain_miner import mine_template_events
@@ -17,12 +17,19 @@ def _process_records(
     rules_path: str,
     state_dir: str,
     window_seconds: int = 300,
+    drain_worker_count: int = 1,
+    drain_partition_by_node: bool = False,
+    drain_progress_callback: Callable[[Dict[str, int]], None] | None = None,
 ) -> tuple[Dict[str, Any], Dict[str, Any]]:
     normalized = normalize_records(records)
-    template_events = mine_template_events(
+    template_events, mining_metadata = mine_template_events(
         normalized,
         config_path=config_path,
         state_dir=state_dir,
+        worker_count=drain_worker_count,
+        partition_by_node=drain_partition_by_node,
+        progress_callback=drain_progress_callback,
+        return_metadata=True,
     )
     template_windows = aggregate_template_events(
         template_events,
@@ -41,6 +48,9 @@ def _process_records(
             "total_template_windows": len(template_windows),
             "drain3_reduced_logs": reduced_logs,
             "drain3_compression_ratio_percent": compression_ratio,
+            "drain3_parallel": mining_metadata["parallel"],
+            "drain3_worker_count": mining_metadata["worker_count"],
+            "drain3_partition_count": mining_metadata["partition_count"],
             "total_risk_entities": len(risk_entities),
             "critical_entities": sum(1 for x in risk_entities if x.get("risk_level") == "critical"),
             "high_entities": sum(1 for x in risk_entities if x.get("risk_level") == "high"),
@@ -62,8 +72,20 @@ def analyze_records(
     rules_path: str,
     state_dir: str,
     window_seconds: int = 300,
+    drain_worker_count: int = 1,
+    drain_partition_by_node: bool = False,
+    drain_progress_callback: Callable[[Dict[str, int]], None] | None = None,
 ) -> Dict[str, Any]:
-    result, _ = _process_records(records, config_path, rules_path, state_dir, window_seconds)
+    result, _ = _process_records(
+        records,
+        config_path,
+        rules_path,
+        state_dir,
+        window_seconds,
+        drain_worker_count,
+        drain_partition_by_node,
+        drain_progress_callback,
+    )
     return result
 
 

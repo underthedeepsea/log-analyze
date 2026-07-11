@@ -66,6 +66,36 @@ def test_duplicate_signature_updates_instead_of_appending(tmp_path):
     assert second["rule_id"] == first["rule_id"]
 
 
+def test_rule_store_persists_lineage_without_affecting_match(tmp_path):
+    value = feature()
+    value.update({
+        "job_id": "job-1",
+        "candidate_id": "candidate-1",
+        "trace_id": "trace-1",
+        "prompt_id": "feature_extract_v3",
+        "prompt_hash": "prompt-sha",
+        "provider": "ollama",
+        "model": "qwen3:1.7b",
+        "evidence_hash": "evidence-sha",
+    })
+    store = ApprovedRuleStore(tmp_path / "rules.json")
+
+    stored = store.upsert_feature(value)
+    matches = store.match_entity(entity())
+
+    assert stored["lineage"] == {
+        "job_id": "job-1",
+        "candidate_id": "candidate-1",
+        "trace_id": "trace-1",
+        "prompt_id": "feature_extract_v3",
+        "prompt_hash": "prompt-sha",
+        "provider": "ollama",
+        "model": "qwen3:1.7b",
+        "evidence_hash": "evidence-sha",
+    }
+    assert matches[0]["lineage"]["trace_id"] == "trace-1"
+
+
 def test_rule_requires_all_template_category_pairs(tmp_path):
     combined = feature()
     combined["source_templates"].append({

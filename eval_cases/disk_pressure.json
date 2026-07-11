@@ -1,0 +1,31 @@
+{
+  "name": "disk_pressure",
+  "input_entity": {
+    "window_start": "2026-07-07T12:00:00+08:00",
+    "window_end": "2026-07-07T12:05:00+08:00",
+    "cluster": "prod-a",
+    "entity_type": "node",
+    "entity_id": "node-c",
+    "risk_score": 82,
+    "risk_level": "high",
+    "affected_entities": [],
+    "top_templates": [
+      {
+        "template_hash": "disk-pressure-001",
+        "component": "kubelet",
+        "severity": "WARNING",
+        "template": "eviction manager: node has disk pressure",
+        "category": "disk_pressure",
+        "count": 5,
+        "first_seen": "2026-07-07T12:01:00+08:00",
+        "last_seen": "2026-07-07T12:04:00+08:00"
+      }
+    ]
+  },
+  "expected": {
+    "must_include_feature_type": ["disk_pressure"],
+    "must_include_template_keywords": ["disk pressure", "eviction"],
+    "must_not_claim": ["处理建议", "修复方法"],
+    "expected_entity_id": "node-c"
+  }
+}

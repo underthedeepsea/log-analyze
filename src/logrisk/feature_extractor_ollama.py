@@ -242,7 +242,7 @@ def _request_features(
     job_id: str | None = None,
     cache_enabled: bool = True,
     model_profile: ModelProfile | None = None,
-) -> tuple[list[Dict[str, Any]], str | None, Dict[str, Any], bool]:
+) -> tuple[list[Dict[str, Any]], str | None, Dict[str, Any], bool, Dict[str, Any]]:
     prompt = PROMPT_REGISTRY.load(prompt_id)
     if model_profile:
         evidence, evidence_meta = build_feature_evidence(
@@ -390,7 +390,10 @@ def _request_features(
     )
     if cache_enabled and not cache_hit:
         AI_CACHE.set(signature, model_output)
-    return features, trace_id, evaluator_summary, cache_hit
+    return features, trace_id, evaluator_summary, cache_hit, {
+        "prompt_hash": prompt.sha256,
+        "evidence_hash": evidence_hash(evidence),
+    }
 
 
 def extract_features_for_entity(
@@ -415,12 +418,14 @@ def extract_features_for_entity(
     normalized_url = _validate_base_url(base_url)
     model_name = resolved_model.strip()
     selected_prompt = prompt_id or profile.default_prompt_id or FEATURE_PROMPT_ID
-    features, trace_id, evaluator_result, cache_hit = _request_features(
+    features, trace_id, evaluator_result, cache_hit, request_meta = _request_features(
         entity, model_name, normalized_url, timeout, model_client, selected_prompt, job_id, cache_enabled, profile
     )
     attached = [_attach_source_facts(entity, feature, model_name) for feature in features]
     for feature in attached:
         feature["prompt_id"] = selected_prompt
+        feature["prompt_hash"] = request_meta["prompt_hash"]
+        feature["evidence_hash"] = request_meta["evidence_hash"]
         feature["trace_id"] = trace_id
         feature["evaluator_result"] = evaluator_result
         feature["cache_hit"] = cache_hit

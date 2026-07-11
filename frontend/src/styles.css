@@ -5,8 +5,8 @@
 .approval-feature-list .feature-list,.evidence-body{max-height:650px;overflow:auto}
 .evidence-body{padding:12px}
 .evidence-notice{padding:9px 10px;border:1px solid #ffd7c1;background:#fff8f4;color:#955331;border-radius:8px;font-size:9px;line-height:1.5;margin-bottom:10px}
-.evidence-template{border:1px solid #e7e9ed;background:#fafbfc;border-radius:9px;padding:10px;margin-bottom:9px}
-.evidence-template:first-of-type{border-color:#ffd7c1;background:#fff8f4}
+.evidence-template{width:100%;text-align:left;border:1px solid #e7e9ed;background:#fafbfc;border-radius:9px;padding:10px;margin-bottom:9px;cursor:pointer}
+.evidence-template.active{border-color:#ffd7c1;background:#fff8f4;box-shadow:inset 3px 0 var(--orange)}
 .evidence-meta{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-bottom:8px}
 .evidence-meta span{font-size:8px;background:#eef1f4;color:#66717d;border-radius:999px;padding:4px 6px}
 .evidence-meta b{font-size:9px;color:#df5712;margin-left:auto}

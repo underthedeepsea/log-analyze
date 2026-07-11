@@ -127,7 +127,7 @@ def test_generate_features_uses_prompt_registry_and_writes_trace(monkeypatch, tm
         raising=False,
     )
 
-    generate_feature_candidates([entity()], model="qwen3:1.7b")
+    result = generate_feature_candidates([entity()], model="qwen3:1.7b")
 
     assert captured["body"]["messages"][0]["content"] == "custom feature prompt"
     trace = json.loads(trace_path.read_text(encoding="utf-8"))
@@ -136,6 +136,8 @@ def test_generate_features_uses_prompt_registry_and_writes_trace(monkeypatch, tm
     assert trace["model"] == "qwen3:1.7b"
     assert trace["parsed_output"]["features"][0]["title"] == "节点内存耗尽"
     assert len(trace["input_evidence_hash"]) == 64
+    assert len(result[0]["prompt_hash"]) == 64
+    assert len(result[0]["evidence_hash"]) == 64
     assert trace["evaluator_result"]["passed"] is True
     assert trace["status"] == "success"
 

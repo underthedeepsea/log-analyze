@@ -1,0 +1,11 @@
+{
+  "name": "logrisk-prompt-eval",
+  "private": true,
+  "version": "1.15.0",
+  "devDependencies": {
+    "promptfoo": "0.121.18"
+  },
+  "scripts": {
+    "promptfoo:eval": "promptfoo eval -c promptfoo.yaml -j 1"
+  }
+}

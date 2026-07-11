@@ -6,6 +6,53 @@
 - 仅修复 Bug 时提升最后一位，例如 `1.2.0 → 1.2.1`；
 - 每次代码更新必须同步更新本文件。
 
+## 1.15.0 - 2026-07-11
+
+### Added
+
+- 新增 M8 Promptfoo 本地 Ollama 回归评测、5 个特征识别用例及 JSON、禁止表达、模板 Hash 断言。
+- Promptfoo 动态加载项目真实的 `prompts/feature_extract_v1.md`，并将测试 Evidence JSON 追加到模型请求中。
+
+### Changed
+
+- README 当前版本更新为 `1.15.0`，增加 Promptfoo 开发期评测命令。
+
+## 1.14.0 - 2026-07-07
+
+### Added
+
+- 新增 M7 AI Eval Dataset + Eval Runner：`eval_cases/` 提供 5 个本地 AI 回归用例。
+- 新增 `python -m logrisk.ai_eval.runner`，可读取 eval cases 并输出 `output/eval_results.json`。
+- Eval 结果新增 `pass_rate`、`json_valid_rate`、`schema_valid_rate`、`template_reference_accuracy` 和 `forbidden_claim_count`。
+- 新增 pytest 覆盖 runner 聚合指标、禁止表达、模板引用准确率和默认 eval case 清单。
+
+### Changed
+
+- README 当前版本更新为 `1.14.0`，增加 AI Eval Runner 使用说明。
+- 大文件 Drain3 改为按“集群 + 节点 + 来源 + 组件”安全分区；不同分区由多进程并行处理，同一分区严格保留原始日志顺序和独占状态文件。
+- 大文件预处理进度新增 Drain3 分区完成数，结果摘要新增并行状态、有效工作进程数和分区数。
+
+## 1.13.0 - 2026-07-06
+
+### Added
+
+- 新增 Rule Lineage：人工批准特征写入规则库时记录来源 `job_id`、`candidate_id`、`trace_id`、Prompt、provider、模型和 evidence hash。
+- 导出包中的已批准特征同步包含 lineage，便于外部审计规则来源。
+
+### Changed
+
+- README 当前版本更新为 `1.13.0`。
+
+### Compatibility
+
+- 旧版无 `lineage` 的 `approved_rules.json` 继续可读，规则匹配与复用逻辑不受 lineage 影响。
+
+### Fixed
+
+- 修复人工审批页“特征日志证据”只有第一条模板有选中态、第二条及后续模板不可选中的问题。
+- 修复切换不同特征日志证据后，右侧人工审批面板仍显示旧证据信息的问题。
+- 修复切换特征日志证据后，特征标题、摘要、标签和审批备注四个输入框不随当前证据更新的问题。
+
 ## 1.12.0 - 2026-07-05
 
 ### Added

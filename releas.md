@@ -6,6 +6,17 @@
 - 仅修复 Bug 时提升最后一位，例如 `1.2.0 → 1.2.1`；
 - 每次代码更新必须同步更新本文件。
 
+## 1.15.0 - 2026-07-11
+
+### Added
+
+- 新增 M8 Promptfoo 本地 Ollama 回归评测、5 个特征识别用例及 JSON、禁止表达、模板 Hash 断言。
+- Promptfoo 动态加载项目真实的 `prompts/feature_extract_v1.md`，并将测试 Evidence JSON 追加到模型请求中。
+
+### Changed
+
+- README 当前版本更新为 `1.15.0`，增加 Promptfoo 开发期评测命令。
+
 ## 1.14.0 - 2026-07-07
 
 ### Added

@@ -1,6 +1,6 @@
 # 日志风险特征分析与审批系统
 
-当前版本：`1.14.0`。变更记录见 [`releas.md`](releas.md)。
+当前版本：`1.15.0`。变更记录见 [`releas.md`](releas.md)。
 
 本项目在本机完成日志规范化、Drain3 模板化、风险评分、规则复用、Ollama 特征识别与人工审批。项目不实现 RCA；原始日志不会直接发送给 Ollama。
 
@@ -89,6 +89,10 @@ OLLAMA_MODEL=qwen3:1.7b .venv/bin/python -m logrisk.ai_eval.runner
 ```
 
 结果写入 `output/eval_results.json`，包含 `pass_rate`、`json_valid_rate`、`schema_valid_rate`、`template_reference_accuracy` 和 `forbidden_claim_count`。自动化测试使用 fake extractor，不要求 CI 启动 Ollama。
+
+## Promptfoo 回归评测
+
+M8 增加开发期 Promptfoo/Ollama 回归评测，运行时不依赖 Node.js。执行 `npm ci` 后，使用 `OLLAMA_BASE_URL=http://127.0.0.1:11434 npm run promptfoo:eval`。评测动态加载真实的 `prompts/feature_extract_v1.md`，覆盖 5 个日志场景。
 
 ## 安全与导出
 

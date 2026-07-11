@@ -1,0 +1,21 @@
+description: LOGRISK feature_extract_v1 local Ollama regression suite
+prompts:
+  - file://eval_cases/promptfoo/feature_extract_v1.js
+providers:
+  - id: ollama:chat:qwen3:1.7b
+    config:
+      temperature: 0
+      num_predict: 900
+      think: false
+      passthrough:
+        format: json
+tests:
+  - file://eval_cases/promptfoo/cases.json
+defaultTest:
+  assert:
+    - type: javascript
+      value: file://eval_cases/promptfoo/assertions.js:validJson
+    - type: javascript
+      value: file://eval_cases/promptfoo/assertions.js:knownHashes
+    - type: javascript
+      value: file://eval_cases/promptfoo/assertions.js:forbiddenClaims

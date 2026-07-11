@@ -181,11 +181,23 @@ def test_release_docs_describe_current_bugfix_version():
     release = Path("releas.md").read_text(encoding="utf-8")
     readme = Path("README.md").read_text(encoding="utf-8")
     agents = Path("AGENTS.md").read_text(encoding="utf-8")
+    harness_doc = Path("docs/AI_HARNESS_ARCHITECTURE.md").read_text(encoding="utf-8")
 
-    assert "## 1.15.0 - 2026-07-11" in release
-    assert "当前版本：`1.15.0`" in readme
+    assert "## 1.16.0 - 2026-07-11" in release
+    assert "当前版本：`1.16.0`" in readme
     assert "Every code update must also update `releas.md`" in agents
     assert "dashboard.sh restart" in readme
     assert ".txt" in readme
+    for text in (
+        "state/prompt_versions.json",
+        "state/ai_traces.jsonl",
+        "state/ai_cache.json",
+        "state/approved_rules.json",
+        "Promptfoo",
+        "Phoenix",
+        "MLflow",
+        "LangSmith",
+    ):
+        assert text in harness_doc
     assert "普通启动不需要 Node.js" in readme
     assert "Vite" not in readme

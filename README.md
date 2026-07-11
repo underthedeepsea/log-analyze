@@ -1,6 +1,8 @@
 # 日志风险特征分析与审批系统
 
-当前版本：`1.15.0`。变更记录见 [`releas.md`](releas.md)。
+当前版本：`1.16.0`。变更记录见 [`releas.md`](releas.md)。
+
+AI Harness 路线图 M1–M9 已完成：Prompt Registry、Trace、Evidence Builder、模型 Provider、Output Evaluator、AI Cache、Rule Lineage、本地 Eval Runner、Promptfoo 与最终架构文档均已落地。
 
 本项目在本机完成日志规范化、Drain3 模板化、风险评分、规则复用、Ollama 特征识别与人工审批。项目不实现 RCA；原始日志不会直接发送给 Ollama。
 
@@ -75,6 +77,8 @@ Dashboard 实时显示 Drain3 压缩量、当日 LLM 关联日志量、处理速
 ## AI Harness
 
 Dashboard 提供 `/ai-observability`、`/prompts`、`/model-profiles` 和 `/ai-traces` 四个轻量 Harness 页面。AI 分析观测展示任务阶段、模型 Profile、Thinking 状态、Evidence 预算/裁剪、规则生成漏斗、AI Cache 命中、Evaluator 质量门禁、事件流和实体级失败原因；Prompt 管理保留当前版本编辑和历史版本查看；AI Trace 可按 Job、Trace、状态和 Prompt 过滤，并展示每次调用的模型画像和上下文预算。
+
+完整的数据流、Prompt 版本、Trace、Eval、Cache、Rule Lineage 和外部观测平台取舍见 [`docs/AI_HARNESS_ARCHITECTURE.md`](docs/AI_HARNESS_ARCHITECTURE.md)。当前 Trace 位于 `state/ai_traces.jsonl`，Prompt 历史位于 `state/prompt_versions.json`；两者均属于本地运行状态，不提交 Git。
 
 批准规则会记录 Rule Lineage：来源 `job_id`、`candidate_id`、`trace_id`、Prompt、模型、provider 和 evidence hash 会随规则持久化，便于后续审计规则从哪次 AI 分析沉淀而来。旧版无 lineage 的规则仍可继续匹配和复用。
 

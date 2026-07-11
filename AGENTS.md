@@ -33,6 +33,8 @@ Tests use pytest and `test_<behavior>` names. Add regression coverage for malfor
 
 This repository identifies and reviews log features; it does not implement RCA. Ollama must receive only aggregated, sanitized evidence and must never receive `samples`, `raw_sample`, or raw log streams. Only approved features may be exported for manual import into the external RCA system. Do not add Kafka, Elasticsearch, a database, external LLM services, or frontend CDNs. Bind the dashboard to `127.0.0.1` by default.
 
+The AI Harness flow and persistence contracts are documented in `docs/AI_HARNESS_ARCHITECTURE.md`. Keep Prompt source in `prompts/`, Prompt metadata in `configs/ai_harness.yaml`, local Prompt history in `state/prompt_versions.json`, AI traces in `state/ai_traces.jsonl`, cache state in `state/ai_cache.json`, and approved rule lineage in `state/approved_rules.json`. Do not add Phoenix, MLflow, or LangSmith until cross-team sharing, long-term metric queries, or distributed tracing becomes an explicit requirement.
+
 ## Commit & Pull Request Guidelines
 
 Use focused Conventional Commit subjects such as `feat: add feature approval export`. Pull requests should identify affected pipeline stages, list verification commands, link issues, and include screenshots for UI changes. Never commit production logs, secrets, `.venv/`, `.superpowers/`, caches, or generated `output/` state.

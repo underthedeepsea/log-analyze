@@ -6,6 +6,26 @@
 - 仅修复 Bug 时提升最后一位，例如 `1.2.0 → 1.2.1`；
 - 每次代码更新必须同步更新本文件。
 
+## 1.16.0 - 2026-07-11
+
+### Added
+
+- 新增 M9 AI Harness 架构文档，集中说明处理链路、Prompt 版本、Trace、Eval、Cache 和 Rule Lineage。
+- AI Harness 路线图 M1–M9 全部完成，形成从证据构造、模型调用、质量门禁、缓存、规则追溯到双层回归评测的完整本地链路。
+
+### Changed
+
+- README 当前版本更新为 `1.16.0`，补充本地状态文件位置和架构文档入口。
+- AGENTS 增加 AI Harness 文件职责与外部观测平台延后接入约束。
+
+### Decisions
+
+- 暂不接入 Phoenix、MLflow 或 LangSmith；现阶段继续使用本地 JSONL Trace、Evaluator、Eval Runner 和 Promptfoo，避免增加服务部署和证据外发风险。
+
+### Fixed
+
+- 修复手工流水线脚本忽略项目 `.venv`、错误调用系统 Python 导致 Drain3 依赖缺失的问题。
+
 ## 1.15.0 - 2026-07-11
 
 ### Added

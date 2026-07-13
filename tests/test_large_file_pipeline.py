@@ -29,3 +29,6 @@ def test_large_file_pipeline_reports_parallel_drain3_metadata_and_progress(tmp_p
     assert summary["drain3_partition_count"] == 2
     assert any(update.get("drain3_partitions_total") == 2 for update in updates)
     assert any(update.get("drain3_partitions_completed") == 2 for update in updates)
+    assert summary["streaming_spool"] is True
+    assert summary["drain3_process_start_method"] == "spawn"
+    assert (tmp_path / "state" / "input_jobs" / "input_job_test" / "spool" / "manifest.json").exists()

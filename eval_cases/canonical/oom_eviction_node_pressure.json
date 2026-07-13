@@ -1,5 +1,7 @@
 {
+  "case_id": "oom_eviction_node_pressure",
   "name": "oom_eviction_node_pressure",
+  "description": "OOM 节点压力与驱逐",
   "input_entity": {
     "window_start": "2026-07-07T10:00:00+08:00",
     "window_end": "2026-07-07T10:05:00+08:00",
@@ -12,6 +14,7 @@
     "top_templates": [
       {
         "template_hash": "oom-evict-001",
+        "template_fingerprint": "oom-evict-fp-001",
         "component": "kernel",
         "severity": "ERROR",
         "template": "Memory cgroup out of memory, pod eviction triggered",
@@ -23,6 +26,12 @@
     ]
   },
   "expected": {
+    "expected_feature_types": ["node_memory_pressure"],
+    "expect_empty_features": false,
+    "allowed_importance": ["high", "critical"],
+    "allowed_components": ["kernel"],
+    "must_reference_hashes": ["oom-evict-001"],
+    "forbidden_claims": ["etcd", "network root cause", "建议重启"],
     "must_include_feature_type": ["node_memory_pressure"],
     "must_include_template_keywords": ["out of memory", "eviction"],
     "must_not_claim": ["etcd", "network root cause", "建议重启"],

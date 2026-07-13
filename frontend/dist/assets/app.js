@@ -360,7 +360,7 @@
     const [tab, setTab] = useState("overview");
     return h(React.Fragment, null,
       h(Tabs, { active: tab, onChange: setTab, items: [["overview", "概览"], ["profile", "Model Profile"], ["evidence", "Evidence"], ["prompt", "Prompt"], ["output", "模型输出"], ["validation", "校验结果"], ["evaluator", "Evaluator 结果"]] }),
-      tab === "overview" && h(CodeBlock, { value: { trace_id: item.trace_id, job_id: item.job_id, candidate_id: item.candidate_id, entity_type: item.entity_type, entity_id: item.entity_id, provider: item.provider, model: item.model, prompt_id: item.prompt_id, prompt_hash: item.prompt_hash, input_evidence_hash: item.input_evidence_hash, latency_ms: item.latency_ms, created_at: item.created_at, status: item.status } }),
+      tab === "overview" && h(React.Fragment, null, h(CodeBlock, { value: { trace_id: item.trace_id, job_id: item.job_id, candidate_id: item.candidate_id, entity_type: item.entity_type, entity_id: item.entity_id, provider: item.provider, model: item.model, prompt_id: item.prompt_id, prompt_hash: item.prompt_hash, input_evidence_hash: item.input_evidence_hash, latency_ms: item.latency_ms, created_at: item.created_at, status: item.status } }), props.rule && h("button", { className: "primary-button lineage-trace", onClick: function () { props.onOpenRule(props.rule.rule_id); } }, "查看关联批准规则")),
       tab === "profile" && h(CodeBlock, { value: { model_profile_id: item.model_profile_id || "无数据", parameter_size: item.parameter_size || "无数据", context_window_tokens: item.context_window_tokens || "无数据", recommended_input_tokens: item.recommended_input_tokens || "无数据", max_output_tokens: item.max_output_tokens || "无数据", thinking_enabled: item.thinking_enabled, model_options: item.model_options || {}, context_budget: item.context_budget || {}, evidence_build_meta: item.evidence_build_meta || {} } }),
       tab === "evidence" && h(CodeBlock, { value: item.input_evidence || "当前 trace 未保存完整 evidence，仅保存 hash。" }),
       tab === "prompt" && h(CodeBlock, { value: { prompt_id: item.prompt_id, prompt_hash: item.prompt_hash, prompt_path: item.prompt_path, prompt_content: item.prompt_content || "当前接口未返回 Prompt 内容。" } }),
@@ -516,9 +516,39 @@
   }
 
   function RuleLibrary(props) {
-    return h("section", { className: "surface rules-surface" }, h("div", { className: "surface-head" }, h("b", null, "批准规则库"), h("span", null, "全局跨集群复用 · " + props.rules.length + " 条规则")), h("div", { className: "rule-table" }, h("div", { className: "rule-head" }, h("span", null, "规则"), h("span", null, "模板 / 类别"), h("span", null, "批准时间"), h("span", null, "复用")), props.rules.length === 0 && h("div", { className: "empty-state" }, "批准首条 Ollama 特征后建立规则库"), props.rules.map(function (rule) {
-      return h("div", { className: "rule-row", key: rule.rule_id }, h("div", null, h("b", null, rule.title), h("span", null, rule.rule_id + " · " + rule.feature_type)), h("div", null, (rule.template_signatures || []).map(function (item) { return h("span", { className: "signature", key: item.template_hash + "-" + item.category }, item.template_hash.slice(0, 10) + " · " + (item.category || "未分类")); })), h("div", null, rule.approved_at ? new Date(rule.approved_at).toLocaleString() : "—"), h("div", null, h("b", null, (rule.reuse_count || 0) + " 次"), h("span", null, rule.last_reused_at ? "最近 " + new Date(rule.last_reused_at).toLocaleString() : "尚未复用")));
-    })));
+    const [selected, setSelected] = useState(null);
+    useEffect(function () {
+      if (props.focusRuleId) setSelected(props.rules.find(function (rule) { return rule.rule_id === props.focusRuleId; }) || null);
+    }, [props.focusRuleId, props.rules]);
+    function lineageStatus(rule) {
+      const lineage = rule.lineage;
+      if (!lineage) return ["历史规则", "history"];
+      if (lineage.trace_id && lineage.prompt_id && lineage.model && lineage.evidence_hash && rule.approved_at) return ["可追溯", "complete"];
+      return ["部分可追溯", "partial"];
+    }
+    function identity(item) { return item.template_fingerprint || item.template_hash || "—"; }
+    const detail = selected && h(React.Fragment, null,
+      h("h3", null, "基础信息"), h(CodeBlock, { value: { rule_id: selected.rule_id, feature_type: selected.feature_type, title: selected.title, importance: selected.importance, approved_at: selected.approved_at } }),
+      h("h3", null, "匹配条件"), h(CodeBlock, { value: selected.template_signatures || [] }),
+      h("h3", null, "来源链路"), h("div", { className: "lineage-timeline" }, ["Input Job", "Candidate", "AI Trace", "Prompt / Model / Evidence", "Evaluator", "Manual Approval", "Approved Rule", "Reuse"].map(function (step) { return h("span", { key: step }, step); })),
+      h(CodeBlock, { value: selected.lineage || { status: "历史规则，无 Lineage 数据" } }),
+      selected.lineage && selected.lineage.trace_id && h("button", { className: "primary-button lineage-trace", onClick: function () { props.onOpenTrace(selected.lineage.trace_id); } }, "查看来源 AI Trace"),
+      h("h3", null, "复用记录"), h(CodeBlock, { value: { reuse_count: selected.reuse_count || 0, last_reused_at: selected.last_reused_at || null } }));
+    return h(React.Fragment, null,
+      h("section", { className: "surface rules-surface" },
+        h("div", { className: "surface-head" }, h("b", null, "批准规则库"), h("span", null, "全局跨集群复用 · " + props.rules.length + " 条规则")),
+        h("div", { className: "rule-table" },
+          h("div", { className: "rule-head" }, h("span", null, "规则"), h("span", null, "模板 / 类别"), h("span", null, "来源模型 / Prompt"), h("span", null, "Lineage 状态 / 复用")),
+          props.rules.length === 0 && h("div", { className: "empty-state" }, "批准首条 Ollama 特征后建立规则库"),
+          props.rules.map(function (rule) {
+            const status = lineageStatus(rule), lineage = rule.lineage || {};
+            return h("button", { className: "rule-row", key: rule.rule_id, onClick: function () { setSelected(rule); } },
+              h("div", null, h("b", null, rule.title), h("span", null, rule.rule_id + " · " + rule.feature_type)),
+              h("div", null, (rule.template_signatures || []).map(function (item) { const value = identity(item); return h("span", { className: "signature", key: value + "-" + item.category }, value.slice(0, 10) + " · " + (item.category || "未分类")); })),
+              h("div", null, h("b", null, lineage.model || "历史数据"), h("span", null, lineage.prompt_id || "未记录 Prompt"), h("span", null, "质量门禁：来源候选已通过")),
+              h("div", null, h("span", { className: "lineage-badge " + status[1] }, status[0]), h("b", null, (rule.reuse_count || 0) + " 次复用")));
+          }))),
+      selected && h(Drawer, { title: "规则详情", subtitle: selected.rule_id, item: selected, onClose: function () { setSelected(null); } }, detail));
   }
 
   function App() {
@@ -533,6 +563,7 @@
     const [drawer, setDrawer] = useState({ type: null, item: null });
     const [selectedId, setSelectedId] = useState(null), [busy, setBusy] = useState(false), [error, setError] = useState("");
     const [selectedTemplate, setSelectedTemplate] = useState(null);
+    const [ruleFocus, setRuleFocus] = useState("");
     const [uploadProgress, setUploadProgress] = useState(null), [preprocessProgress, setPreprocessProgress] = useState(null);
     const events = useRef(null);
     const selected = useMemo(function () { return snapshot && snapshot.features && snapshot.features.find(function (feature) { return feature.candidate_id === selectedId; }) || null; }, [snapshot, selectedId]);
@@ -589,10 +620,12 @@
     function saveModelProfile(profile) { api.saveModelProfile(profile).then(function (saved) { setModelProfileId(saved.profile_id); setModel(saved.model || model); setPromptId(saved.default_prompt_id || promptId); return loadHarness(); }).catch(function (reason) { setError(reason.message); }); }
     function openTraceList(query) { const filters = traceFiltersFromSearch(query || ""); applyTraceFilters(filters); }
     function openObservability(id) { setView("observability"); history.pushState({}, "", "/ai-observability" + (id ? "?job_id=" + encodeURIComponent(id) : "")); loadObservability(id).catch(function (reason) { setError(reason.message); }); }
+    function openRule(ruleId) { setDrawer({ type: null, item: null }); setRuleFocus(ruleId); changeView("rules"); }
     const workspace = h(Workspace, { snapshot: snapshot, selectedId: selectedId, onSelect: setSelectedId, onRetry: retry, onOpenTraces: openTraceList, onOpenObservability: openObservability });
     const activePrompts = prompts.filter(function (prompt) { return prompt.analysis_type === "feature_extract" && prompt.status === "active"; });
     const activeProfiles = modelProfiles.profiles || [];
-    const drawerContent = !drawer.item ? null : (drawer.type === "prompt" ? h(PromptDrawer, { item: drawer.item, onSave: savePrompt, onOpenTrace: openTrace }) : h(TraceDrawer, { item: drawer.item }));
+    const traceRule = drawer.item && rules.find(function (rule) { return rule.lineage && rule.lineage.trace_id === drawer.item.trace_id; });
+    const drawerContent = !drawer.item ? null : (drawer.type === "prompt" ? h(PromptDrawer, { item: drawer.item, onSave: savePrompt, onOpenTrace: openTrace }) : h(TraceDrawer, { item: drawer.item, rule: traceRule, onOpenRule: openRule }));
     return h("div", { className: "app-shell" },
       h("header", { className: "topbar" }, h("div", { className: "brand" }, h("i", null, "L"), h("div", null, h("b", null, "LOGRISK"), h("span", null, "FEATURE REVIEW"))), h("div", { className: "system-status" }, h("span", { className: ollama.online ? "online" : "offline" }, "● Ollama " + (ollama.online ? "在线" : "离线")), h("span", null, model), h("button", { className: "prompt-pill", onClick: function () { changeView("prompts"); } }, "Prompt " + (harness.current_prompt_id || promptId)), h("span", { className: harness.trace_enabled ? "trace-on" : "trace-off" }, "● Trace " + (harness.trace_enabled ? "ON" : "OFF")))),
       h(Sidebar, { active: view, onChange: changeView }),
@@ -610,7 +643,7 @@
           h(FeatureList, { features: snapshot && snapshot.features || [], selectedId: selectedId, onSelect: setSelectedId }),
           h(FeatureEvidence, { feature: selected, onSelectTemplate: setSelectedTemplate }),
           h(ReviewEditor, { feature: selected, selectedTemplate: selectedTemplate, onSave: save, onOpenTrace: openTrace })),
-        view === "rules" && h(RuleLibrary, { rules: rules }),
+        view === "rules" && h(RuleLibrary, { rules: rules, focusRuleId: ruleFocus, onOpenTrace: openTrace }),
         view === "export" && h("section", { className: "surface export-surface" }, h("h2", null, "导出记录"), h("p", null, "导出包只包含人工批准或历史规则复用的脱敏特征，不包含原始日志和 RCA 结论。"), h("button", { className: "primary-button", disabled: !jobId || !(snapshot && snapshot.features || []).some(function (feature) { return feature.status === "approved"; }), onClick: function () { api.exportApproved(jobId).catch(function (reason) { setError(reason.message); }); } }, "导出已批准特征 JSON"))),
       h(Drawer, { title: drawer.type === "prompt" ? "Prompt 详情" : "Trace 详情", subtitle: drawer.item && (drawer.item.prompt_id || drawer.item.trace_id), item: drawer.item, onClose: function () { setDrawer({ type: null, item: null }); } }, drawerContent));
   }

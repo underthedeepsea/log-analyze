@@ -1,7 +1,0 @@
-[
-  {"description":"OOM 节点压力","vars":{"evidence_json":"{\"templates\":[{\"template_hash\":\"oom-001\",\"component\":\"kernel\",\"severity\":\"ERROR\",\"template\":\"Memory cgroup out of memory eviction\",\"count\":4}]}","allowed_hashes_json":"[\"oom-001\"]","forbidden_json":"[\"根因是\",\"建议重启\"]"}},
-  {"description":"容器运行时失败","vars":{"evidence_json":"{\"templates\":[{\"template_hash\":\"runtime-001\",\"component\":\"containerd\",\"severity\":\"ERROR\",\"template\":\"failed to start container task\",\"count\":3}]}","allowed_hashes_json":"[\"runtime-001\"]","forbidden_json":"[\"根因是\",\"建议重启\"]"}},
-  {"description":"磁盘压力","vars":{"evidence_json":"{\"templates\":[{\"template_hash\":\"disk-001\",\"component\":\"kubelet\",\"severity\":\"WARN\",\"template\":\"node has disk pressure\",\"count\":5}]}","allowed_hashes_json":"[\"disk-001\"]","forbidden_json":"[\"根因是\",\"建议扩容\"]"}},
-  {"description":"Pod 业务错误","vars":{"evidence_json":"{\"templates\":[{\"template_hash\":\"app-001\",\"component\":\"pay-api\",\"severity\":\"ERROR\",\"template\":\"database connection refused\",\"count\":6}]}","allowed_hashes_json":"[\"app-001\"]","forbidden_json":"[\"根因是\",\"建议重启\"]"}},
-  {"description":"正常日志误报控制","vars":{"evidence_json":"{\"templates\":[{\"template_hash\":\"info-001\",\"component\":\"kernel\",\"severity\":\"INFO\",\"template\":\"usbcore registered driver\",\"count\":2}]}","allowed_hashes_json":"[\"info-001\"]","forbidden_json":"[\"根因是\",\"建议重启\",\"故障\"]"}}
-]

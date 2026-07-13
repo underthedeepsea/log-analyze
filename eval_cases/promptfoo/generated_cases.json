@@ -1,0 +1,42 @@
+[
+  {
+    "description": "容器运行时启动失败",
+    "vars": {
+      "case_id": "containerd_runtime_failed",
+      "evidence_json": "{\"templates\":[{\"template_hash\":\"containerd-failed-001\",\"template_fingerprint\":\"containerd-failed-fp-001\",\"component\":\"containerd\",\"severity\":\"ERROR\",\"template\":\"failed to create container task: runtime failed to start\",\"category\":\"container_runtime_failure\",\"count\":6,\"first_seen\":\"2026-07-07T11:00:30+08:00\",\"last_seen\":\"2026-07-07T11:04:30+08:00\"}],\"window_start\":\"2026-07-07T11:00:00+08:00\",\"window_end\":\"2026-07-07T11:05:00+08:00\",\"cluster\":\"prod-a\",\"entity_type\":\"node\",\"entity_id\":\"node-b\",\"risk_score\":88,\"risk_level\":\"high\",\"affected_entities\":[\"pod/order-api-2\"]}",
+      "expected_json": "{\"expected_feature_types\":[\"container_runtime_failure\"],\"expect_empty_features\":false,\"allowed_importance\":[\"low\",\"medium\",\"high\",\"critical\"],\"allowed_components\":[\"containerd\"],\"must_reference_hashes\":[\"containerd-failed-001\"],\"forbidden_claims\":[\"根因是\",\"建议重启\"]}"
+    }
+  },
+  {
+    "description": "节点磁盘压力",
+    "vars": {
+      "case_id": "disk_pressure",
+      "evidence_json": "{\"templates\":[{\"template_hash\":\"disk-pressure-001\",\"template_fingerprint\":\"disk-pressure-fp-001\",\"component\":\"kubelet\",\"severity\":\"WARNING\",\"template\":\"eviction manager: node has disk pressure\",\"category\":\"disk_pressure\",\"count\":5,\"first_seen\":\"2026-07-07T12:01:00+08:00\",\"last_seen\":\"2026-07-07T12:04:00+08:00\"}],\"window_start\":\"2026-07-07T12:00:00+08:00\",\"window_end\":\"2026-07-07T12:05:00+08:00\",\"cluster\":\"prod-a\",\"entity_type\":\"node\",\"entity_id\":\"node-c\",\"risk_score\":82,\"risk_level\":\"high\",\"affected_entities\":[]}",
+      "expected_json": "{\"expected_feature_types\":[\"disk_pressure\"],\"expect_empty_features\":false,\"allowed_importance\":[\"low\",\"medium\",\"high\",\"critical\"],\"allowed_components\":[\"kubelet\"],\"must_reference_hashes\":[\"disk-pressure-001\"],\"forbidden_claims\":[\"处理建议\",\"修复方法\"]}"
+    }
+  },
+  {
+    "description": "正常驱动注册零误报",
+    "vars": {
+      "case_id": "normal_warning_false_positive",
+      "evidence_json": "{\"templates\":[{\"template_hash\":\"normal-warning-001\",\"template_fingerprint\":\"normal-warning-fp-001\",\"component\":\"kernel\",\"severity\":\"INFO\",\"template\":\"usbcore registered new interface driver\",\"category\":\"normal_driver_registration\",\"count\":2,\"first_seen\":\"2026-07-07T14:00:30+08:00\",\"last_seen\":\"2026-07-07T14:02:30+08:00\"}],\"window_start\":\"2026-07-07T14:00:00+08:00\",\"window_end\":\"2026-07-07T14:05:00+08:00\",\"cluster\":\"prod-a\",\"entity_type\":\"node\",\"entity_id\":\"node-d\",\"risk_score\":42,\"risk_level\":\"medium\",\"affected_entities\":[]}",
+      "expected_json": "{\"expected_feature_types\":[],\"expect_empty_features\":true,\"allowed_importance\":[\"low\",\"medium\",\"high\",\"critical\"],\"allowed_components\":[\"kernel\"],\"must_reference_hashes\":[],\"forbidden_claims\":[\"根因是\",\"建议重启\",\"故障\"]}"
+    }
+  },
+  {
+    "description": "OOM 节点压力与驱逐",
+    "vars": {
+      "case_id": "oom_eviction_node_pressure",
+      "evidence_json": "{\"templates\":[{\"template_hash\":\"oom-evict-001\",\"template_fingerprint\":\"oom-evict-fp-001\",\"component\":\"kernel\",\"severity\":\"ERROR\",\"template\":\"Memory cgroup out of memory, pod eviction triggered\",\"category\":\"node_memory_pressure\",\"count\":4,\"first_seen\":\"2026-07-07T10:01:00+08:00\",\"last_seen\":\"2026-07-07T10:04:00+08:00\"}],\"window_start\":\"2026-07-07T10:00:00+08:00\",\"window_end\":\"2026-07-07T10:05:00+08:00\",\"cluster\":\"prod-a\",\"entity_type\":\"node\",\"entity_id\":\"node-a\",\"risk_score\":96,\"risk_level\":\"critical\",\"affected_entities\":[\"pod/pay-api-1\"]}",
+      "expected_json": "{\"expected_feature_types\":[\"node_memory_pressure\"],\"expect_empty_features\":false,\"allowed_importance\":[\"high\",\"critical\"],\"allowed_components\":[\"kernel\"],\"must_reference_hashes\":[\"oom-evict-001\"],\"forbidden_claims\":[\"etcd\",\"network root cause\",\"建议重启\"]}"
+    }
+  },
+  {
+    "description": "Pod 业务错误特征",
+    "vars": {
+      "case_id": "pod_only_business_error",
+      "evidence_json": "{\"templates\":[{\"template_hash\":\"business-error-001\",\"template_fingerprint\":\"business-error-fp-001\",\"component\":\"pay-api\",\"severity\":\"ERROR\",\"template\":\"payment business validation failed with code <NUM>\",\"category\":\"business_error\",\"count\":12,\"first_seen\":\"2026-07-07T13:00:10+08:00\",\"last_seen\":\"2026-07-07T13:04:50+08:00\"}],\"window_start\":\"2026-07-07T13:00:00+08:00\",\"window_end\":\"2026-07-07T13:05:00+08:00\",\"cluster\":\"prod-a\",\"entity_type\":\"pod\",\"entity_id\":\"pay-api-7\",\"risk_score\":61,\"risk_level\":\"medium\",\"affected_entities\":[]}",
+      "expected_json": "{\"expected_feature_types\":[\"business_error\"],\"expect_empty_features\":false,\"allowed_importance\":[\"low\",\"medium\",\"high\",\"critical\"],\"allowed_components\":[\"pay-api\"],\"must_reference_hashes\":[\"business-error-001\"],\"forbidden_claims\":[\"节点故障\",\"node root cause\",\"建议扩容\"]}"
+    }
+  }
+]

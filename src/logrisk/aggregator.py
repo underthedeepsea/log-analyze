@@ -26,12 +26,22 @@ def aggregate_template_events(
     window_seconds: int = 300,
     max_samples_per_template: int = 3,
 ) -> list[Dict[str, Any]]:
-    windows: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
-
+    aggregator = TemplateEventAggregator(window_seconds, max_samples_per_template)
     for event in events:
+        aggregator.add(event)
+    return aggregator.finalize()
+
+
+class TemplateEventAggregator:
+    def __init__(self, window_seconds: int = 300, max_samples_per_template: int = 3) -> None:
+        self.window_seconds = window_seconds
+        self.max_samples_per_template = max_samples_per_template
+        self.windows: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
+
+    def add(self, event: Dict[str, Any]) -> None:
         dt = parse_ts(event.get("timestamp"))
-        start = floor_window(dt, window_seconds)
-        end = datetime.fromtimestamp(start.timestamp() + window_seconds, tz=start.tzinfo)
+        start = floor_window(dt, self.window_seconds)
+        end = datetime.fromtimestamp(start.timestamp() + self.window_seconds, tz=start.tzinfo)
 
         entity_id = event.get("node") or event.get("pod") or "unknown"
         entity_type = "node" if event.get("node") else ("pod" if event.get("pod") else "unknown")
@@ -44,8 +54,8 @@ def aggregate_template_events(
             event.get("template_hash"),
         )
 
-        if key not in windows:
-            windows[key] = {
+        if key not in self.windows:
+            self.windows[key] = {
                 "window_start": start.isoformat(),
                 "window_end": end.isoformat(),
                 "cluster": event.get("cluster"),
@@ -55,6 +65,9 @@ def aggregate_template_events(
                 "component": event.get("component"),
                 "severity": event.get("severity"),
                 "template_hash": event.get("template_hash"),
+                "template_fingerprint": event.get("template_fingerprint"),
+                "template_instance_hash": event.get("template_instance_hash"),
+                "hash_version": event.get("hash_version"),
                 "template": event.get("template"),
                 "count": 0,
                 "first_seen": event.get("timestamp"),
@@ -64,22 +77,24 @@ def aggregate_template_events(
                 "affected_pods": set(),
             }
 
-        w = windows[key]
+        w = self.windows[key]
         w["count"] += 1
         ts = event.get("timestamp")
         if ts:
             w["last_seen"] = ts
-        if event.get("raw_sample") and len(w["samples"]) < max_samples_per_template:
+        if event.get("raw_sample") and len(w["samples"]) < self.max_samples_per_template:
             w["samples"].append(event["raw_sample"])
         if event.get("namespace"):
             w["affected_namespaces"].add(event["namespace"])
         if event.get("pod"):
             w["affected_pods"].add(event["pod"])
 
-    out = []
-    for w in windows.values():
-        w["affected_namespaces"] = sorted(w["affected_namespaces"])
-        w["affected_pods"] = sorted(w["affected_pods"])
-        out.append(w)
+    def finalize(self) -> list[Dict[str, Any]]:
+        out = []
+        for w in self.windows.values():
+            item = dict(w)
+            item["affected_namespaces"] = sorted(w["affected_namespaces"])
+            item["affected_pods"] = sorted(w["affected_pods"])
+            out.append(item)
 
-    return sorted(out, key=lambda x: (x["window_start"], x["entity_id"], -x["count"]))
+        return sorted(out, key=lambda x: (x["window_start"], x["entity_id"], -x["count"]))

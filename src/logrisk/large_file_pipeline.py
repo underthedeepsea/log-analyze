@@ -5,11 +5,16 @@ import time
 from pathlib import Path
 from typing import Any, Callable
 
+from logrisk.partition_spool import spool_normalized_records, update_manifest_status
+from logrisk.risk_engine import load_rules, score_risk_entities
 from logrisk.stream_input_parser import iter_log_records_from_file
-from pipeline.manual_import_pipeline import analyze_records
+from logrisk.streaming_drain_pipeline import mine_spooled_partitions
 
 
 ProgressCallback = Callable[[dict[str, Any]], None]
+DEFAULT_MAX_DECOMPRESSED_BYTES = 1024 * 1024 * 1024
+DEFAULT_MAX_COMPRESSION_RATIO = 100.0
+DEFAULT_MAX_LINE_BYTES = 1024 * 1024
 
 
 def run_large_file_pipeline(
@@ -23,10 +28,18 @@ def run_large_file_pipeline(
     window_seconds: int = 300,
     worker_count: int | None = None,
     progress_callback: ProgressCallback | None = None,
+    max_decompressed_bytes: int = DEFAULT_MAX_DECOMPRESSED_BYTES,
+    max_compression_ratio: float = DEFAULT_MAX_COMPRESSION_RATIO,
+    max_line_bytes: int = DEFAULT_MAX_LINE_BYTES,
+    max_drain_workers: int = 4,
+    reserve_cpu_cores: int = 1,
+    process_start_method: str = "spawn",
 ) -> dict[str, Any]:
     input_path = Path(input_path)
     started = time.monotonic()
-    records: list[dict[str, Any]] = []
+    parsed = 0
+    job_root = Path(state_dir) / "input_jobs" / input_job_id
+    spool_dir = job_root / "spool"
 
     def emit(stage: str, progress: float, **extra: Any) -> None:
         if progress_callback:
@@ -35,50 +48,87 @@ def run_large_file_pipeline(
                 "status": "running",
                 "stage": stage,
                 "size_bytes": input_path.stat().st_size,
-                "records_parsed": len(records),
-                "lines_read": len(records),
+                "records_parsed": parsed,
+                "lines_read": parsed,
                 "progress": progress,
                 "elapsed_seconds": round(time.monotonic() - started, 2),
             }
             payload.update(extra)
             progress_callback(payload)
 
-    emit("reading", 0.05)
-    for record in iter_log_records_from_file(input_path, filename=filename):
-        records.append(record)
-        if len(records) % 5000 == 0:
-            emit("reading", 0.25)
+    def source_records():
+        nonlocal parsed
+        for record in iter_log_records_from_file(
+            input_path,
+            filename=filename,
+            max_decompressed_bytes=max_decompressed_bytes,
+            max_compression_ratio=max_compression_ratio,
+            max_line_bytes=max_line_bytes,
+        ):
+            parsed += 1
+            yield record
+
+    emit("spooling", 0.05)
+    manifest = spool_normalized_records(
+        source_records(),
+        spool_dir=spool_dir,
+        partition_by_node=True,
+        progress_callback=lambda count: emit("spooling", 0.35),
+    )
+    update_manifest_status(spool_dir, manifest, "MINING")
     requested_workers = worker_count or (os.cpu_count() or 1)
 
-    def report_mining(progress: dict[str, int]) -> None:
-        total = progress["records_total"]
-        completed = progress["records_processed"]
+    def report_mining(completed: int, total: int) -> None:
         emit(
             "drain3_mining",
-            0.45 + (0.45 * completed / total if total else 0.45),
-            drain3_partitions_total=progress["partition_count"],
-            drain3_partitions_completed=progress["partitions_completed"],
-            drain3_records_processed=completed,
+            0.4 + (0.45 * completed / total if total else 0.45),
+            drain3_partitions_total=total,
+            drain3_partitions_completed=completed,
+            drain3_records_processed=sum(
+                int(item["record_count"]) for item in manifest["partitions"][:completed]
+            ),
         )
 
-    emit("drain3_mining", 0.45)
-    result = analyze_records(
-        records,
-        config_path=str(config_path),
-        rules_path=str(rules_path),
-        state_dir=str(state_dir),
+    template_windows, mining = mine_spooled_partitions(
+        spool_dir=spool_dir,
+        manifest=manifest,
+        config_path=config_path,
+        state_dir=Path(state_dir) / "drain3",
         window_seconds=window_seconds,
-        drain_worker_count=requested_workers,
-        drain_partition_by_node=True,
-        drain_progress_callback=report_mining,
+        requested_workers=requested_workers,
+        max_workers=max_drain_workers,
+        reserve_cpu_cores=reserve_cpu_cores,
+        process_start_method=process_start_method,
+        progress_callback=report_mining,
     )
-    result.setdefault("summary", {})
-    result["summary"].update({
-        "input_job_id": input_job_id,
-        "filename": filename,
-        "large_file": True,
-        "lines_read": len(records),
-        "records_parsed": len(records),
-    })
+    update_manifest_status(spool_dir, manifest, "AGGREGATING")
+    risk_entities = score_risk_entities(template_windows, load_rules(rules_path))
+    reduced = max(0, parsed - len(template_windows))
+    result = {
+        "summary": {
+            "total_raw_logs": parsed,
+            "total_normalized_logs": parsed,
+            "total_template_events": mining["template_event_count"],
+            "total_template_windows": len(template_windows),
+            "drain3_reduced_logs": reduced,
+            "drain3_compression_ratio_percent": round(reduced / parsed * 100, 2) if parsed else 0.0,
+            "drain3_parallel": mining["parallel"],
+            "drain3_worker_count": mining["worker_count"],
+            "drain3_partition_count": mining["partition_count"],
+            "drain3_process_start_method": mining["process_start_method"],
+            "total_risk_entities": len(risk_entities),
+            "critical_entities": sum(item.get("risk_level") == "critical" for item in risk_entities),
+            "high_entities": sum(item.get("risk_level") == "high" for item in risk_entities),
+            "input_job_id": input_job_id,
+            "filename": filename,
+            "large_file": True,
+            "lines_read": parsed,
+            "records_parsed": parsed,
+            "streaming_spool": True,
+        },
+        "risk_entities": risk_entities,
+        "top_templates": sorted(template_windows, key=lambda item: item.get("count", 0), reverse=True)[:20],
+    }
+    update_manifest_status(spool_dir, manifest, "COMPLETED")
     emit("completed", 1.0)
     return result

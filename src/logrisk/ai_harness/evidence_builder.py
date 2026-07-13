@@ -9,6 +9,9 @@ from logrisk.ai_harness.context_budget import EvidenceBudget, EvidenceBuildMeta,
 
 TEMPLATE_FIELDS = (
     "template_hash",
+    "template_fingerprint",
+    "template_instance_hash",
+    "hash_version",
     "component",
     "severity",
     "template",
@@ -22,7 +25,7 @@ TEMPLATE_FIELDS = (
 
 def sanitized_templates(entity: Dict[str, Any]) -> list[Dict[str, Any]]:
     return [
-        {key: template.get(key) for key in TEMPLATE_FIELDS}
+        {key: template.get(key) for key in TEMPLATE_FIELDS if key in template}
         for template in (entity.get("top_templates") or [])
         if isinstance(template, dict)
     ]

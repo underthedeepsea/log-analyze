@@ -1,5 +1,7 @@
 {
+  "case_id": "containerd_runtime_failed",
   "name": "containerd_runtime_failed",
+  "description": "容器运行时启动失败",
   "input_entity": {
     "window_start": "2026-07-07T11:00:00+08:00",
     "window_end": "2026-07-07T11:05:00+08:00",
@@ -12,6 +14,7 @@
     "top_templates": [
       {
         "template_hash": "containerd-failed-001",
+        "template_fingerprint": "containerd-failed-fp-001",
         "component": "containerd",
         "severity": "ERROR",
         "template": "failed to create container task: runtime failed to start",
@@ -23,6 +26,11 @@
     ]
   },
   "expected": {
+    "expected_feature_types": ["container_runtime_failure"],
+    "expect_empty_features": false,
+    "allowed_components": ["containerd"],
+    "must_reference_hashes": ["containerd-failed-001"],
+    "forbidden_claims": ["根因是", "建议重启"],
     "must_include_feature_type": ["container_runtime_failure"],
     "must_include_template_keywords": ["runtime failed", "container"],
     "must_not_claim": ["根因是", "建议重启"],

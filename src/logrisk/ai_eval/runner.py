@@ -12,9 +12,30 @@ from logrisk.feature_extractor_ollama import FEATURE_PROMPT_ID, extract_features
 
 
 ROOT = Path(__file__).resolve().parents[3]
-DEFAULT_CASE_DIR = ROOT / "eval_cases"
+DEFAULT_CASE_DIR = ROOT / "eval_cases" / "canonical"
 DEFAULT_OUTPUT = ROOT / "output" / "eval_results.json"
 Extractor = Callable[..., list[dict[str, Any]]]
+
+
+def mock_extractor(entity: dict[str, Any], **_: Any) -> list[dict[str, Any]]:
+    templates = [item for item in entity.get("top_templates") or [] if item.get("severity") != "INFO"]
+    if not templates:
+        return []
+    template = templates[0]
+    feature_type = str(template.get("category") or "abnormal_log_feature")
+    return [{
+        "candidate_id": "mock-" + str(template.get("template_hash")),
+        "feature_type": feature_type,
+        "title": "异常日志特征",
+        "summary": "检测到具有运维价值的异常日志模板。",
+        "importance": "high",
+        "template_hashes": [str(template["template_hash"])],
+        "components": [str(template["component"])],
+        "tags": ["异常日志", str(template["component"])],
+        "selection_reason": "该组件日志模板包含明确异常语义。",
+        "entity": {"type": entity.get("entity_type"), "id": entity.get("entity_id")},
+        "source_templates": templates,
+    }]
 
 
 def load_cases(case_dir: str | Path = DEFAULT_CASE_DIR) -> list[dict[str, Any]]:
@@ -71,6 +92,7 @@ def main() -> int:
     parser.add_argument("--ollama-url", default=os.getenv("OLLAMA_HOST") or "http://127.0.0.1:11434")
     parser.add_argument("--timeout", type=float, default=float(os.getenv("OLLAMA_TIMEOUT") or 120))
     parser.add_argument("--model-profile-id", default=None)
+    parser.add_argument("--provider", choices=("ollama", "mock"), default="ollama")
     args = parser.parse_args()
     result = run_eval(
         case_dir=args.cases,
@@ -80,6 +102,7 @@ def main() -> int:
         base_url=args.ollama_url,
         timeout=args.timeout,
         model_profile_id=args.model_profile_id,
+        extractor=mock_extractor if args.provider == "mock" else extract_features_for_entity,
     )
     print(json.dumps({key: result[key] for key in ("cases_total", "cases_passed", "pass_rate")}, ensure_ascii=False))
     return 0 if result["cases_passed"] == result["cases_total"] else 1

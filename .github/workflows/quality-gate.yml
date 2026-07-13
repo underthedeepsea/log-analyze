@@ -1,0 +1,22 @@
+name: quality-gate
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  deterministic:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python -m venv .venv
+      - run: .venv/bin/pip install -r requirements.txt
+      - run: .venv/bin/python -m pytest -q
+      - run: .venv/bin/python -m compileall -q src
+      - run: bash -n scripts/*.sh
+      - run: PYTHONPATH=src .venv/bin/python -m logrisk.ai_eval.runner --provider mock
+      - run: .venv/bin/python scripts/generate_promptfoo_cases.py
+      - run: git diff --exit-code

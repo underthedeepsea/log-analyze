@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import multiprocessing
+import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Callable, Dict, Tuple
@@ -8,6 +10,8 @@ from typing import Any, Callable, Dict, Tuple
 from drain3 import TemplateMiner
 from drain3.file_persistence import FilePersistence
 from drain3.template_miner_config import TemplateMinerConfig
+
+from .template_identity import HASH_VERSION, template_fingerprint, template_instance_hash
 
 
 class Drain3ShardManager:
@@ -61,6 +65,8 @@ def mine_template_event(
     record: Dict[str, Any],
     shard_manager: Drain3ShardManager,
     state_scope: str | None = None,
+    *,
+    parameter_extraction_mode: str = "off",
 ) -> Dict[str, Any]:
     cluster = str(record.get("cluster") or "default")
     source_type = str(record.get("source_type") or "unknown")
@@ -71,10 +77,22 @@ def mine_template_event(
     result = miner.add_log_message(message_core)
     template = result["template_mined"]
     template_hash = stable_template_hash(cluster, source_type, component, template)
+    fingerprint = template_fingerprint(source_type, component, template)
+    instance_hash = template_instance_hash(
+        cluster,
+        str(record.get("node") or state_scope or "unknown"),
+        source_type,
+        component,
+        template,
+    )
 
-    extracted = miner.extract_parameters(template, message_core, exact_matching=True)
-    if extracted is None:
-        extracted = miner.extract_parameters(template, message_core, exact_matching=False)
+    if parameter_extraction_mode not in {"off", "all"}:
+        raise ValueError("parameter_extraction_mode 必须是 off 或 all")
+    extracted = None
+    if parameter_extraction_mode == "all":
+        extracted = miner.extract_parameters(template, message_core, exact_matching=True)
+        if extracted is None:
+            extracted = miner.extract_parameters(template, message_core, exact_matching=False)
 
     parameters = [
         {"type": p.mask_name, "value": p.value}
@@ -93,6 +111,9 @@ def mine_template_event(
         "component": component,
         "severity": record.get("severity"),
         "template_hash": template_hash,
+        "template_fingerprint": fingerprint,
+        "template_instance_hash": instance_hash,
+        "hash_version": HASH_VERSION,
         "template": template,
         "parameters": parameters,
         "message_core": message_core,
@@ -116,10 +137,16 @@ def _mine_indexed_partition(
     config_path: str,
     state_dir: str,
     state_scope: str | None,
+    parameter_extraction_mode: str,
 ) -> list[tuple[int, Dict[str, Any]]]:
     manager = Drain3ShardManager(config_path=config_path, state_dir=state_dir)
     return [
-        (index, mine_template_event(record, manager, state_scope=state_scope))
+        (index, mine_template_event(
+            record,
+            manager,
+            state_scope=state_scope,
+            parameter_extraction_mode=parameter_extraction_mode,
+        ))
         for index, record in indexed_records
     ]
 
@@ -133,6 +160,10 @@ def mine_template_events(
     partition_by_node: bool = False,
     progress_callback: Callable[[Dict[str, int]], None] | None = None,
     return_metadata: bool = False,
+    parameter_extraction_mode: str = "off",
+    process_start_method: str = "spawn",
+    max_workers: int = 4,
+    reserve_cpu_cores: int = 1,
 ) -> list[Dict[str, Any]] | tuple[list[Dict[str, Any]], Dict[str, int | bool]]:
     partitions: Dict[Tuple[str, ...], list[tuple[int, Dict[str, Any]]]] = {}
     for index, record in enumerate(records):
@@ -141,11 +172,18 @@ def mine_template_events(
 
     partition_items = list(partitions.items())
     partition_count = len(partition_items)
-    effective_workers = min(max(1, int(worker_count)), partition_count) if partition_count else 0
+    available_cpus = max(1, (os.cpu_count() or 1) - max(0, int(reserve_cpu_cores)))
+    effective_workers = min(
+        max(1, int(worker_count)),
+        max(1, int(max_workers)),
+        available_cpus,
+        partition_count,
+    ) if partition_count else 0
     metadata: Dict[str, int | bool] = {
         "partition_count": partition_count,
         "worker_count": effective_workers,
         "parallel": effective_workers > 1,
+        "process_start_method": process_start_method,
     }
     if progress_callback:
         progress_callback({
@@ -176,7 +214,8 @@ def mine_template_events(
     config = str(config_path)
     state = str(state_dir)
     if effective_workers > 1:
-        with ProcessPoolExecutor(max_workers=effective_workers) as executor:
+        context = multiprocessing.get_context(process_start_method)
+        with ProcessPoolExecutor(max_workers=effective_workers, mp_context=context) as executor:
             futures = {
                 executor.submit(
                     _mine_indexed_partition,
@@ -184,6 +223,7 @@ def mine_template_events(
                     config,
                     state,
                     key[1] if partition_by_node else None,
+                    parameter_extraction_mode,
                 ): key
                 for key, indexed_records in partition_items
             }
@@ -196,6 +236,7 @@ def mine_template_events(
                 config,
                 state,
                 key[1] if partition_by_node else None,
+                parameter_extraction_mode,
             ))
 
     events = [event for event in ordered_events if event is not None]

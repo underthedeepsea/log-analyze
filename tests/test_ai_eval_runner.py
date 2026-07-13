@@ -122,7 +122,7 @@ def test_eval_runner_reports_forbidden_claim_and_bad_template_reference(tmp_path
 
 
 def test_default_eval_cases_include_milestone_seed_cases():
-    cases = load_cases(Path("eval_cases"))
+    cases = load_cases(Path("eval_cases/canonical"))
 
     assert len(cases) >= 5
     assert {

@@ -6,6 +6,25 @@
 - 仅修复 Bug 时提升最后一位，例如 `1.2.0 → 1.2.1`；
 - 每次代码更新必须同步更新本文件。
 
+## 1.16.1 - 2026-07-13
+
+### Changed
+
+- M10 生产加固改用双层模板标识：实例 Hash 保留集群/节点隔离，跨集群 Fingerprint 用于批准规则复用，并兼容旧版 `template_hash` 规则。
+- Feature Job 改为 `state/feature_jobs/<job_id>/snapshot.json` 与 `events.jsonl` 文件持久化，不引入 SQLite；服务重启后恢复已完成任务，将运行中任务标记为 `interrupted`，且不会自动重放模型调用。
+- Promptfoo 改为动态评测生产默认 Prompt，补齐严格 8 字段 Schema、模板/组件引用、业务预期、零误报、禁止表达和原始日志泄漏断言。
+- M7 与 M8 统一读取 `eval_cases/canonical/`，Promptfoo 用例由确定性脚本生成。
+- Drain3 参数提取默认关闭；多进程显式使用 `spawn`，默认最多 4 个 Worker 并保留 1 个 CPU 核。
+- 大文件改为流式 Normalize、分区 Spool、Worker 按文件挖掘和增量聚合；增加 GZ 解压量、压缩比和单行字节限制。
+- 批准规则库新增来源模型、Prompt、Lineage 状态和详情链路，支持 Rule 与 Trace 双向跳转。
+- 新增 PR CI 质量门禁，覆盖 pytest、compileall、Shell、确定性 Eval 和 Promptfoo 用例漂移检查。
+- 生产默认 Prompt 明确禁止将模板 Hash 复制为 `feature_type`，优先使用合法异常类别，并强化正常 INFO/驱动注册日志零误报约束。
+
+### Fixed
+
+- 修复旧模板 Hash 包含集群信息，导致相同异常模板无法跨集群复用的问题。
+- 修复 Dashboard 重启后内存中的分析任务、候选特征和审批上下文全部丢失的问题。
+
 ## 1.16.0 - 2026-07-11
 
 ### Added

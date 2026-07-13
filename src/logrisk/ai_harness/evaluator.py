@@ -23,7 +23,13 @@ def evaluate_feature_output(*, feature: dict, entity: dict, evidence: dict) -> d
     warnings: list[str] = []
     rule_results: list[dict[str, Any]] = []
     templates = evidence.get("templates") if isinstance(evidence, dict) else []
-    template_hashes = {str(item.get("template_hash")) for item in templates if isinstance(item, dict) and item.get("template_hash")}
+    template_hashes = {
+        str(value)
+        for item in templates
+        if isinstance(item, dict)
+        for value in (item.get("template_hash"), item.get("template_fingerprint"))
+        if value
+    }
     components = {str(item.get("component")) for item in templates if isinstance(item, dict) and item.get("component")}
     known_entities = {
         str((evidence.get("entity") or {}).get("id") or ""),

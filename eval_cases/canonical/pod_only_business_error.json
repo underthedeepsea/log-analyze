@@ -1,5 +1,7 @@
 {
+  "case_id": "pod_only_business_error",
   "name": "pod_only_business_error",
+  "description": "Pod 业务错误特征",
   "input_entity": {
     "window_start": "2026-07-07T13:00:00+08:00",
     "window_end": "2026-07-07T13:05:00+08:00",
@@ -12,6 +14,7 @@
     "top_templates": [
       {
         "template_hash": "business-error-001",
+        "template_fingerprint": "business-error-fp-001",
         "component": "pay-api",
         "severity": "ERROR",
         "template": "payment business validation failed with code <NUM>",
@@ -23,6 +26,11 @@
     ]
   },
   "expected": {
+    "expected_feature_types": ["business_error"],
+    "expect_empty_features": false,
+    "allowed_components": ["pay-api"],
+    "must_reference_hashes": ["business-error-001"],
+    "forbidden_claims": ["节点故障", "node root cause", "建议扩容"],
     "must_include_feature_type": ["business_error"],
     "must_include_template_keywords": ["business validation failed"],
     "must_not_claim": ["节点故障", "node root cause", "建议扩容"],

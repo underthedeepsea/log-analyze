@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import json
 import os
 import threading
 import time
 import uuid
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable, Dict
 
 from logrisk.approved_rules import ApprovedRuleStore
@@ -21,6 +23,60 @@ from logrisk.processing_metrics import ProcessingMetricsStore
 
 class FeatureJobError(RuntimeError):
     """Raised for invalid feature extraction job operations."""
+
+
+class FeatureJobFileStore:
+    """Durable local job snapshots without introducing a database dependency."""
+
+    def __init__(self, root: str | Path) -> None:
+        self.root = Path(root)
+
+    @staticmethod
+    def _atomic_json(path: Path, payload: Any) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(temporary, path)
+
+    def save(self, job: Dict[str, Any]) -> None:
+        job_dir = self.root / str(job["job_id"])
+        snapshot = {
+            key: copy.deepcopy(value)
+            for key, value in job.items()
+            if key not in {"condition", "events"}
+        }
+        self._atomic_json(job_dir / "snapshot.json", snapshot)
+        events_text = "".join(
+            json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n"
+            for event in job.get("events", [])
+        )
+        events_path = job_dir / "events.jsonl"
+        events_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = events_path.with_name(f".{events_path.name}.{os.getpid()}.tmp")
+        temporary.write_text(events_text, encoding="utf-8")
+        os.replace(temporary, events_path)
+
+    def load(self) -> list[Dict[str, Any]]:
+        if not self.root.exists():
+            return []
+        jobs = []
+        for snapshot_path in sorted(self.root.glob("*/snapshot.json")):
+            try:
+                job = json.loads(snapshot_path.read_text(encoding="utf-8"))
+                events_path = snapshot_path.with_name("events.jsonl")
+                events = []
+                if events_path.exists():
+                    events = [
+                        json.loads(line)
+                        for line in events_path.read_text(encoding="utf-8").splitlines()
+                        if line.strip()
+                    ]
+                if isinstance(job, dict) and job.get("job_id") and isinstance(events, list):
+                    job["events"] = events
+                    jobs.append(job)
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                continue
+        return jobs
 
 
 def _now() -> str:
@@ -56,6 +112,9 @@ def _entity_log_count(entity: Dict[str, Any]) -> int:
 def _sanitized_templates(entity: Dict[str, Any]) -> list[Dict[str, Any]]:
     allowed = (
         "template_hash",
+        "template_fingerprint",
+        "template_instance_hash",
+        "hash_version",
         "component",
         "severity",
         "template",
@@ -74,14 +133,14 @@ def _sanitized_templates(entity: Dict[str, Any]) -> list[Dict[str, Any]]:
 
 def _feature_from_rule(rule: Dict[str, Any], entity: Dict[str, Any]) -> Dict[str, Any]:
     required = {
-        (str(item.get("template_hash") or ""), str(item.get("category") or ""))
+        (str(item.get("template_fingerprint") or item.get("template_hash") or ""), str(item.get("category") or ""))
         for item in (rule.get("template_signatures") or [])
     }
     sources = [
         template
         for template in _sanitized_templates(entity)
         if (
-            str(template.get("template_hash") or ""),
+            str(template.get("template_fingerprint") or template.get("template_hash") or ""),
             str(template.get("category") or ""),
         ) in required
     ]
@@ -135,14 +194,45 @@ class FeatureJobManager:
         metrics_store: ProcessingMetricsStore | None = None,
         monotonic: Callable[[], float] = time.monotonic,
         auto_start: bool = True,
+        persistence: FeatureJobFileStore | None = None,
     ) -> None:
         self.extractor = extractor
         self.rule_store = rule_store
         self.metrics_store = metrics_store
         self.monotonic = monotonic
         self.auto_start = auto_start
+        self.persistence = persistence
         self._jobs: Dict[str, Dict[str, Any]] = {}
         self._lock = threading.RLock()
+        self._restore_jobs()
+
+    def _restore_jobs(self) -> None:
+        if not self.persistence:
+            return
+        for job in self.persistence.load():
+            condition = threading.Condition(self._lock)
+            job["condition"] = condition
+            job.setdefault("events", [])
+            job.setdefault("processed_samples", [])
+            job["started_monotonic"] = self.monotonic()
+            interrupted = job.get("status") in {"queued", "running"}
+            for record in job.get("entities", []):
+                if record.get("status") in {"queued", "running"}:
+                    record["status"] = "interrupted"
+                    record["error"] = "服务重启中断，需人工重试"
+                    interrupted = True
+            if interrupted:
+                job["status"] = "interrupted"
+                job["completed_at"] = None
+                job["events"].append({
+                    "sequence": len(job["events"]),
+                    "type": "job_interrupted",
+                    "timestamp": _now(),
+                    "job_id": job["job_id"],
+                })
+            self._jobs[str(job["job_id"])] = job
+            if interrupted:
+                self.persistence.save(job)
 
     def create_job(
         self,
@@ -259,6 +349,8 @@ class FeatureJobManager:
             **payload,
         }
         job["events"].append(event)
+        if self.persistence:
+            self.persistence.save(job)
         job["condition"].notify_all()
 
     def run_job(self, job_id: str, only_entity_id: str | None = None) -> None:
@@ -488,8 +580,8 @@ class FeatureJobManager:
             if not matches:
                 raise FeatureJobError("风险实体不存在")
             record = matches[0]
-            if record["status"] != "failed":
-                raise FeatureJobError("只能重试失败的风险实体")
+            if record["status"] not in {"failed", "interrupted"}:
+                raise FeatureJobError("只能重试失败或已中断的风险实体")
             record["status"] = "queued"
             record["error"] = None
             job["status"] = "queued"

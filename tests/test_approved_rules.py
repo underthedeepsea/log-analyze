@@ -54,6 +54,28 @@ def test_approved_rule_persists_and_matches_globally(tmp_path):
     assert json.loads(path.read_text(encoding="utf-8"))["schema_version"] == "1.0"
 
 
+def test_fingerprint_rule_matches_different_cluster_instance_hash(tmp_path):
+    value = feature()
+    value["source_templates"][0].update({
+        "template_fingerprint": "fingerprint-oom",
+        "template_instance_hash": "instance-a",
+        "hash_version": "v2",
+    })
+    target = entity(cluster="prod-b", entity_id="node-b")
+    target["top_templates"][0].update({
+        "template_hash": "different-legacy-hash",
+        "template_fingerprint": "fingerprint-oom",
+        "template_instance_hash": "instance-b",
+        "hash_version": "v2",
+    })
+    store = ApprovedRuleStore(tmp_path / "rules.json")
+
+    stored = store.upsert_feature(value)
+
+    assert store.match_entity(target)[0]["rule_id"] == stored["rule_id"]
+    assert stored["template_signatures"][0]["template_fingerprint"] == "fingerprint-oom"
+
+
 def test_duplicate_signature_updates_instead_of_appending(tmp_path):
     store = ApprovedRuleStore(tmp_path / "rules.json")
     first = store.upsert_feature(feature(title="旧标题"))

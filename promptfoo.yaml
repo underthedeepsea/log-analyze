@@ -1,6 +1,6 @@
-description: LOGRISK feature_extract_v1 local Ollama regression suite
+description: LOGRISK production feature extraction local Ollama regression suite
 prompts:
-  - file://eval_cases/promptfoo/feature_extract_v1.js
+  - file://eval_cases/promptfoo/load_prompt.js
 providers:
   - id: ollama:chat:qwen3:1.7b
     config:
@@ -10,12 +10,30 @@ providers:
       passthrough:
         format: json
 tests:
-  - file://eval_cases/promptfoo/cases.json
+  - file://eval_cases/promptfoo/generated_cases.json
 defaultTest:
   assert:
     - type: javascript
       value: file://eval_cases/promptfoo/assertions.js:validJson
+      metric: json_valid
+    - type: javascript
+      value: file://eval_cases/promptfoo/assertions.js:schemaValid
+      metric: schema_valid
     - type: javascript
       value: file://eval_cases/promptfoo/assertions.js:knownHashes
+      metric: template_reference_accuracy
+    - type: javascript
+      value: file://eval_cases/promptfoo/assertions.js:knownComponents
+      metric: component_reference_accuracy
+    - type: javascript
+      value: file://eval_cases/promptfoo/assertions.js:expectedFeatureTypes
+      metric: expected_feature_types
+    - type: javascript
+      value: file://eval_cases/promptfoo/assertions.js:expectedEmptyFeatures
+      metric: false_positive_control
     - type: javascript
       value: file://eval_cases/promptfoo/assertions.js:forbiddenClaims
+      metric: forbidden_claims
+    - type: javascript
+      value: file://eval_cases/promptfoo/assertions.js:noRawLogLeak
+      metric: raw_log_leak

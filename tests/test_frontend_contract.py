@@ -76,6 +76,10 @@ def test_ai_harness_pages_and_routes_are_present():
         "feature_extract_v3_compact_strict_json_en",
         "重试次数",
         "retry_count",
+        "来源链路",
+        "Lineage 状态",
+        "查看来源 AI Trace",
+        "template_fingerprint",
     ):
         assert text in source
 
@@ -184,7 +188,8 @@ def test_release_docs_describe_current_bugfix_version():
     harness_doc = Path("docs/AI_HARNESS_ARCHITECTURE.md").read_text(encoding="utf-8")
 
     assert "## 1.16.0 - 2026-07-11" in release
-    assert "当前版本：`1.16.0`" in readme
+    assert "## 1.16.2 - 2026-07-13" in release
+    assert "当前版本：`1.16.2`" in readme
     assert "Every code update must also update `releas.md`" in agents
     assert "dashboard.sh restart" in readme
     assert ".txt" in readme

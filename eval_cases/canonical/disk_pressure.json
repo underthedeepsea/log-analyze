@@ -1,5 +1,7 @@
 {
+  "case_id": "disk_pressure",
   "name": "disk_pressure",
+  "description": "节点磁盘压力",
   "input_entity": {
     "window_start": "2026-07-07T12:00:00+08:00",
     "window_end": "2026-07-07T12:05:00+08:00",
@@ -12,6 +14,7 @@
     "top_templates": [
       {
         "template_hash": "disk-pressure-001",
+        "template_fingerprint": "disk-pressure-fp-001",
         "component": "kubelet",
         "severity": "WARNING",
         "template": "eviction manager: node has disk pressure",
@@ -23,6 +26,11 @@
     ]
   },
   "expected": {
+    "expected_feature_types": ["disk_pressure"],
+    "expect_empty_features": false,
+    "allowed_components": ["kubelet"],
+    "must_reference_hashes": ["disk-pressure-001"],
+    "forbidden_claims": ["处理建议", "修复方法"],
     "must_include_feature_type": ["disk_pressure"],
     "must_include_template_keywords": ["disk pressure", "eviction"],
     "must_not_claim": ["处理建议", "修复方法"],

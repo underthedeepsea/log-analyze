@@ -19,7 +19,7 @@ from logrisk.ai_harness.prompt_registry import PromptRegistry, PromptTemplate
 from logrisk.ai_harness.trace_logger import AITraceLogger
 from logrisk.approved_rules import ApprovedRuleError, ApprovedRuleStore
 from logrisk.feature_extractor_ollama import DEFAULT_OLLAMA_URL, FEATURE_PROMPT_ID
-from logrisk.feature_jobs import FeatureJobError, FeatureJobManager, _cache_enabled_default
+from logrisk.feature_jobs import FeatureJobError, FeatureJobFileStore, FeatureJobManager, _cache_enabled_default
 from logrisk.input_jobs import InputJobConfig, InputJobStore
 from logrisk.input_parser import parse_log_content
 from logrisk.large_file_pipeline import run_large_file_pipeline
@@ -64,6 +64,7 @@ def build_server(
     server.manager = manager or FeatureJobManager(  # type: ignore[attr-defined]
         rule_store=ApprovedRuleStore(state_root / "approved_rules.json"),
         metrics_store=ProcessingMetricsStore(state_root / "processing_metrics.json"),
+        persistence=FeatureJobFileStore(state_root / "feature_jobs"),
     )
     server.frontend_path = Path(frontend_path or root / "frontend" / "dist" / "index.html")  # type: ignore[attr-defined]
     server.default_model = default_model  # type: ignore[attr-defined]

@@ -1,0 +1,11 @@
+drain3_runtime:
+  parameter_extraction_mode: off
+
+large_file:
+  process_start_method: spawn
+  max_drain_workers: 4
+  reserve_cpu_cores: 1
+  max_upload_bytes: 524288000
+  max_decompressed_bytes: 1073741824
+  max_compression_ratio: 100
+  max_line_bytes: 1048576

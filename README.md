@@ -1,8 +1,8 @@
 # 日志风险特征分析与审批系统
 
-当前版本：`1.16.0`。变更记录见 [`releas.md`](releas.md)。
+当前版本：`1.16.2`。变更记录见 [`releas.md`](releas.md)。
 
-AI Harness 路线图 M1–M9 已完成：Prompt Registry、Trace、Evidence Builder、模型 Provider、Output Evaluator、AI Cache、Rule Lineage、本地 Eval Runner、Promptfoo 与最终架构文档均已落地。
+AI Harness 路线图 M1–M10 已完成：在 M1–M9 能力上补充生产 Prompt 评测、模板 Fingerprint v2、流式大文件处理、输入安全边界、任务恢复和 CI 质量门禁。
 
 本项目在本机完成日志规范化、Drain3 模板化、风险评分、规则复用、Ollama 特征识别与人工审批。项目不实现 RCA；原始日志不会直接发送给 Ollama。
 
@@ -60,9 +60,11 @@ bash scripts/dashboard.sh restart
 bash scripts/dashboard.sh stop
 ```
 
+启动脚本使用轻量 `nohup` 后台进程，不注册 `launchd` 或其他常驻系统服务；通过 `stop` 即可终止进程并清理 PID 文件。
+
 访问 [http://127.0.0.1:8080](http://127.0.0.1:8080)。日志写入 `state/dashboard.log`，PID 写入 `state/dashboard.pid`。兼容的前台方式为 `bash scripts/run_dashboard.sh`。可通过 `OLLAMA_MODEL`、`OLLAMA_HOST`、`OLLAMA_TIMEOUT`、`DASHBOARD_HOST` 和 `DASHBOARD_PORT` 覆盖默认配置。
 
-Dashboard 上传 10MB 以内文件时继续使用 inline 分析；超过 10MB 时自动使用 1MB 分片上传到 `state/uploads/`，后端创建异步 input job 并把结果写入 `output/uploads/{input_job_id}/result.json`。默认单文件上限为 500MB，支持 `.log`、`.txt`、`.jsonl`、`.ndjson`、`.gz` 和 Linux `messages` 这类无后缀文本日志。大文件 Drain3 会按“集群 + 节点 + 来源 + 组件”安全分区，并使用最多 CPU 核数的独立进程并行处理；同一分区保持原始顺序。结果摘要包含 `drain3_parallel`、`drain3_worker_count` 与 `drain3_partition_count`；只有一个分区时会自动串行处理，以保持在线模板学习语义。
+Dashboard 上传 10MB 以内文件时继续使用 inline 分析；超过 10MB 时自动使用 1MB 分片上传到 `state/uploads/`，后端创建异步 input job 并把结果写入 `output/uploads/{input_job_id}/result.json`。默认单文件上限为 500MB，支持 `.log`、`.txt`、`.jsonl`、`.ndjson`、`.gz` 和 Linux `messages` 这类无后缀文本日志。大文件会流式规范化并写入 `state/.../input_jobs/{input_job_id}/spool/`，不会在主进程保留完整日志列表。Drain3 使用 `spawn` 进程、默认最多 4 个 Worker 并保留 1 个 CPU 核；同一“集群 + 节点 + 来源 + 组件”分区保持原始顺序。GZ 解压默认限制 1GB、压缩比 100 倍、单行 1MB，配置见 `configs/runtime.yaml`。
 
 AI Cache 默认启用，缓存文件为 `state/ai_cache.json`。同一 evidence hash、Prompt hash、provider、模型和 Thinking 开关再次分析时会跳过 Ollama；调试模型或 Prompt 时可用 `AI_CACHE_ENABLED=0 bash scripts/dashboard.sh restart` 临时关闭。
 
@@ -70,7 +72,7 @@ AI Cache 默认启用，缓存文件为 `state/ai_cache.json`。同一 evidence 
 
 ## 规则复用与指标
 
-人工批准的特征会原子写入 `state/approved_rules.json`。后续任何集群或节点命中相同模板 Hash、规则类别和特征类型时，会生成“规则复用”特征并跳过 Ollama。建议定期备份该文件。
+人工批准的特征会原子写入 `state/approved_rules.json`。模板实例 Hash 用于定位集群/节点实例，跨集群 Fingerprint 用于规则复用；旧版 `template_hash` 规则继续兼容。命中后会生成“规则复用”特征并跳过 Ollama。Feature Job 使用 `state/feature_jobs/{job_id}/snapshot.json` 与 `events.jsonl` 持久化；重启时运行中任务标记为 `interrupted`，不会自动重放模型调用。
 
 Dashboard 实时显示 Drain3 压缩量、当日 LLM 关联日志量、处理速度、ETA、规则复用、AI Cache 命中和节省的调用。`state/processing_metrics.json` 按本地日期累计真实进入模型的关联日志量；该数字是模板关联计数，不代表原始日志被发送给模型。
 
@@ -86,7 +88,7 @@ Dashboard 提供 `/ai-observability`、`/prompts`、`/model-profiles` 和 `/ai-t
 
 ## AI Eval Runner
 
-M7 新增本地回归评估能力。默认用例位于 `eval_cases/`，覆盖 OOM 驱逐、containerd runtime 失败、磁盘压力、Pod 业务错误和普通 warning 误报控制。运行：
+M7/M8 共用 `eval_cases/canonical/`，覆盖 OOM 驱逐、containerd runtime 失败、磁盘压力、Pod 业务错误和普通 warning 误报控制。运行：
 
 ```bash
 OLLAMA_MODEL=qwen3:1.7b .venv/bin/python -m logrisk.ai_eval.runner
@@ -96,7 +98,7 @@ OLLAMA_MODEL=qwen3:1.7b .venv/bin/python -m logrisk.ai_eval.runner
 
 ## Promptfoo 回归评测
 
-M8 增加开发期 Promptfoo/Ollama 回归评测，运行时不依赖 Node.js。执行 `npm ci` 后，使用 `OLLAMA_BASE_URL=http://127.0.0.1:11434 npm run promptfoo:eval`。评测动态加载真实的 `prompts/feature_extract_v1.md`，覆盖 5 个日志场景。
+M8 增加开发期 Promptfoo/Ollama 回归评测。执行 `npm ci` 后，使用 `OLLAMA_BASE_URL=http://127.0.0.1:11434 npm run promptfoo:eval`。评测动态读取 `configs/ai_harness.yaml` 的生产默认 Prompt，并使用 `scripts/generate_promptfoo_cases.py` 从 canonical cases 生成用例；可通过 `LOGRISK_EVAL_PROMPT_ID` 临时覆盖 Prompt。
 
 ## 安全与导出
 

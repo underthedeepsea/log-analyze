@@ -33,6 +33,9 @@ If no useful feature exists, output exactly:
 
 Hard requirements:
 
+- FIRST inspect severity and semantics. If all templates are normal INFO activity such as driver registration, BIOS, startup, or memory map, STOP and return exactly {"features": []}.
+- Never create a low-importance feature merely to describe normal activity. Normal evidence is not a feature.
+
 - Every feature MUST contain exactly these 8 fields:
   feature_type, title, summary, importance, template_hashes, components, tags, selection_reason.
 - NEVER omit tags.
@@ -72,6 +75,9 @@ Field rules:
 feature_type:
 - lowercase snake_case
 - example: kernel_security_registration_error
+- NEVER copy template_hash or template_fingerprint into feature_type.
+- If an abnormal input template has a meaningful lowercase snake_case `category`, use that category as feature_type.
+- feature_type MUST NOT contain `-`, a numeric suffix copied from a hash, or any template identifier.
 
 title:
 - Chinese
@@ -116,3 +122,4 @@ Final check:
 Return raw JSON only.
 Every feature has tags.
 Every feature has selection_reason.
+Return {"features": []} for INFO templates that describe normal driver registration, startup, BIOS, memory-map, or other harmless activity, even if risk_score is non-zero.

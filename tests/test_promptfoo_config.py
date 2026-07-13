@@ -1,28 +1,30 @@
 import json
+import subprocess
 from pathlib import Path
 
 import yaml
 
 
-def test_promptfoo_config_uses_local_ollama_and_feature_extract_v1():
+def test_promptfoo_config_loads_production_default_prompt():
     config = yaml.safe_load(Path("promptfoo.yaml").read_text(encoding="utf-8"))
-    prompt_source = Path("eval_cases/promptfoo/feature_extract_v1.js").read_text(encoding="utf-8")
+    loader = Path("eval_cases/promptfoo/load_prompt.js").read_text(encoding="utf-8")
 
-    assert config["prompts"] == ["file://eval_cases/promptfoo/feature_extract_v1.js"]
+    assert config["prompts"] == ["file://eval_cases/promptfoo/load_prompt.js"]
     assert config["providers"][0]["id"] == "ollama:chat:qwen3:1.7b"
-    assert "prompts/feature_extract_v1.md" in prompt_source
-    assert "evidence_json" in prompt_source
+    assert "configs/ai_harness.yaml" in loader
+    assert "LOGRISK_EVAL_PROMPT_ID" in loader
 
 
-def test_promptfoo_suite_has_five_cases_and_required_assertions():
+def test_promptfoo_generated_cases_are_deterministic_and_assertions_are_strong():
+    path = Path("eval_cases/promptfoo/generated_cases.json")
+    before = path.read_text(encoding="utf-8")
+    subprocess.run([".venv/bin/python", "scripts/generate_promptfoo_cases.py"], check=True)
     config = yaml.safe_load(Path("promptfoo.yaml").read_text(encoding="utf-8"))
-    cases = json.loads(Path("eval_cases/promptfoo/cases.json").read_text(encoding="utf-8"))
+    cases = json.loads(path.read_text(encoding="utf-8"))
     assertions = "\n".join(item["value"] for item in config["defaultTest"]["assert"])
 
+    assert path.read_text(encoding="utf-8") == before
     assert len(cases) >= 5
-    assert "validJson" in assertions
-    assert "knownHashes" in assertions
-    assert "forbiddenClaims" in assertions
-    assert all(isinstance(case["vars"]["allowed_hashes_json"], str) for case in cases)
-    assert all(isinstance(case["vars"]["forbidden_json"], str) for case in cases)
-    assert all(not any(isinstance(value, list) for value in case["vars"].values()) for case in cases)
+    for name in ("validJson", "schemaValid", "knownHashes", "knownComponents", "expectedFeatureTypes", "expectedEmptyFeatures", "forbiddenClaims", "noRawLogLeak"):
+        assert name in assertions
+    assert all(isinstance(case["vars"]["expected_json"], str) for case in cases)

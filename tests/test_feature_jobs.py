@@ -1,7 +1,7 @@
 import pytest
 
 from logrisk.approved_rules import ApprovedRuleStore
-from logrisk.feature_jobs import FeatureJobError, FeatureJobManager, validate_result_document
+from logrisk.feature_jobs import FeatureJobError, FeatureJobFileStore, FeatureJobManager, validate_result_document
 from logrisk.processing_metrics import ProcessingMetricsStore
 
 
@@ -450,3 +450,54 @@ def test_job_reports_cache_hit_event_and_savings():
     assert snapshot["live_metrics"]["cache_hit_logs"] == 7
     assert snapshot["live_metrics"]["saved_llm_calls"] == 1
     assert snapshot["live_metrics"]["saved_llm_logs"] == 7
+
+
+def test_file_store_restores_completed_job_for_review(tmp_path):
+    store = FeatureJobFileStore(tmp_path / "feature_jobs")
+    manager = FeatureJobManager(
+        extractor=lambda source, **kwargs: [candidate(source)],
+        persistence=store,
+        auto_start=False,
+    )
+    job_id = manager.create_job(
+        {"summary": {}, "risk_entities": [entity("node-a", 90)]},
+        model="qwen3:1.7b",
+    )
+    manager.run_job(job_id)
+
+    restored = FeatureJobManager(persistence=store, auto_start=False)
+
+    assert restored.get_job(job_id)["status"] == "completed"
+    assert restored.get_job(job_id)["features"][0]["status"] == "pending"
+    assert (tmp_path / "feature_jobs" / job_id / "snapshot.json").exists()
+    assert (tmp_path / "feature_jobs" / job_id / "events.jsonl").exists()
+
+
+def test_file_store_marks_running_job_interrupted_without_model_retry(tmp_path):
+    calls = []
+    store = FeatureJobFileStore(tmp_path / "feature_jobs")
+    manager = FeatureJobManager(
+        extractor=lambda source, **kwargs: calls.append(source),
+        persistence=store,
+        auto_start=False,
+    )
+    job_id = manager.create_job(
+        {"summary": {}, "risk_entities": [entity("node-a", 90)]},
+        model="qwen3:1.7b",
+    )
+    with manager._lock:
+        job = manager._job(job_id)
+        job["status"] = "running"
+        job["entities"][0]["status"] = "running"
+        manager._emit_locked(job, "entity_started", entity_id="node-a")
+
+    restored = FeatureJobManager(
+        extractor=lambda source, **kwargs: calls.append(source),
+        persistence=store,
+        auto_start=True,
+    )
+
+    snapshot = restored.get_job(job_id)
+    assert snapshot["status"] == "interrupted"
+    assert snapshot["entities"][0]["status"] == "interrupted"
+    assert calls == []

@@ -22,15 +22,28 @@ def _now() -> str:
 
 
 def _template_pairs(items: list[Dict[str, Any]]) -> list[Dict[str, str]]:
-    pairs = {
-        (str(item.get("template_hash") or "").strip(), str(item.get("category") or "").strip())
-        for item in items
-        if isinstance(item, dict) and str(item.get("template_hash") or "").strip()
-    }
-    return [
-        {"template_hash": template_hash, "category": category}
-        for template_hash, category in sorted(pairs)
-    ]
+    pairs: dict[tuple[str, str], Dict[str, str]] = {}
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        fingerprint = str(item.get("template_fingerprint") or "").strip()
+        legacy_hash = str(item.get("template_hash") or "").strip()
+        identity = fingerprint or legacy_hash
+        if not identity:
+            continue
+        category = str(item.get("category") or "").strip()
+        signature = {"category": category}
+        if fingerprint:
+            signature["template_fingerprint"] = fingerprint
+        if legacy_hash:
+            signature["template_hash"] = legacy_hash
+        pairs[(identity, category)] = signature
+    return [pairs[key] for key in sorted(pairs)]
+
+
+def _identity_pair(item: Dict[str, Any]) -> tuple[str, str]:
+    identity = str(item.get("template_fingerprint") or item.get("template_hash") or "").strip()
+    return identity, str(item.get("category") or "").strip()
 
 
 def rule_signature(feature_type: str, sources: list[Dict[str, Any]]) -> str:
@@ -140,14 +153,14 @@ class ApprovedRuleStore:
 
     def match_entity(self, entity: Dict[str, Any]) -> list[Dict[str, Any]]:
         entity_pairs = {
-            (item["template_hash"], item["category"])
+            _identity_pair(item)
             for item in _template_pairs(entity.get("top_templates") or [])
         }
         with _PROCESS_LOCK:
             matches = []
             for rule in self._read_locked():
                 required = {
-                    (str(item.get("template_hash") or ""), str(item.get("category") or ""))
+                    _identity_pair(item)
                     for item in (rule.get("template_signatures") or [])
                 }
                 if required and required.issubset(entity_pairs):

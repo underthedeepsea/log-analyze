@@ -1,7 +1,7 @@
 {
   "name": "logrisk-prompt-eval",
   "private": true,
-  "version": "1.16.1",
+  "version": "1.16.2",
   "devDependencies": {
     "promptfoo": "0.121.18"
   },

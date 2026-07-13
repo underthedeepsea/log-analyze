@@ -1,6 +1,6 @@
 # 日志风险特征分析与审批系统
 
-当前版本：`1.16.1`。变更记录见 [`releas.md`](releas.md)。
+当前版本：`1.16.2`。变更记录见 [`releas.md`](releas.md)。
 
 AI Harness 路线图 M1–M10 已完成：在 M1–M9 能力上补充生产 Prompt 评测、模板 Fingerprint v2、流式大文件处理、输入安全边界、任务恢复和 CI 质量门禁。
 
@@ -59,6 +59,8 @@ bash scripts/dashboard.sh status
 bash scripts/dashboard.sh restart
 bash scripts/dashboard.sh stop
 ```
+
+启动脚本使用轻量 `nohup` 后台进程，不注册 `launchd` 或其他常驻系统服务；通过 `stop` 即可终止进程并清理 PID 文件。
 
 访问 [http://127.0.0.1:8080](http://127.0.0.1:8080)。日志写入 `state/dashboard.log`，PID 写入 `state/dashboard.pid`。兼容的前台方式为 `bash scripts/run_dashboard.sh`。可通过 `OLLAMA_MODEL`、`OLLAMA_HOST`、`OLLAMA_TIMEOUT`、`DASHBOARD_HOST` 和 `DASHBOARD_PORT` 覆盖默认配置。
 

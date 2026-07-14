@@ -59,6 +59,26 @@ def test_runtime_backend_address_contract():
     assert (FRONTEND / "dist" / "config.js").is_file()
 
 
+def test_m11_quality_and_settings_use_workspace_design_contract():
+    source = source_text()
+    for text in (
+        "drain-quality-page",
+        "settings-page",
+        "quality-annotation-layout",
+        "annotation-queue",
+        "annotation-detail",
+        "suspicious-filters",
+        "profile-compare-selectors",
+        "profile-parameter-table",
+        "template-toolbar",
+        "release-stage-grid",
+        "secondary-button",
+    ):
+        assert text in source
+    assert '!["drainQuality", "settings"].includes(view)' in source
+    assert "h(CodeBlock, { value: profile.parameters })" not in source
+
+
 def test_ai_harness_pages_and_routes_are_present():
     source = source_text()
     for text in (
@@ -231,7 +251,8 @@ def test_release_docs_describe_current_feature_version():
     assert "## 1.16.0 - 2026-07-11" in release
     assert "## 1.16.2 - 2026-07-13" in release
     assert "## 1.17.0 - 2026-07-14" in release
-    assert "当前版本：`1.17.0`" in readme
+    assert "## 1.17.1 - 2026-07-14" in release
+    assert "当前版本：`1.17.1`" in readme
     assert "Every code update must also update `releas.md`" in agents
     assert "dashboard.sh restart" in readme
     assert ".txt" in readme

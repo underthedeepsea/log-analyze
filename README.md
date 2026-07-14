@@ -1,8 +1,8 @@
 # 日志风险特征分析与审批系统
 
-当前版本：`1.16.2`。变更记录见 [`releas.md`](releas.md)。
+当前版本：`1.17.0`。变更记录见 [`releas.md`](releas.md)。
 
-AI Harness 路线图 M1–M10 已完成：在 M1–M9 能力上补充生产 Prompt 评测、模板 Fingerprint v2、流式大文件处理、输入安全边界、任务恢复和 CI 质量门禁。
+AI Harness 路线图 M1–M10 已完成；Phase 2 M11 新增 Drain Template Quality Center、Gold Dataset、模板治理和前后端分离部署能力。
 
 本项目在本机完成日志规范化、Drain3 模板化、风险评分、规则复用、Ollama 特征识别与人工审批。项目不实现 RCA；原始日志不会直接发送给 Ollama。
 
@@ -34,6 +34,12 @@ pip install -r requirements.txt
 ```
 
 前端是已提交到 `frontend/dist/` 的纯 React 静态应用，不依赖前端构建工具或 CDN，普通启动不需要 Node.js，也不需要编译。
+
+前后端可以分开部署。默认后端地址可在 `frontend/dist/config.js` 设置，页面“系统设置”允许测试并保存浏览器级覆盖。解析优先级为浏览器设置、`config.js`、当前页面同源地址。跨域部署时启动后端前设置允许来源：
+
+```bash
+DASHBOARD_CORS_ORIGINS=https://logrisk.example.internal bash scripts/dashboard.sh start
+```
 
 ## 输入格式
 
@@ -85,6 +91,12 @@ Dashboard 提供 `/ai-observability`、`/prompts`、`/model-profiles` 和 `/ai-t
 批准规则会记录 Rule Lineage：来源 `job_id`、`candidate_id`、`trace_id`、Prompt、模型、provider 和 evidence hash 会随规则持久化，便于后续审计规则从哪次 AI 分析沉淀而来。旧版无 lineage 的规则仍可继续匹配和复用。
 
 人工审批页的“特征日志证据”支持逐条选择脱敏模板；切换模板时，标题、摘要、标签和审批备注会同步生成当前证据的审批草稿，仍可由人工编辑后批准。
+
+## Drain3 模板质量与治理
+
+“评测中心 → 模板质量”提供 Grouping F1、Over-merge、Over-split、Singleton、Wildcard、Churn、Gold Dataset、标注工作台、可疑模板、Profile 对比和发布管理。内置 `kernel_v1`、`kubelet_v1`、`containerd_v1`、`audit_v1`、`podlog_v1` 五个候选 Profile。
+
+模板管理支持编辑、忽略、合并、恢复、软删除和版本回滚。系统永久保留原始 `template_hash` 与原始模板，变更写入 `state/drain_quality/template_overrides.json` 和追加式审计事件，不直接修改 Drain3 聚类树。所有生产有效变更和 Profile 发布均需人工二次确认；Profile 发布不会自动覆盖生产配置。详细说明见 [`docs/DRAIN_TEMPLATE_QUALITY.md`](docs/DRAIN_TEMPLATE_QUALITY.md)。
 
 ## AI Eval Runner
 

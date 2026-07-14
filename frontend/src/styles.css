@@ -22,3 +22,24 @@
 
 .upload-progress{display:flex;flex-direction:column;gap:4px;margin-top:10px;color:#9a3412;font-size:13px}
 .rule-row{width:100%;border:0;border-top:1px solid #f0f1f3;background:#fff;text-align:left;cursor:pointer}.rule-row:hover{background:#fff8f4}.lineage-badge{display:inline-block;border-radius:999px;padding:4px 7px;font-size:8px!important;width:max-content}.lineage-badge.complete{background:#eaf8f2;color:var(--green)!important}.lineage-badge.partial{background:#fff3ea;color:var(--orange-dark)!important}.lineage-badge.history{background:#f0f2f4;color:#65707c!important}.lineage-timeline{margin:0 18px 12px;display:flex;gap:5px;flex-wrap:wrap;align-items:center}.lineage-timeline span{font-size:9px;background:#fff3ea;color:var(--orange-dark);border-radius:999px;padding:6px 8px}.lineage-timeline span:not(:last-child):after{content:" →";margin-left:6px}.lineage-trace{margin:0 18px 12px}
+.quality-tabs { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 18px; }
+.quality-tabs button { border: 1px solid #eadfd7; background: #fff; color: #6d5a50; padding: 9px 14px; border-radius: 999px; cursor: pointer; }
+.quality-tabs button.active { color: #fff; background: #f26a21; border-color: #f26a21; }
+.quality-card-grid, .profile-compare { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 14px; }
+.template-card { display: grid; gap: 12px; }
+.template-card code, .template-row code { white-space: pre-wrap; overflow-wrap: anywhere; color: #4d3c34; }
+.button-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.button-row button { cursor: pointer; }
+.template-table { display: grid; gap: 12px; }
+.template-row { display: grid; grid-template-columns: minmax(120px, .6fr) minmax(280px, 2fr) auto auto; gap: 12px; align-items: center; border-top: 1px solid #f1e8e2; padding: 13px 0; }
+.template-row.managed { grid-template-columns: minmax(190px, .8fr) minmax(260px, 1.6fr) minmax(150px, .6fr) minmax(260px, 1fr); }
+.template-row > div:first-child { display: grid; gap: 4px; }
+.danger-button { color: #a93123; border-color: #efc6bf !important; background: #fff8f6 !important; }
+.settings-panel { max-width: 760px; display: grid; gap: 15px; }
+.settings-panel label { display: grid; gap: 7px; font-weight: 700; }
+.settings-panel input { min-height: 44px; border: 1px solid #dccfc6; border-radius: 10px; padding: 0 12px; font: inherit; }
+.settings-status { padding: 11px 13px; border-radius: 10px; background: #fff4ec; color: #9b4d1d; }
+
+@media (max-width: 900px) {
+  .template-row, .template-row.managed { grid-template-columns: 1fr; }
+}

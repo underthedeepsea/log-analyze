@@ -14,8 +14,49 @@ def source_text() -> str:
 
 def test_react_source_has_all_workspaces():
     source = source_text()
-    for label in ("特征总览", "识别队列", "AI 调用追踪", "Prompt 管理", "模型画像", "人工审批", "批准规则库", "导出记录"):
+    for label in ("特征总览", "识别队列", "AI 调用追踪", "Prompt 管理", "模型画像", "人工审批", "批准规则库", "导出记录", "评测中心", "模板质量"):
         assert label in source
+
+
+def test_drain_quality_center_contract():
+    source = source_text()
+    for text in (
+        "/api/drain-quality/datasets",
+        "/api/drain-quality/annotations",
+        "/api/drain-quality/eval-runs",
+        "/api/drain-quality/profiles",
+        "Grouping F1",
+        "Over-merge",
+        "Over-split",
+        "Singleton",
+        "Wildcard",
+        "标注工作台",
+        "可疑模板",
+        "配置对比",
+        "发布管理",
+        "确认发布",
+    ):
+        assert text in source
+
+
+def test_runtime_backend_address_contract():
+    source = source_text()
+    for text in (
+        "LOGRISK_CONFIG",
+        'localStorage.getItem("logrisk.apiBase")',
+        'localStorage.setItem("logrisk.apiBase"',
+        'localStorage.removeItem("logrisk.apiBase")',
+        "function apiUrl(path)",
+        "/api/health",
+        "测试连接",
+        "测试并保存",
+        "恢复默认",
+        "DASHBOARD_CORS_ORIGINS",
+    ):
+        assert text in source
+    html = (FRONTEND / "dist" / "index.html").read_text(encoding="utf-8")
+    assert '<script src="/config.js"></script>' in html
+    assert (FRONTEND / "dist" / "config.js").is_file()
 
 
 def test_ai_harness_pages_and_routes_are_present():
@@ -181,7 +222,7 @@ def test_package_uses_react_without_vite_or_a_runtime_build_step():
     assert '"build"' not in package
 
 
-def test_release_docs_describe_current_bugfix_version():
+def test_release_docs_describe_current_feature_version():
     release = Path("releas.md").read_text(encoding="utf-8")
     readme = Path("README.md").read_text(encoding="utf-8")
     agents = Path("AGENTS.md").read_text(encoding="utf-8")
@@ -189,7 +230,8 @@ def test_release_docs_describe_current_bugfix_version():
 
     assert "## 1.16.0 - 2026-07-11" in release
     assert "## 1.16.2 - 2026-07-13" in release
-    assert "当前版本：`1.16.2`" in readme
+    assert "## 1.17.0 - 2026-07-14" in release
+    assert "当前版本：`1.17.0`" in readme
     assert "Every code update must also update `releas.md`" in agents
     assert "dashboard.sh restart" in readme
     assert ".txt" in readme

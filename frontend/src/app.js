@@ -4,9 +4,17 @@
   const { useEffect, useMemo, useRef, useState } = React;
   const INLINE_MAX_BYTES = 10 * 1024 * 1024;
   const LARGE_CHUNK_BYTES = 1024 * 1024;
+  const DEPLOYMENT_API_BASE = String(window.LOGRISK_CONFIG && window.LOGRISK_CONFIG.apiBase || "").replace(/\/$/, "");
+
+  function currentApiBase() {
+    const configured = String(localStorage.getItem("logrisk.apiBase") || DEPLOYMENT_API_BASE || (window.location.origin === "null" ? "" : window.location.origin));
+    return configured.replace(/\/$/, "");
+  }
+
+  function apiUrl(path) { return currentApiBase() + path; }
 
   async function jsonRequest(path, options) {
-    const response = await fetch(path, Object.assign({}, options, {
+    const response = await fetch(apiUrl(path), Object.assign({}, options, {
       headers: Object.assign({ "Content-Type": "application/json" }, (options && options.headers) || {}),
     }));
     const payload = await response.json().catch(function () { return {}; });
@@ -15,10 +23,21 @@
   }
 
   const api = {
+    health: function () { return jsonRequest("/api/health"); },
     config: function () { return jsonRequest("/api/config"); },
     status: function () { return jsonRequest("/api/ollama/status"); },
     rules: function () { return jsonRequest("/api/rules"); },
     metrics: function () { return jsonRequest("/api/metrics"); },
+    drainDatasets: function () { return jsonRequest("/api/drain-quality/datasets"); },
+    drainAnnotations: function () { return jsonRequest("/api/drain-quality/annotations"); },
+    drainEvalRuns: function () { return jsonRequest("/api/drain-quality/eval-runs"); },
+    drainProfiles: function () { return jsonRequest("/api/drain-quality/profiles"); },
+    drainTemplates: function () { return jsonRequest("/api/drain-quality/templates"); },
+    importDrainTemplates: function (templates) { return jsonRequest("/api/drain-quality/templates/import", { method: "POST", body: JSON.stringify({ templates: templates }) }); },
+    annotateDrainTemplate: function (payload) { return jsonRequest("/api/drain-quality/annotations", { method: "POST", body: JSON.stringify(payload) }); },
+    changeDrainTemplate: function (templateHash, payload) { return jsonRequest("/api/drain-quality/templates/" + encodeURIComponent(templateHash) + "/changes", { method: "POST", body: JSON.stringify(payload) }); },
+    rollbackDrainTemplate: function (templateHash, payload) { return jsonRequest("/api/drain-quality/templates/" + encodeURIComponent(templateHash) + "/rollback", { method: "POST", body: JSON.stringify(payload) }); },
+    promoteDrainProfile: function (profileId, action, payload) { return jsonRequest("/api/drain-quality/profiles/" + encodeURIComponent(profileId) + "/" + action, { method: "POST", body: JSON.stringify(payload) }); },
     harnessStatus: function () { return jsonRequest("/api/ai-harness/status"); },
     observabilitySummary: function () { return jsonRequest("/api/ai-harness/observability/summary"); },
     observabilityProgress: function (jobId) { return jsonRequest("/api/ai-harness/jobs/" + encodeURIComponent(jobId) + "/progress"); },
@@ -58,7 +77,7 @@
       const session = await jsonRequest("/api/uploads", { method: "POST", body: JSON.stringify({ filename: file.name, size_bytes: file.size, chunk_size_bytes: LARGE_CHUNK_BYTES }) });
       for (let index = 0; index < session.total_chunks; index++) {
         const start = index * session.chunk_size_bytes;
-        const response = await fetch("/api/uploads/" + session.upload_id + "/chunks/" + index, { method: "PUT", headers: { "Content-Type": "application/octet-stream" }, body: file.slice(start, Math.min(file.size, start + session.chunk_size_bytes)) });
+        const response = await fetch(apiUrl("/api/uploads/" + session.upload_id + "/chunks/" + index), { method: "PUT", headers: { "Content-Type": "application/octet-stream" }, body: file.slice(start, Math.min(file.size, start + session.chunk_size_bytes)) });
         const chunkStatus = await response.json().catch(function () { return {}; });
         if (!response.ok) throw new Error(chunkStatus.error || "分片上传失败");
         callbacks.onUploadProgress && callbacks.onUploadProgress(chunkStatus);
@@ -77,14 +96,14 @@
       }
     },
     subscribe: function (jobId, onEvent) {
-      const source = new EventSource("/api/jobs/" + jobId + "/events?cursor=0");
+      const source = new EventSource(apiUrl("/api/jobs/" + jobId + "/events?cursor=0"));
       ["job_created", "job_started", "entity_rule_matched", "entity_cache_hit", "entity_started", "entity_retrying", "entity_completed", "entity_failed", "feature_updated", "job_completed"].forEach(function (type) {
         source.addEventListener(type, onEvent);
       });
       return source;
     },
     async exportApproved(jobId) {
-      const response = await fetch("/api/jobs/" + jobId + "/export", { method: "POST", body: "{}" });
+      const response = await fetch(apiUrl("/api/jobs/" + jobId + "/export"), { method: "POST", body: "{}" });
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.error || "导出失败");
       const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
@@ -99,7 +118,7 @@
 
   const navItems = [
     ["overview", "▦", "特征总览"], ["queue", "◫", "识别队列"], ["observability", "◉", "AI 分析观测"], ["traces", "⌁", "AI 调用追踪"], ["prompts", "{}", "Prompt 管理"], ["modelProfiles", "◌", "模型画像"], ["review", "✓", "人工审批"],
-    ["rules", "⌘", "批准规则库"], ["export", "⇩", "导出记录"],
+    ["rules", "⌘", "批准规则库"], ["drainQuality", "◇", "评测中心 · 模板质量"], ["export", "⇩", "导出记录"], ["settings", "⚙", "系统设置"],
   ];
   const statusNames = { queued: "等待分析", running: "识别中", completed: "Ollama 完成", failed: "识别失败", skipped: "低风险跳过", rule_matched: "规则复用" };
 
@@ -119,8 +138,8 @@
 
   function shortHash(value) { return value ? String(value).slice(0, 10) : "—"; }
   function timeText(value) { return value ? new Date(value).toLocaleString() : "—"; }
-  function pathToView(path) { return path === "/prompts" ? "prompts" : (path === "/model-profiles" ? "modelProfiles" : (path === "/ai-traces" ? "traces" : (path === "/ai-observability" ? "observability" : "overview"))); }
-  function routeForView(view) { return view === "prompts" ? "/prompts" : (view === "modelProfiles" ? "/model-profiles" : (view === "traces" ? "/ai-traces" : (view === "observability" ? "/ai-observability" : "/"))); }
+  function pathToView(path) { return path === "/prompts" ? "prompts" : (path === "/model-profiles" ? "modelProfiles" : (path === "/ai-traces" ? "traces" : (path === "/ai-observability" ? "observability" : (path === "/drain-quality" ? "drainQuality" : (path === "/settings" ? "settings" : "overview"))))); }
+  function routeForView(view) { return view === "prompts" ? "/prompts" : (view === "modelProfiles" ? "/model-profiles" : (view === "traces" ? "/ai-traces" : (view === "observability" ? "/ai-observability" : (view === "drainQuality" ? "/drain-quality" : (view === "settings" ? "/settings" : "/"))))); }
   function traceFiltersFromSearch(search) {
     const params = new URLSearchParams(search || "");
     return { job_id: params.get("job_id") || "", trace_id: params.get("trace_id") || "", status: params.get("status") || "", prompt_id: params.get("prompt_id") || "" };
@@ -551,6 +570,91 @@
       selected && h(Drawer, { title: "规则详情", subtitle: selected.rule_id, item: selected, onClose: function () { setSelected(null); } }, detail));
   }
 
+  function BackendSettings(props) {
+    const [address, setAddress] = useState(currentApiBase());
+    const [status, setStatus] = useState("");
+    async function testAddress(save) {
+      const candidate = address.trim().replace(/\/$/, "");
+      if (!/^https?:\/\//.test(candidate)) { setStatus("后端地址必须以 http:// 或 https:// 开头"); return; }
+      try {
+        const response = await fetch(candidate + "/api/health", { headers: { "Content-Type": "application/json" } });
+        const payload = await response.json().catch(function () { return {}; });
+        if (!response.ok || payload.status !== "ok") throw new Error(payload.error || "健康检查失败");
+        if (save) localStorage.setItem("logrisk.apiBase", candidate);
+        setStatus(save ? "连接成功，后端地址已保存" : "连接成功：" + (payload.service || "LOGRISK"));
+        props.onSaved && props.onSaved();
+      } catch (reason) { setStatus("连接失败：" + reason.message); }
+    }
+    function reset() {
+      localStorage.removeItem("logrisk.apiBase");
+      setAddress(DEPLOYMENT_API_BASE || (window.location.origin === "null" ? "" : window.location.origin));
+      setStatus("已恢复部署默认地址");
+      props.onSaved && props.onSaved();
+    }
+    return h(React.Fragment, null,
+      h("div", { className: "page-head" }, h("div", null, h("h1", null, "系统设置"), h("p", null, "配置前后端分离部署时使用的 LOGRISK 后端地址"))),
+      h("section", { className: "surface settings-panel" },
+        h("h2", null, "后端连接"),
+        h("p", null, "优先级：浏览器配置 → frontend/config.js → 当前页面同源地址。后端需将本页面来源加入 DASHBOARD_CORS_ORIGINS。"),
+        h("label", null, "后端 API 地址", h("input", { value: address, placeholder: "http://127.0.0.1:8080", onChange: function (event) { setAddress(event.target.value); } })),
+        h("div", { className: "button-row" },
+          h("button", { className: "secondary-button", onClick: function () { testAddress(false); } }, "测试连接"),
+          h("button", { className: "primary-button", onClick: function () { testAddress(true); } }, "测试并保存"),
+          h("button", { className: "text-button", onClick: reset }, "恢复默认")),
+        status && h("div", { className: "settings-status" }, status),
+        h("small", null, "当前生效地址：" + (currentApiBase() || "同源"))));
+  }
+
+  function DrainQualityPage(props) {
+    const data = props.data || { datasets: [], annotations: [], evalRuns: [], profiles: [], templates: [] };
+    const [tab, setTab] = useState("overview");
+    const latest = data.evalRuns[0] || {};
+    const labeled = latest.metrics && latest.metrics.labeled || {};
+    const unlabeled = latest.metrics && latest.metrics.unlabeled || {};
+    const templates = data.templates || [];
+    const suspicious = templates.filter(function (item) { return item.status !== "active" || (String(item.effective_template || "").match(/<[^>]+>/g) || []).length >= 2; });
+    function confirmedChange(item, action) {
+      if (!window.confirm("确认对模板 " + item.template_hash + " 执行“" + action + "”？此操作会写入审计历史。")) return;
+      const payload = { action: action, expected_version: item.version, confirmed: true, operator: "local-operator" };
+      if (action === "edit") {
+        const template = window.prompt("输入新的有效模板", item.effective_template);
+        if (!template) return;
+        payload.template = template;
+      }
+      if (action === "merge") {
+        const target = window.prompt("输入目标 template_hash", "");
+        if (!target) return;
+        payload.target_template_hash = target;
+      }
+      props.onTemplateChange(item.template_hash, payload);
+    }
+    function rollback(item) {
+      const version = Number(window.prompt("回滚到哪个版本？", "1"));
+      if (!version || !window.confirm("确认回滚模板？回滚也会新增一条审计事件。")) return;
+      props.onTemplateRollback(item.template_hash, { target_version: version, expected_version: item.version, confirmed: true, operator: "local-operator" });
+    }
+    const tabs = [["overview", "质量概览"], ["annotation", "标注工作台"], ["suspicious", "可疑模板"], ["compare", "配置对比"], ["templates", "模板管理"], ["release", "发布管理"]];
+    return h(React.Fragment, null,
+      h("div", { className: "page-head" }, h("div", null, h("h1", null, "评测中心 · 模板质量"), h("p", null, "评估 Drain3 分组、语义保留、稳定性及下游一致性")), h("div", { className: "button-row" }, h("button", { className: "secondary-button", onClick: props.onImport }, "导入当前结果模板"), h("button", { className: "primary-button", onClick: props.onRefresh }, "刷新"))),
+      h("nav", { className: "quality-tabs" }, tabs.map(function (item) { return h("button", { key: item[0], className: tab === item[0] ? "active" : "", onClick: function () { setTab(item[0]); } }, item[1]); })),
+      tab === "overview" && h(React.Fragment, null,
+        h("section", { className: "metrics-grid" },
+          h(Metric, { label: "Grouping F1", value: labeled.pairwise_grouping_f1 == null ? "—" : Math.round(labeled.pairwise_grouping_f1 * 1000) / 10 + "%", tone: "orange" }),
+          h(Metric, { label: "Over-merge", value: labeled.over_merge_rate == null ? "—" : Math.round(labeled.over_merge_rate * 1000) / 10 + "%" }),
+          h(Metric, { label: "Over-split", value: labeled.over_split_rate == null ? "—" : Math.round(labeled.over_split_rate * 1000) / 10 + "%" }),
+          h(Metric, { label: "Singleton", value: unlabeled.singleton_ratio == null ? "—" : Math.round(unlabeled.singleton_ratio * 1000) / 10 + "%" }),
+          h(Metric, { label: "Wildcard", value: unlabeled.wildcard_ratio == null ? "—" : Math.round(unlabeled.wildcard_ratio * 1000) / 10 + "%" }),
+          h(Metric, { label: "Churn", value: latest.metrics && latest.metrics.stability ? Math.round((latest.metrics.stability.template_churn || 0) * 1000) / 10 + "%" : "—" })),
+        h("section", { className: "surface" }, h("h2", null, "评测基线"), h("p", null, data.datasets.length + " 个 Gold Dataset · " + data.evalRuns.length + " 次评测 · " + templates.length + " 个受管模板"), !latest.run_id && h("div", { className: "empty-state" }, "创建 Gold Dataset 和评测任务后显示质量指标"))),
+      tab === "annotation" && h("section", { className: "quality-card-grid" }, templates.length === 0 && h("div", { className: "empty-state" }, "导入模板后开始人工标注"), templates.slice(0, 100).map(function (item) {
+        return h("article", { className: "surface template-card", key: item.template_hash }, h("div", { className: "surface-head" }, h("b", null, item.component), h("span", null, item.count + " 条")), h("code", null, item.effective_template), h("small", null, item.template_hash), h("div", { className: "button-row" }, h("button", { onClick: function () { props.onAnnotate({ cluster_id: item.template_hash, action: "accept", reviewer: "local-operator" }); } }, "接受当前簇"), h("button", { onClick: function () { props.onAnnotate({ cluster_id: item.template_hash, action: "ignore", reviewer: "local-operator" }); } }, "忽略"), h("button", { onClick: function () { confirmedChange(item, "edit"); } }, "编辑模板"), h("button", { onClick: function () { confirmedChange(item, "merge"); } }, "合并簇")));
+      })),
+      tab === "suspicious" && h("section", { className: "surface template-table" }, h("h2", null, "可疑模板"), h("p", null, "按高通配符、已忽略、已合并或软删除状态筛选。"), suspicious.length === 0 && h("div", { className: "empty-state" }, "暂无可疑模板"), suspicious.map(function (item) { return h("div", { className: "template-row", key: item.template_hash }, h("b", null, item.component), h("code", null, item.effective_template), h("span", null, item.status), h("span", null, "v" + item.version)); })),
+      tab === "compare" && h("section", { className: "profile-compare" }, (data.profiles || []).map(function (profile) { return h("article", { className: "surface", key: profile.profile_id }, h("h3", null, profile.name), h("span", { className: "status-chip " + profile.status }, profile.status), h(CodeBlock, { value: profile.parameters })); })),
+      tab === "templates" && h("section", { className: "surface template-table" }, h("div", { className: "surface-head" }, h("b", null, "Drain3 模板管理"), h("span", null, templates.length + " 个模板")), templates.length === 0 && h("div", { className: "empty-state" }, "导入分析结果中的脱敏模板后进行管理"), templates.map(function (item) { return h("div", { className: "template-row managed", key: item.template_hash }, h("div", null, h("b", null, item.component + " · " + item.status), h("small", null, item.template_hash + " · v" + item.version + " · " + item.count + " 条")), h("code", null, item.effective_template), item.original_template !== item.effective_template && h("small", null, "原始：" + item.original_template), h("div", { className: "button-row" }, h("button", { onClick: function () { confirmedChange(item, "edit"); } }, "编辑"), h("button", { onClick: function () { confirmedChange(item, "merge"); } }, "合并"), h("button", { onClick: function () { confirmedChange(item, item.status === "ignored" || item.status === "deleted" ? "restore" : "ignore"); } }, item.status === "ignored" || item.status === "deleted" ? "恢复" : "忽略"), h("button", { className: "danger-button", onClick: function () { confirmedChange(item, "delete"); } }, "软删除"), h("button", { onClick: function () { rollback(item); } }, "版本回滚"))); })),
+      tab === "release" && h("section", { className: "profile-compare" }, (data.profiles || []).map(function (profile) { return h("article", { className: "surface", key: profile.profile_id }, h("h3", null, profile.name), h("p", null, "状态：" + profile.status + "。发布仅记录人工决策，不自动修改生产 Drain3 配置。"), h("div", { className: "button-row" }, h("button", { className: "primary-button", onClick: function () { if (window.confirm("确认发布 Profile " + profile.profile_id + "？")) props.onProfile(profile.profile_id, "promote"); } }, "确认发布"), h("button", { onClick: function () { if (window.confirm("确认回滚 Profile " + profile.profile_id + "？")) props.onProfile(profile.profile_id, "rollback"); } }, "回滚"))); })));
+  }
+
   function App() {
     const [view, setView] = useState(pathToView(window.location.pathname)), [model, setModel] = useState("qwen3:1.7b"), [threshold, setThreshold] = useState(40), [promptId, setPromptId] = useState("feature_extract_v3_compact_strict_json_en"), [retryCount, setRetryCount] = useState(1);
     const [ollama, setOllama] = useState({ online: false }), [result, setResult] = useState(null), [fileName, setFileName] = useState("");
@@ -565,6 +669,7 @@
     const [selectedTemplate, setSelectedTemplate] = useState(null);
     const [ruleFocus, setRuleFocus] = useState("");
     const [uploadProgress, setUploadProgress] = useState(null), [preprocessProgress, setPreprocessProgress] = useState(null);
+    const [drainQuality, setDrainQuality] = useState({ datasets: [], annotations: [], evalRuns: [], profiles: [], templates: [] });
     const events = useRef(null);
     const selected = useMemo(function () { return snapshot && snapshot.features && snapshot.features.find(function (feature) { return feature.candidate_id === selectedId; }) || null; }, [snapshot, selectedId]);
     useEffect(function () {
@@ -577,6 +682,7 @@
     function changeView(next) {
       setView(next);
       history.pushState({}, "", routeForView(next));
+      if (next === "drainQuality") loadDrainQuality().catch(function (reason) { setError(reason.message); });
     }
     function applyTraceFilters(next) {
       const query = traceFilterQuery(next);
@@ -586,6 +692,10 @@
       loadHarness(query).catch(function (reason) { setError(reason.message); });
     }
     async function loadHarness(query) { const values = await Promise.all([api.harnessStatus(), api.prompts(), api.traces(query || "?limit=50"), api.modelProfiles()]); setHarness(values[0]); setPrompts(values[1].items || []); setPromptId(values[1].current_prompt_id || "feature_extract_v3_compact_strict_json_en"); setTraces(values[2].items || []); setModelProfiles(values[3]); setModelProfileId(function (current) { return current || values[3].default_profile_id || ""; }); }
+    async function loadDrainQuality() {
+      const values = await Promise.all([api.drainDatasets(), api.drainAnnotations(), api.drainEvalRuns(), api.drainProfiles(), api.drainTemplates()]);
+      setDrainQuality({ datasets: values[0].items || [], annotations: values[1].items || [], annotationState: values[1].state || {}, evalRuns: values[2].items || [], profiles: values[3].items || [], templates: values[4].items || [] });
+    }
     async function loadObservability(id) {
       const summary = await api.observabilitySummary();
       const target = id || new URLSearchParams(window.location.search).get("job_id") || summary.current_job_id;
@@ -598,8 +708,8 @@
     async function refresh(id) { const next = await api.job(id || jobId); setSnapshot(next); if (["completed", "completed_with_errors"].includes(next.status) && events.current) events.current.close(); loadHarness().catch(function () {}); }
     useEffect(function () {
       const query = window.location.pathname === "/ai-traces" ? traceFilterQuery(traceFiltersFromSearch(window.location.search)) : "?limit=50";
-      Promise.all([api.config(), api.status(), api.rules(), api.metrics(), api.harnessStatus(), api.prompts(), api.traces(query), api.modelProfiles()]).then(function (values) { setModel(values[0].default_model); setOllama(values[1]); setRules(values[2].rules || []); setSystemMetrics(values[3]); setHarness(values[4]); setPrompts(values[5].items || []); setPromptId(values[5].current_prompt_id || values[4].current_prompt_id || "feature_extract_v3_compact_strict_json_en"); setTraces(values[6].items || []); setModelProfiles(values[7]); setModelProfileId(values[7].default_profile_id || ""); if (window.location.pathname === "/ai-observability") loadObservability().catch(function (reason) { setError(reason.message); }); }).catch(function (reason) { setError(reason.message); });
-      function onPop() { const filters = traceFiltersFromSearch(window.location.search); setView(pathToView(window.location.pathname)); setTraceFilters(filters); if (window.location.pathname === "/ai-traces") loadHarness(traceFilterQuery(filters)).catch(function () {}); if (window.location.pathname === "/ai-observability") loadObservability().catch(function () {}); }
+      Promise.all([api.config(), api.status(), api.rules(), api.metrics(), api.harnessStatus(), api.prompts(), api.traces(query), api.modelProfiles()]).then(function (values) { setModel(values[0].default_model); setOllama(values[1]); setRules(values[2].rules || []); setSystemMetrics(values[3]); setHarness(values[4]); setPrompts(values[5].items || []); setPromptId(values[5].current_prompt_id || values[4].current_prompt_id || "feature_extract_v3_compact_strict_json_en"); setTraces(values[6].items || []); setModelProfiles(values[7]); setModelProfileId(values[7].default_profile_id || ""); if (window.location.pathname === "/ai-observability") loadObservability().catch(function (reason) { setError(reason.message); }); if (window.location.pathname === "/drain-quality") loadDrainQuality().catch(function (reason) { setError(reason.message); }); }).catch(function (reason) { setError(reason.message); });
+      function onPop() { const filters = traceFiltersFromSearch(window.location.search); setView(pathToView(window.location.pathname)); setTraceFilters(filters); if (window.location.pathname === "/ai-traces") loadHarness(traceFilterQuery(filters)).catch(function () {}); if (window.location.pathname === "/ai-observability") loadObservability().catch(function () {}); if (window.location.pathname === "/drain-quality") loadDrainQuality().catch(function () {}); }
       window.addEventListener("popstate", onPop);
       return function () { window.removeEventListener("popstate", onPop); if (events.current) events.current.close(); };
     }, []);
@@ -621,6 +731,15 @@
     function openTraceList(query) { const filters = traceFiltersFromSearch(query || ""); applyTraceFilters(filters); }
     function openObservability(id) { setView("observability"); history.pushState({}, "", "/ai-observability" + (id ? "?job_id=" + encodeURIComponent(id) : "")); loadObservability(id).catch(function (reason) { setError(reason.message); }); }
     function openRule(ruleId) { setDrawer({ type: null, item: null }); setRuleFocus(ruleId); changeView("rules"); }
+    async function importCurrentTemplates() {
+      const templates = (result && result.top_templates || []).map(function (item) { return { template_hash: item.template_hash, template: item.template, component: item.component, count: item.count || 0, risk_levels: item.risk_levels || [] }; }).filter(function (item) { return item.template_hash && item.template; });
+      if (!templates.length) { setError("当前分析结果没有可导入的 Drain3 模板"); return; }
+      try { await api.importDrainTemplates(templates); await loadDrainQuality(); } catch (reason) { setError(reason.message); }
+    }
+    async function annotateTemplate(payload) { try { await api.annotateDrainTemplate(payload); await loadDrainQuality(); } catch (reason) { setError(reason.message); } }
+    async function changeTemplate(templateHash, payload) { try { await api.changeDrainTemplate(templateHash, payload); await loadDrainQuality(); } catch (reason) { setError(reason.message); } }
+    async function rollbackTemplate(templateHash, payload) { try { await api.rollbackDrainTemplate(templateHash, payload); await loadDrainQuality(); } catch (reason) { setError(reason.message); } }
+    async function changeDrainProfile(profileId, action) { try { await api.promoteDrainProfile(profileId, action, { confirmed: true, reviewer: "local-operator" }); await loadDrainQuality(); } catch (reason) { setError(reason.message); } }
     const workspace = h(Workspace, { snapshot: snapshot, selectedId: selectedId, onSelect: setSelectedId, onRetry: retry, onOpenTraces: openTraceList, onOpenObservability: openObservability });
     const activePrompts = prompts.filter(function (prompt) { return prompt.analysis_type === "feature_extract" && prompt.status === "active"; });
     const activeProfiles = modelProfiles.profiles || [];
@@ -644,6 +763,8 @@
           h(FeatureEvidence, { feature: selected, onSelectTemplate: setSelectedTemplate }),
           h(ReviewEditor, { feature: selected, selectedTemplate: selectedTemplate, onSave: save, onOpenTrace: openTrace })),
         view === "rules" && h(RuleLibrary, { rules: rules, focusRuleId: ruleFocus, onOpenTrace: openTrace }),
+        view === "drainQuality" && h(DrainQualityPage, { data: drainQuality, onRefresh: loadDrainQuality, onImport: importCurrentTemplates, onAnnotate: annotateTemplate, onTemplateChange: changeTemplate, onTemplateRollback: rollbackTemplate, onProfile: changeDrainProfile }),
+        view === "settings" && h(BackendSettings, { onSaved: function () { setError(""); } }),
         view === "export" && h("section", { className: "surface export-surface" }, h("h2", null, "导出记录"), h("p", null, "导出包只包含人工批准或历史规则复用的脱敏特征，不包含原始日志和 RCA 结论。"), h("button", { className: "primary-button", disabled: !jobId || !(snapshot && snapshot.features || []).some(function (feature) { return feature.status === "approved"; }), onClick: function () { api.exportApproved(jobId).catch(function (reason) { setError(reason.message); }); } }, "导出已批准特征 JSON"))),
       h(Drawer, { title: drawer.type === "prompt" ? "Prompt 详情" : "Trace 详情", subtitle: drawer.item && (drawer.item.prompt_id || drawer.item.trace_id), item: drawer.item, onClose: function () { setDrawer({ type: null, item: null }); } }, drawerContent));
   }

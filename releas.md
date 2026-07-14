@@ -6,6 +6,27 @@
 - 仅修复 Bug 时提升最后一位，例如 `1.2.0 → 1.2.1`；
 - 每次代码更新必须同步更新本文件。
 
+## 1.17.0 - 2026-07-14
+
+### Added
+
+- 新增 M11 Drain Template Quality Center，支持 Gold Dataset、人工簇标注与复核、有标签/无标签/稳定性/下游/性能指标以及 Profile 对比。
+- 新增 kernel、kubelet、containerd、audit、podlog 五类候选 Drain3 Profile，并提供带硬门槛的 Grid Search 排序基础能力。
+- 新增版本化 Drain3 模板治理：编辑、忽略、合并、恢复、软删除、历史和回滚均保留追加式审计记录。
+- 新增“评测中心 · 模板质量”和“系统设置”页面，覆盖质量概览、标注工作台、可疑模板、配置对比、模板管理和发布管理。
+- 前端支持连接任意 HTTP/HTTPS LOGRISK 后端；可通过 `frontend/dist/config.js` 设置部署默认值，或在浏览器中测试并保存覆盖地址。
+- Dashboard 新增 `/api/health`、Drain Quality API、可配置 CORS 和跨域预检支持。
+
+### Changed
+
+- Dashboard 分析结果自动登记脱敏 Drain3 模板，并应用当前模板覆盖版本；原始模板和 `template_hash` 始终保留。
+- Profile promote/rollback 仅记录人工治理决策，不自动改写生产 Drain3 配置。
+
+### Security
+
+- CORS 默认不向未知来源开放，分离部署必须显式配置 `DASHBOARD_CORS_ORIGINS`。
+- 模板治理不保存原始日志；生产有效变更要求人工确认和乐观版本校验。
+
 ## 1.16.2 - 2026-07-13
 
 ### Fixed

@@ -1,10 +1,14 @@
 # 日志风险特征分析与审批系统
 
-当前版本：`1.17.1`。变更记录见 [`releas.md`](releas.md)。
+当前版本：`1.18.0`。变更记录见 [`releas.md`](releas.md)。
 
 AI Harness 路线图 M1–M10 已完成；Phase 2 M11 新增 Drain Template Quality Center、Gold Dataset、模板治理和前后端分离部署能力。
 
 M11 质量中心采用统一的橙色白底工作台设计：标注工作台为“模板队列 + 审核详情”，配置对比按字段并排展示参数差异，模板管理提供搜索筛选，发布管理展示人工治理阶段。系统设置使用同一组件规范，并避免重复显示工作台标题。
+
+1.18.0 在质量中心增加 Drain3 配置治理：系统将 `configs/drain3_recommended.ini` 作为只读基线，可复制为候选版本后编辑算法参数、脱敏规则或完整 INI。候选配置需要先完成配置校验，再关联相同配置 ID、版本和 Hash 的 Gold Dataset 评测；关键风险召回率必须达到 100%，过度合并率和正常日志误报率均不得超过 2%，最后由人工确认发布。
+
+候选版本保存在 `state/drain_quality/configs/`，目录信息保存在 `state/drain_quality/config_catalog.json`，当前活动指针保存在 `state/drain_quality/active_config.json`，发布及回滚事件保存在 `state/drain_quality/config_events.jsonl`。发布不会覆盖基线文件，只影响发布后新建的普通或大文件分析任务；运行中的任务继续使用创建时锁定的配置版本。可在 [质量中心](http://127.0.0.1:8080/drain-quality) 的“Drain3 配置”页管理和回滚。
 
 本项目在本机完成日志规范化、Drain3 模板化、风险评分、规则复用、Ollama 特征识别与人工审批。项目不实现 RCA；原始日志不会直接发送给 Ollama。
 

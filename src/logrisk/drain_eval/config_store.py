@@ -88,8 +88,18 @@ class DrainConfigStore:
             if not minimum <= value <= maximum:
                 raise DrainQualityError(f"{name} 必须在 {minimum:g}–{maximum:g} 之间")
             parameters[name] = value
-        parameters["parametrize_numeric_tokens"] = drain.getboolean("parametrize_numeric_tokens", fallback=True)
-        parameters["extra_delimiters"] = drain.get("extra_delimiters", fallback='["="]')
+        try:
+            parameters["parametrize_numeric_tokens"] = drain.getboolean("parametrize_numeric_tokens", fallback=True)
+        except ValueError as exc:
+            raise DrainQualityError("parametrize_numeric_tokens 必须是布尔值") from exc
+        raw_delimiters = drain.get("extra_delimiters", fallback='["="]')
+        try:
+            delimiters = json.loads(raw_delimiters)
+        except json.JSONDecodeError as exc:
+            raise DrainQualityError("extra_delimiters 必须是 JSON 字符串数组") from exc
+        if not isinstance(delimiters, list) or not all(isinstance(item, str) and item for item in delimiters):
+            raise DrainQualityError("extra_delimiters 必须是 JSON 字符串数组")
+        parameters["extra_delimiters"] = raw_delimiters
         if parser.has_section("SNAPSHOT"):
             parameters["snapshot_interval_minutes"] = parser.getint("SNAPSHOT", "snapshot_interval_minutes", fallback=5)
             parameters["compress_state"] = parser.getboolean("SNAPSHOT", "compress_state", fallback=True)
@@ -135,6 +145,7 @@ class DrainConfigStore:
             "ini_content": content,
             "created_at": metadata.get("created_at"),
             "created_by": metadata.get("created_by"),
+            "available_versions": sorted(int(item["version"]) for item in metadata.get("versions", [])) or [version],
         }
 
     def _baseline(self) -> dict[str, Any]:

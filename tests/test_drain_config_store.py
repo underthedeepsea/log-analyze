@@ -28,6 +28,7 @@ def test_baseline_is_read_only_and_candidate_versions_are_append_only(tmp_path):
     assert baseline["path"] == str(BASELINE)
     assert candidate["version"] == 1
     assert changed["version"] == 2
+    assert changed["available_versions"] == [1, 2]
     assert store.get_version(candidate["config_id"], 1)["parameters"]["sim_th"] == 0.40
     assert store.get_version(candidate["config_id"], 2)["parameters"]["sim_th"] == 0.45
     with pytest.raises(DrainQualityError, match="基线"):
@@ -42,6 +43,11 @@ def test_rejects_invalid_parameter_masking_json_and_regex(tmp_path):
         store.save_version(candidate["config_id"], {
             "expected_version": 1,
             "ini_content": candidate["ini_content"].replace("sim_th = 0.40", "sim_th = 1.50"),
+        })
+    with pytest.raises(DrainQualityError, match="extra_delimiters"):
+        store.save_version(candidate["config_id"], {
+            "expected_version": 1,
+            "ini_content": candidate["ini_content"].replace('extra_delimiters = ["=", ":"]', "extra_delimiters = broken"),
         })
     with pytest.raises(DrainQualityError, match="masking"):
         store.save_version(candidate["config_id"], {

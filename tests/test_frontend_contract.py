@@ -95,6 +95,8 @@ def test_drain_config_governance_ui_contract():
         "脱敏规则",
         "INI 原文",
         "readIniValue(draft",
+        "drainConfigVersion",
+        "available_versions",
     ):
         assert text in source
 
@@ -272,7 +274,9 @@ def test_release_docs_describe_current_feature_version():
     assert "## 1.16.2 - 2026-07-13" in release
     assert "## 1.17.0 - 2026-07-14" in release
     assert "## 1.17.1 - 2026-07-14" in release
-    assert "当前版本：`1.17.1`" in readme
+    assert "## 1.18.0 - 2026-07-15" in release
+    assert "当前版本：`1.18.0`" in readme
+    assert "state/drain_quality/active_config.json" in readme
     assert "Every code update must also update `releas.md`" in agents
     assert "dashboard.sh restart" in readme
     assert ".txt" in readme

@@ -87,6 +87,9 @@ class TemplateStore:
             if current:
                 current["count"] = int(source.get("count") or current.get("count") or 0)
                 current["risk_levels"] = list(source.get("risk_levels") or current.get("risk_levels") or [])
+                for field in ("template_fingerprint", "semantic_fields", "semantic_tags", "typed_parameters", "semantic_dictionary_versions", "semantic_extractor_version"):
+                    if field in source:
+                        current[field] = source[field]
                 current["updated_at"] = now_iso()
                 imported.append(current)
                 continue
@@ -99,6 +102,12 @@ class TemplateStore:
                 "component": str(source.get("component") or "unknown"),
                 "count": int(source.get("count") or 0),
                 "risk_levels": list(source.get("risk_levels") or []),
+                "template_fingerprint": source.get("template_fingerprint"),
+                "semantic_fields": source.get("semantic_fields") or {},
+                "semantic_tags": source.get("semantic_tags") or [],
+                "typed_parameters": source.get("typed_parameters") or [],
+                "semantic_dictionary_versions": source.get("semantic_dictionary_versions") or {},
+                "semantic_extractor_version": source.get("semantic_extractor_version"),
                 "status": "active",
                 "merged_into": None,
                 "version": 1,
@@ -129,6 +138,46 @@ class TemplateStore:
         if not item:
             raise DrainQualityError("模板不存在")
         return item
+
+    @synchronized
+    def semantic_summary(self, template_fingerprint: str) -> dict[str, Any]:
+        matches = [
+            item for item in self._catalog()["items"].values()
+            if item.get("template_fingerprint") == template_fingerprint
+        ]
+        if not matches:
+            raise DrainQualityError("模板语义摘要不存在")
+        fields: dict[str, dict[str, dict[str, Any]]] = {}
+        tags: set[str] = set()
+        typed: dict[tuple[str, str], dict[str, Any]] = {}
+        versions: dict[str, Any] = {}
+        for item in matches:
+            tags.update(str(tag) for tag in item.get("semantic_tags") or [])
+            versions.update(item.get("semantic_dictionary_versions") or {})
+            for field, values in (item.get("semantic_fields") or {}).items():
+                bucket = fields.setdefault(field, {})
+                for value in values if isinstance(values, list) else []:
+                    key = repr(value.get("value"))
+                    entry = bucket.setdefault(key, {"value": value.get("value"), "count": 0})
+                    entry["count"] += int(value.get("count") or 0)
+            for parameter in item.get("typed_parameters") or []:
+                key = (str(parameter.get("field") or ""), str(parameter.get("typed_mask") or ""))
+                if not all(key):
+                    continue
+                entry = typed.setdefault(key, {"field": key[0], "typed_mask": key[1], "count": 0})
+                entry["count"] += int(parameter.get("count") or 0)
+        return {
+            "schema_version": "template_semantic_summary_v1",
+            "template_fingerprint": template_fingerprint,
+            "template_count": len(matches),
+            "semantic_fields": {
+                field: sorted(bucket.values(), key=lambda value: (-value["count"], str(value["value"])))[:20]
+                for field, bucket in sorted(fields.items())
+            },
+            "semantic_tags": sorted(tags),
+            "typed_parameters": sorted(typed.values(), key=lambda value: (value["field"], value["typed_mask"])),
+            "semantic_dictionary_versions": versions,
+        }
 
     @synchronized
     def change_template(self, template_hash: str, payload: Any) -> dict[str, Any]:

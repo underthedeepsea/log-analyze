@@ -25,6 +25,7 @@ class InputJobStore:
         filename: str,
         source_path: str,
         drain_config: dict[str, Any] | None = None,
+        semantic_snapshot: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         input_job_id = "input_job_" + uuid.uuid4().hex
         self.root(input_job_id).mkdir(parents=True, exist_ok=False)
@@ -48,6 +49,9 @@ class InputJobStore:
                 "drain_config_hash": drain_config["content_hash"],
                 "drain_config_path": drain_config["path"],
             })
+        if semantic_snapshot:
+            job["semantic_dictionary_snapshot"] = semantic_snapshot
+            job["semantic_dictionary_versions"] = semantic_snapshot.get("versions", {})
         self.write_job(input_job_id, job)
         self.write_progress(input_job_id, {"input_job_id": input_job_id, "status": "queued", "stage": "queued", "progress": 0.0})
         return job

@@ -26,6 +26,8 @@ from logrisk.input_jobs import InputJobConfig, InputJobStore
 from logrisk.input_parser import parse_log_content
 from logrisk.large_file_pipeline import run_large_file_pipeline
 from logrisk.processing_metrics import ProcessingMetricsError, ProcessingMetricsStore
+from logrisk.semantic.schema import SemanticValidationError
+from logrisk.semantic.store import SemanticDictionaryStore
 from logrisk.upload_sessions import UploadConfig, UploadSessionStore
 from pipeline.manual_import_pipeline import analyze_records
 
@@ -60,6 +62,7 @@ def build_server(
     default_timeout: float = 120,
     input_analyzer: Callable[[list[dict[str, Any]]], dict[str, Any]] | None = None,
     drain_quality_root: str | Path | None = None,
+    semantic_root: str | Path | None = None,
     cors_origins: list[str] | tuple[str, ...] | set[str] | None = None,
 ) -> DashboardHTTPServer:
     root = Path(__file__).resolve().parents[2]
@@ -83,6 +86,10 @@ def build_server(
         drain_quality_root or state_root / "drain_quality",
         root / "configs" / "drain3_profiles",
         root / "configs" / "drain3_recommended.ini",
+    )
+    server.semantic_dictionaries = SemanticDictionaryStore(  # type: ignore[attr-defined]
+        semantic_root or state_root / "semantic_dictionaries",
+        root / "configs" / "semantic_dictionary",
     )
     configured_origins = cors_origins if cors_origins is not None else os.getenv("DASHBOARD_CORS_ORIGINS", "").split(",")
     server.cors_origins = {str(origin).strip().rstrip("/") for origin in configured_origins if str(origin).strip()}  # type: ignore[attr-defined]
@@ -115,13 +122,18 @@ def build_server(
     server.govern_drain_result = govern_drain_result  # type: ignore[attr-defined]
     analysis_lock = threading.Lock()
 
-    def default_input_analyzer(records: list[dict[str, Any]], config_path: str | Path | None = None) -> dict[str, Any]:
+    def default_input_analyzer(
+        records: list[dict[str, Any]],
+        config_path: str | Path | None = None,
+        semantic_snapshot: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         with analysis_lock:
             return analyze_records(
                 records,
                 config_path=str(config_path or root / "configs" / "drain3_recommended.ini"),
                 rules_path=str(root / "configs" / "risk_rules.yaml"),
                 state_dir=str(state_root / "dashboard_drain3"),
+                semantic_snapshot=semantic_snapshot,
             )
 
     server.input_analyzer = input_analyzer or default_input_analyzer  # type: ignore[attr-defined]
@@ -141,6 +153,7 @@ def build_server(
                 rules_path=root / "configs" / "risk_rules.yaml",
                 state_dir=state_root / "dashboard_drain3_large" / input_job_id,
                 progress_callback=lambda progress: store.write_progress(input_job_id, progress),
+                semantic_snapshot=job.get("semantic_dictionary_snapshot"),
             )
             result = server.govern_drain_result(result)  # type: ignore[attr-defined]
             store.write_result(input_job_id, result)
@@ -280,6 +293,29 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "active": self.server.drain_quality.configs.active_snapshot(),  # type: ignore[attr-defined]
                 })
                 return
+            if path == "/api/semantic/dictionaries":
+                self._json(HTTPStatus.OK, {
+                    "schema_version": "semantic_dictionary_list_v1",
+                    "items": self.server.semantic_dictionaries.list_dictionaries(),  # type: ignore[attr-defined]
+                    "active": self.server.semantic_dictionaries.active_snapshot()["versions"],  # type: ignore[attr-defined]
+                })
+                return
+            match = re.fullmatch(r"/api/semantic/dictionaries/([A-Za-z0-9_-]+)", path)
+            if match:
+                items = self.server.semantic_dictionaries.list_dictionaries()  # type: ignore[attr-defined]
+                item = next((entry for entry in items if entry["dictionary_id"] == match.group(1)), None)
+                if item is None:
+                    raise SemanticValidationError("语义词典不存在")
+                self._json(HTTPStatus.OK, item)
+                return
+            match = re.fullmatch(r"/api/semantic/dictionaries/([A-Za-z0-9_-]+)/versions/(\d+)", path)
+            if match:
+                self._json(HTTPStatus.OK, self.server.semantic_dictionaries.get_version(match.group(1), int(match.group(2))))  # type: ignore[attr-defined]
+                return
+            match = re.fullmatch(r"/api/templates/([^/]+)/semantic-summary", path)
+            if match:
+                self._json(HTTPStatus.OK, self.server.drain_quality.templates.semantic_summary(unquote(match.group(1))))  # type: ignore[attr-defined]
+                return
             match = re.fullmatch(r"/api/drain-quality/configs/([A-Za-z0-9_-]+)/versions/(\d+)", path)
             if match:
                 self._json(HTTPStatus.OK, self.server.drain_quality.configs.get_version(match.group(1), int(match.group(2))))  # type: ignore[attr-defined]
@@ -363,7 +399,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._serve_events(match.group(1), max(0, cursor))
                 return
             self._json(HTTPStatus.NOT_FOUND, {"error": "资源不存在"})
-        except (FeatureJobError, ApprovedRuleError, ProcessingMetricsError, DrainQualityError) as exc:
+        except (FeatureJobError, ApprovedRuleError, ProcessingMetricsError, DrainQualityError, SemanticValidationError) as exc:
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
         except (TypeError, ValueError) as exc:
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
@@ -399,6 +435,31 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/drain-quality/configs":
                 self._json(HTTPStatus.CREATED, self.server.drain_quality.configs.create_candidate(payload))  # type: ignore[attr-defined]
+                return
+            match = re.fullmatch(r"/api/semantic/dictionaries/([A-Za-z0-9_-]+)/candidates", path)
+            if match:
+                self._json(HTTPStatus.CREATED, self.server.semantic_dictionaries.create_candidate(match.group(1), payload))  # type: ignore[attr-defined]
+                return
+            match = re.fullmatch(r"/api/semantic/dictionaries/([A-Za-z0-9_-]+)/candidates/(\d+)/(validate|publish)", path)
+            if match:
+                version = int(match.group(2))
+                result = (
+                    self.server.semantic_dictionaries.validate_version(match.group(1), version)  # type: ignore[attr-defined]
+                    if match.group(3) == "validate"
+                    else self.server.semantic_dictionaries.publish(match.group(1), version, payload)  # type: ignore[attr-defined]
+                )
+                self._json(HTTPStatus.OK, result)
+                return
+            match = re.fullmatch(r"/api/semantic/dictionaries/([A-Za-z0-9_-]+)/rollback", path)
+            if match:
+                if not isinstance(payload, dict):
+                    raise SemanticValidationError("请求体必须是 object")
+                self._json(HTTPStatus.OK, self.server.semantic_dictionaries.rollback(  # type: ignore[attr-defined]
+                    match.group(1), int(payload.get("version") or 0), payload,
+                ))
+                return
+            if path == "/api/semantic/test":
+                self._json(HTTPStatus.OK, self.server.semantic_dictionaries.test_snapshot(payload))  # type: ignore[attr-defined]
                 return
             match = re.fullmatch(r"/api/drain-quality/configs/([A-Za-z0-9_-]+)/versions", path)
             if match:
@@ -455,13 +516,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     raise FeatureJobError("上传内容必须是 UTF-8 文本")
                 records = parse_log_content(filename.strip(), content)
                 drain_config = self.server.drain_quality.configs.active_snapshot()  # type: ignore[attr-defined]
-                analyzed = self.server.input_analyzer(records, drain_config["path"]) if self.server.input_analyzer_accepts_config else self.server.input_analyzer(records)  # type: ignore[attr-defined]
+                semantic_snapshot = self.server.semantic_dictionaries.active_snapshot()  # type: ignore[attr-defined]
+                analyzed = self.server.input_analyzer(records, drain_config["path"], semantic_snapshot) if self.server.input_analyzer_accepts_config else self.server.input_analyzer(records)  # type: ignore[attr-defined]
                 result = self.server.govern_drain_result(analyzed)  # type: ignore[attr-defined]
                 self._json(HTTPStatus.OK, {"result": result, "drain_config": {
                     "config_id": drain_config["config_id"],
                     "version": drain_config["version"],
                     "content_hash": drain_config["content_hash"],
-                }})
+                }, "semantic_dictionaries": semantic_snapshot["versions"]})
                 return
             if path == "/api/uploads":
                 if not isinstance(payload, dict):
@@ -496,6 +558,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     filename=str(payload.get("filename") or manifest.get("safe_filename") or "upload.log"),
                     source_path=str(self.server.upload_store.source_path(upload_id)),  # type: ignore[attr-defined]
                     drain_config=self.server.drain_quality.configs.active_snapshot(),  # type: ignore[attr-defined]
+                    semantic_snapshot=self.server.semantic_dictionaries.active_snapshot(),  # type: ignore[attr-defined]
                 )
                 threading.Thread(target=self.server.run_input_job, args=(job["input_job_id"],), daemon=True).start()  # type: ignore[attr-defined]
                 self._json(HTTPStatus.ACCEPTED, job)
@@ -537,7 +600,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 )
                 return
             self._json(HTTPStatus.NOT_FOUND, {"error": "资源不存在"})
-        except (FeatureJobError, ApprovedRuleError, ProcessingMetricsError, DrainQualityError) as exc:
+        except (FeatureJobError, ApprovedRuleError, ProcessingMetricsError, DrainQualityError, SemanticValidationError) as exc:
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
         except (TypeError, ValueError) as exc:
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
@@ -545,6 +608,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def do_PUT(self) -> None:
         path, _ = self._route_parts()
         try:
+            semantic_match = re.fullmatch(r"/api/semantic/dictionaries/([A-Za-z0-9_-]+)/candidates/(\d+)", path)
+            if semantic_match:
+                payload = self._read_json()
+                if not isinstance(payload, dict):
+                    raise SemanticValidationError("请求体必须是 object")
+                payload = dict(payload, expected_version=int(semantic_match.group(2)))
+                self._json(HTTPStatus.CREATED, self.server.semantic_dictionaries.save_version(semantic_match.group(1), payload))  # type: ignore[attr-defined]
+                return
             match = re.fullmatch(r"/api/uploads/([A-Za-z0-9_-]+)/chunks/([0-9]+)", path)
             if not match:
                 self._json(HTTPStatus.NOT_FOUND, {"error": "资源不存在"})
@@ -566,7 +637,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 "total_chunks": total,
                 "progress": received / total if total else 1.0,
             })
-        except (FeatureJobError, DrainQualityError, KeyError, ValueError, OSError) as exc:
+        except (FeatureJobError, DrainQualityError, SemanticValidationError, KeyError, ValueError, OSError) as exc:
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
 
     def do_PATCH(self) -> None:

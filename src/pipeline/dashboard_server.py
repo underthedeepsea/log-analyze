@@ -82,6 +82,7 @@ def build_server(
     server.drain_quality = DrainQualityService(  # type: ignore[attr-defined]
         drain_quality_root or state_root / "drain_quality",
         root / "configs" / "drain3_profiles",
+        root / "configs" / "drain3_recommended.ini",
     )
     configured_origins = cors_origins if cors_origins is not None else os.getenv("DASHBOARD_CORS_ORIGINS", "").split(",")
     server.cors_origins = {str(origin).strip().rstrip("/") for origin in configured_origins if str(origin).strip()}  # type: ignore[attr-defined]
@@ -114,16 +115,17 @@ def build_server(
     server.govern_drain_result = govern_drain_result  # type: ignore[attr-defined]
     analysis_lock = threading.Lock()
 
-    def default_input_analyzer(records: list[dict[str, Any]]) -> dict[str, Any]:
+    def default_input_analyzer(records: list[dict[str, Any]], config_path: str | Path | None = None) -> dict[str, Any]:
         with analysis_lock:
             return analyze_records(
                 records,
-                config_path=str(root / "configs" / "drain3_recommended.ini"),
+                config_path=str(config_path or root / "configs" / "drain3_recommended.ini"),
                 rules_path=str(root / "configs" / "risk_rules.yaml"),
                 state_dir=str(state_root / "dashboard_drain3"),
             )
 
     server.input_analyzer = input_analyzer or default_input_analyzer  # type: ignore[attr-defined]
+    server.input_analyzer_accepts_config = input_analyzer is None  # type: ignore[attr-defined]
 
     def run_input_job(input_job_id: str) -> None:
         store = server.input_jobs  # type: ignore[attr-defined]
@@ -135,7 +137,7 @@ def build_server(
                 input_job_id=input_job_id,
                 input_path=job["source_path"],
                 filename=job["filename"],
-                config_path=root / "configs" / "drain3_recommended.ini",
+                config_path=job.get("drain_config_path") or root / "configs" / "drain3_recommended.ini",
                 rules_path=root / "configs" / "risk_rules.yaml",
                 state_dir=state_root / "dashboard_drain3_large" / input_job_id,
                 progress_callback=lambda progress: store.write_progress(input_job_id, progress),
@@ -239,7 +241,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 })
                 return
             if path == "/api/health":
-                self._json(HTTPStatus.OK, {"schema_version": "logrisk_health_v1", "service": "logrisk-dashboard", "status": "ok", "version": "1.17.1"})
+                self._json(HTTPStatus.OK, {"schema_version": "logrisk_health_v1", "service": "logrisk-dashboard", "status": "ok", "version": "1.18.0"})
                 return
             if path == "/api/drain-quality/datasets":
                 self._json(HTTPStatus.OK, {"schema_version": "drain_dataset_list_v1", "items": self.server.drain_quality.datasets.list()})  # type: ignore[attr-defined]
@@ -270,6 +272,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/drain-quality/profiles":
                 self._json(HTTPStatus.OK, {"schema_version": "drain_profile_list_v1", "items": self.server.drain_quality.list_profiles()})  # type: ignore[attr-defined]
+                return
+            if path == "/api/drain-quality/configs":
+                self._json(HTTPStatus.OK, {
+                    "schema_version": "drain_config_list_v1",
+                    "items": self.server.drain_quality.configs.list_configs(),  # type: ignore[attr-defined]
+                    "active": self.server.drain_quality.configs.active_snapshot(),  # type: ignore[attr-defined]
+                })
+                return
+            match = re.fullmatch(r"/api/drain-quality/configs/([A-Za-z0-9_-]+)/versions/(\d+)", path)
+            if match:
+                self._json(HTTPStatus.OK, self.server.drain_quality.configs.get_version(match.group(1), int(match.group(2))))  # type: ignore[attr-defined]
                 return
             if path == "/api/drain-quality/templates":
                 self._json(HTTPStatus.OK, {"schema_version": "drain_template_list_v1", "items": self.server.drain_quality.templates.list_templates(  # type: ignore[attr-defined]
@@ -384,6 +397,26 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if path == "/api/drain-quality/eval-runs":
                 self._json(HTTPStatus.CREATED, self.server.drain_quality.create_eval_run(payload))  # type: ignore[attr-defined]
                 return
+            if path == "/api/drain-quality/configs":
+                self._json(HTTPStatus.CREATED, self.server.drain_quality.configs.create_candidate(payload))  # type: ignore[attr-defined]
+                return
+            match = re.fullmatch(r"/api/drain-quality/configs/([A-Za-z0-9_-]+)/versions", path)
+            if match:
+                self._json(HTTPStatus.CREATED, self.server.drain_quality.configs.save_version(match.group(1), payload))  # type: ignore[attr-defined]
+                return
+            match = re.fullmatch(r"/api/drain-quality/configs/([A-Za-z0-9_-]+)/(validate|publish|rollback)", path)
+            if match:
+                if not isinstance(payload, dict):
+                    raise DrainQualityError("请求体必须是 JSON object")
+                version = int(payload.get("version") or 0)
+                if match.group(2) == "validate":
+                    result = self.server.drain_quality.configs.validate_version(match.group(1), version)  # type: ignore[attr-defined]
+                elif match.group(2) == "publish":
+                    result = self.server.drain_quality.publish_config(match.group(1), version, payload)  # type: ignore[attr-defined]
+                else:
+                    result = self.server.drain_quality.configs.rollback(match.group(1), version, payload)  # type: ignore[attr-defined]
+                self._json(HTTPStatus.OK, result)
+                return
             if path == "/api/drain-quality/tune-runs":
                 self._json(HTTPStatus.CREATED, self.server.drain_quality.create_tune_run(payload))  # type: ignore[attr-defined]
                 return
@@ -421,8 +454,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 if not isinstance(content, str):
                     raise FeatureJobError("上传内容必须是 UTF-8 文本")
                 records = parse_log_content(filename.strip(), content)
-                result = self.server.govern_drain_result(self.server.input_analyzer(records))  # type: ignore[attr-defined]
-                self._json(HTTPStatus.OK, {"result": result})
+                drain_config = self.server.drain_quality.configs.active_snapshot()  # type: ignore[attr-defined]
+                analyzed = self.server.input_analyzer(records, drain_config["path"]) if self.server.input_analyzer_accepts_config else self.server.input_analyzer(records)  # type: ignore[attr-defined]
+                result = self.server.govern_drain_result(analyzed)  # type: ignore[attr-defined]
+                self._json(HTTPStatus.OK, {"result": result, "drain_config": {
+                    "config_id": drain_config["config_id"],
+                    "version": drain_config["version"],
+                    "content_hash": drain_config["content_hash"],
+                }})
                 return
             if path == "/api/uploads":
                 if not isinstance(payload, dict):
@@ -456,6 +495,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     upload_id=upload_id,
                     filename=str(payload.get("filename") or manifest.get("safe_filename") or "upload.log"),
                     source_path=str(self.server.upload_store.source_path(upload_id)),  # type: ignore[attr-defined]
+                    drain_config=self.server.drain_quality.configs.active_snapshot(),  # type: ignore[attr-defined]
                 )
                 threading.Thread(target=self.server.run_input_job, args=(job["input_job_id"],), daemon=True).start()  # type: ignore[attr-defined]
                 self._json(HTTPStatus.ACCEPTED, job)

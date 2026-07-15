@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from logrisk.drain_eval.annotation_store import AnnotationStore
+from logrisk.drain_eval.config_store import DrainConfigStore
 from logrisk.drain_eval.dataset import DatasetStore, atomic_json
 from logrisk.drain_eval.downstream_metrics import evaluate_downstream
 from logrisk.drain_eval.labeled_metrics import evaluate_labeled
@@ -19,12 +20,13 @@ from logrisk.drain_eval.unlabeled_metrics import evaluate_unlabeled
 
 
 class DrainQualityService:
-    def __init__(self, root: str | Path, profiles_root: str | Path):
+    def __init__(self, root: str | Path, profiles_root: str | Path, baseline_path: str | Path | None = None):
         self.root = Path(root)
         self.profiles_root = Path(profiles_root)
         self.datasets = DatasetStore(self.root)
         self.annotations = AnnotationStore(self.root)
         self.templates = TemplateStore(self.root)
+        self.configs = DrainConfigStore(self.root, baseline_path or self.profiles_root.parent / "drain3_recommended.ini")
         self.profile_events_path = self.root / "profile_events.jsonl"
 
     def create_eval_run(self, payload: Any) -> dict[str, Any]:
@@ -57,6 +59,9 @@ class DrainQualityService:
             "run_id": run_id,
             "dataset_id": dataset["dataset_id"],
             "profile_id": str(source.get("profile_id") or "legacy-default"),
+            "config_id": source.get("config_id"),
+            "config_version": source.get("config_version"),
+            "config_hash": source.get("config_hash"),
             "status": "completed",
             "progress": 1.0,
             "error": None,
@@ -80,6 +85,33 @@ class DrainQualityService:
             key=lambda item: str(item.get("created_at")),
             reverse=True,
         )
+
+    def publish_config(self, config_id: str, version: int, payload: Any) -> dict[str, Any]:
+        source = require_object(payload)
+        if source.get("confirmed") is not True:
+            raise DrainQualityError("配置发布需要人工确认")
+        run_id = str(source.get("eval_run_id") or "")
+        if not run_id:
+            raise DrainQualityError("配置发布必须关联评测任务")
+        try:
+            run = self.get_eval_run(run_id)
+        except DrainQualityError as exc:
+            raise DrainQualityError("关联评测任务不存在") from exc
+        snapshot = self.configs.get_version(config_id, version)
+        if run.get("status") != "completed":
+            raise DrainQualityError("关联评测任务尚未完成")
+        if run.get("config_id") != config_id or int(run.get("config_version") or 0) != int(version) or run.get("config_hash") != snapshot["content_hash"]:
+            raise DrainQualityError("评测任务与候选配置版本不匹配")
+        metrics = run.get("metrics") or {}
+        labeled = metrics.get("labeled") or {}
+        downstream = metrics.get("downstream") or {}
+        if not (
+            float(downstream.get("critical_risk_recall", 0)) >= 1.0
+            and float(labeled.get("over_merge_rate", 1)) <= 0.02
+            and float(downstream.get("normal_log_false_positive_rate", 1)) <= 0.02
+        ):
+            raise DrainQualityError("评测质量门槛未通过，禁止发布")
+        return self.configs.publish(config_id, version, source)
 
     def create_tune_run(self, payload: Any) -> dict[str, Any]:
         source = require_object(payload)

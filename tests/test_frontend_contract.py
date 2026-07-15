@@ -101,6 +101,28 @@ def test_drain_config_governance_ui_contract():
         assert text in source
 
 
+def test_semantic_dictionary_governance_ui_contract():
+    source = source_text()
+    for text in (
+        "/api/semantic/dictionaries",
+        "/api/semantic/test",
+        "semantic-dictionary-governance",
+        "语义词典",
+        "内置规则（只读）",
+        "自定义扩展规则",
+        "语义测试台",
+        "Typed Mask",
+        "版本历史",
+        "创建候选",
+        "配置校验",
+        "人工发布",
+        "回滚版本",
+        "semanticDictionaryVersion",
+        "validateSemanticDictionary",
+    ):
+        assert text in source
+
+
 def test_ai_harness_pages_and_routes_are_present():
     source = source_text()
     for text in (

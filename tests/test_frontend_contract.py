@@ -79,6 +79,26 @@ def test_m11_quality_and_settings_use_workspace_design_contract():
     assert "h(CodeBlock, { value: profile.parameters })" not in source
 
 
+def test_drain_config_governance_ui_contract():
+    source = source_text()
+    for text in (
+        "/api/drain-quality/configs",
+        "drain-config-governance",
+        "config-version-list",
+        "config-structured-editor",
+        "masking-rule-table",
+        "config-ini-editor",
+        "config-version-diff",
+        "配置校验",
+        "人工发布",
+        "复制为候选",
+        "脱敏规则",
+        "INI 原文",
+        "readIniValue(draft",
+    ):
+        assert text in source
+
+
 def test_ai_harness_pages_and_routes_are_present():
     source = source_text()
     for text in (

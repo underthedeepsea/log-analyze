@@ -33,6 +33,12 @@
     drainEvalRuns: function () { return jsonRequest("/api/drain-quality/eval-runs"); },
     drainProfiles: function () { return jsonRequest("/api/drain-quality/profiles"); },
     drainTemplates: function () { return jsonRequest("/api/drain-quality/templates"); },
+    drainConfigs: function () { return jsonRequest("/api/drain-quality/configs"); },
+    createDrainConfig: function (payload) { return jsonRequest("/api/drain-quality/configs", { method: "POST", body: JSON.stringify(payload) }); },
+    saveDrainConfig: function (configId, payload) { return jsonRequest("/api/drain-quality/configs/" + encodeURIComponent(configId) + "/versions", { method: "POST", body: JSON.stringify(payload) }); },
+    validateDrainConfig: function (configId, payload) { return jsonRequest("/api/drain-quality/configs/" + encodeURIComponent(configId) + "/validate", { method: "POST", body: JSON.stringify(payload) }); },
+    publishDrainConfig: function (configId, payload) { return jsonRequest("/api/drain-quality/configs/" + encodeURIComponent(configId) + "/publish", { method: "POST", body: JSON.stringify(payload) }); },
+    rollbackDrainConfig: function (configId, payload) { return jsonRequest("/api/drain-quality/configs/" + encodeURIComponent(configId) + "/rollback", { method: "POST", body: JSON.stringify(payload) }); },
     importDrainTemplates: function (templates) { return jsonRequest("/api/drain-quality/templates/import", { method: "POST", body: JSON.stringify({ templates: templates }) }); },
     annotateDrainTemplate: function (payload) { return jsonRequest("/api/drain-quality/annotations", { method: "POST", body: JSON.stringify(payload) }); },
     changeDrainTemplate: function (templateHash, payload) { return jsonRequest("/api/drain-quality/templates/" + encodeURIComponent(templateHash) + "/changes", { method: "POST", body: JSON.stringify(payload) }); },
@@ -609,6 +615,123 @@
           h("p", { className: "settings-help" }, "跨域部署时，后端需将本页面来源加入 DASHBOARD_CORS_ORIGINS。"))));
   }
 
+  function replaceIniValue(content, section, key, value) {
+    let current = "";
+    let replaced = false;
+    const lines = String(content || "").split("\n").map(function (line) {
+      const heading = line.match(/^\s*\[([^\]]+)\]\s*$/);
+      if (heading) current = heading[1];
+      if (current === section && new RegExp("^\\s*" + key + "\\s*=").test(line)) {
+        replaced = true;
+        return key + " = " + value;
+      }
+      return line;
+    });
+    if (!replaced) throw new Error(section + "." + key + " 不存在于当前 INI");
+    return lines.join("\n");
+  }
+
+  function readIniValue(content, section, key) {
+    let current = "";
+    for (const line of String(content || "").split("\n")) {
+      const heading = line.match(/^\s*\[([^\]]+)\]\s*$/);
+      if (heading) current = heading[1];
+      const value = current === section && line.match(new RegExp("^\\s*" + key + "\\s*=\\s*(.*)$"));
+      if (value) return value[1].trim();
+    }
+    return "";
+  }
+
+  function replaceMaskingRules(content, rules) {
+    const start = content.indexOf("masking =");
+    const end = content.indexOf("\nmask_prefix", start);
+    if (start < 0 || end < 0) throw new Error("当前 INI 缺少 MASKING.masking");
+    const formatted = JSON.stringify(rules.map(function (rule) { return { regex_pattern: rule.regex_pattern, mask_with: rule.mask_with }; }), null, 3);
+    return content.slice(0, start) + "masking = " + formatted + "\n" + content.slice(end + 1);
+  }
+
+  function DrainConfigGovernance(props) {
+    const catalog = props.configs || { items: [], active: null };
+    const items = catalog.items || [];
+    const [selectedId, setSelectedId] = useState("");
+    const [detailTab, setDetailTab] = useState("structured");
+    const [draft, setDraft] = useState("");
+    const [draftRules, setDraftRules] = useState([]);
+    const [validation, setValidation] = useState(null);
+    const [evalRunId, setEvalRunId] = useState("");
+    const selected = items.find(function (item) { return item.config_id === selectedId; }) || items.find(function (item) { return catalog.active && item.config_id === catalog.active.config_id; }) || items[0] || null;
+    const baseline = items.find(function (item) { return item.config_id === "baseline"; }) || null;
+    const candidates = items.filter(function (item) { return item.config_id !== "baseline"; });
+    const matchingRuns = (props.evalRuns || []).filter(function (run) { return selected && run.status === "completed" && run.config_id === selected.config_id && Number(run.config_version) === Number(selected.version) && run.config_hash === selected.content_hash; });
+    useEffect(function () {
+      if (!selected) return;
+      setSelectedId(selected.config_id);
+      setDraft(selected.ini_content || "");
+      setDraftRules((selected.masking_rules || []).map(function (rule) { return Object.assign({}, rule); }));
+      setValidation(null);
+      setEvalRunId("");
+    }, [selected && selected.config_id, selected && selected.version, selected && selected.content_hash]);
+    function createCandidate() {
+      const name = window.prompt("候选配置名称", "Drain3 candidate");
+      if (!name) return;
+      props.onCreate({ source_config_id: selected ? selected.config_id : "baseline", source_version: selected ? selected.version : 1, name: name, operator: "local-operator" });
+    }
+    function updateParameter(section, key, value) {
+      try { setDraft(replaceIniValue(draft, section, key, value)); } catch (reason) { window.alert(reason.message); }
+    }
+    function updateRules(next) {
+      try { setDraftRules(next); setDraft(replaceMaskingRules(draft, next)); } catch (reason) { window.alert(reason.message); }
+    }
+    function save() {
+      if (!selected || selected.config_id === "baseline") return;
+      props.onSave(selected.config_id, { expected_version: selected.version, ini_content: draft, operator: "local-operator" });
+    }
+    function validate() {
+      if (!selected) return;
+      props.onValidate(selected.config_id, { version: selected.version }).then(setValidation).catch(function () {});
+    }
+    function publish() {
+      if (!selected || !evalRunId || !window.confirm("确认将此配置发布给后续新分析任务？")) return;
+      props.onPublish(selected.config_id, { version: selected.version, eval_run_id: evalRunId, confirmed: true, operator: "local-operator" });
+    }
+    function rollback() {
+      if (!selected || selected.config_id === "baseline") return;
+      const version = Number(window.prompt("回滚到哪个版本？", "1"));
+      if (!version || !window.confirm("确认回滚活动 Drain3 配置？")) return;
+      props.onRollback(selected.config_id, { version: version, confirmed: true, operator: "local-operator" });
+    }
+    const parameterFields = [
+      ["DRAIN", "sim_th", "相似度阈值", "模板归并的最小相似度"],
+      ["DRAIN", "depth", "解析树深度", "规范化日志推荐 5"],
+      ["DRAIN", "max_children", "最大子节点", "控制树分支数量"],
+      ["DRAIN", "max_clusters", "最大模板簇", "每个分片的模板上限"],
+      ["DRAIN", "parametrize_numeric_tokens", "数字参数化", "true / false"],
+      ["DRAIN", "extra_delimiters", "额外分隔符", "JSON 字符串数组"],
+      ["SNAPSHOT", "snapshot_interval_minutes", "快照间隔（分钟）", "状态保存频率"],
+      ["PROFILING", "enabled", "性能分析", "true / false"],
+    ];
+    const diffRows = !selected || !baseline ? [] : String(draft).split("\n").map(function (line, index) { return { index: index + 1, before: String(baseline.ini_content || "").split("\n")[index] || "", after: line }; }).filter(function (row) { return row.before !== row.after; });
+    return h("section", { className: "drain-config-governance" },
+      h("div", { className: "config-governance-summary" },
+        h("div", null, h("span", null, "当前生效配置"), h("b", null, catalog.active ? catalog.active.name + " v" + catalog.active.version : "—"), h("small", { className: "positive" }, "● " + (catalog.active && catalog.active.status === "baseline" ? "系统基线" : "已发布"))),
+        h("div", null, h("span", null, "脱敏规则"), h("b", null, catalog.active ? (catalog.active.masking_rules || []).length : 0), h("small", null, "算法运行前脱敏")),
+        h("div", null, h("span", null, "候选配置"), h("b", null, candidates.length), h("small", null, "完整 INI 版本")),
+        h("div", null, h("span", null, "关联评测"), h("b", null, (props.evalRuns || []).filter(function (run) { return run.config_id; }).length), h("small", null, "通过门槛后人工发布"))),
+      h("div", { className: "config-governance-layout" },
+        h("aside", { className: "surface config-version-list" },
+          h("div", { className: "surface-head" }, h("div", null, h("b", null, "配置版本"), h("span", null, items.length + " 个配置")), h("button", { className: "mini-add", onClick: createCandidate }, "+")),
+          items.map(function (item) { return h("button", { className: "config-version-item " + (selected && selected.config_id === item.config_id ? "active" : ""), key: item.config_id, onClick: function () { setSelectedId(item.config_id); } }, h("div", null, h("b", null, item.name + " v" + item.version), h("span", { className: "status-chip " + item.status }, item.status)), h("small", null, item.config_id), h("em", null, (item.masking_rules || []).length + " 条脱敏规则 · " + item.content_hash.slice(0, 10))); })),
+        h("div", { className: "surface config-governance-detail" }, selected ? h(React.Fragment, null,
+          h("div", { className: "surface-head" }, h("div", null, h("b", null, selected.name + " v" + selected.version), h("span", null, selected.config_id + " · " + selected.content_hash.slice(0, 16))), h("span", { className: "status-chip " + selected.status }, selected.status)),
+          h("div", { className: "config-detail-tabs" }, [["structured", "结构化配置"], ["masking", "脱敏规则（" + draftRules.length + "）"], ["ini", "INI 原文"], ["diff", "版本差异"]].map(function (tab) { return h("button", { key: tab[0], className: detailTab === tab[0] ? "active" : "", onClick: function () { setDetailTab(tab[0]); } }, tab[1]); })),
+          detailTab === "structured" && h("div", { className: "config-structured-editor" }, parameterFields.map(function (field) { const value = readIniValue(draft, field[0], field[1]); return h("label", { key: field[0] + field[1] }, h("span", null, field[2]), h("input", { value: value, disabled: selected.config_id === "baseline", onChange: function (event) { updateParameter(field[0], field[1], event.target.value); } }), h("small", null, field[0] + "." + field[1] + " · " + field[3])); })),
+          detailTab === "masking" && h("div", { className: "masking-rule-table" }, h("div", { className: "masking-rule-row head" }, h("span", null, "占位符"), h("span", null, "正则表达式"), h("span", null, "操作")), draftRules.map(function (rule, index) { return h("div", { className: "masking-rule-row", key: index }, h("input", { value: rule.mask_with, disabled: selected.config_id === "baseline", onChange: function (event) { const next = draftRules.slice(); next[index] = Object.assign({}, rule, { mask_with: event.target.value }); updateRules(next); } }), h("input", { value: rule.regex_pattern, disabled: selected.config_id === "baseline", onChange: function (event) { const next = draftRules.slice(); next[index] = Object.assign({}, rule, { regex_pattern: event.target.value }); updateRules(next); } }), h("div", { className: "row-actions" }, h("button", { className: "text-button", disabled: selected.config_id === "baseline" || index === 0, onClick: function () { const next = draftRules.slice(); const moved = next.splice(index, 1)[0]; next.splice(index - 1, 0, moved); updateRules(next); } }, "上移"), h("button", { className: "text-button danger-text", disabled: selected.config_id === "baseline", onClick: function () { updateRules(draftRules.filter(function (_, ruleIndex) { return ruleIndex !== index; })); } }, "移除"))); }), selected.config_id !== "baseline" && h("button", { className: "secondary-button add-mask-rule", onClick: function () { updateRules(draftRules.concat([{ mask_with: "CUSTOM", regex_pattern: "" }])); } }, "＋ 新增脱敏规则")),
+          detailTab === "ini" && h("textarea", { className: "config-ini-editor", value: draft, readOnly: selected.config_id === "baseline", spellCheck: false, onChange: function (event) { setDraft(event.target.value); } }),
+          detailTab === "diff" && h("div", { className: "config-version-diff" }, diffRows.length === 0 ? h("div", { className: "empty-state" }, "与系统基线无差异") : diffRows.slice(0, 100).map(function (row) { return h("div", { className: "config-diff-row", key: row.index }, h("span", null, "L" + row.index), h("code", { className: "before" }, row.before || "∅"), h("code", { className: "after" }, row.after || "∅")); })),
+          validation && h("div", { className: "config-validation " + (validation.valid ? "valid" : "invalid") }, validation.valid ? "配置校验通过：参数与 " + validation.masking_rules.length + " 条脱敏正则有效" : "配置校验失败"),
+          h("div", { className: "config-governance-actions" }, selected.config_id === "baseline" ? h("button", { className: "primary-button", onClick: createCandidate }, "复制为候选") : h(React.Fragment, null, h("button", { className: "secondary-button", onClick: save }, "保存新版本"), h("button", { className: "secondary-button", onClick: validate }, "配置校验"), h("select", { value: evalRunId, onChange: function (event) { setEvalRunId(event.target.value); } }, h("option", { value: "" }, matchingRuns.length ? "选择关联评测" : "暂无匹配评测"), matchingRuns.map(function (run) { return h("option", { key: run.run_id, value: run.run_id }, run.run_id + " · F1 " + ((run.metrics && run.metrics.labeled && run.metrics.labeled.pairwise_grouping_f1) || "—")); })), h("button", { className: "primary-button", disabled: !evalRunId, onClick: publish }, "人工发布"), h("button", { className: "text-button", onClick: rollback }, "回滚")))) : h("div", { className: "empty-state" }, "暂无 Drain3 配置"))));
+  }
+
   function DrainQualityPage(props) {
     const data = props.data || { datasets: [], annotations: [], evalRuns: [], profiles: [], templates: [] };
     const [tab, setTab] = useState("overview");
@@ -663,7 +786,7 @@
       if (!version || !window.confirm("确认回滚模板？回滚也会新增一条审计事件。")) return;
       props.onTemplateRollback(item.template_hash, { target_version: version, expected_version: item.version, confirmed: true, operator: "local-operator" });
     }
-    const tabs = [["overview", "质量概览"], ["annotation", "标注工作台"], ["suspicious", "可疑模板"], ["compare", "配置对比"], ["templates", "模板管理"], ["release", "发布管理"]];
+    const tabs = [["overview", "质量概览"], ["annotation", "标注工作台"], ["suspicious", "可疑模板"], ["compare", "配置对比"], ["templates", "模板管理"], ["configs", "Drain3 配置"], ["release", "发布管理"]];
     const annotationActions = selectedTemplate && h("div", { className: "button-row annotation-actions" },
       h("button", { className: "primary-button", onClick: function () { props.onAnnotate({ cluster_id: selectedTemplate.template_hash, action: "accept", reviewer: "local-operator" }); } }, "接受当前簇"),
       h("button", { className: "secondary-button", onClick: function () { confirmedChange(selectedTemplate, "edit"); } }, "编辑模板"),
@@ -687,7 +810,8 @@
       tab === "suspicious" && h("section", { className: "surface suspicious-panel" }, h("div", { className: "surface-head" }, h("div", null, h("b", null, "可疑模板"), h("span", null, "聚焦高通配符及非活跃模板")), h("span", null, visibleSuspicious.length + " 条")), h("div", { className: "suspicious-filters" }, [["all", "全部"], ["wildcard", "高通配符"], ["ignored", "已忽略"], ["merged", "已合并"], ["deleted", "软删除"]].map(function (filter) { return h("button", { key: filter[0], className: suspiciousFilter === filter[0] ? "active" : "", onClick: function () { setSuspiciousFilter(filter[0]); } }, filter[1]); })), visibleSuspicious.length === 0 && h("div", { className: "empty-state" }, "当前筛选条件下暂无可疑模板"), h("div", { className: "suspicious-list" }, visibleSuspicious.map(function (item) { const wildcardCount = (String(item.effective_template || "").match(/<[^>]+>/g) || []).length; return h("article", { className: "suspicious-item", key: item.template_hash }, h("div", null, h("span", { className: "issue-icon" }, "!"), h("div", null, h("b", null, item.component || "unknown"), h("small", null, item.template_hash + " · v" + item.version))), h("code", null, item.effective_template), h("div", { className: "issue-meta" }, h("span", null, wildcardCount + " 个通配符"), h("span", { className: "status-chip " + item.status }, item.status))); }))),
       tab === "compare" && h("section", { className: "surface profile-compare-panel" }, h("div", { className: "surface-head" }, h("div", null, h("b", null, "Profile 配置对比"), h("span", null, "并排检查候选 Drain3 参数差异"))), h("div", { className: "profile-compare-selectors" }, h("label", null, h("span", null, "Profile A"), h("select", { value: selectedProfileA && selectedProfileA.profile_id || "", onChange: function (event) { setProfileA(event.target.value); } }, profiles.map(function (profile) { return h("option", { key: profile.profile_id, value: profile.profile_id }, profile.name); }))), h("span", null, "对比"), h("label", null, h("span", null, "Profile B"), h("select", { value: selectedProfileB && selectedProfileB.profile_id || "", onChange: function (event) { setProfileB(event.target.value); } }, profiles.map(function (profile) { return h("option", { key: profile.profile_id, value: profile.profile_id }, profile.name); })))), profiles.length === 0 ? h("div", { className: "empty-state" }, "暂无可对比的 Profile") : h("div", { className: "profile-parameter-table" }, h("div", { className: "parameter-row head" }, h("span", null, "参数"), h("span", null, selectedProfileA.name), h("span", null, selectedProfileB.name)), [["sim_th", "相似度阈值"], ["depth", "树深度"], ["max_children", "最大子节点"], ["parametrize_numeric_tokens", "数字参数化"], ["extra_delimiters", "额外分隔符"]].map(function (entry) { const a = profileValue(selectedProfileA, entry[0]), b = profileValue(selectedProfileB, entry[0]); return h("div", { className: "parameter-row " + (a !== b ? "different" : ""), key: entry[0] }, h("span", null, h("b", null, entry[1]), h("small", null, entry[0])), h("code", null, a), h("code", null, b)); }))),
       tab === "templates" && h("section", { className: "surface template-management" }, h("div", { className: "surface-head" }, h("div", null, h("b", null, "Drain3 模板管理"), h("span", null, "搜索、筛选并执行受审计的模板操作")), h("span", null, visibleTemplates.length + " / " + templates.length)), h("div", { className: "template-toolbar" }, h("input", { value: templateQuery, placeholder: "搜索组件、Hash 或模板内容", onChange: function (event) { setTemplateQuery(event.target.value); } }), h("select", { value: componentFilter, onChange: function (event) { setComponentFilter(event.target.value); } }, h("option", { value: "all" }, "全部组件"), components.map(function (component) { return h("option", { value: component, key: component }, component); })), h("select", { value: statusFilter, onChange: function (event) { setStatusFilter(event.target.value); } }, h("option", { value: "all" }, "全部状态"), ["active", "ignored", "merged", "deleted"].map(function (status) { return h("option", { value: status, key: status }, status); }))), templates.length === 0 && h("div", { className: "empty-state" }, "导入分析结果中的脱敏模板后进行管理"), h("div", { className: "managed-template-table" }, h("div", { className: "managed-template-row head" }, h("span", null, "模板"), h("span", null, "有效内容"), h("span", null, "状态"), h("span", null, "操作")), visibleTemplates.map(function (item) { return h("div", { className: "managed-template-row", key: item.template_hash }, h("div", null, h("b", null, item.component || "unknown"), h("small", null, item.template_hash + " · v" + item.version + " · " + item.count + " 条")), h("code", null, item.effective_template), h("span", { className: "status-chip " + item.status }, item.status), h("div", { className: "row-actions" }, h("button", { className: "text-button", onClick: function () { confirmedChange(item, "edit"); } }, "编辑"), h("button", { className: "text-button", onClick: function () { confirmedChange(item, "merge"); } }, "合并"), h("button", { className: "text-button", onClick: function () { confirmedChange(item, item.status === "ignored" || item.status === "deleted" ? "restore" : "ignore"); } }, item.status === "ignored" || item.status === "deleted" ? "恢复" : "忽略"), h("button", { className: "text-button danger-text", onClick: function () { confirmedChange(item, "delete"); } }, "软删除"), h("button", { className: "text-button", onClick: function () { rollback(item); } }, "回滚"))); }))),
-      tab === "release" && h("section", { className: "release-stage-grid" }, profiles.length === 0 && h("div", { className: "empty-state" }, "暂无待治理 Profile"), profiles.map(function (profile) { const promoted = profile.status === "promoted"; return h("article", { className: "surface release-card", key: profile.profile_id }, h("div", { className: "release-card-head" }, h("div", null, h("span", { className: "release-icon" }, promoted ? "✓" : "↑"), h("div", null, h("h3", null, profile.name), h("small", null, profile.profile_id))), h("span", { className: "status-chip " + profile.status }, profile.status)), h("div", { className: "release-flow" }, ["候选", "人工确认", "已发布"].map(function (stage, index) { return h("span", { className: index <= (promoted ? 2 : 0) ? "done" : "", key: stage }, stage); })), h("p", null, "发布仅记录人工治理决策，不会自动修改生产 Drain3 配置。"), h("div", { className: "button-row" }, h("button", { className: "primary-button", disabled: promoted, onClick: function () { if (window.confirm("确认发布 Profile " + profile.profile_id + "？")) props.onProfile(profile.profile_id, "promote"); } }, promoted ? "已发布" : "确认发布"), h("button", { className: "secondary-button", onClick: function () { if (window.confirm("确认回滚 Profile " + profile.profile_id + "？")) props.onProfile(profile.profile_id, "rollback"); } }, "回滚"))); })));
+      tab === "configs" && h(DrainConfigGovernance, { configs: data.configs, evalRuns: data.evalRuns, onCreate: props.onConfigCreate, onSave: props.onConfigSave, onValidate: props.onConfigValidate, onPublish: props.onConfigPublish, onRollback: props.onConfigRollback }),
+      tab === "release" && h("section", { className: "release-stage-grid" }, profiles.length === 0 && h("div", { className: "empty-state" }, "暂无待治理 Profile"), profiles.map(function (profile) { const promoted = profile.status === "promoted"; return h("article", { className: "surface release-card", key: profile.profile_id }, h("div", { className: "release-card-head" }, h("div", null, h("span", { className: "release-icon" }, promoted ? "✓" : "↑"), h("div", null, h("h3", null, profile.name), h("small", null, profile.profile_id))), h("span", { className: "status-chip " + profile.status }, profile.status)), h("div", { className: "release-flow" }, ["候选", "人工确认", "已发布"].map(function (stage, index) { return h("span", { className: index <= (promoted ? 2 : 0) ? "done" : "", key: stage }, stage); })), h("p", null, "发布仅记录旧版 Profile 决策；实际运行配置请在 Drain3 配置页评测并发布。"), h("div", { className: "button-row" }, h("button", { className: "primary-button", disabled: promoted, onClick: function () { if (window.confirm("确认发布 Profile " + profile.profile_id + "？")) props.onProfile(profile.profile_id, "promote"); } }, promoted ? "已发布" : "确认发布"), h("button", { className: "secondary-button", onClick: function () { if (window.confirm("确认回滚 Profile " + profile.profile_id + "？")) props.onProfile(profile.profile_id, "rollback"); } }, "回滚"))); })));
   }
 
   function App() {
@@ -704,7 +828,7 @@
     const [selectedTemplate, setSelectedTemplate] = useState(null);
     const [ruleFocus, setRuleFocus] = useState("");
     const [uploadProgress, setUploadProgress] = useState(null), [preprocessProgress, setPreprocessProgress] = useState(null);
-    const [drainQuality, setDrainQuality] = useState({ datasets: [], annotations: [], evalRuns: [], profiles: [], templates: [] });
+    const [drainQuality, setDrainQuality] = useState({ datasets: [], annotations: [], evalRuns: [], profiles: [], templates: [], configs: { items: [], active: null } });
     const events = useRef(null);
     const selected = useMemo(function () { return snapshot && snapshot.features && snapshot.features.find(function (feature) { return feature.candidate_id === selectedId; }) || null; }, [snapshot, selectedId]);
     useEffect(function () {
@@ -728,8 +852,8 @@
     }
     async function loadHarness(query) { const values = await Promise.all([api.harnessStatus(), api.prompts(), api.traces(query || "?limit=50"), api.modelProfiles()]); setHarness(values[0]); setPrompts(values[1].items || []); setPromptId(values[1].current_prompt_id || "feature_extract_v3_compact_strict_json_en"); setTraces(values[2].items || []); setModelProfiles(values[3]); setModelProfileId(function (current) { return current || values[3].default_profile_id || ""; }); }
     async function loadDrainQuality() {
-      const values = await Promise.all([api.drainDatasets(), api.drainAnnotations(), api.drainEvalRuns(), api.drainProfiles(), api.drainTemplates()]);
-      setDrainQuality({ datasets: values[0].items || [], annotations: values[1].items || [], annotationState: values[1].state || {}, evalRuns: values[2].items || [], profiles: values[3].items || [], templates: values[4].items || [] });
+      const values = await Promise.all([api.drainDatasets(), api.drainAnnotations(), api.drainEvalRuns(), api.drainProfiles(), api.drainTemplates(), api.drainConfigs()]);
+      setDrainQuality({ datasets: values[0].items || [], annotations: values[1].items || [], annotationState: values[1].state || {}, evalRuns: values[2].items || [], profiles: values[3].items || [], templates: values[4].items || [], configs: values[5] });
     }
     async function loadObservability(id) {
       const summary = await api.observabilitySummary();
@@ -775,6 +899,11 @@
     async function changeTemplate(templateHash, payload) { try { await api.changeDrainTemplate(templateHash, payload); await loadDrainQuality(); } catch (reason) { setError(reason.message); } }
     async function rollbackTemplate(templateHash, payload) { try { await api.rollbackDrainTemplate(templateHash, payload); await loadDrainQuality(); } catch (reason) { setError(reason.message); } }
     async function changeDrainProfile(profileId, action) { try { await api.promoteDrainProfile(profileId, action, { confirmed: true, reviewer: "local-operator" }); await loadDrainQuality(); } catch (reason) { setError(reason.message); } }
+    async function createDrainConfig(payload) { try { await api.createDrainConfig(payload); await loadDrainQuality(); } catch (reason) { setError(reason.message); } }
+    async function saveDrainConfig(configId, payload) { try { await api.saveDrainConfig(configId, payload); await loadDrainQuality(); } catch (reason) { setError(reason.message); } }
+    async function validateDrainConfig(configId, payload) { try { return await api.validateDrainConfig(configId, payload); } catch (reason) { setError(reason.message); throw reason; } }
+    async function publishDrainConfig(configId, payload) { try { await api.publishDrainConfig(configId, payload); await loadDrainQuality(); } catch (reason) { setError(reason.message); } }
+    async function rollbackDrainConfig(configId, payload) { try { await api.rollbackDrainConfig(configId, payload); await loadDrainQuality(); } catch (reason) { setError(reason.message); } }
     const workspace = h(Workspace, { snapshot: snapshot, selectedId: selectedId, onSelect: setSelectedId, onRetry: retry, onOpenTraces: openTraceList, onOpenObservability: openObservability });
     const activePrompts = prompts.filter(function (prompt) { return prompt.analysis_type === "feature_extract" && prompt.status === "active"; });
     const activeProfiles = modelProfiles.profiles || [];
@@ -798,7 +927,7 @@
           h(FeatureEvidence, { feature: selected, onSelectTemplate: setSelectedTemplate }),
           h(ReviewEditor, { feature: selected, selectedTemplate: selectedTemplate, onSave: save, onOpenTrace: openTrace })),
         view === "rules" && h(RuleLibrary, { rules: rules, focusRuleId: ruleFocus, onOpenTrace: openTrace }),
-        view === "drainQuality" && h(DrainQualityPage, { data: drainQuality, onRefresh: loadDrainQuality, onImport: importCurrentTemplates, onAnnotate: annotateTemplate, onTemplateChange: changeTemplate, onTemplateRollback: rollbackTemplate, onProfile: changeDrainProfile }),
+        view === "drainQuality" && h(DrainQualityPage, { data: drainQuality, onRefresh: loadDrainQuality, onImport: importCurrentTemplates, onAnnotate: annotateTemplate, onTemplateChange: changeTemplate, onTemplateRollback: rollbackTemplate, onProfile: changeDrainProfile, onConfigCreate: createDrainConfig, onConfigSave: saveDrainConfig, onConfigValidate: validateDrainConfig, onConfigPublish: publishDrainConfig, onConfigRollback: rollbackDrainConfig }),
         view === "settings" && h(BackendSettings, { onSaved: function () { setError(""); } }),
         view === "export" && h("section", { className: "surface export-surface" }, h("h2", null, "导出记录"), h("p", null, "导出包只包含人工批准或历史规则复用的脱敏特征，不包含原始日志和 RCA 结论。"), h("button", { className: "primary-button", disabled: !jobId || !(snapshot && snapshot.features || []).some(function (feature) { return feature.status === "approved"; }), onClick: function () { api.exportApproved(jobId).catch(function (reason) { setError(reason.message); }); } }, "导出已批准特征 JSON"))),
       h(Drawer, { title: drawer.type === "prompt" ? "Prompt 详情" : "Trace 详情", subtitle: drawer.item && (drawer.item.prompt_id || drawer.item.trace_id), item: drawer.item, onClose: function () { setDrawer({ type: null, item: null }); } }, drawerContent));

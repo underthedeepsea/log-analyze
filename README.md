@@ -1,8 +1,8 @@
 # 日志风险特征分析与审批系统
 
-当前版本：`1.18.0`。变更记录见 [`releas.md`](releas.md)。
+当前版本：`1.19.0`。变更记录见 [`releas.md`](releas.md)。
 
-AI Harness 路线图 M1–M10 已完成；Phase 2 M11 新增 Drain Template Quality Center、Gold Dataset、模板治理和前后端分离部署能力。
+AI Harness 路线图 M1–M10 已完成；Phase 2 M11 新增 Drain Template Quality Center，M11.5 新增确定性语义增强与词典治理。
 
 M11 质量中心采用统一的橙色白底工作台设计：标注工作台为“模板队列 + 审核详情”，配置对比按字段并排展示参数差异，模板管理提供搜索筛选，发布管理展示人工治理阶段。系统设置使用同一组件规范，并避免重复显示工作台标题。
 
@@ -10,12 +10,16 @@ M11 质量中心采用统一的橙色白底工作台设计：标注工作台为�
 
 候选版本保存在 `state/drain_quality/configs/`，目录信息保存在 `state/drain_quality/config_catalog.json`，当前活动指针保存在 `state/drain_quality/active_config.json`，发布及回滚事件保存在 `state/drain_quality/config_events.jsonl`。发布不会覆盖基线文件，只影响发布后新建的普通或大文件分析任务；运行中的任务继续使用创建时锁定的配置版本。可在 [质量中心](http://127.0.0.1:8080/drain-quality) 的“Drain3 配置”页管理和回滚。
 
+1.19.0 在标准化与风险聚合之间增加确定性语义增强层。系统在不改变 Drain3 结构模板的前提下，保留 HTTP 状态码、errno、exit code、signal、NVIDIA Xid 和 Kubernetes Reason，并生成 Typed Parameters。内置词典位于 `configs/semantic_dictionary/`，只读；自定义候选版本、校验报告、活动指针和审计事件保存在 `state/semantic_dictionaries/`。四类词典独立发布和回滚，普通分析与大文件任务均锁定创建时的版本和 Hash。
+
+在 [质量中心](http://127.0.0.1:8080/drain-quality) 的“语义词典”页可创建候选、编辑自定义规则、输入单条日志测试、校验六类核心语义，并人工发布或回滚。发布只影响后续任务。主要接口为 `GET /api/semantic/dictionaries`、`POST /api/semantic/test` 以及 `/api/semantic/dictionaries/{dictionary_id}/...` 版本治理接口。
+
 本项目在本机完成日志规范化、Drain3 模板化、风险评分、规则复用、Ollama 特征识别与人工审批。项目不实现 RCA；原始日志不会直接发送给 Ollama。
 
 ```text
 JSON / JSONL / TXT / LOG
         ↓
-规范化 → Drain3 → 风险评分
+规范化 → Drain3 + 确定性语义增强 → 风险评分
         ↓
 全局批准规则匹配 ──命中──→ 规则复用（跳过 LLM）
         │未命中
@@ -92,7 +96,7 @@ Dashboard 实时显示 Drain3 压缩量、当日 LLM 关联日志量、处理速
 
 Dashboard 提供 `/ai-observability`、`/prompts`、`/model-profiles` 和 `/ai-traces` 四个轻量 Harness 页面。AI 分析观测展示任务阶段、模型 Profile、Thinking 状态、Evidence 预算/裁剪、规则生成漏斗、AI Cache 命中、Evaluator 质量门禁、事件流和实体级失败原因；Prompt 管理保留当前版本编辑和历史版本查看；AI Trace 可按 Job、Trace、状态和 Prompt 过滤，并展示每次调用的模型画像和上下文预算。
 
-完整的数据流、Prompt 版本、Trace、Eval、Cache、Rule Lineage 和外部观测平台取舍见 [`docs/AI_HARNESS_ARCHITECTURE.md`](docs/AI_HARNESS_ARCHITECTURE.md)。当前 Trace 位于 `state/ai_traces.jsonl`，Prompt 历史位于 `state/prompt_versions.json`；两者均属于本地运行状态，不提交 Git。
+当前 Trace 位于 `state/ai_traces.jsonl`，Prompt 历史位于 `state/prompt_versions.json`；两者均属于本地运行状态，不提交 Git。
 
 批准规则会记录 Rule Lineage：来源 `job_id`、`candidate_id`、`trace_id`、Prompt、模型、provider 和 evidence hash 会随规则持久化，便于后续审计规则从哪次 AI 分析沉淀而来。旧版无 lineage 的规则仍可继续匹配和复用。
 
@@ -102,7 +106,7 @@ Dashboard 提供 `/ai-observability`、`/prompts`、`/model-profiles` 和 `/ai-t
 
 “评测中心 → 模板质量”提供 Grouping F1、Over-merge、Over-split、Singleton、Wildcard、Churn、Gold Dataset、标注工作台、可疑模板、Profile 对比和发布管理。内置 `kernel_v1`、`kubelet_v1`、`containerd_v1`、`audit_v1`、`podlog_v1` 五个候选 Profile。
 
-模板管理支持编辑、忽略、合并、恢复、软删除和版本回滚。系统永久保留原始 `template_hash` 与原始模板，变更写入 `state/drain_quality/template_overrides.json` 和追加式审计事件，不直接修改 Drain3 聚类树。所有生产有效变更和 Profile 发布均需人工二次确认；Profile 发布不会自动覆盖生产配置。详细说明见 [`docs/DRAIN_TEMPLATE_QUALITY.md`](docs/DRAIN_TEMPLATE_QUALITY.md)。
+模板管理支持编辑、忽略、合并、恢复、软删除和版本回滚。系统永久保留原始 `template_hash` 与原始模板，变更写入 `state/drain_quality/template_overrides.json` 和追加式审计事件，不直接修改 Drain3 聚类树。所有生产有效变更和 Profile 发布均需人工二次确认；Profile 发布不会自动覆盖生产配置。
 
 ## AI Eval Runner
 

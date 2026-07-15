@@ -18,7 +18,14 @@ class InputJobStore:
         self.config = config
         self.config.output_dir.mkdir(parents=True, exist_ok=True)
 
-    def create(self, *, upload_id: str, filename: str, source_path: str) -> dict[str, Any]:
+    def create(
+        self,
+        *,
+        upload_id: str,
+        filename: str,
+        source_path: str,
+        drain_config: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         input_job_id = "input_job_" + uuid.uuid4().hex
         self.root(input_job_id).mkdir(parents=True, exist_ok=False)
         now = self._now()
@@ -34,6 +41,13 @@ class InputJobStore:
             "completed_at": None,
             "error": None,
         }
+        if drain_config:
+            job.update({
+                "drain_config_id": drain_config["config_id"],
+                "drain_config_version": drain_config["version"],
+                "drain_config_hash": drain_config["content_hash"],
+                "drain_config_path": drain_config["path"],
+            })
         self.write_job(input_job_id, job)
         self.write_progress(input_job_id, {"input_job_id": input_job_id, "status": "queued", "stage": "queued", "progress": 0.0})
         return job

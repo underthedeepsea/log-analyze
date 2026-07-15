@@ -9,3 +9,14 @@ large_file:
   max_decompressed_bytes: 1073741824
   max_compression_ratio: 100
   max_line_bytes: 1048576
+
+drain_quality:
+  enabled: true
+  annotation_sample_size: 1000
+  samples_per_cluster: 20
+  high_wildcard_threshold: 0.60
+  singleton_warning_threshold: 0.30
+  order_stability_runs: 4
+  critical_risk_recall_min: 1.0
+  over_merge_rate_max: 0.02
+  normal_false_positive_rate_max: 0.02

@@ -11,13 +11,15 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
 from urllib.error import URLError
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 from urllib.request import urlopen
 
 from logrisk.ai_harness.model_profile import ModelProfileRegistry
 from logrisk.ai_harness.prompt_registry import PromptRegistry, PromptTemplate
 from logrisk.ai_harness.trace_logger import AITraceLogger
 from logrisk.approved_rules import ApprovedRuleError, ApprovedRuleStore
+from logrisk.drain_eval.schema import DrainQualityError
+from logrisk.drain_eval.service import DrainQualityService
 from logrisk.feature_extractor_ollama import DEFAULT_OLLAMA_URL, FEATURE_PROMPT_ID
 from logrisk.feature_jobs import FeatureJobError, FeatureJobFileStore, FeatureJobManager, _cache_enabled_default
 from logrisk.input_jobs import InputJobConfig, InputJobStore
@@ -57,6 +59,8 @@ def build_server(
     default_ollama_url: str = DEFAULT_OLLAMA_URL,
     default_timeout: float = 120,
     input_analyzer: Callable[[list[dict[str, Any]]], dict[str, Any]] | None = None,
+    drain_quality_root: str | Path | None = None,
+    cors_origins: list[str] | tuple[str, ...] | set[str] | None = None,
 ) -> DashboardHTTPServer:
     root = Path(__file__).resolve().parents[2]
     server = DashboardHTTPServer((host, port), DashboardHandler)
@@ -75,21 +79,53 @@ def build_server(
     server.trace_logger = AITraceLogger(state_root / "ai_traces.jsonl")  # type: ignore[attr-defined]
     server.upload_store = UploadSessionStore(UploadConfig(upload_dir=state_root / "uploads"))  # type: ignore[attr-defined]
     server.input_jobs = InputJobStore(InputJobConfig(output_dir=root / "output" / "uploads"))  # type: ignore[attr-defined]
+    server.drain_quality = DrainQualityService(  # type: ignore[attr-defined]
+        drain_quality_root or state_root / "drain_quality",
+        root / "configs" / "drain3_profiles",
+        root / "configs" / "drain3_recommended.ini",
+    )
+    configured_origins = cors_origins if cors_origins is not None else os.getenv("DASHBOARD_CORS_ORIGINS", "").split(",")
+    server.cors_origins = {str(origin).strip().rstrip("/") for origin in configured_origins if str(origin).strip()}  # type: ignore[attr-defined]
     server.ollama_checker = ollama_checker or (  # type: ignore[attr-defined]
         lambda: check_ollama(default_ollama_url)
     )
+
+    def govern_drain_result(result: dict[str, Any]) -> dict[str, Any]:
+        def active_templates(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+            governed = [server.drain_quality.templates.apply_override(item) for item in items]  # type: ignore[attr-defined]
+            return [item for item in governed if item.get("template_governance_status") not in {"ignored", "deleted"}]
+
+        risk_levels: dict[str, set[str]] = {}
+        for entity in result.get("risk_entities") or []:
+            for template in entity.get("top_templates") or []:
+                template_hash = str(template.get("template_hash") or "")
+                if template_hash:
+                    risk_levels.setdefault(template_hash, set()).add(str(entity.get("risk_level") or "unknown"))
+        catalog_rows = []
+        for template in result.get("top_templates") or []:
+            if template.get("template_hash") and template.get("template"):
+                catalog_rows.append(dict(template, risk_levels=sorted(risk_levels.get(str(template["template_hash"]), set()))))
+        if catalog_rows:
+            server.drain_quality.templates.import_templates(catalog_rows)  # type: ignore[attr-defined]
+        governed = dict(result)
+        governed["top_templates"] = active_templates(result.get("top_templates") or [])
+        governed["risk_entities"] = [dict(entity, top_templates=active_templates(entity.get("top_templates") or [])) for entity in result.get("risk_entities") or []]
+        return governed
+
+    server.govern_drain_result = govern_drain_result  # type: ignore[attr-defined]
     analysis_lock = threading.Lock()
 
-    def default_input_analyzer(records: list[dict[str, Any]]) -> dict[str, Any]:
+    def default_input_analyzer(records: list[dict[str, Any]], config_path: str | Path | None = None) -> dict[str, Any]:
         with analysis_lock:
             return analyze_records(
                 records,
-                config_path=str(root / "configs" / "drain3_recommended.ini"),
+                config_path=str(config_path or root / "configs" / "drain3_recommended.ini"),
                 rules_path=str(root / "configs" / "risk_rules.yaml"),
                 state_dir=str(state_root / "dashboard_drain3"),
             )
 
     server.input_analyzer = input_analyzer or default_input_analyzer  # type: ignore[attr-defined]
+    server.input_analyzer_accepts_config = input_analyzer is None  # type: ignore[attr-defined]
 
     def run_input_job(input_job_id: str) -> None:
         store = server.input_jobs  # type: ignore[attr-defined]
@@ -101,11 +137,12 @@ def build_server(
                 input_job_id=input_job_id,
                 input_path=job["source_path"],
                 filename=job["filename"],
-                config_path=root / "configs" / "drain3_recommended.ini",
+                config_path=job.get("drain_config_path") or root / "configs" / "drain3_recommended.ini",
                 rules_path=root / "configs" / "risk_rules.yaml",
                 state_dir=state_root / "dashboard_drain3_large" / input_job_id,
                 progress_callback=lambda progress: store.write_progress(input_job_id, progress),
             )
+            result = server.govern_drain_result(result)  # type: ignore[attr-defined]
             store.write_result(input_job_id, result)
             job.update({"status": "completed", "stage": "completed", "completed_at": _now(), "error": None})
             store.write_job(input_job_id, job)
@@ -131,12 +168,21 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def log_message(self, format: str, *args: Any) -> None:
         return
 
+    def _cors_headers(self) -> None:
+        origin = self.headers.get("Origin", "").rstrip("/")
+        if origin and origin in self.server.cors_origins:  # type: ignore[attr-defined]
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, OPTIONS")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Chunk-SHA256")
+            self.send_header("Vary", "Origin")
+
     def _json(self, status: int, payload: Any, headers: dict[str, str] | None = None) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        self._cors_headers()
         for key, value in (headers or {}).items():
             self.send_header(key, value)
         self.end_headers()
@@ -167,11 +213,20 @@ class DashboardHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         return parsed.path, parse_qs(parsed.query)
 
+    def do_OPTIONS(self) -> None:
+        self.send_response(HTTPStatus.NO_CONTENT)
+        self._cors_headers()
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def do_GET(self) -> None:
         path, query = self._route_parts()
         try:
-            if path in {"/", "/prompts", "/ai-traces", "/ai-observability", "/model-profiles"}:
+            if path in {"/", "/prompts", "/ai-traces", "/ai-observability", "/model-profiles", "/drain-quality", "/settings"}:
                 self._serve_frontend()
+                return
+            if path == "/config.js":
+                self._serve_frontend_file("config.js", "application/javascript; charset=utf-8")
                 return
             if path.startswith("/assets/"):
                 self._serve_asset(path)
@@ -184,6 +239,63 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "ai_cache_enabled": _cache_enabled_default(),
                     "max_upload_bytes": MAX_UPLOAD_BYTES,
                 })
+                return
+            if path == "/api/health":
+                self._json(HTTPStatus.OK, {"schema_version": "logrisk_health_v1", "service": "logrisk-dashboard", "status": "ok", "version": "1.18.0"})
+                return
+            if path == "/api/drain-quality/datasets":
+                self._json(HTTPStatus.OK, {"schema_version": "drain_dataset_list_v1", "items": self.server.drain_quality.datasets.list()})  # type: ignore[attr-defined]
+                return
+            match = re.fullmatch(r"/api/drain-quality/datasets/([A-Za-z0-9_-]+)", path)
+            if match:
+                self._json(HTTPStatus.OK, self.server.drain_quality.datasets.get(match.group(1)))  # type: ignore[attr-defined]
+                return
+            if path == "/api/drain-quality/annotations":
+                self._json(HTTPStatus.OK, {"schema_version": "drain_annotation_list_v1", "items": self.server.drain_quality.annotations.events(), "state": self.server.drain_quality.annotations.replay()})  # type: ignore[attr-defined]
+                return
+            if path == "/api/drain-quality/annotation-queue/next":
+                annotated = set(self.server.drain_quality.annotations.replay())  # type: ignore[attr-defined]
+                item = next((template for template in self.server.drain_quality.templates.list_templates() if template["template_hash"] not in annotated), None)  # type: ignore[attr-defined]
+                self._json(HTTPStatus.OK, {"item": item})
+                return
+            if path == "/api/drain-quality/eval-runs":
+                self._json(HTTPStatus.OK, {"schema_version": "drain_eval_run_list_v1", "items": self.server.drain_quality.list_eval_runs()})  # type: ignore[attr-defined]
+                return
+            match = re.fullmatch(r"/api/drain-quality/eval-runs/([A-Za-z0-9_-]+)(/templates)?", path)
+            if match:
+                run = self.server.drain_quality.get_eval_run(match.group(1))  # type: ignore[attr-defined]
+                self._json(HTTPStatus.OK, {"items": run.get("templates", [])} if match.group(2) else run)
+                return
+            match = re.fullmatch(r"/api/drain-quality/tune-runs/([A-Za-z0-9_-]+)", path)
+            if match:
+                self._json(HTTPStatus.OK, self.server.drain_quality.get_tune_run(match.group(1)))  # type: ignore[attr-defined]
+                return
+            if path == "/api/drain-quality/profiles":
+                self._json(HTTPStatus.OK, {"schema_version": "drain_profile_list_v1", "items": self.server.drain_quality.list_profiles()})  # type: ignore[attr-defined]
+                return
+            if path == "/api/drain-quality/configs":
+                self._json(HTTPStatus.OK, {
+                    "schema_version": "drain_config_list_v1",
+                    "items": self.server.drain_quality.configs.list_configs(),  # type: ignore[attr-defined]
+                    "active": self.server.drain_quality.configs.active_snapshot(),  # type: ignore[attr-defined]
+                })
+                return
+            match = re.fullmatch(r"/api/drain-quality/configs/([A-Za-z0-9_-]+)/versions/(\d+)", path)
+            if match:
+                self._json(HTTPStatus.OK, self.server.drain_quality.configs.get_version(match.group(1), int(match.group(2))))  # type: ignore[attr-defined]
+                return
+            if path == "/api/drain-quality/templates":
+                self._json(HTTPStatus.OK, {"schema_version": "drain_template_list_v1", "items": self.server.drain_quality.templates.list_templates(  # type: ignore[attr-defined]
+                    status=query.get("status", [None])[0],
+                    component=query.get("component", [None])[0],
+                    query=query.get("query", [None])[0],
+                )})
+                return
+            match = re.fullmatch(r"/api/drain-quality/templates/([^/]+)(/history)?", path)
+            if match:
+                template_hash = unquote(match.group(1))
+                payload = {"items": self.server.drain_quality.templates.history(template_hash)} if match.group(2) else self.server.drain_quality.templates.get_template(template_hash)  # type: ignore[attr-defined]
+                self._json(HTTPStatus.OK, payload)
                 return
             if path == "/api/ollama/status":
                 self._json(HTTPStatus.OK, self.server.ollama_checker())  # type: ignore[attr-defined]
@@ -251,7 +363,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._serve_events(match.group(1), max(0, cursor))
                 return
             self._json(HTTPStatus.NOT_FOUND, {"error": "资源不存在"})
-        except (FeatureJobError, ApprovedRuleError, ProcessingMetricsError) as exc:
+        except (FeatureJobError, ApprovedRuleError, ProcessingMetricsError, DrainQualityError) as exc:
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
         except (TypeError, ValueError) as exc:
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
@@ -260,6 +372,78 @@ class DashboardHandler(BaseHTTPRequestHandler):
         path, _ = self._route_parts()
         try:
             payload = self._read_json()
+            if path == "/api/drain-quality/datasets":
+                self._json(HTTPStatus.CREATED, self.server.drain_quality.datasets.create(payload))  # type: ignore[attr-defined]
+                return
+            if path == "/api/drain-quality/annotations":
+                self._json(HTTPStatus.CREATED, self.server.drain_quality.annotations.append(payload))  # type: ignore[attr-defined]
+                return
+            match = re.fullmatch(r"/api/drain-quality/annotations/([A-Za-z0-9_-]+)/review", path)
+            if match:
+                self._json(HTTPStatus.CREATED, self.server.drain_quality.annotations.review(match.group(1), payload))  # type: ignore[attr-defined]
+                return
+            if path == "/api/drain-quality/clusters/merge":
+                source = dict(payload) if isinstance(payload, dict) else payload
+                if isinstance(source, dict):
+                    source["action"] = "merge"
+                self._json(HTTPStatus.CREATED, self.server.drain_quality.annotations.append(source))  # type: ignore[attr-defined]
+                return
+            if path == "/api/drain-quality/clusters/split":
+                source = dict(payload) if isinstance(payload, dict) else payload
+                if isinstance(source, dict):
+                    source["action"] = "split"
+                self._json(HTTPStatus.CREATED, self.server.drain_quality.annotations.append(source))  # type: ignore[attr-defined]
+                return
+            if path == "/api/drain-quality/eval-runs":
+                self._json(HTTPStatus.CREATED, self.server.drain_quality.create_eval_run(payload))  # type: ignore[attr-defined]
+                return
+            if path == "/api/drain-quality/configs":
+                self._json(HTTPStatus.CREATED, self.server.drain_quality.configs.create_candidate(payload))  # type: ignore[attr-defined]
+                return
+            match = re.fullmatch(r"/api/drain-quality/configs/([A-Za-z0-9_-]+)/versions", path)
+            if match:
+                self._json(HTTPStatus.CREATED, self.server.drain_quality.configs.save_version(match.group(1), payload))  # type: ignore[attr-defined]
+                return
+            match = re.fullmatch(r"/api/drain-quality/configs/([A-Za-z0-9_-]+)/(validate|publish|rollback)", path)
+            if match:
+                if not isinstance(payload, dict):
+                    raise DrainQualityError("请求体必须是 JSON object")
+                version = int(payload.get("version") or 0)
+                if match.group(2) == "validate":
+                    result = self.server.drain_quality.configs.validate_version(match.group(1), version)  # type: ignore[attr-defined]
+                elif match.group(2) == "publish":
+                    result = self.server.drain_quality.publish_config(match.group(1), version, payload)  # type: ignore[attr-defined]
+                else:
+                    result = self.server.drain_quality.configs.rollback(match.group(1), version, payload)  # type: ignore[attr-defined]
+                self._json(HTTPStatus.OK, result)
+                return
+            if path == "/api/drain-quality/tune-runs":
+                self._json(HTTPStatus.CREATED, self.server.drain_quality.create_tune_run(payload))  # type: ignore[attr-defined]
+                return
+            if path == "/api/drain-quality/templates/import":
+                templates = payload.get("templates") if isinstance(payload, dict) else None
+                self._json(HTTPStatus.CREATED, {"items": self.server.drain_quality.templates.import_templates(templates)})  # type: ignore[attr-defined]
+                return
+            match = re.fullmatch(r"/api/drain-quality/templates/([^/]+)/changes", path)
+            if match:
+                self._json(HTTPStatus.OK, self.server.drain_quality.templates.change_template(unquote(match.group(1)), payload))  # type: ignore[attr-defined]
+                return
+            match = re.fullmatch(r"/api/drain-quality/templates/([^/]+)/rollback", path)
+            if match:
+                if not isinstance(payload, dict):
+                    raise DrainQualityError("请求体必须是 JSON object")
+                self._json(HTTPStatus.OK, self.server.drain_quality.templates.rollback(  # type: ignore[attr-defined]
+                    unquote(match.group(1)), int(payload.get("target_version") or 0),
+                    expected_version=int(payload.get("expected_version") or 0),
+                    confirmed=payload.get("confirmed") is True,
+                    operator=str(payload.get("operator") or "local-operator"),
+                ))
+                return
+            match = re.fullmatch(r"/api/drain-quality/profiles/([A-Za-z0-9_-]+)/(promote|rollback)", path)
+            if match:
+                method = self.server.drain_quality.promote_profile if match.group(2) == "promote" else self.server.drain_quality.rollback_profile  # type: ignore[attr-defined]
+                self._json(HTTPStatus.OK, method(match.group(1), payload))
+                return
             if path == "/api/inputs/analyze":
                 if not isinstance(payload, dict):
                     raise FeatureJobError("请求体必须是 JSON object")
@@ -270,8 +454,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 if not isinstance(content, str):
                     raise FeatureJobError("上传内容必须是 UTF-8 文本")
                 records = parse_log_content(filename.strip(), content)
-                result = self.server.input_analyzer(records)  # type: ignore[attr-defined]
-                self._json(HTTPStatus.OK, {"result": result})
+                drain_config = self.server.drain_quality.configs.active_snapshot()  # type: ignore[attr-defined]
+                analyzed = self.server.input_analyzer(records, drain_config["path"]) if self.server.input_analyzer_accepts_config else self.server.input_analyzer(records)  # type: ignore[attr-defined]
+                result = self.server.govern_drain_result(analyzed)  # type: ignore[attr-defined]
+                self._json(HTTPStatus.OK, {"result": result, "drain_config": {
+                    "config_id": drain_config["config_id"],
+                    "version": drain_config["version"],
+                    "content_hash": drain_config["content_hash"],
+                }})
                 return
             if path == "/api/uploads":
                 if not isinstance(payload, dict):
@@ -305,6 +495,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     upload_id=upload_id,
                     filename=str(payload.get("filename") or manifest.get("safe_filename") or "upload.log"),
                     source_path=str(self.server.upload_store.source_path(upload_id)),  # type: ignore[attr-defined]
+                    drain_config=self.server.drain_quality.configs.active_snapshot(),  # type: ignore[attr-defined]
                 )
                 threading.Thread(target=self.server.run_input_job, args=(job["input_job_id"],), daemon=True).start()  # type: ignore[attr-defined]
                 self._json(HTTPStatus.ACCEPTED, job)
@@ -346,7 +537,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 )
                 return
             self._json(HTTPStatus.NOT_FOUND, {"error": "资源不存在"})
-        except (FeatureJobError, ApprovedRuleError, ProcessingMetricsError) as exc:
+        except (FeatureJobError, ApprovedRuleError, ProcessingMetricsError, DrainQualityError) as exc:
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
         except (TypeError, ValueError) as exc:
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
@@ -375,7 +566,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 "total_chunks": total,
                 "progress": received / total if total else 1.0,
             })
-        except (FeatureJobError, KeyError, ValueError, OSError) as exc:
+        except (FeatureJobError, DrainQualityError, KeyError, ValueError, OSError) as exc:
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
 
     def do_PATCH(self) -> None:
@@ -398,7 +589,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 return
             feature = self.server.manager.update_feature(match.group(1), match.group(2), payload)  # type: ignore[attr-defined]
             self._json(HTTPStatus.OK, feature)
-        except (FeatureJobError, ApprovedRuleError, ProcessingMetricsError) as exc:
+        except (FeatureJobError, ApprovedRuleError, ProcessingMetricsError, DrainQualityError) as exc:
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
 
     def _serve_frontend(self) -> None:
@@ -411,6 +602,21 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        self._cors_headers()
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _serve_frontend_file(self, filename: str, content_type: str) -> None:
+        target = self.server.frontend_path.parent / filename  # type: ignore[attr-defined]
+        if not target.is_file():
+            self._json(HTTPStatus.NOT_FOUND, {"error": "资源不存在"})
+            return
+        body = target.read_bytes()
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self._cors_headers()
         self.end_headers()
         self.wfile.write(body)
 
@@ -766,6 +972,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
+        self._cors_headers()
         self.end_headers()
         self.wfile.write(body)
 
@@ -774,6 +981,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-cache")
         self.send_header("Connection", "close")
+        self._cors_headers()
         self.end_headers()
         while True:
             events, cursor = self.server.manager.wait_for_events(job_id, cursor, timeout=15)  # type: ignore[attr-defined]
@@ -797,6 +1005,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--model", default=os.getenv("OLLAMA_MODEL", DEFAULT_MODEL))
     parser.add_argument("--ollama-url", default=os.getenv("OLLAMA_HOST", DEFAULT_OLLAMA_URL))
     parser.add_argument("--ollama-timeout", type=float, default=float(os.getenv("OLLAMA_TIMEOUT", "120")))
+    parser.add_argument("--cors-origins", default=os.getenv("DASHBOARD_CORS_ORIGINS", ""), help="逗号分隔的允许跨域来源")
     return parser.parse_args(argv)
 
 
@@ -808,6 +1017,7 @@ def main() -> None:
         default_model=args.model,
         default_ollama_url=args.ollama_url,
         default_timeout=args.ollama_timeout,
+        cors_origins=args.cors_origins.split(","),
     )
     print(f"Feature review dashboard: http://{args.host}:{args.port}")
     try:

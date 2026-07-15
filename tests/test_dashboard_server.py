@@ -198,6 +198,8 @@ def test_plain_text_analysis_endpoint(dashboard):
 
     assert status == 200
     assert payload["result"]["summary"]["total_raw_logs"] == 2
+    assert payload["drain_config"]["config_id"] == "baseline"
+    assert payload["drain_config"]["content_hash"]
 
 
 def test_large_upload_routes_create_input_job_and_result(dashboard):
@@ -237,6 +239,9 @@ def test_large_upload_routes_create_input_job_and_result(dashboard):
     assert complete_status == 200
     assert completed["status"] == "completed"
     assert job_status == 202
+    assert job["drain_config_id"] == "baseline"
+    assert job["drain_config_hash"]
+    assert progress["drain_config_version"] == 1
     assert result_status == 200
     assert result["result"]["summary"]["total_raw_logs"] == 2
 

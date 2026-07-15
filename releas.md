@@ -6,6 +6,17 @@
 - 仅修复 Bug 时提升最后一位，例如 `1.2.0 → 1.2.1`；
 - 每次代码更新必须同步更新本文件。
 
+## 1.19.0 - 2026-07-15
+
+### Added
+
+- 新增 M11.5 确定性语义增强层，首期识别 HTTP 状态码、errno、exit code、signal、NVIDIA Xid 和 Kubernetes Reason，并生成 Typed Parameters。
+- 新增 Linux、Kubernetes、NVIDIA 和容器运行时四类只读内置语义词典。
+
+### Security
+
+- 语义提取不调用 LLM，不生成 RCA 或处置建议，也不额外持久化原始日志。
+
 ## 1.18.0 - 2026-07-15
 
 ### Added

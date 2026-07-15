@@ -1,0 +1,15 @@
+schema_version: semantic_dictionary_v1
+dictionary_id: nvidia
+name: NVIDIA GPU 语义
+version: 1
+rules:
+  - rule_id: nvidia-xid-code
+    field: xid_code
+    pattern: '\bXid(?:\s*\([^)]*\))?[:,]?\s*(?P<value>\d+)\b'
+    group: value
+    value_type: integer
+    typed_mask: XID_CODE
+    tags: [GPU, NVIDIA, Xid]
+    priority: 150
+    source_types: []
+    components: [kernel, nvidia, nvidia-driver]

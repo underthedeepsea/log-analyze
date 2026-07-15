@@ -1,0 +1,35 @@
+schema_version: semantic_dictionary_v1
+dictionary_id: linux
+name: Linux 系统语义
+version: 1
+rules:
+  - rule_id: linux-http-status
+    field: http_status
+    pattern: '(?:HTTP(?:/\d(?:\.\d)?)?\s+|status(?:=|\s+))(?P<value>[1-5]\d{2})\b'
+    group: value
+    value_type: integer
+    typed_mask: HTTP_STATUS
+    tags: [HTTP, 状态码]
+    priority: 100
+    source_types: []
+    components: []
+  - rule_id: linux-errno-number
+    field: errno
+    pattern: '\berrno(?:=|\s+)(?P<value>\d+)\b'
+    group: value
+    value_type: integer
+    typed_mask: ERRNO
+    tags: [系统错误, errno]
+    priority: 100
+    source_types: []
+    components: []
+  - rule_id: linux-signal-number
+    field: signal
+    pattern: '\bsignal(?:=|\s+)(?P<value>\d+)\b'
+    group: value
+    value_type: integer
+    typed_mask: SIGNAL
+    tags: [进程, 信号]
+    priority: 100
+    source_types: []
+    components: []

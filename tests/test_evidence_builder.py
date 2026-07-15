@@ -26,6 +26,10 @@ def entity():
                 "first_seen": "2026-06-22T10:01:02+08:00",
                 "last_seen": "2026-06-22T10:02:02+08:00",
                 "feature_hint": "检查内存水位",
+                "semantic_fields": {"exit_code": [{"value": 137, "count": 3}]},
+                "semantic_tags": ["容器", "异常退出"],
+                "typed_parameters": [{"field": "exit_code", "typed_mask": "<EXIT_CODE>", "count": 3}],
+                "semantic_dictionary_versions": {"container_runtime": {"version": 1, "content_hash": "abc"}},
                 "samples": ["SECRET RAW LOG"],
                 "raw_sample": "SECRET RAW SAMPLE",
             },
@@ -47,6 +51,10 @@ def test_sanitized_templates_keep_only_allowed_fields():
         "first_seen": "2026-06-22T10:01:02+08:00",
         "last_seen": "2026-06-22T10:02:02+08:00",
         "feature_hint": "检查内存水位",
+        "semantic_fields": {"exit_code": [{"value": 137, "count": 3}]},
+        "semantic_tags": ["容器", "异常退出"],
+        "typed_parameters": [{"field": "exit_code", "typed_mask": "<EXIT_CODE>", "count": 3}],
+        "semantic_dictionary_versions": {"container_runtime": {"version": 1, "content_hash": "abc"}},
     }]
 
 

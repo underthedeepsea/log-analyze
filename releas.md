@@ -13,6 +13,7 @@
 - 新增 M11.5 确定性语义增强层，首期识别 HTTP 状态码、errno、exit code、signal、NVIDIA Xid 和 Kubernetes Reason，并生成 Typed Parameters。
 - 新增 Linux、Kubernetes、NVIDIA 和容器运行时四类只读内置语义词典。
 - 新增按词典独立演进的文件化候选版本库，支持追加式版本、校验报告、人工发布、活动指针、审计回滚和任务可锁定快照。
+- 小文件与大文件流水线支持锁定词典快照，在不改变 Drain3 结构聚类的前提下，将有界语义字段、标签和 Typed Parameters 传递到模板窗口、风险实体与脱敏 Evidence。
 
 ### Security
 

@@ -22,6 +22,7 @@ def spool_normalized_records(
     spool_dir: str | Path,
     partition_by_node: bool = True,
     progress_callback=None,
+    semantic_extractor=None,
 ) -> dict[str, Any]:
     root = Path(spool_dir)
     root.mkdir(parents=True, exist_ok=True)
@@ -31,6 +32,8 @@ def spool_normalized_records(
     try:
         for record in records:
             normalized = normalize_record(record)
+            if semantic_extractor is not None:
+                normalized = semantic_extractor.enrich(normalized)
             key = mining_partition_key(normalized, partition_by_node=partition_by_node)
             if key not in handles:
                 digest = hashlib.sha256("\x1f".join(key).encode("utf-8")).hexdigest()[:16]

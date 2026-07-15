@@ -100,6 +100,7 @@ def mine_template_event(
     ]
 
     return {
+        "schema_version": "template_event_v2" if "semantic_fields" in record else "template_event_v1",
         "event_id": record.get("raw_log_id"),
         "timestamp": record.get("timestamp"),
         "cluster": cluster,
@@ -116,6 +117,11 @@ def mine_template_event(
         "hash_version": HASH_VERSION,
         "template": template,
         "parameters": parameters,
+        "semantic_fields": record.get("semantic_fields") or {},
+        "semantic_tags": record.get("semantic_tags") or [],
+        "typed_parameters": record.get("typed_parameters") or [],
+        "semantic_extractor_version": record.get("semantic_extractor_version"),
+        "semantic_dictionary_versions": record.get("semantic_dictionary_versions") or {},
         "message_core": message_core,
         "raw_sample": record.get("raw_log"),
         "change_type": result.get("change_type"),

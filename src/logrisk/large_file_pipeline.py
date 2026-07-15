@@ -9,6 +9,7 @@ from logrisk.partition_spool import spool_normalized_records, update_manifest_st
 from logrisk.risk_engine import load_rules, score_risk_entities
 from logrisk.stream_input_parser import iter_log_records_from_file
 from logrisk.streaming_drain_pipeline import mine_spooled_partitions
+from logrisk.semantic.extractor import SemanticExtractor
 
 
 ProgressCallback = Callable[[dict[str, Any]], None]
@@ -34,6 +35,7 @@ def run_large_file_pipeline(
     max_drain_workers: int = 4,
     reserve_cpu_cores: int = 1,
     process_start_method: str = "spawn",
+    semantic_snapshot: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     input_path = Path(input_path)
     started = time.monotonic()
@@ -69,11 +71,13 @@ def run_large_file_pipeline(
             yield record
 
     emit("spooling", 0.05)
+    semantic_extractor = SemanticExtractor.from_snapshot(semantic_snapshot) if semantic_snapshot else None
     manifest = spool_normalized_records(
         source_records(),
         spool_dir=spool_dir,
         partition_by_node=True,
         progress_callback=lambda count: emit("spooling", 0.35),
+        semantic_extractor=semantic_extractor,
     )
     update_manifest_status(spool_dir, manifest, "MINING")
     requested_workers = worker_count or (os.cpu_count() or 1)
@@ -125,6 +129,8 @@ def run_large_file_pipeline(
             "lines_read": parsed,
             "records_parsed": parsed,
             "streaming_spool": True,
+            "semantic_enrichment": semantic_snapshot is not None,
+            "semantic_dictionary_versions": (semantic_snapshot or {}).get("versions", {}),
         },
         "risk_entities": risk_entities,
         "top_templates": sorted(template_windows, key=lambda item: item.get("count", 0), reverse=True)[:20],

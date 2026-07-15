@@ -5,6 +5,12 @@
   const INLINE_MAX_BYTES = 10 * 1024 * 1024;
   const LARGE_CHUNK_BYTES = 1024 * 1024;
   const DEPLOYMENT_API_BASE = String(window.LOGRISK_CONFIG && window.LOGRISK_CONFIG.apiBase || "").replace(/\/$/, "");
+  const SEMANTIC_TEST_EXAMPLES = {
+    container_runtime: { component: "containerd", message: "container exited with code 137" },
+    kubernetes: { component: "kubelet", message: "Pod eviction event Reason=Evicted" },
+    linux: { component: "kernel", message: "request failed errno=5 signal=9 HTTP 503" },
+    nvidia: { component: "kernel", message: "NVRM: Xid 79, GPU has fallen off the bus" },
+  };
 
   function currentApiBase() {
     const configured = String(localStorage.getItem("logrisk.apiBase") || DEPLOYMENT_API_BASE || (window.location.origin === "null" ? "" : window.location.origin));
@@ -768,6 +774,14 @@
       setCustomRules((selected.custom_rules || []).map(function (rule) { return Object.assign({}, rule); }));
       setValidation(null);
     }, [selected && selected.dictionary_id, selected && selected.version, selected && selected.content_hash]);
+    useEffect(function () {
+      if (!selected) return;
+      const example = SEMANTIC_TEST_EXAMPLES[selected.dictionary_id];
+      if (!example) return;
+      setTestComponent(example.component);
+      setTestInput(example.message);
+      setTestResult(null);
+    }, [selected && selected.dictionary_id]);
     function selectDictionary(id) { setLoaded(null); setSelectedId(id); }
     function selectVersion(version) { props.onLoadVersion(selected.dictionary_id, Number(version)).then(setLoaded).catch(function () {}); }
     function updateRule(index, key, value) {

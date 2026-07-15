@@ -123,6 +123,24 @@ def test_semantic_dictionary_governance_ui_contract():
         assert text in source
 
 
+def test_semantic_dictionary_selection_updates_test_bench_and_allows_copy():
+    source = source_text()
+    styles = Path("frontend/src/styles.css").read_text(encoding="utf-8")
+
+    for text in (
+        "SEMANTIC_TEST_EXAMPLES",
+        'container_runtime: { component: "containerd"',
+        'kubernetes: { component: "kubelet"',
+        'linux: { component: "kernel"',
+        'nvidia: { component: "kernel"',
+        "setTestComponent(example.component)",
+        "setTestInput(example.message)",
+        "setTestResult(null)",
+    ):
+        assert text in source
+    assert "user-select:text" in styles
+
+
 def test_ai_harness_pages_and_routes_are_present():
     source = source_text()
     for text in (
@@ -297,7 +315,8 @@ def test_release_docs_describe_current_feature_version():
     assert "## 1.17.1 - 2026-07-14" in release
     assert "## 1.18.0 - 2026-07-15" in release
     assert "## 1.19.0 - 2026-07-15" in release
-    assert "当前版本：`1.19.0`" in readme
+    assert "## 1.19.1 - 2026-07-15" in release
+    assert "当前版本：`1.19.1`" in readme
     assert "state/drain_quality/active_config.json" in readme
     assert "state/semantic_dictionaries/" in readme
     assert "configs/semantic_dictionary/" in readme

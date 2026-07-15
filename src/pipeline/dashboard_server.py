@@ -254,7 +254,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 })
                 return
             if path == "/api/health":
-                self._json(HTTPStatus.OK, {"schema_version": "logrisk_health_v1", "service": "logrisk-dashboard", "status": "ok", "version": "1.19.0"})
+                self._json(HTTPStatus.OK, {"schema_version": "logrisk_health_v1", "service": "logrisk-dashboard", "status": "ok", "version": "1.19.1"})
                 return
             if path == "/api/drain-quality/datasets":
                 self._json(HTTPStatus.OK, {"schema_version": "drain_dataset_list_v1", "items": self.server.drain_quality.datasets.list()})  # type: ignore[attr-defined]

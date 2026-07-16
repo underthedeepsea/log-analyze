@@ -91,7 +91,38 @@ def test_ollama_model_client_merges_options_with_temperature_default():
         options={"think": False, "num_predict": 1200},
     )
 
-    assert captured["body"]["options"] == {"temperature": 0, "think": False, "num_predict": 1200}
+    assert captured["body"]["think"] is False
+    assert captured["body"]["options"] == {"temperature": 0, "num_predict": 1200}
+
+
+def test_ollama_model_client_reports_when_thinking_consumes_output_budget():
+    def fake_urlopen(request, timeout):
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def read(self):
+                return json.dumps({
+                    "message": {"content": "", "thinking": "still reasoning"},
+                    "done_reason": "length",
+                    "eval_count": 900,
+                }).encode()
+
+        return Response()
+
+    with pytest.raises(ModelClientError, match="Thinking 耗尽了输出预算") as error:
+        OllamaModelClient("http://127.0.0.1:11434", opener=fake_urlopen).generate_json(
+            [],
+            SCHEMA,
+            model="qwen3.5:4b-mlx",
+            timeout=9,
+            options={"think": False, "num_predict": 900},
+        )
+
+    assert error.value.status == "parse_failed"
 
 
 def test_ollama_model_client_accepts_markdown_fenced_json_response():

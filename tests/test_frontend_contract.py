@@ -316,7 +316,8 @@ def test_release_docs_describe_current_feature_version():
     assert "## 1.18.0 - 2026-07-15" in release
     assert "## 1.19.0 - 2026-07-15" in release
     assert "## 1.19.1 - 2026-07-15" in release
-    assert "当前版本：`1.19.1`" in readme
+    assert "## 1.19.2 - 2026-07-16" in release
+    assert "当前版本：`1.19.2`" in readme
     assert "state/drain_quality/active_config.json" in readme
     assert "state/semantic_dictionaries/" in readme
     assert "configs/semantic_dictionary/" in readme

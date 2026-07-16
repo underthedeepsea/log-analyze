@@ -56,6 +56,7 @@ class OllamaModelClient:
         options: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         request_options = {"temperature": 0, **(options or {})}
+        think = request_options.pop("think", None)
         body = {
             "model": model,
             "stream": False,
@@ -63,6 +64,8 @@ class OllamaModelClient:
             "options": request_options,
             "messages": messages,
         }
+        if think is not None:
+            body["think"] = think
         request = Request(
             f"{self.base_url}/api/chat",
             data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
@@ -84,8 +87,17 @@ class OllamaModelClient:
 
         try:
             payload = json.loads(raw_response)
-            content = payload["message"]["content"]
+            message = payload["message"]
+            content = message["content"]
+            if not str(content).strip() and message.get("thinking") and payload.get("done_reason") == "length":
+                raise ModelClientError(
+                    "Ollama Thinking 耗尽了输出预算，未返回结构化内容",
+                    raw_output=raw_response.decode("utf-8", errors="replace"),
+                    status="parse_failed",
+                )
             parsed = _parse_content_json(content)
+        except ModelClientError:
+            raise
         except (json.JSONDecodeError, UnicodeDecodeError, KeyError, TypeError) as exc:
             raw = raw_response.decode("utf-8", errors="replace")
             raise ModelClientError(

@@ -6,6 +6,13 @@
 - 仅修复 Bug 时提升最后一位，例如 `1.2.0 → 1.2.1`；
 - 每次代码更新必须同步更新本文件。
 
+## 1.19.2 - 2026-07-16
+
+### Fixed
+
+- 修复 Ollama Thinking 开关错误放入 `options` 导致 Qwen3.5 忽略 `think=false`、思考耗尽 `num_predict` 且结构化内容为空的问题；Thinking 现在按 `/api/chat` 顶层字段发送。
+- 当模型因 Thinking 耗尽输出预算且未返回内容时，记录明确的 `parse_failed` 原因，便于在 AI Trace 中区分普通 JSON 解析失败。
+
 ## 1.19.1 - 2026-07-15
 
 ### Fixed

@@ -1,6 +1,6 @@
 # 日志风险特征分析与审批系统
 
-当前版本：`1.19.1`。变更记录见 [`releas.md`](releas.md)。
+当前版本：`1.19.2`。变更记录见 [`releas.md`](releas.md)。
 
 AI Harness 路线图 M1–M10 已完成；Phase 2 M11 新增 Drain Template Quality Center，M11.5 新增确定性语义增强与词典治理。
 
@@ -15,6 +15,8 @@ M11 质量中心采用统一的橙色白底工作台设计：标注工作台为�
 在 [质量中心](http://127.0.0.1:8080/drain-quality) 的“语义词典”页可创建候选、编辑自定义规则、输入单条日志测试、校验六类核心语义，并人工发布或回滚。发布只影响后续任务。主要接口为 `GET /api/semantic/dictionaries`、`POST /api/semantic/test` 以及 `/api/semantic/dictionaries/{dictionary_id}/...` 版本治理接口。
 
 1.19.1 修复词典内容选中复制与测试台联动：切换词典会自动加载对应组件和示例日志，并清空上一词典的测试结果。
+
+1.19.2 修复 Ollama `/api/chat` 的 Thinking 参数层级：模型 Profile 中的 `think` 会被提升为请求顶层字段，避免 Qwen3.5 仅输出思考过程并在 `num_predict` 上限处终止。
 
 本项目在本机完成日志规范化、Drain3 模板化、风险评分、规则复用、Ollama 特征识别与人工审批。项目不实现 RCA；原始日志不会直接发送给 Ollama。
 

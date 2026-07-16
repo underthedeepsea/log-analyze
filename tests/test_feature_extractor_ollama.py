@@ -198,7 +198,8 @@ profiles:
     trace = json.loads(trace_path.read_text(encoding="utf-8"))
     sent_evidence = json.loads(captured["body"]["messages"][1]["content"])
     assert captured["body"]["model"] == "qwen3:1.7b"
-    assert captured["body"]["options"]["think"] is False
+    assert captured["body"]["think"] is False
+    assert "think" not in captured["body"]["options"]
     assert len(sent_evidence["templates"]) == 1
     assert result[0]["model_profile_id"] == "tiny"
     assert trace["model_profile_id"] == "tiny"

@@ -16,6 +16,10 @@
 - 将 `qwen3.5:4b-mlx` 默认输出预算从 900 提升至 1600 tokens，降低多特征 JSON 因截断而缺少 `tags` 或 `selection_reason` 的概率。
 - 新增 SQLite 迁移，自动清理历史 Profile 中的派生 options，并仅将仍使用 900 默认值的内置 4B Profile 升级为 1600。
 
+### Documentation
+
+- 重构 README 为面向使用和部署的产品说明，删除内部里程碑与 Phase 表述，并按快速开始、日志处理、模型配置、治理、存储、安全和测试重新组织内容。
+
 ## 1.20.0 - 2026-07-16
 
 ### Added

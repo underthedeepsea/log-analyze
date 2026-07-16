@@ -6,6 +6,26 @@
 - 仅修复 Bug 时提升最后一位，例如 `1.2.0 → 1.2.1`；
 - 每次代码更新必须同步更新本文件。
 
+## 1.20.0 - 2026-07-16
+
+### Added
+
+- 新增 Ollama 与 OpenAI-compatible API 连接管理，支持新增、编辑、启停和连接测试；模型 Profile 通过 `connection_id` 绑定连接。
+- 新增 `/v1/chat/completions` Provider，支持 `json_schema`、`json_object` 和 `prompt_only` 三种结构化输出模式，并兼容原始 JSON 与 Markdown fenced JSON。
+- 新增 SQLite 运行时数据层、版本化 SQL 迁移和 `database/schema.yaml` 数据字典；任务、Prompt、规则、Trace、缓存、指标、上传元数据、Drain3 治理和语义词典统一持久化。
+- 新增旧 JSON、JSONL、YAML 和 Prompt 历史的 SHA256 幂等导入；原始上传、分片、Drain3 状态和导出物继续保留在文件系统。
+- 模型画像页面新增 API 连接管理、Provider 状态、连接选择和结构化输出模式配置。
+
+### Changed
+
+- 仓库中的 Prompt、模型 Profile、风险规则、Drain3 基线和内置语义词典改为首次启动种子；初始化后以 SQLite 为运行时权威来源。
+- 新建任务锁定连接、模型 Profile、模型和 Prompt 快照；自动重试始终使用同一 Provider，不进行隐式降级。
+
+### Security
+
+- API Key 仅按环境变量名引用，不保存真实密钥到 SQLite、Trace、日志、错误消息或前端响应。
+- Ollama 与远端 Provider 均只接收聚合、脱敏 Evidence，继续禁止发送原始日志。
+
 ## 1.19.2 - 2026-07-16
 
 ### Fixed

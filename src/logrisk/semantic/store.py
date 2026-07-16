@@ -40,6 +40,30 @@ class SemanticDictionaryStore:
         self._lock = threading.RLock()
         self._builtins = self._load_builtins()
 
+    def _write_catalog(self, catalog: dict[str, Any]) -> None:
+        _atomic_json(self.catalog_path, catalog)
+
+    def _read_version_payload(self, dictionary_id: str, version: int) -> dict[str, Any]:
+        path = self._version_path(dictionary_id, version)
+        if not path.exists():
+            raise SemanticValidationError("语义词典版本不存在")
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise SemanticValidationError(f"语义词典版本损坏: {exc}") from exc
+
+    def _write_version_payload(self, dictionary_id: str, version: int, payload: dict[str, Any]) -> None:
+        _atomic_json(self._version_path(dictionary_id, version), payload)
+
+    def _write_validation(self, dictionary_id: str, version: int, report: dict[str, Any]) -> None:
+        _atomic_json(self._validation_path(dictionary_id, version), report)
+
+    def _read_validation(self, dictionary_id: str, version: int) -> dict[str, Any] | None:
+        path = self._validation_path(dictionary_id, version)
+        if not path.exists():
+            return None
+        return json.loads(path.read_text(encoding="utf-8"))
+
     def _load_builtins(self) -> dict[str, dict[str, Any]]:
         dictionaries: dict[str, dict[str, Any]] = {}
         for path in sorted(self.builtin_root.glob("*.yaml")):
@@ -86,13 +110,7 @@ class SemanticDictionaryStore:
     def _custom_rules(self, dictionary_id: str, version: int) -> list[dict[str, Any]]:
         if version == 1:
             return []
-        path = self._version_path(dictionary_id, version)
-        if not path.exists():
-            raise SemanticValidationError("语义词典版本不存在")
-        try:
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError) as exc:
-            raise SemanticValidationError(f"语义词典版本损坏: {exc}") from exc
+        payload = self._read_version_payload(dictionary_id, version)
         rules = payload.get("custom_rules")
         if not isinstance(rules, list):
             raise SemanticValidationError("语义词典版本格式无效")
@@ -146,7 +164,7 @@ class SemanticDictionaryStore:
             metadata = catalog["items"][dictionary_id]
             version = int(metadata["latest_version"]) + 1
             source_version = int(metadata.get("active_version", 1))
-            _atomic_json(self._version_path(dictionary_id, version), {
+            self._write_version_payload(dictionary_id, version, {
                 "schema_version": "semantic_custom_version_v1",
                 "dictionary_id": dictionary_id,
                 "version": version,
@@ -155,7 +173,7 @@ class SemanticDictionaryStore:
             })
             metadata["latest_version"] = version
             metadata.setdefault("versions", [1]).append(version)
-            _atomic_json(self.catalog_path, catalog)
+            self._write_catalog(catalog)
             return self._snapshot(dictionary_id, version)
 
     def save_version(self, dictionary_id: str, payload: Any) -> dict[str, Any]:
@@ -182,7 +200,7 @@ class SemanticDictionaryStore:
                 "version": version,
                 "rules": [*self._builtins[dictionary_id]["rules"], *custom_rules],
             }, expected_id=dictionary_id)
-            _atomic_json(self._version_path(dictionary_id, version), {
+            self._write_version_payload(dictionary_id, version, {
                 "schema_version": "semantic_custom_version_v1",
                 "dictionary_id": dictionary_id,
                 "version": version,
@@ -191,7 +209,7 @@ class SemanticDictionaryStore:
             })
             metadata["latest_version"] = version
             metadata.setdefault("versions", [1]).append(version)
-            _atomic_json(self.catalog_path, catalog)
+            self._write_catalog(catalog)
             return self._snapshot(dictionary_id, version)
 
     def _bundle(self, override: tuple[str, int] | None = None) -> dict[str, Any]:
@@ -236,7 +254,7 @@ class SemanticDictionaryStore:
             "checks": checks,
             "errors": [f"{item['field']} 核心用例未通过" for item in checks if not item["passed"]],
         }
-        _atomic_json(self._validation_path(dictionary_id, int(version)), report)
+        self._write_validation(dictionary_id, int(version), report)
         return report
 
     def _append_event(self, event: dict[str, Any]) -> None:
@@ -257,15 +275,14 @@ class SemanticDictionaryStore:
             raise SemanticValidationError("词典变更需要人工确认")
         snapshot = self._snapshot(dictionary_id, int(version))
         if action == "publish":
-            validation_path = self._validation_path(dictionary_id, int(version))
-            if not validation_path.exists():
+            validation = self._read_validation(dictionary_id, int(version))
+            if validation is None:
                 raise SemanticValidationError("候选版本必须先通过校验")
-            validation = json.loads(validation_path.read_text(encoding="utf-8"))
             if validation.get("valid") is not True or validation.get("content_hash") != snapshot["content_hash"]:
                 raise SemanticValidationError("候选版本校验未通过或已失效")
         catalog = self._catalog()
         catalog["items"][dictionary_id]["active_version"] = int(version)
-        _atomic_json(self.catalog_path, catalog)
+        self._write_catalog(catalog)
         self._append_event({
             "schema_version": "semantic_dictionary_event_v1",
             "event_id": f"semantic_event_{uuid.uuid4().hex}",

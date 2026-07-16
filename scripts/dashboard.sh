@@ -9,6 +9,7 @@ PYTHON="$ROOT_DIR/.venv/bin/python"
 [[ -x "$PYTHON" ]] || PYTHON="${PYTHON_BIN:-python3}"
 HOST="${DASHBOARD_HOST:-127.0.0.1}"
 PORT="${DASHBOARD_PORT:-8080}"
+DATABASE="${LOGRISK_DB_PATH:-$STATE_DIR/logrisk.sqlite3}"
 
 mkdir -p "$STATE_DIR"
 export PYTHONPATH="${PYTHONPATH:-}:$ROOT_DIR/src"
@@ -17,6 +18,7 @@ dashboard_command() {
   exec "$PYTHON" -m pipeline.dashboard_server \
     --host "$HOST" \
     --port "$PORT" \
+    --database "$DATABASE" \
     --model "${OLLAMA_MODEL:-qwen3:1.7b}" \
     --ollama-url "${OLLAMA_HOST:-http://127.0.0.1:11434}" \
     --ollama-timeout "${OLLAMA_TIMEOUT:-120}"
@@ -72,6 +74,7 @@ start_dashboard() {
   nohup "$PYTHON" -m pipeline.dashboard_server \
     --host "$HOST" \
     --port "$PORT" \
+    --database "$DATABASE" \
     --model "${OLLAMA_MODEL:-qwen3:1.7b}" \
     --ollama-url "${OLLAMA_HOST:-http://127.0.0.1:11434}" \
     --ollama-timeout "${OLLAMA_TIMEOUT:-120}" </dev/null >> "$LOG_FILE" 2>&1 &

@@ -1,6 +1,8 @@
 import pytest
 
+from logrisk.ai_harness.connections import ConnectionStore
 from logrisk.ai_harness.model_profile import ModelProfileRegistry
+from logrisk.database import SQLiteDatabase
 
 
 def test_model_profile_registry_loads_default_and_options(tmp_path):
@@ -81,3 +83,24 @@ def test_model_profile_registry_can_save_new_profile(tmp_path):
 
     assert saved.profile_id == "custom_profile"
     assert registry.get("custom_profile").model == "qwen3.5:4b-mlx"
+
+
+def test_sqlite_profile_registry_binds_connection_and_structured_mode(tmp_path):
+    database = SQLiteDatabase(tmp_path / "logrisk.sqlite3")
+    connections = ConnectionStore(database)
+    connections.seed_defaults("http://127.0.0.1:11434")
+    registry = ModelProfileRegistry("configs/model_profiles.yaml", database=database)
+
+    saved = registry.save({
+        "profile_id": "remote_profile",
+        "connection_id": "ollama-local",
+        "model": "qwen3:1.7b",
+        "display_name": "测试 Profile",
+        "default_prompt_id": "feature_extract_v3_compact_strict_json_en",
+        "structured_output_mode": "json_object",
+    })
+
+    reloaded = ModelProfileRegistry("configs/model_profiles.yaml", database=database).get("remote_profile")
+    assert saved.connection_id == "ollama-local"
+    assert reloaded.structured_output_mode == "json_object"
+    assert reloaded.build_model_options()["structured_output_mode"] == "json_object"

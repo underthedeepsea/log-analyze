@@ -5,8 +5,10 @@ from pathlib import Path
 
 import pytest
 
+from logrisk.database import SQLiteDatabase
 from logrisk.semantic.schema import SemanticValidationError
 from logrisk.semantic.store import SemanticDictionaryStore
+from logrisk.sqlite_stores import SQLiteSemanticDictionaryStore
 
 
 BUILTINS = Path("configs/semantic_dictionary").resolve()
@@ -117,3 +119,16 @@ def test_active_snapshot_test_returns_typed_result(tmp_path):
     assert result["semantic_fields"]["xid_code"] == 79
     assert result["matched_rule_ids"] == ["nvidia-xid-code"]
     assert result["dictionary_versions"]["nvidia"]["version"] == 1
+
+
+def test_sqlite_semantic_dictionary_store_does_not_write_runtime_json(tmp_path):
+    database = SQLiteDatabase(tmp_path / "state" / "logrisk.sqlite3")
+    subject = SQLiteSemanticDictionaryStore(database, BUILTINS)
+
+    candidate = subject.create_candidate("linux", {"operator": "qa"})
+    subject.validate_version("linux", candidate["version"])
+    subject.publish("linux", candidate["version"], {"confirmed": True, "operator": "qa"})
+
+    restored = SQLiteSemanticDictionaryStore(database, BUILTINS)
+    assert restored.active_snapshot()["versions"]["linux"]["version"] == candidate["version"]
+    assert not list((tmp_path / "state" / "semantic-artifacts").rglob("*.json"))

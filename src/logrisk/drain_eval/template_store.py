@@ -43,6 +43,9 @@ class TemplateStore:
         payload.setdefault("schema_version", "drain_template_catalog_v1")
         return payload
 
+    def _write_catalog(self, catalog: dict[str, Any]) -> None:
+        atomic_json(self.catalog_path, catalog)
+
     def _events(self) -> list[dict[str, Any]]:
         if not self.events_path.exists():
             return []
@@ -117,7 +120,7 @@ class TemplateStore:
             catalog["items"][template_hash] = item
             imported.append(item)
             self._record_event(template_hash, "import", None, dict(item), "system")
-        atomic_json(self.catalog_path, catalog)
+        self._write_catalog(catalog)
         return imported
 
     @synchronized
@@ -215,7 +218,7 @@ class TemplateStore:
             current["effective_template"] = catalog["items"][target]["effective_template"]
         current["version"] = int(current["version"]) + 1
         current["updated_at"] = now_iso()
-        atomic_json(self.catalog_path, catalog)
+        self._write_catalog(catalog)
         self._record_event(template_hash, str(action), before, dict(current), str(source.get("operator") or "local-operator"))
         return current
 
@@ -241,7 +244,7 @@ class TemplateStore:
         restored["version"] = int(current["version"]) + 1
         restored["updated_at"] = now_iso()
         catalog["items"][template_hash] = restored
-        atomic_json(self.catalog_path, catalog)
+        self._write_catalog(catalog)
         self._record_event(template_hash, "rollback", before, dict(restored), operator)
         return restored
 

@@ -207,6 +207,19 @@ def test_ai_harness_pages_and_routes_are_present():
         assert text in source
 
 
+def test_model_profile_page_manages_provider_connections():
+    source = source_text()
+    for text in (
+        "/api/ai-harness/connections",
+        "API 连接",
+        "api_key_env",
+        "openai_compatible",
+        "structured_output_mode",
+        "测试连接",
+    ):
+        assert text in source
+
+
 def test_v3_metrics_and_animations_are_present():
     source = source_text()
     for text in (
@@ -317,14 +330,16 @@ def test_release_docs_describe_current_feature_version():
     assert "## 1.19.0 - 2026-07-15" in release
     assert "## 1.19.1 - 2026-07-15" in release
     assert "## 1.19.2 - 2026-07-16" in release
-    assert "当前版本：`1.19.2`" in readme
-    assert "state/drain_quality/active_config.json" in readme
-    assert "state/semantic_dictionaries/" in readme
+    assert "## 1.20.0 - 2026-07-16" in release
+    assert "当前版本：`1.20.0`" in readme
+    assert "state/logrisk.sqlite3" in readme
+    assert "database/migrations/" in readme
+    assert "database/schema.yaml" in readme
     assert "configs/semantic_dictionary/" in readme
     assert "Every code update must also update `releas.md`" in agents
     assert "dashboard.sh restart" in readme
     assert ".txt" in readme
-    for text in ("state/prompt_versions.json", "state/ai_traces.jsonl", "state/ai_cache.json", "state/approved_rules.json", "Promptfoo"):
+    for text in ("OpenAI-compatible", "LOGRISK_DB_PATH", "REMOTE_LLM_API_KEY", "Promptfoo"):
         assert text in readme
     assert "普通启动不需要 Node.js" in readme
     assert "Vite" not in readme

@@ -12,10 +12,12 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.error import URLError
 from urllib.parse import parse_qs, unquote, urlparse
-from urllib.request import urlopen
+from urllib.request import Request, urlopen
 
+from logrisk.ai_harness.connections import ConnectionStore
 from logrisk.ai_harness.model_profile import ModelProfileRegistry
-from logrisk.ai_harness.prompt_registry import PromptRegistry, PromptTemplate
+from logrisk.ai_harness.prompt_registry import PromptRegistry, PromptTemplate, SQLitePromptRegistry
+from logrisk.ai_harness.providers import create_model_client
 from logrisk.ai_harness.trace_logger import AITraceLogger
 from logrisk.approved_rules import ApprovedRuleError, ApprovedRuleStore
 from logrisk.drain_eval.schema import DrainQualityError
@@ -29,6 +31,19 @@ from logrisk.processing_metrics import ProcessingMetricsError, ProcessingMetrics
 from logrisk.semantic.schema import SemanticValidationError
 from logrisk.semantic.store import SemanticDictionaryStore
 from logrisk.upload_sessions import UploadConfig, UploadSessionStore
+from logrisk.database import SQLiteDatabase
+from logrisk.legacy_import import LegacyStateImporter
+from logrisk.sqlite_stores import (
+    SQLiteAICache,
+    SQLiteAITraceLogger,
+    SQLiteApprovedRuleStore,
+    SQLiteDrainQualityService,
+    SQLiteFeatureJobStore,
+    SQLiteInputJobStore,
+    SQLiteProcessingMetricsStore,
+    SQLiteSemanticDictionaryStore,
+    SQLiteUploadSessionStore,
+)
 from pipeline.manual_import_pipeline import analyze_records
 
 
@@ -51,6 +66,28 @@ def check_ollama(base_url: str, timeout: float = 2) -> dict[str, Any]:
         return {"online": False, "models": [], "error": str(exc)}
 
 
+def check_model_connection(connection: dict[str, Any]) -> dict[str, Any]:
+    if not connection.get("enabled"):
+        return {"online": False, "models": [], "error": "连接已停用"}
+    if connection.get("provider") == "ollama":
+        return check_ollama(str(connection["base_url"]), float(connection.get("timeout_seconds") or 2))
+    api_key_env = str(connection.get("api_key_env") or "")
+    api_key = os.environ.get(api_key_env)
+    if not api_key:
+        return {"online": False, "models": [], "error": f"未配置环境变量: {api_key_env}"}
+    request = Request(
+        f"{str(connection['base_url']).rstrip('/')}/models",
+        headers={"Accept": "application/json", "Authorization": f"Bearer {api_key}"},
+    )
+    try:
+        with urlopen(request, timeout=float(connection.get("timeout_seconds") or 10)) as response:
+            payload = json.load(response)
+        models = [item.get("id") for item in payload.get("data", []) if isinstance(item, dict) and item.get("id")]
+        return {"online": True, "models": models}
+    except (OSError, URLError, ValueError, json.JSONDecodeError) as exc:
+        return {"online": False, "models": [], "error": str(exc)}
+
+
 def build_server(
     host: str,
     port: int,
@@ -64,33 +101,73 @@ def build_server(
     drain_quality_root: str | Path | None = None,
     semantic_root: str | Path | None = None,
     cors_origins: list[str] | tuple[str, ...] | set[str] | None = None,
+    database_path: str | Path | None = None,
 ) -> DashboardHTTPServer:
     root = Path(__file__).resolve().parents[2]
+    state_root = Path(database_path).parent if database_path else root / "state"
+    database = SQLiteDatabase(database_path or os.getenv("LOGRISK_DB_PATH") or state_root / "logrisk.sqlite3")
+    connections = ConnectionStore(database)
+    connections.seed_defaults(default_ollama_url)
+    profiles = ModelProfileRegistry(root / "configs" / "model_profiles.yaml", database=database)
+    prompts = SQLitePromptRegistry(database, root / "prompts", root / "configs" / "ai_harness.yaml")
+    traces = SQLiteAITraceLogger(database)
+    ai_cache = SQLiteAICache(database)
+    drain_quality = (
+        DrainQualityService(drain_quality_root, root / "configs" / "drain3_profiles", root / "configs" / "drain3_recommended.ini")
+        if drain_quality_root else SQLiteDrainQualityService(database, root / "configs" / "drain3_profiles", root / "configs" / "drain3_recommended.ini")
+    )
+    semantic_dictionaries = (
+        SemanticDictionaryStore(semantic_root, root / "configs" / "semantic_dictionary")
+        if semantic_root else SQLiteSemanticDictionaryStore(database, root / "configs" / "semantic_dictionary")
+    )
+    LegacyStateImporter(database, state_root, root / "output" / "uploads").run()
+
+    def configured_extractor(entity: dict[str, Any], **kwargs: Any) -> list[dict[str, Any]]:
+        import logrisk.feature_extractor_ollama as feature_extractor
+
+        profile_snapshot = kwargs.get("profile_snapshot")
+        profile = profiles.from_snapshot(profile_snapshot) if isinstance(profile_snapshot, dict) else profiles.get(kwargs.get("model_profile_id"))
+        connection_snapshot = kwargs.get("connection_snapshot")
+        connection = dict(connection_snapshot) if isinstance(connection_snapshot, dict) else connections.get(profile.connection_id)
+        if not connection["enabled"]:
+            raise FeatureJobError(f"模型连接已停用: {profile.connection_id}")
+        feature_extractor.PROMPT_REGISTRY = prompts
+        feature_extractor.TRACE_LOGGER = traces
+        feature_extractor.AI_CACHE = ai_cache
+        return feature_extractor.extract_features_for_entity(
+            entity,
+            model=profile.model,
+            base_url=connection["base_url"],
+            timeout=float(connection["timeout_seconds"]),
+            model_client=create_model_client(connection),
+            prompt_id=kwargs.get("prompt_id") or profile.default_prompt_id,
+            job_id=kwargs.get("job_id"),
+            cache_enabled=bool(kwargs.get("cache_enabled", True)),
+            model_profile_id=profile.profile_id,
+            provider=connection["provider"],
+            model_profile=profile,
+        )
+
     server = DashboardHTTPServer((host, port), DashboardHandler)
-    state_root = root / "state"
+    server.database = database  # type: ignore[attr-defined]
+    server.connections = connections  # type: ignore[attr-defined]
     server.manager = manager or FeatureJobManager(  # type: ignore[attr-defined]
-        rule_store=ApprovedRuleStore(state_root / "approved_rules.json"),
-        metrics_store=ProcessingMetricsStore(state_root / "processing_metrics.json"),
-        persistence=FeatureJobFileStore(state_root / "feature_jobs"),
+        extractor=configured_extractor,
+        rule_store=SQLiteApprovedRuleStore(database),
+        metrics_store=SQLiteProcessingMetricsStore(database),
+        persistence=SQLiteFeatureJobStore(database),
     )
     server.frontend_path = Path(frontend_path or root / "frontend" / "dist" / "index.html")  # type: ignore[attr-defined]
     server.default_model = default_model  # type: ignore[attr-defined]
     server.default_ollama_url = default_ollama_url  # type: ignore[attr-defined]
     server.default_timeout = default_timeout  # type: ignore[attr-defined]
-    server.prompt_registry = PromptRegistry(root / "prompts", root / "configs" / "ai_harness.yaml", state_root / "prompt_versions.json")  # type: ignore[attr-defined]
-    server.model_profiles = ModelProfileRegistry(root / "configs" / "model_profiles.yaml")  # type: ignore[attr-defined]
-    server.trace_logger = AITraceLogger(state_root / "ai_traces.jsonl")  # type: ignore[attr-defined]
-    server.upload_store = UploadSessionStore(UploadConfig(upload_dir=state_root / "uploads"))  # type: ignore[attr-defined]
-    server.input_jobs = InputJobStore(InputJobConfig(output_dir=root / "output" / "uploads"))  # type: ignore[attr-defined]
-    server.drain_quality = DrainQualityService(  # type: ignore[attr-defined]
-        drain_quality_root or state_root / "drain_quality",
-        root / "configs" / "drain3_profiles",
-        root / "configs" / "drain3_recommended.ini",
-    )
-    server.semantic_dictionaries = SemanticDictionaryStore(  # type: ignore[attr-defined]
-        semantic_root or state_root / "semantic_dictionaries",
-        root / "configs" / "semantic_dictionary",
-    )
+    server.prompt_registry = prompts  # type: ignore[attr-defined]
+    server.model_profiles = profiles  # type: ignore[attr-defined]
+    server.trace_logger = traces  # type: ignore[attr-defined]
+    server.upload_store = SQLiteUploadSessionStore(UploadConfig(upload_dir=state_root / "uploads"), database)  # type: ignore[attr-defined]
+    server.input_jobs = SQLiteInputJobStore(InputJobConfig(output_dir=root / "output" / "uploads"), database)  # type: ignore[attr-defined]
+    server.drain_quality = drain_quality  # type: ignore[attr-defined]
+    server.semantic_dictionaries = semantic_dictionaries  # type: ignore[attr-defined]
     configured_origins = cors_origins if cors_origins is not None else os.getenv("DASHBOARD_CORS_ORIGINS", "").split(",")
     server.cors_origins = {str(origin).strip().rstrip("/") for origin in configured_origins if str(origin).strip()}  # type: ignore[attr-defined]
     server.ollama_checker = ollama_checker or (  # type: ignore[attr-defined]
@@ -254,7 +331,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 })
                 return
             if path == "/api/health":
-                self._json(HTTPStatus.OK, {"schema_version": "logrisk_health_v1", "service": "logrisk-dashboard", "status": "ok", "version": "1.19.2"})
+                self._json(HTTPStatus.OK, {"schema_version": "logrisk_health_v1", "service": "logrisk-dashboard", "status": "ok", "version": "1.20.0", "storage": "sqlite"})
                 return
             if path == "/api/drain-quality/datasets":
                 self._json(HTTPStatus.OK, {"schema_version": "drain_dataset_list_v1", "items": self.server.drain_quality.datasets.list()})  # type: ignore[attr-defined]
@@ -347,6 +424,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/ai-harness/model-profiles":
                 self._json(HTTPStatus.OK, self._model_profiles())
+                return
+            if path == "/api/ai-harness/connections":
+                self._json(HTTPStatus.OK, {"items": self.server.connections.list()})  # type: ignore[attr-defined]
                 return
             if path == "/api/ai-harness/observability/summary":
                 self._json(HTTPStatus.OK, self._observability_summary())
@@ -566,22 +646,44 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if path == "/api/ai-harness/model-profiles":
                 if not isinstance(payload, dict):
                     raise FeatureJobError("请求体必须是 JSON object")
+                connection_id = str(payload.get("connection_id") or "ollama-local")
+                connection = self.server.connections.get(connection_id)  # type: ignore[attr-defined]
+                payload = {**payload, "connection_id": connection_id, "provider": connection["provider"]}
                 profile = self.server.model_profiles.save(payload)  # type: ignore[attr-defined]
                 self._json(HTTPStatus.OK, profile.public_dict())
+                return
+            if path == "/api/ai-harness/connections":
+                if not isinstance(payload, dict):
+                    raise FeatureJobError("请求体必须是 JSON object")
+                self._json(HTTPStatus.OK, self.server.connections.save(payload))  # type: ignore[attr-defined]
+                return
+            match = re.fullmatch(r"/api/ai-harness/connections/([A-Za-z0-9_-]+)/test", path)
+            if match:
+                connection = self.server.connections.get(match.group(1))  # type: ignore[attr-defined]
+                self._json(HTTPStatus.OK, {"connection_id": match.group(1), **check_model_connection(connection)})
                 return
             if path == "/api/jobs":
                 if not isinstance(payload, dict):
                     raise FeatureJobError("请求体必须是 JSON object")
+                profile = self.server.model_profiles.get(payload.get("model_profile_id"))  # type: ignore[attr-defined]
+                connection = self.server.connections.get(profile.connection_id)  # type: ignore[attr-defined]
+                if not connection["enabled"]:
+                    raise FeatureJobError(f"模型连接已停用: {profile.connection_id}")
+                if connection["provider"] == "openai_compatible" and not connection["api_key_configured"]:
+                    raise FeatureJobError(f"未配置 API Key 环境变量: {connection.get('api_key_env')}")
                 job_id = self.server.manager.create_job(  # type: ignore[attr-defined]
                     payload.get("result"),
-                    model=payload.get("model") or self.server.default_model,  # type: ignore[attr-defined]
+                    model=profile.model,
                     min_score=float(payload.get("min_score", 40)),
-                    base_url=payload.get("ollama_url") or self.server.default_ollama_url,  # type: ignore[attr-defined]
-                    timeout=float(payload.get("timeout", self.server.default_timeout)),  # type: ignore[attr-defined]
-                    prompt_id=payload.get("prompt_id") or FEATURE_PROMPT_ID,
+                    base_url=connection["base_url"],
+                    timeout=float(connection["timeout_seconds"]),
+                    prompt_id=payload.get("prompt_id") or profile.default_prompt_id,
                     cache_enabled=payload.get("cache_enabled", None),
-                    model_profile_id=payload.get("model_profile_id"),
+                    model_profile_id=profile.profile_id,
                     retry_count=int(payload.get("retry_count", 0)),
+                    provider=connection["provider"],
+                    connection_snapshot=connection,
+                    profile_snapshot=profile.public_dict(),
                 )
                 self._json(HTTPStatus.ACCEPTED, {"job_id": job_id})
                 return
@@ -654,13 +756,21 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self.server.prompt_registry.update(match.group(1), content, str(payload.get("note") or ""))  # type: ignore[attr-defined]
                 self._json(HTTPStatus.OK, self._prompt_detail(match.group(1)))
                 return
+            match = re.fullmatch(r"/api/ai-harness/connections/([A-Za-z0-9_-]+)", path)
+            if match:
+                if not isinstance(payload, dict):
+                    raise FeatureJobError("请求体必须是 JSON object")
+                current = self.server.connections.get(match.group(1))  # type: ignore[attr-defined]
+                updated = self.server.connections.save({**current, **payload, "connection_id": match.group(1)})  # type: ignore[attr-defined]
+                self._json(HTTPStatus.OK, updated)
+                return
             match = re.fullmatch(r"/api/jobs/([a-f0-9]+)/features/([A-Za-z0-9_-]+)", path)
             if not match:
                 self._json(HTTPStatus.NOT_FOUND, {"error": "资源不存在"})
                 return
             feature = self.server.manager.update_feature(match.group(1), match.group(2), payload)  # type: ignore[attr-defined]
             self._json(HTTPStatus.OK, feature)
-        except (FeatureJobError, ApprovedRuleError, ProcessingMetricsError, DrainQualityError) as exc:
+        except (FeatureJobError, ApprovedRuleError, ProcessingMetricsError, DrainQualityError, KeyError, ValueError) as exc:
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
 
     def _serve_frontend(self) -> None:
@@ -1076,6 +1186,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--model", default=os.getenv("OLLAMA_MODEL", DEFAULT_MODEL))
     parser.add_argument("--ollama-url", default=os.getenv("OLLAMA_HOST", DEFAULT_OLLAMA_URL))
     parser.add_argument("--ollama-timeout", type=float, default=float(os.getenv("OLLAMA_TIMEOUT", "120")))
+    parser.add_argument("--database", default=os.getenv("LOGRISK_DB_PATH", "state/logrisk.sqlite3"), help="SQLite 数据库路径")
     parser.add_argument("--cors-origins", default=os.getenv("DASHBOARD_CORS_ORIGINS", ""), help="逗号分隔的允许跨域来源")
     return parser.parse_args(argv)
 
@@ -1089,6 +1200,7 @@ def main() -> None:
         default_ollama_url=args.ollama_url,
         default_timeout=args.ollama_timeout,
         cors_origins=args.cors_origins.split(","),
+        database_path=args.database,
     )
     print(f"Feature review dashboard: http://{args.host}:{args.port}")
     try:

@@ -84,6 +84,7 @@ def dashboard(tmp_path):
             "risk_entities": [],
             "top_templates": [],
         },
+        database_path=tmp_path / "state" / "logrisk.sqlite3",
     )
     prompt_dir = tmp_path / "prompts"
     shutil.copytree(Path("prompts"), prompt_dir)
@@ -301,6 +302,30 @@ def test_model_profiles_route_creates_profile(dashboard):
     assert status == 200
     assert payload["profile_id"] == "custom_fast"
     assert any(item["profile_id"] == "custom_fast" for item in listed["profiles"])
+
+
+def test_model_connections_api_creates_lists_and_updates_remote_connection(dashboard, monkeypatch):
+    base_url, _ = dashboard
+    monkeypatch.setenv("REMOTE_LLM_KEY", "secret")
+
+    status, saved, _ = request_json(base_url + "/api/ai-harness/connections", "POST", {
+        "connection_id": "remote-main",
+        "display_name": "远端主模型",
+        "provider": "openai_compatible",
+        "base_url": "https://llm.example/v1",
+        "api_key_env": "REMOTE_LLM_KEY",
+        "timeout_seconds": 60,
+        "enabled": True,
+    })
+    _, listed, _ = request_json(base_url + "/api/ai-harness/connections")
+    patch_status, updated, _ = request_json(base_url + "/api/ai-harness/connections/remote-main", "PATCH", {"enabled": False})
+
+    assert status == 200
+    assert saved["api_key_configured"] is True
+    assert "secret" not in json.dumps(saved)
+    assert any(item["connection_id"] == "remote-main" for item in listed["items"])
+    assert patch_status == 200
+    assert updated["enabled"] is False
 
 
 def test_observability_progress_exposes_evaluator_status(dashboard):

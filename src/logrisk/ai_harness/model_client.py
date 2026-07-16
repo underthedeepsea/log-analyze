@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from typing import Any, Protocol
 
 
@@ -8,6 +9,22 @@ class ModelClientError(RuntimeError):
         super().__init__(message)
         self.raw_output = raw_output
         self.status = status
+
+
+def parse_content_json(content: str) -> dict[str, Any]:
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError:
+        text = content.strip()
+        if not text.startswith("```"):
+            raise
+        lines = text.splitlines()
+        if not lines or lines[0].strip() not in {"```", "```json", "```JSON"} or lines[-1].strip() != "```":
+            raise
+        parsed = json.loads("\n".join(lines[1:-1]).strip())
+    if not isinstance(parsed, dict):
+        raise TypeError("模型 content JSON 必须是 object")
+    return parsed
 
 
 class ModelClient(Protocol):

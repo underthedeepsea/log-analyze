@@ -29,6 +29,7 @@ def semantic_api(tmp_path):
         frontend_path=frontend,
         drain_quality_root=tmp_path / "drain_quality",
         semantic_root=tmp_path / "semantic",
+        database_path=tmp_path / "state" / "logrisk.sqlite3",
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()

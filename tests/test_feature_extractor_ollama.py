@@ -142,6 +142,28 @@ def test_generate_features_uses_prompt_registry_and_writes_trace(monkeypatch, tm
     assert trace["status"] == "success"
 
 
+def test_generate_features_records_selected_remote_provider(monkeypatch, tmp_path):
+    trace_path = tmp_path / "ai_traces.jsonl"
+
+    class RemoteClient:
+        def generate_json(self, messages, schema, *, model, timeout, options=None):
+            return {"features": [model_feature()]}
+
+    monkeypatch.setattr("logrisk.feature_extractor_ollama.TRACE_LOGGER", AITraceLogger(trace_path))
+
+    result = generate_feature_candidates(
+        [entity()],
+        model="remote-model",
+        model_client=RemoteClient(),
+        provider="openai_compatible",
+        cache_enabled=False,
+    )
+
+    trace = json.loads(trace_path.read_text(encoding="utf-8"))
+    assert result[0]["provider"] == "openai_compatible"
+    assert trace["provider"] == "openai_compatible"
+
+
 def test_generate_features_uses_model_profile_budget_thinking_and_trace(monkeypatch, tmp_path):
     prompt_dir = tmp_path / "prompts"
     prompt_dir.mkdir()

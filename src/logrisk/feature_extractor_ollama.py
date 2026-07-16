@@ -68,7 +68,7 @@ FEATURE_RESPONSE_SCHEMA = {
 
 
 class FeatureExtractionError(RuntimeError):
-    """Raised when Ollama cannot return valid log feature candidates."""
+    """Raised when a model provider cannot return valid feature candidates."""
 
 
 def _validate_base_url(base_url: str) -> str:
@@ -200,6 +200,7 @@ def _attach_source_facts(
     entity: Dict[str, Any],
     feature: Dict[str, Any],
     model: str,
+    provider: str = "ollama",
 ) -> Dict[str, Any]:
     source_by_hash = {
         str(template.get("template_hash")): template
@@ -227,7 +228,7 @@ def _attach_source_facts(
             "last_seen": max(last_seen) if last_seen else entity.get("window_end"),
         },
         "source_templates": sources,
-        "provider": "ollama",
+        "provider": provider,
         "model": model,
     }
 
@@ -242,6 +243,7 @@ def _request_features(
     job_id: str | None = None,
     cache_enabled: bool = True,
     model_profile: ModelProfile | None = None,
+    provider: str = "ollama",
 ) -> tuple[list[Dict[str, Any]], str | None, Dict[str, Any], bool, Dict[str, Any]]:
     prompt = PROMPT_REGISTRY.load(prompt_id)
     if model_profile:
@@ -258,7 +260,7 @@ def _request_features(
     signature = cache_signature(
         evidence_hash(evidence),
         prompt.sha256,
-        "ollama",
+        provider,
         model,
         model_profile.thinking.enabled if model_profile else None,
     )
@@ -283,7 +285,7 @@ def _request_features(
             _write_trace(
                 prompt=prompt,
                 evidence=evidence,
-                provider="ollama",
+                provider=provider,
                 model=model,
                 job_id=job_id,
                 raw_output=exc.raw_output,
@@ -304,7 +306,7 @@ def _request_features(
         _write_trace(
             prompt=prompt,
             evidence=evidence,
-            provider="ollama",
+            provider=provider,
             model=model,
             job_id=job_id,
             raw_output=json.dumps(model_output, ensure_ascii=False),
@@ -316,7 +318,7 @@ def _request_features(
             evidence_meta=evidence_meta,
             model_options=model_options,
         )
-        raise FeatureExtractionError("Ollama 特征响应缺少 features 数组")
+        raise FeatureExtractionError("模型特征响应缺少 features 数组")
 
     known_hashes = {
         str(template.get("template_hash"))
@@ -329,7 +331,7 @@ def _request_features(
         _write_trace(
             prompt=prompt,
             evidence=evidence,
-            provider="ollama",
+            provider=provider,
             model=model,
             job_id=job_id,
             raw_output=json.dumps(model_output, ensure_ascii=False),
@@ -358,7 +360,7 @@ def _request_features(
         _write_trace(
             prompt=prompt,
             evidence=evidence,
-            provider="ollama",
+            provider=provider,
             model=model,
             job_id=job_id,
             raw_output=json.dumps(model_output, ensure_ascii=False),
@@ -375,7 +377,7 @@ def _request_features(
     trace_id = _write_trace(
         prompt=prompt,
         evidence=evidence,
-        provider="ollama",
+        provider=provider,
         model=model,
         job_id=job_id,
         raw_output=json.dumps(model_output, ensure_ascii=False),
@@ -407,21 +409,26 @@ def extract_features_for_entity(
     cache_enabled: bool = True,
     model_profile_id: str | None = None,
     profile_config_path: str | Path | None = None,
+    provider: str = "ollama",
+    model_profile: ModelProfile | None = None,
 ) -> list[Dict[str, Any]]:
-    registry = ModelProfileRegistry(profile_config_path) if profile_config_path else MODEL_PROFILES
-    profile = registry.get(model_profile_id)
+    if model_profile is None:
+        registry = ModelProfileRegistry(profile_config_path) if profile_config_path else MODEL_PROFILES
+        profile = registry.get(model_profile_id)
+    else:
+        profile = model_profile
     resolved_model = model or profile.model
     if not resolved_model or not resolved_model.strip():
-        raise FeatureExtractionError("必须指定 Ollama 模型")
+        raise FeatureExtractionError("必须指定模型")
     if timeout <= 0:
-        raise FeatureExtractionError("Ollama timeout 必须大于 0")
+        raise FeatureExtractionError("模型 timeout 必须大于 0")
     normalized_url = _validate_base_url(base_url)
     model_name = resolved_model.strip()
     selected_prompt = prompt_id or profile.default_prompt_id or FEATURE_PROMPT_ID
     features, trace_id, evaluator_result, cache_hit, request_meta = _request_features(
-        entity, model_name, normalized_url, timeout, model_client, selected_prompt, job_id, cache_enabled, profile
+        entity, model_name, normalized_url, timeout, model_client, selected_prompt, job_id, cache_enabled, profile, provider
     )
-    attached = [_attach_source_facts(entity, feature, model_name) for feature in features]
+    attached = [_attach_source_facts(entity, feature, model_name, provider) for feature in features]
     for feature in attached:
         feature["prompt_id"] = selected_prompt
         feature["prompt_hash"] = request_meta["prompt_hash"]
@@ -448,6 +455,8 @@ def generate_feature_candidates(
     cache_enabled: bool = True,
     model_profile_id: str | None = None,
     profile_config_path: str | Path | None = None,
+    provider: str = "ollama",
+    model_profile: ModelProfile | None = None,
 ) -> list[Dict[str, Any]]:
     results = []
     for entity in entities:
@@ -464,5 +473,7 @@ def generate_feature_candidates(
             cache_enabled,
             model_profile_id,
             profile_config_path,
+            provider,
+            model_profile,
         ))
     return results

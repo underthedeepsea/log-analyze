@@ -7,25 +7,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
-from logrisk.ai_harness.model_client import ModelClientError
-
-
-def _parse_content_json(content: str) -> dict[str, Any]:
-    try:
-        parsed = json.loads(content)
-    except json.JSONDecodeError:
-        text = content.strip()
-        if text.startswith("```"):
-            lines = text.splitlines()
-            if lines and lines[0].strip() in {"```", "```json", "```JSON"} and lines[-1].strip() == "```":
-                parsed = json.loads("\n".join(lines[1:-1]).strip())
-            else:
-                raise
-        else:
-            raise
-    if not isinstance(parsed, dict):
-        raise TypeError("Ollama content JSON must be object")
-    return parsed
+from logrisk.ai_harness.model_client import ModelClientError, parse_content_json
 
 
 class OllamaModelClient:
@@ -56,6 +38,9 @@ class OllamaModelClient:
         options: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         request_options = {"temperature": 0, **(options or {})}
+        request_options.pop("structured_output_mode", None)
+        if "max_output_tokens" in request_options:
+            request_options["num_predict"] = request_options.pop("max_output_tokens")
         think = request_options.pop("think", None)
         body = {
             "model": model,
@@ -95,7 +80,7 @@ class OllamaModelClient:
                     raw_output=raw_response.decode("utf-8", errors="replace"),
                     status="parse_failed",
                 )
-            parsed = _parse_content_json(content)
+            parsed = parse_content_json(content)
         except ModelClientError:
             raise
         except (json.JSONDecodeError, UnicodeDecodeError, KeyError, TypeError) as exc:

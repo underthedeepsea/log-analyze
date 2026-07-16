@@ -2,7 +2,7 @@
 DO NOT send optional commentary
 ## Project Structure & Module Organization
 
-Core Python logic lives in `src/logrisk/`: normalization, Drain3 mining, aggregation, risk scoring, approved-rule persistence, metrics, Ollama extraction, and review jobs are separate modules. `src/pipeline/manual_import_pipeline.py` creates `result.json`; `src/pipeline/dashboard_server.py` hosts the application. Keep React source in `frontend/src/`, committed runtime assets in `frontend/dist/`, configuration in `configs/`, samples in `examples/`, launchers in `scripts/`, and pytest modules in `tests/`. Generated artifacts belong in `output/`; runtime state belongs in ignored `state/`.
+Core Python logic lives in `src/logrisk/`: normalization, Drain3 mining, aggregation, risk scoring, provider clients, SQLite stores, metrics, and review jobs are separate modules. `src/pipeline/manual_import_pipeline.py` creates `result.json`; `src/pipeline/dashboard_server.py` hosts the application. Keep migrations in `database/migrations/`, the PostgreSQL-ready data dictionary in `database/schema.yaml`, React source in `frontend/src/`, committed runtime assets in `frontend/dist/`, configuration in `configs/`, samples in `examples/`, launchers in `scripts/`, and pytest modules in `tests/`. Generated artifacts belong in `output/`; runtime state belongs in ignored `state/`.
 
 ## Build, Test, and Development Commands
 
@@ -27,13 +27,13 @@ Use four-space indentation, PEP 8 spacing, type hints, and `from __future__ impo
 
 ## Testing Guidelines
 
-Tests use pytest and `test_<behavior>` names. Add regression coverage for malformed records, schema failures, sanitization, job transitions, HTTP routes, and export filtering. HTTP tests may bind a random loopback port and must not require a live Ollama instance. Preserve deterministic tests by injecting the extractor and using temporary output/state directories. No coverage threshold is configured.
+Tests use pytest and `test_<behavior>` names. Add regression coverage for malformed records, schema failures, sanitization, job transitions, HTTP routes, export filtering, migrations, and transaction rollback. HTTP tests may bind a random loopback port and must not require a live model service. Preserve deterministic tests with injected extractors, fake Provider HTTP servers, temporary SQLite databases, and temporary output/state directories. No coverage threshold is configured.
 
 ## Architecture and Security Constraints
 
-This repository identifies and reviews log features; it does not implement RCA. Ollama must receive only aggregated, sanitized evidence and must never receive `samples`, `raw_sample`, or raw log streams. Only approved features may be exported for manual import into the external RCA system. Do not add Kafka, Elasticsearch, a database, external LLM services, or frontend CDNs. Bind the dashboard to `127.0.0.1` by default.
+This repository identifies and reviews log features; it does not implement RCA. Every model Provider must receive only aggregated, sanitized evidence and must never receive `samples`, `raw_sample`, or raw log streams. Only approved features may be exported for manual import into the external RCA system. SQLite via Python's standard library and explicitly configured OpenAI-compatible APIs are supported; do not add Kafka, Elasticsearch, an ORM, another database, automatic Provider fallback, or frontend CDNs without an explicit requirement. Bind the dashboard to `127.0.0.1` by default.
 
-Keep Prompt source in `prompts/`, Prompt metadata in `configs/ai_harness.yaml`, local Prompt history in `state/prompt_versions.json`, AI traces in `state/ai_traces.jsonl`, cache state in `state/ai_cache.json`, and approved rule lineage in `state/approved_rules.json`. Do not add Phoenix, MLflow, or LangSmith until cross-team sharing, long-term metric queries, or distributed tracing becomes an explicit requirement.
+Keep tracked seed data in `prompts/`, `configs/ai_harness.yaml`, `configs/model_profiles.yaml`, `configs/risk_rules.yaml`, `configs/drain3_recommended.ini`, `configs/drain3_profiles/`, and `configs/semantic_dictionary/`. Runtime business state belongs in ignored `state/logrisk.sqlite3`; local database files, WAL/SHM files, logs, uploads, exports, and legacy state backups must never be committed. API keys must be read from environment variables and must not enter SQLite, Trace, logs, errors, or frontend responses. Do not add Phoenix, MLflow, or LangSmith until cross-team sharing, long-term metric queries, or distributed tracing becomes explicit.
 
 ## Commit & Pull Request Guidelines
 

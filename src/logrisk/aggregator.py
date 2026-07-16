@@ -75,6 +75,11 @@ class TemplateEventAggregator:
                 "samples": [],
                 "affected_namespaces": set(),
                 "affected_pods": set(),
+                "semantic_field_counts": defaultdict(dict),
+                "semantic_tags": set(),
+                "typed_parameter_counts": {},
+                "semantic_extractor_version": event.get("semantic_extractor_version"),
+                "semantic_dictionary_versions": event.get("semantic_dictionary_versions") or {},
             }
 
         w = self.windows[key]
@@ -88,6 +93,21 @@ class TemplateEventAggregator:
             w["affected_namespaces"].add(event["namespace"])
         if event.get("pod"):
             w["affected_pods"].add(event["pod"])
+        for field, value in (event.get("semantic_fields") or {}).items():
+            value_key = repr(value)
+            entry = w["semantic_field_counts"][field].setdefault(value_key, {"value": value, "count": 0})
+            entry["count"] += 1
+        w["semantic_tags"].update(str(tag) for tag in (event.get("semantic_tags") or []) if str(tag))
+        for parameter in event.get("typed_parameters") or []:
+            if not isinstance(parameter, dict) or not parameter.get("field") or not parameter.get("typed_mask"):
+                continue
+            parameter_key = (str(parameter["field"]), str(parameter["typed_mask"]))
+            entry = w["typed_parameter_counts"].setdefault(parameter_key, {
+                "field": parameter_key[0],
+                "typed_mask": parameter_key[1],
+                "count": 0,
+            })
+            entry["count"] += 1
 
     def finalize(self) -> list[Dict[str, Any]]:
         out = []
@@ -95,6 +115,14 @@ class TemplateEventAggregator:
             item = dict(w)
             item["affected_namespaces"] = sorted(w["affected_namespaces"])
             item["affected_pods"] = sorted(w["affected_pods"])
+            item["semantic_fields"] = {
+                field: sorted(values.values(), key=lambda entry: (-entry["count"], str(entry["value"])))[:20]
+                for field, values in sorted(w["semantic_field_counts"].items())
+            }
+            item["semantic_tags"] = sorted(w["semantic_tags"])
+            item["typed_parameters"] = sorted(w["typed_parameter_counts"].values(), key=lambda entry: (entry["field"], entry["typed_mask"]))
+            item.pop("semantic_field_counts", None)
+            item.pop("typed_parameter_counts", None)
             out.append(item)
 
         return sorted(out, key=lambda x: (x["window_start"], x["entity_id"], -x["count"]))

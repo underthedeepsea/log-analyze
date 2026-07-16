@@ -101,6 +101,46 @@ def test_drain_config_governance_ui_contract():
         assert text in source
 
 
+def test_semantic_dictionary_governance_ui_contract():
+    source = source_text()
+    for text in (
+        "/api/semantic/dictionaries",
+        "/api/semantic/test",
+        "semantic-dictionary-governance",
+        "语义词典",
+        "内置规则（只读）",
+        "自定义扩展规则",
+        "语义测试台",
+        "Typed Mask",
+        "版本历史",
+        "创建候选",
+        "配置校验",
+        "人工发布",
+        "回滚版本",
+        "semanticDictionaryVersion",
+        "validateSemanticDictionary",
+    ):
+        assert text in source
+
+
+def test_semantic_dictionary_selection_updates_test_bench_and_allows_copy():
+    source = source_text()
+    styles = Path("frontend/src/styles.css").read_text(encoding="utf-8")
+
+    for text in (
+        "SEMANTIC_TEST_EXAMPLES",
+        'container_runtime: { component: "containerd"',
+        'kubernetes: { component: "kubelet"',
+        'linux: { component: "kernel"',
+        'nvidia: { component: "kernel"',
+        "setTestComponent(example.component)",
+        "setTestInput(example.message)",
+        "setTestResult(null)",
+    ):
+        assert text in source
+    assert "user-select:text" in styles
+
+
 def test_ai_harness_pages_and_routes_are_present():
     source = source_text()
     for text in (
@@ -163,6 +203,33 @@ def test_ai_harness_pages_and_routes_are_present():
         "Lineage 状态",
         "查看来源 AI Trace",
         "template_fingerprint",
+    ):
+        assert text in source
+
+
+def test_model_profile_page_manages_provider_connections():
+    source = source_text()
+    for text in (
+        "/api/ai-harness/connections",
+        "API 连接",
+        "api_key_env",
+        "openai_compatible",
+        "structured_output_mode",
+        "测试连接",
+    ):
+        assert text in source
+
+
+def test_model_profile_save_has_feedback_and_edits_top_level_output_budget():
+    source = source_text()
+    for text in (
+        'const [saveState, setSaveState] = useState("idle")',
+        "async function saveProfile()",
+        'saveState === "saving" ? "保存中…" : "保存 Profile"',
+        "Profile 已保存",
+        'setField("max_output_tokens"',
+        'setField("recommended_input_tokens"',
+        "runtime_options",
     ):
         assert text in source
 
@@ -268,28 +335,26 @@ def test_release_docs_describe_current_feature_version():
     release = Path("releas.md").read_text(encoding="utf-8")
     readme = Path("README.md").read_text(encoding="utf-8")
     agents = Path("AGENTS.md").read_text(encoding="utf-8")
-    harness_doc = Path("docs/AI_HARNESS_ARCHITECTURE.md").read_text(encoding="utf-8")
 
     assert "## 1.16.0 - 2026-07-11" in release
     assert "## 1.16.2 - 2026-07-13" in release
     assert "## 1.17.0 - 2026-07-14" in release
     assert "## 1.17.1 - 2026-07-14" in release
     assert "## 1.18.0 - 2026-07-15" in release
-    assert "当前版本：`1.18.0`" in readme
-    assert "state/drain_quality/active_config.json" in readme
+    assert "## 1.19.0 - 2026-07-15" in release
+    assert "## 1.19.1 - 2026-07-15" in release
+    assert "## 1.19.2 - 2026-07-16" in release
+    assert "## 1.20.0 - 2026-07-16" in release
+    assert "## 1.20.1 - 2026-07-16" in release
+    assert "当前版本：`1.20.1`" in readme
+    assert "state/logrisk.sqlite3" in readme
+    assert "database/migrations/" in readme
+    assert "database/schema.yaml" in readme
+    assert "configs/semantic_dictionary/" in readme
     assert "Every code update must also update `releas.md`" in agents
     assert "dashboard.sh restart" in readme
     assert ".txt" in readme
-    for text in (
-        "state/prompt_versions.json",
-        "state/ai_traces.jsonl",
-        "state/ai_cache.json",
-        "state/approved_rules.json",
-        "Promptfoo",
-        "Phoenix",
-        "MLflow",
-        "LangSmith",
-    ):
-        assert text in harness_doc
+    for text in ("OpenAI-compatible", "LOGRISK_DB_PATH", "REMOTE_LLM_API_KEY", "Promptfoo"):
+        assert text in readme
     assert "普通启动不需要 Node.js" in readme
     assert "Vite" not in readme

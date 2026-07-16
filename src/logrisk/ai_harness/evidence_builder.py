@@ -20,6 +20,11 @@ TEMPLATE_FIELDS = (
     "first_seen",
     "last_seen",
     "feature_hint",
+    "semantic_fields",
+    "semantic_tags",
+    "typed_parameters",
+    "semantic_extractor_version",
+    "semantic_dictionary_versions",
 )
 
 

@@ -1,0 +1,15 @@
+schema_version: semantic_dictionary_v1
+dictionary_id: container_runtime
+name: 容器运行时语义
+version: 1
+rules:
+  - rule_id: runtime-exit-code
+    field: exit_code
+    pattern: '\b(?:exit(?:ed)?(?:\s+with)?(?:\s+code)?|exitCode)(?:=|:\s*|\s+)(?P<value>\d+)\b'
+    group: value
+    value_type: integer
+    typed_mask: EXIT_CODE
+    tags: [容器, 异常退出]
+    priority: 120
+    source_types: []
+    components: [containerd, docker, cri-o, kubelet]

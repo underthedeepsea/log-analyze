@@ -1,6 +1,15 @@
 import json
+from pathlib import Path
 
+from logrisk.semantic.store import SemanticDictionaryStore
 from pipeline.manual_import_pipeline import analyze_records, parse_args, run_pipeline
+
+
+def semantic_snapshot(tmp_path):
+    return SemanticDictionaryStore(
+        tmp_path / "semantic",
+        Path("configs/semantic_dictionary").resolve(),
+    ).active_snapshot()
 
 
 def test_run_pipeline_stops_after_risk_scoring(tmp_path):
@@ -72,3 +81,24 @@ def test_analyze_records_returns_result_without_debug_file_contract(tmp_path):
     assert result["summary"]["total_raw_logs"] == 1
     assert "risk_entities" in result
     assert "debug_files" not in result
+
+
+def test_pipeline_keeps_structural_template_and_distinct_semantic_values(tmp_path):
+    result = analyze_records(
+        records=[
+            {"message": "HTTP request failed with status 500", "component": "nginx", "node": "node-a"},
+            {"message": "HTTP request failed with status 503", "component": "nginx", "node": "node-a"},
+        ],
+        config_path="configs/drain3_recommended.ini",
+        rules_path="configs/risk_rules.yaml",
+        state_dir=str(tmp_path / "state"),
+        semantic_snapshot=semantic_snapshot(tmp_path),
+    )
+
+    assert result["summary"]["semantic_enrichment"] is True
+    assert len(result["top_templates"]) == 1
+    assert result["top_templates"][0]["semantic_fields"]["http_status"] == [
+        {"value": 500, "count": 1},
+        {"value": 503, "count": 1},
+    ]
+    assert "状态码" in result["top_templates"][0]["semantic_tags"]

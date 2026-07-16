@@ -28,6 +28,7 @@ def drain_api(tmp_path):
         manager=FeatureJobManager(auto_start=False),
         frontend_path=frontend,
         drain_quality_root=tmp_path / "drain_quality",
+        database_path=tmp_path / "state" / "logrisk.sqlite3",
         cors_origins=["http://127.0.0.1:3000"],
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)

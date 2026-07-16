@@ -245,12 +245,15 @@ class FeatureJobManager:
         cache_enabled: bool | None = None,
         model_profile_id: str | None = None,
         retry_count: int = 0,
+        provider: str = "ollama",
+        connection_snapshot: dict[str, Any] | None = None,
+        profile_snapshot: dict[str, Any] | None = None,
     ) -> str:
         validate_result_document(document)
         if not isinstance(model, str) or not model.strip():
-            raise FeatureJobError("必须指定 Ollama 模型")
+            raise FeatureJobError("必须指定模型")
         if timeout <= 0:
-            raise FeatureJobError("Ollama timeout 必须大于 0")
+            raise FeatureJobError("模型 timeout 必须大于 0")
         try:
             normalized_retry_count = int(retry_count)
         except (TypeError, ValueError) as exc:
@@ -305,10 +308,13 @@ class FeatureJobManager:
                 "created_at": _now(),
                 "completed_at": None,
                 "model": model.strip(),
+                "provider": str(provider or "ollama"),
                 "base_url": base_url,
                 "timeout": float(timeout),
                 "prompt_id": str(prompt_id or FEATURE_PROMPT_ID),
                 "model_profile_id": model_profile_id,
+                "connection_snapshot": copy.deepcopy(connection_snapshot) if connection_snapshot else None,
+                "profile_snapshot": copy.deepcopy(profile_snapshot) if profile_snapshot else None,
                 "cache_enabled": _cache_enabled_default() if cache_enabled is None else bool(cache_enabled),
                 "retry_count": normalized_retry_count,
                 "min_score": float(min_score),
@@ -382,6 +388,9 @@ class FeatureJobManager:
                             job_id=job["job_id"],
                             cache_enabled=job["cache_enabled"],
                             model_profile_id=job.get("model_profile_id"),
+                            provider=job.get("provider", "ollama"),
+                            connection_snapshot=copy.deepcopy(job.get("connection_snapshot")),
+                            profile_snapshot=copy.deepcopy(job.get("profile_snapshot")),
                         )
                         break
                     except Exception as exc:
@@ -407,7 +416,7 @@ class FeatureJobManager:
                         record["llm_counted"] = True
                     record["feature_ids"] = []
                     for feature in features:
-                        feature.setdefault("origin", "ollama")
+                        feature.setdefault("origin", job.get("provider", "ollama"))
                         candidate_id = feature["candidate_id"]
                         job["features"][candidate_id] = copy.deepcopy(feature)
                         record["feature_ids"].append(candidate_id)
@@ -538,8 +547,11 @@ class FeatureJobManager:
                 "created_at": job["created_at"],
                 "completed_at": job["completed_at"],
                 "model": job["model"],
+                "provider": job.get("provider", "ollama"),
                 "prompt_id": job["prompt_id"],
                 "model_profile_id": job.get("model_profile_id"),
+                "connection_snapshot": copy.deepcopy(job.get("connection_snapshot")),
+                "profile_snapshot": copy.deepcopy(job.get("profile_snapshot")),
                 "retry_count": job.get("retry_count", 0),
                 "min_score": job["min_score"],
                 "source_summary": copy.deepcopy(job["source_summary"]),

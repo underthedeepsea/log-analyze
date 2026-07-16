@@ -1,0 +1,15 @@
+schema_version: semantic_dictionary_v1
+dictionary_id: kubernetes
+name: Kubernetes 语义
+version: 1
+rules:
+  - rule_id: kubernetes-reason
+    field: k8s_reason
+    pattern: '\bReason(?:=|:\s*)(?P<value>[A-Za-z][A-Za-z0-9_-]{1,63})\b'
+    group: value
+    value_type: string
+    typed_mask: K8S_REASON
+    tags: [Kubernetes, 状态原因]
+    priority: 120
+    source_types: []
+    components: [kubelet, apiserver, scheduler, controller-manager]

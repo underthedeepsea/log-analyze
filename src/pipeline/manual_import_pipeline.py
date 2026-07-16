@@ -9,6 +9,7 @@ from logrisk.drain_miner import mine_template_events
 from logrisk.io_utils import read_json_or_jsonl, write_json
 from logrisk.normalizer import normalize_records
 from logrisk.risk_engine import load_rules, score_risk_entities
+from logrisk.semantic.extractor import SemanticExtractor
 
 
 def _process_records(
@@ -20,8 +21,12 @@ def _process_records(
     drain_worker_count: int = 1,
     drain_partition_by_node: bool = False,
     drain_progress_callback: Callable[[Dict[str, int]], None] | None = None,
+    semantic_snapshot: Dict[str, Any] | None = None,
 ) -> tuple[Dict[str, Any], Dict[str, Any]]:
     normalized = normalize_records(records)
+    if semantic_snapshot:
+        extractor = SemanticExtractor.from_snapshot(semantic_snapshot)
+        normalized = [extractor.enrich(record) for record in normalized]
     template_events, mining_metadata = mine_template_events(
         normalized,
         config_path=config_path,
@@ -54,6 +59,8 @@ def _process_records(
             "total_risk_entities": len(risk_entities),
             "critical_entities": sum(1 for x in risk_entities if x.get("risk_level") == "critical"),
             "high_entities": sum(1 for x in risk_entities if x.get("risk_level") == "high"),
+            "semantic_enrichment": semantic_snapshot is not None,
+            "semantic_dictionary_versions": (semantic_snapshot or {}).get("versions", {}),
         },
         "risk_entities": risk_entities,
         "top_templates": sorted(template_windows, key=lambda x: x.get("count", 0), reverse=True)[:20],
@@ -75,6 +82,7 @@ def analyze_records(
     drain_worker_count: int = 1,
     drain_partition_by_node: bool = False,
     drain_progress_callback: Callable[[Dict[str, int]], None] | None = None,
+    semantic_snapshot: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     result, _ = _process_records(
         records,
@@ -85,6 +93,7 @@ def analyze_records(
         drain_worker_count,
         drain_partition_by_node,
         drain_progress_callback,
+        semantic_snapshot,
     )
     return result
 

@@ -501,3 +501,29 @@ def test_file_store_marks_running_job_interrupted_without_model_retry(tmp_path):
     assert snapshot["status"] == "interrupted"
     assert snapshot["entities"][0]["status"] == "interrupted"
     assert calls == []
+
+
+def test_job_locks_provider_connection_and_profile_snapshots():
+    captured = {}
+
+    def extractor(source, **kwargs):
+        captured.update(kwargs)
+        return []
+
+    manager = FeatureJobManager(extractor=extractor, auto_start=False)
+    job_id = manager.create_job(
+        {"summary": {}, "risk_entities": [entity("node-a", 90)]},
+        model="remote-model",
+        model_profile_id="remote-profile",
+        provider="openai_compatible",
+        connection_snapshot={"connection_id": "remote", "provider": "openai_compatible", "base_url": "https://example/v1"},
+        profile_snapshot={"profile_id": "remote-profile", "model": "remote-model"},
+    )
+
+    manager.run_job(job_id)
+    snapshot = manager.get_job(job_id)
+
+    assert snapshot["provider"] == "openai_compatible"
+    assert snapshot["connection_snapshot"]["connection_id"] == "remote"
+    assert captured["connection_snapshot"]["base_url"] == "https://example/v1"
+    assert captured["profile_snapshot"]["profile_id"] == "remote-profile"

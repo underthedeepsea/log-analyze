@@ -12,3 +12,24 @@ def test_input_job_store_writes_progress_and_result(tmp_path):
     assert progress["upload_id"] == "upl_a"
     assert progress["stage"] == "reading"
     assert store.get_result(job["input_job_id"])["summary"]["total_raw_logs"] == 1
+
+
+def test_input_job_persists_semantic_dictionary_snapshot(tmp_path):
+    store = InputJobStore(InputJobConfig(output_dir=tmp_path / "jobs"))
+    snapshot = {
+        "schema_version": "semantic_snapshot_v1",
+        "extractor_version": "1.0.0",
+        "dictionaries": [{"dictionary_id": "linux", "version": 2, "rules": []}],
+        "versions": {"linux": {"version": 2, "content_hash": "abc"}},
+    }
+
+    job = store.create(
+        upload_id="upload-1",
+        filename="messages",
+        source_path="/tmp/messages",
+        semantic_snapshot=snapshot,
+    )
+
+    persisted = store.get_job(job["input_job_id"])
+    assert persisted["semantic_dictionary_snapshot"] == snapshot
+    assert persisted["semantic_dictionary_versions"]["linux"]["version"] == 2

@@ -6,6 +6,64 @@
 - 仅修复 Bug 时提升最后一位，例如 `1.2.0 → 1.2.1`；
 - 每次代码更新必须同步更新本文件。
 
+## 1.20.1 - 2026-07-16
+
+### Fixed
+
+- 修复模型画像页点击“保存 Profile”没有可见反馈的问题；按钮现在显示保存中、成功或错误状态。
+- 修复 `recommended_input_tokens` 和 `max_output_tokens` 错误写入 Evidence Budget、顶层配置未更新的问题。
+- 修复页面回传的派生 `options.num_predict` 覆盖新输出预算的问题；派生的 Thinking、输出长度和结构化模式不再作为可编辑 options 持久化。
+- 将 `qwen3.5:4b-mlx` 默认输出预算从 900 提升至 1600 tokens，降低多特征 JSON 因截断而缺少 `tags` 或 `selection_reason` 的概率。
+- 新增 SQLite 迁移，自动清理历史 Profile 中的派生 options，并仅将仍使用 900 默认值的内置 4B Profile 升级为 1600。
+
+## 1.20.0 - 2026-07-16
+
+### Added
+
+- 新增 Ollama 与 OpenAI-compatible API 连接管理，支持新增、编辑、启停和连接测试；模型 Profile 通过 `connection_id` 绑定连接。
+- 新增 `/v1/chat/completions` Provider，支持 `json_schema`、`json_object` 和 `prompt_only` 三种结构化输出模式，并兼容原始 JSON 与 Markdown fenced JSON。
+- 新增 SQLite 运行时数据层、版本化 SQL 迁移和 `database/schema.yaml` 数据字典；任务、Prompt、规则、Trace、缓存、指标、上传元数据、Drain3 治理和语义词典统一持久化。
+- 新增旧 JSON、JSONL、YAML 和 Prompt 历史的 SHA256 幂等导入；原始上传、分片、Drain3 状态和导出物继续保留在文件系统。
+- 模型画像页面新增 API 连接管理、Provider 状态、连接选择和结构化输出模式配置。
+
+### Changed
+
+- 仓库中的 Prompt、模型 Profile、风险规则、Drain3 基线和内置语义词典改为首次启动种子；初始化后以 SQLite 为运行时权威来源。
+- 新建任务锁定连接、模型 Profile、模型和 Prompt 快照；自动重试始终使用同一 Provider，不进行隐式降级。
+
+### Security
+
+- API Key 仅按环境变量名引用，不保存真实密钥到 SQLite、Trace、日志、错误消息或前端响应。
+- Ollama 与远端 Provider 均只接收聚合、脱敏 Evidence，继续禁止发送原始日志。
+
+## 1.19.2 - 2026-07-16
+
+### Fixed
+
+- 修复 Ollama Thinking 开关错误放入 `options` 导致 Qwen3.5 忽略 `think=false`、思考耗尽 `num_predict` 且结构化内容为空的问题；Thinking 现在按 `/api/chat` 顶层字段发送。
+- 当模型因 Thinking 耗尽输出预算且未返回内容时，记录明确的 `parse_failed` 原因，便于在 AI Trace 中区分普通 JSON 解析失败。
+
+## 1.19.1 - 2026-07-15
+
+### Fixed
+
+- 修复语义词典内容无法选中复制的问题；切换 Linux、Kubernetes、NVIDIA GPU 或容器运行时词典时，语义测试台现在会同步对应组件和示例日志，并清空旧测试结果。
+
+## 1.19.0 - 2026-07-15
+
+### Added
+
+- 新增 M11.5 确定性语义增强层，首期识别 HTTP 状态码、errno、exit code、signal、NVIDIA Xid 和 Kubernetes Reason，并生成 Typed Parameters。
+- 新增 Linux、Kubernetes、NVIDIA 和容器运行时四类只读内置语义词典。
+- 新增按词典独立演进的文件化候选版本库，支持追加式版本、校验报告、人工发布、活动指针、审计回滚和任务可锁定快照。
+- 小文件与大文件流水线支持锁定词典快照，在不改变 Drain3 结构聚类的前提下，将有界语义字段、标签和 Typed Parameters 传递到模板窗口、风险实体与脱敏 Evidence。
+- 新增语义词典列表、版本、候选保存、校验、人工发布、回滚、单日志测试和模板语义摘要 API；大文件任务持久化创建时锁定的完整安全快照。
+- 质量中心新增“语义词典”页面，提供独立词典状态、只读内置规则、自定义扩展编辑、单日志语义测试、Typed Mask、版本历史、校验、发布和回滚操作。
+
+### Security
+
+- 语义提取不调用 LLM，不生成 RCA 或处置建议，也不额外持久化原始日志。
+
 ## 1.18.0 - 2026-07-15
 
 ### Added

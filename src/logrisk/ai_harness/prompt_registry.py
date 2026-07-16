@@ -9,6 +9,8 @@ from typing import Any
 
 import yaml
 
+from logrisk.database import SQLiteDatabase, utc_now
+
 
 @dataclass(frozen=True)
 class PromptTemplate:
@@ -107,4 +109,134 @@ class PromptRegistry:
         history_path.parent.mkdir(parents=True, exist_ok=True)
         history_path.write_text(json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")
         path.write_text(content, encoding="utf-8")
+        return self.load(prompt_id)
+
+
+class SQLitePromptRegistry(PromptRegistry):
+    def __init__(
+        self,
+        database: SQLiteDatabase,
+        prompt_dir: str | Path,
+        config_path: str | Path | None = None,
+    ) -> None:
+        super().__init__(prompt_dir, config_path)
+        self.database = database
+        self._seed()
+
+    def _seed(self) -> None:
+        with self.database.connect() as connection:
+            if connection.execute("SELECT 1 FROM prompt_templates LIMIT 1").fetchone():
+                return
+        config = self._config()
+        defaults = set((config.get("defaults") or {}).values())
+        configured = [item for item in (config.get("prompts") or []) if item.get("prompt_id")]
+        if not configured:
+            configured = [{"prompt_id": path.stem} for path in sorted(self.prompt_dir.glob("*.md"))]
+        now = utc_now()
+        with self.database.transaction() as connection:
+            for meta in configured:
+                prompt_id = str(meta["prompt_id"])
+                path = self.prompt_dir / f"{prompt_id}.md"
+                content = path.read_text(encoding="utf-8")
+                digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+                connection.execute(
+                    "INSERT INTO prompt_templates(prompt_id, analysis_type, display_name, description, status, is_default, "
+                    "current_version, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)",
+                    (
+                        prompt_id,
+                        meta.get("analysis_type") or "feature_extract",
+                        meta.get("display_name"),
+                        meta.get("description"),
+                        meta.get("status") or "active",
+                        int(bool(meta.get("is_default") or prompt_id in defaults)),
+                        now,
+                        now,
+                    ),
+                )
+                connection.execute(
+                    "INSERT INTO prompt_versions(prompt_id, version, content, content_sha256, note, created_at) VALUES (?, 1, ?, ?, ?, ?)",
+                    (prompt_id, content, digest, "seed", now),
+                )
+
+    @staticmethod
+    def _template(row: Any) -> PromptTemplate:
+        return PromptTemplate(
+            prompt_id=row["prompt_id"],
+            content=row["content"],
+            sha256=row["content_sha256"],
+            path=f"database:prompt/{row['prompt_id']}/v{row['current_version']}",
+            display_name=row["display_name"],
+            description=row["description"],
+            analysis_type=row["analysis_type"],
+            status=row["status"],
+            is_default=bool(row["is_default"]),
+            version=f"v{row['current_version']}",
+        )
+
+    def load(self, prompt_id: str) -> PromptTemplate:
+        with self.database.connect() as connection:
+            row = connection.execute(
+                "SELECT t.*, v.content, v.content_sha256 FROM prompt_templates t "
+                "JOIN prompt_versions v ON v.prompt_id=t.prompt_id AND v.version=t.current_version WHERE t.prompt_id=?",
+                (prompt_id,),
+            ).fetchone()
+        if row is None:
+            raise FileNotFoundError(f"prompt not found: {prompt_id}")
+        return self._template(row)
+
+    def list_prompts(self) -> list[PromptTemplate]:
+        with self.database.connect() as connection:
+            rows = connection.execute(
+                "SELECT t.*, v.content, v.content_sha256 FROM prompt_templates t "
+                "JOIN prompt_versions v ON v.prompt_id=t.prompt_id AND v.version=t.current_version ORDER BY t.prompt_id"
+            ).fetchall()
+        return [self._template(row) for row in rows]
+
+    def get_default(self, analysis_type: str) -> PromptTemplate:
+        for prompt in self.list_prompts():
+            if prompt.analysis_type == analysis_type and prompt.is_default:
+                return prompt
+        raise FileNotFoundError(f"default prompt not found for analysis_type: {analysis_type}")
+
+    def history(self, prompt_id: str) -> list[dict[str, Any]]:
+        with self.database.connect() as connection:
+            current = connection.execute(
+                "SELECT current_version FROM prompt_templates WHERE prompt_id=?", (prompt_id,)
+            ).fetchone()
+            if current is None:
+                return []
+            rows = connection.execute(
+                "SELECT version, content, content_sha256, note, created_at FROM prompt_versions "
+                "WHERE prompt_id=? AND version < ? ORDER BY version DESC",
+                (prompt_id, current[0]),
+            ).fetchall()
+        return [{
+            "version_id": row["content_sha256"][:12],
+            "version": f"v{row['version']}",
+            "content": row["content"],
+            "sha256": row["content_sha256"],
+            "note": row["note"] or "",
+            "saved_at": row["created_at"],
+        } for row in rows]
+
+    def update(self, prompt_id: str, content: str, note: str = "") -> PromptTemplate:
+        if not isinstance(content, str) or not content.strip():
+            raise ValueError("prompt content must be non-empty")
+        digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        now = utc_now()
+        with self.database.transaction() as connection:
+            row = connection.execute(
+                "SELECT current_version FROM prompt_templates WHERE prompt_id=?", (prompt_id,)
+            ).fetchone()
+            if row is None:
+                raise FileNotFoundError(f"prompt not found: {prompt_id}")
+            version = int(row[0]) + 1
+            connection.execute(
+                "INSERT INTO prompt_versions(prompt_id, version, content, content_sha256, note, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (prompt_id, version, content, digest, note, now),
+            )
+            connection.execute(
+                "UPDATE prompt_templates SET current_version=?, updated_at=? WHERE prompt_id=?",
+                (version, now, prompt_id),
+            )
         return self.load(prompt_id)

@@ -7,25 +7,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
-from logrisk.ai_harness.model_client import ModelClientError
-
-
-def _parse_content_json(content: str) -> dict[str, Any]:
-    try:
-        parsed = json.loads(content)
-    except json.JSONDecodeError:
-        text = content.strip()
-        if text.startswith("```"):
-            lines = text.splitlines()
-            if lines and lines[0].strip() in {"```", "```json", "```JSON"} and lines[-1].strip() == "```":
-                parsed = json.loads("\n".join(lines[1:-1]).strip())
-            else:
-                raise
-        else:
-            raise
-    if not isinstance(parsed, dict):
-        raise TypeError("Ollama content JSON must be object")
-    return parsed
+from logrisk.ai_harness.model_client import ModelClientError, parse_content_json
 
 
 class OllamaModelClient:
@@ -56,6 +38,10 @@ class OllamaModelClient:
         options: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         request_options = {"temperature": 0, **(options or {})}
+        request_options.pop("structured_output_mode", None)
+        if "max_output_tokens" in request_options:
+            request_options["num_predict"] = request_options.pop("max_output_tokens")
+        think = request_options.pop("think", None)
         body = {
             "model": model,
             "stream": False,
@@ -63,6 +49,8 @@ class OllamaModelClient:
             "options": request_options,
             "messages": messages,
         }
+        if think is not None:
+            body["think"] = think
         request = Request(
             f"{self.base_url}/api/chat",
             data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
@@ -84,8 +72,17 @@ class OllamaModelClient:
 
         try:
             payload = json.loads(raw_response)
-            content = payload["message"]["content"]
-            parsed = _parse_content_json(content)
+            message = payload["message"]
+            content = message["content"]
+            if not str(content).strip() and message.get("thinking") and payload.get("done_reason") == "length":
+                raise ModelClientError(
+                    "Ollama Thinking 耗尽了输出预算，未返回结构化内容",
+                    raw_output=raw_response.decode("utf-8", errors="replace"),
+                    status="parse_failed",
+                )
+            parsed = parse_content_json(content)
+        except ModelClientError:
+            raise
         except (json.JSONDecodeError, UnicodeDecodeError, KeyError, TypeError) as exc:
             raw = raw_response.decode("utf-8", errors="replace")
             raise ModelClientError(

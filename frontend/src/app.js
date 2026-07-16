@@ -5,6 +5,12 @@
   const INLINE_MAX_BYTES = 10 * 1024 * 1024;
   const LARGE_CHUNK_BYTES = 1024 * 1024;
   const DEPLOYMENT_API_BASE = String(window.LOGRISK_CONFIG && window.LOGRISK_CONFIG.apiBase || "").replace(/\/$/, "");
+  const SEMANTIC_TEST_EXAMPLES = {
+    container_runtime: { component: "containerd", message: "container exited with code 137" },
+    kubernetes: { component: "kubelet", message: "Pod eviction event Reason=Evicted" },
+    linux: { component: "kernel", message: "request failed errno=5 signal=9 HTTP 503" },
+    nvidia: { component: "kernel", message: "NVRM: Xid 79, GPU has fallen off the bus" },
+  };
 
   function currentApiBase() {
     const configured = String(localStorage.getItem("logrisk.apiBase") || DEPLOYMENT_API_BASE || (window.location.origin === "null" ? "" : window.location.origin));
@@ -40,6 +46,14 @@
     validateDrainConfig: function (configId, payload) { return jsonRequest("/api/drain-quality/configs/" + encodeURIComponent(configId) + "/validate", { method: "POST", body: JSON.stringify(payload) }); },
     publishDrainConfig: function (configId, payload) { return jsonRequest("/api/drain-quality/configs/" + encodeURIComponent(configId) + "/publish", { method: "POST", body: JSON.stringify(payload) }); },
     rollbackDrainConfig: function (configId, payload) { return jsonRequest("/api/drain-quality/configs/" + encodeURIComponent(configId) + "/rollback", { method: "POST", body: JSON.stringify(payload) }); },
+    semanticDictionaries: function () { return jsonRequest("/api/semantic/dictionaries"); },
+    semanticDictionaryVersion: function (dictionaryId, version) { return jsonRequest("/api/semantic/dictionaries/" + encodeURIComponent(dictionaryId) + "/versions/" + Number(version)); },
+    createSemanticCandidate: function (dictionaryId) { return jsonRequest("/api/semantic/dictionaries/" + encodeURIComponent(dictionaryId) + "/candidates", { method: "POST", body: JSON.stringify({ operator: "local-operator" }) }); },
+    saveSemanticDictionary: function (dictionaryId, version, customRules) { return jsonRequest("/api/semantic/dictionaries/" + encodeURIComponent(dictionaryId) + "/candidates/" + Number(version), { method: "PUT", body: JSON.stringify({ custom_rules: customRules, operator: "local-operator" }) }); },
+    validateSemanticDictionary: function (dictionaryId, version) { return jsonRequest("/api/semantic/dictionaries/" + encodeURIComponent(dictionaryId) + "/candidates/" + Number(version) + "/validate", { method: "POST", body: "{}" }); },
+    publishSemanticDictionary: function (dictionaryId, version) { return jsonRequest("/api/semantic/dictionaries/" + encodeURIComponent(dictionaryId) + "/candidates/" + Number(version) + "/publish", { method: "POST", body: JSON.stringify({ confirmed: true, operator: "local-operator" }) }); },
+    rollbackSemanticDictionary: function (dictionaryId, version) { return jsonRequest("/api/semantic/dictionaries/" + encodeURIComponent(dictionaryId) + "/rollback", { method: "POST", body: JSON.stringify({ version: Number(version), confirmed: true, operator: "local-operator" }) }); },
+    testSemanticDictionary: function (payload) { return jsonRequest("/api/semantic/test", { method: "POST", body: JSON.stringify(payload) }); },
     importDrainTemplates: function (templates) { return jsonRequest("/api/drain-quality/templates/import", { method: "POST", body: JSON.stringify({ templates: templates }) }); },
     annotateDrainTemplate: function (payload) { return jsonRequest("/api/drain-quality/annotations", { method: "POST", body: JSON.stringify(payload) }); },
     changeDrainTemplate: function (templateHash, payload) { return jsonRequest("/api/drain-quality/templates/" + encodeURIComponent(templateHash) + "/changes", { method: "POST", body: JSON.stringify(payload) }); },
@@ -53,6 +67,10 @@
     prompts: function () { return jsonRequest("/api/ai-harness/prompts"); },
     modelProfiles: function () { return jsonRequest("/api/ai-harness/model-profiles"); },
     saveModelProfile: function (profile) { return jsonRequest("/api/ai-harness/model-profiles", { method: "POST", body: JSON.stringify(profile) }); },
+    modelConnections: function () { return jsonRequest("/api/ai-harness/connections"); },
+    saveModelConnection: function (connection) { return jsonRequest("/api/ai-harness/connections", { method: "POST", body: JSON.stringify(connection) }); },
+    updateModelConnection: function (id, changes) { return jsonRequest("/api/ai-harness/connections/" + encodeURIComponent(id), { method: "PATCH", body: JSON.stringify(changes) }); },
+    testModelConnection: function (id) { return jsonRequest("/api/ai-harness/connections/" + encodeURIComponent(id) + "/test", { method: "POST", body: "{}" }); },
     prompt: function (id) { return jsonRequest("/api/ai-harness/prompts/" + encodeURIComponent(id)); },
     savePrompt: function (id, content, note) { return jsonRequest("/api/ai-harness/prompts/" + encodeURIComponent(id), { method: "PATCH", body: JSON.stringify({ content: content, note: note || "" }) }); },
     traces: function (query) { return jsonRequest("/api/ai-harness/traces" + (query || "")); },
@@ -493,10 +511,17 @@
     const currentId = props.selectedProfileId || props.profiles && props.profiles.default_profile_id;
     const current = profiles.find(function (profile) { return profile.profile_id === currentId; }) || profiles[0] || {};
     const [draft, setDraft] = useState(current);
-    useEffect(function () { setDraft(current); }, [current.profile_id]);
+    const [connections, setConnections] = useState([]);
+    const [connectionDraft, setConnectionDraft] = useState({ connection_id: "", display_name: "", provider: "openai_compatible", base_url: "https://api.example.com/v1", api_key_env: "REMOTE_LLM_API_KEY", timeout_seconds: 120, enabled: true });
+    const [connectionStatus, setConnectionStatus] = useState(null);
+    const [connectionError, setConnectionError] = useState("");
+    const [saveState, setSaveState] = useState("idle");
+    const [saveMessage, setSaveMessage] = useState("");
+    useEffect(function () { setDraft(current); setSaveState("idle"); setSaveMessage(""); }, [current.profile_id]);
+    useEffect(function () { api.modelConnections().then(function (value) { const items = value.items || []; setConnections(items); if (items[0]) setConnectionDraft(items[0]); }).catch(function (reason) { setConnectionError(reason.message); }); }, []);
     const budget = draft.evidence_budget || {};
-    function setField(key, value) { setDraft(Object.assign({}, draft, { [key]: value })); }
-    function setBudget(key, value) { setDraft(Object.assign({}, draft, { evidence_budget: Object.assign({}, budget, { [key]: Number(value) || 0 }) })); }
+    function setField(key, value) { setDraft(Object.assign({}, draft, { [key]: value })); setSaveState("idle"); setSaveMessage(""); }
+    function setBudget(key, value) { setDraft(Object.assign({}, draft, { evidence_budget: Object.assign({}, budget, { [key]: Number(value) || 0 }) })); setSaveState("idle"); setSaveMessage(""); }
     function createProfile() {
       const next = Object.assign({}, current, {
         profile_id: (current.profile_id || "custom") + "_copy",
@@ -505,6 +530,24 @@
       props.onSelect(next);
       setDraft(next);
     }
+    function selectConnection(connection) { setConnectionDraft(connection); setConnectionStatus(null); setConnectionError(""); }
+    function newConnection() { setConnectionDraft({ connection_id: "remote-" + Date.now(), display_name: "远端模型 API", provider: "openai_compatible", base_url: "https://api.example.com/v1", api_key_env: "REMOTE_LLM_API_KEY", timeout_seconds: 120, enabled: true, is_default: false }); setConnectionStatus(null); }
+    async function saveConnection() { try { const saved = await api.saveModelConnection(connectionDraft); const value = await api.modelConnections(); setConnections(value.items || []); setConnectionDraft(saved); setConnectionError(""); } catch (reason) { setConnectionError(reason.message); } }
+    async function testConnection() { try { setConnectionStatus(await api.testModelConnection(connectionDraft.connection_id)); setConnectionError(""); } catch (reason) { setConnectionError(reason.message); } }
+    async function saveProfile() {
+      setSaveState("saving");
+      setSaveMessage("");
+      try {
+        const saved = await props.onSave(draft);
+        if (saved) setDraft(saved);
+        setSaveState("saved");
+        setSaveMessage("Profile 已保存");
+      } catch (reason) {
+        setSaveState("error");
+        setSaveMessage(reason.message || "Profile 保存失败");
+      }
+    }
+    function setConnectionField(key, value) { setConnectionDraft(Object.assign({}, connectionDraft, { [key]: value })); }
     const head = h("div", { className: "page-head obs-head" }, h("div", null, h("h1", null, "模型画像与上下文预算"), h("p", null, "按模型参数量、上下文窗口、Prompt 策略和 Thinking 开关，控制 Evidence 输入规模与调用行为")));
     const metrics = h("section", { className: "metrics-grid" },
         h(Metric, { label: "当前模型参数量", value: current.parameter_size || "—", tone: "orange" }),
@@ -513,6 +556,19 @@
         h(Metric, { label: "单模板字符上限", value: budget.max_template_chars || "—" }),
         h(Metric, { label: "Thinking 模式", value: current.thinking_enabled ? "ON" : "OFF", tone: current.thinking_enabled ? "green" : "red" }),
         h(Metric, { label: "默认 Prompt", value: current.default_prompt_id || "—" }));
+    const connectionPanel = h("section", { className: "surface connection-manager" },
+      h("div", { className: "surface-head" }, h("div", null, h("b", null, "API 连接"), h("span", null, "Ollama 与 OpenAI-compatible 服务地址和鉴权引用")), h("button", { className: "secondary-button", onClick: newConnection }, "新增连接")),
+      h("div", { className: "connection-layout" },
+        h("div", { className: "connection-list" }, connections.map(function (connection) { return h("button", { className: "connection-card " + (connection.connection_id === connectionDraft.connection_id ? "active" : ""), key: connection.connection_id, onClick: function () { selectConnection(connection); } }, h("div", null, h("b", null, connection.display_name), h("span", { className: "status-chip " + (connection.enabled ? "active" : "ignored") }, connection.enabled ? "启用" : "停用")), h("small", null, connection.provider + " · " + connection.base_url), h("small", null, connection.api_key_env ? (connection.api_key_configured ? "密钥环境变量已配置" : "密钥环境变量未配置") : "无需 API Key")); })),
+        h("div", { className: "connection-form" },
+          h("label", null, "连接 ID", h("input", { value: connectionDraft.connection_id || "", onChange: function (event) { setConnectionField("connection_id", event.target.value); } })),
+          h("label", null, "显示名称", h("input", { value: connectionDraft.display_name || "", onChange: function (event) { setConnectionField("display_name", event.target.value); } })),
+          h("label", null, "Provider", h("select", { value: connectionDraft.provider || "ollama", onChange: function (event) { setConnectionField("provider", event.target.value); } }, h("option", { value: "ollama" }, "Ollama"), h("option", { value: "openai_compatible" }, "OpenAI-compatible"))),
+          h("label", { className: "wide" }, "API 基础地址", h("input", { value: connectionDraft.base_url || "", onChange: function (event) { setConnectionField("base_url", event.target.value); } }), h("small", null, connectionDraft.provider === "ollama" ? "示例：http://127.0.0.1:11434" : "地址需包含 /v1，例如：https://api.example.com/v1")),
+          h("label", null, "API Key 环境变量", h("input", { value: connectionDraft.api_key_env || "", disabled: connectionDraft.provider === "ollama", onChange: function (event) { setConnectionField("api_key_env", event.target.value); } }), h("small", null, "仅保存变量名，不保存密钥")),
+          h("label", null, "超时（秒）", h("input", { type: "number", value: connectionDraft.timeout_seconds || 120, onChange: function (event) { setConnectionField("timeout_seconds", Number(event.target.value) || 120); } })),
+          h("label", null, "状态", h("select", { value: connectionDraft.enabled === false ? "off" : "on", onChange: function (event) { setConnectionField("enabled", event.target.value === "on"); } }, h("option", { value: "on" }, "启用"), h("option", { value: "off" }, "停用"))),
+          h("div", { className: "button-row wide" }, h("button", { className: "primary-button", onClick: saveConnection }, "保存连接"), h("button", { className: "secondary-button", disabled: !connectionDraft.connection_id, onClick: testConnection }, "测试连接"), connectionStatus && h("span", { className: "connection-result " + (connectionStatus.online ? "success" : "failed") }, connectionStatus.online ? "连接成功 · " + (connectionStatus.models || []).length + " 个模型" : connectionStatus.error), connectionError && h("span", { className: "connection-result failed" }, connectionError)))));
     const list = h("div", { className: "surface" }, h("div", { className: "surface-head" }, h("b", null, "模型 Profile 列表"), h("span", null, profiles.length + " 个启用")),
       h("div", { className: "profile-list" }, profiles.map(function (profile) {
         return h("button", { className: "profile-card " + (profile.profile_id === current.profile_id ? "active" : ""), key: profile.profile_id, onClick: function () { props.onSelect(profile); } },
@@ -526,19 +582,21 @@
         h("label", null, "Profile ID", h("input", { value: draft.profile_id || "", onChange: function (event) { setField("profile_id", event.target.value); } })),
         h("label", null, "模型名称", h("input", { value: draft.model || "", onChange: function (event) { setField("model", event.target.value); } })),
         h("label", null, "显示名称", h("input", { value: draft.display_name || "", onChange: function (event) { setField("display_name", event.target.value); } })),
-        h("label", null, "Provider", h("input", { value: draft.provider || "ollama", onChange: function (event) { setField("provider", event.target.value); } })),
+        h("label", null, "API 连接", h("select", { value: draft.connection_id || "ollama-local", onChange: function (event) { const connection = connections.find(function (item) { return item.connection_id === event.target.value; }); setDraft(Object.assign({}, draft, { connection_id: event.target.value, provider: connection ? connection.provider : draft.provider })); } }, connections.map(function (connection) { return h("option", { value: connection.connection_id, key: connection.connection_id }, connection.display_name + " · " + connection.provider); }))),
+        h("label", null, "结构化输出", h("select", { value: draft.structured_output_mode || "json_schema", onChange: function (event) { setField("structured_output_mode", event.target.value); } }, h("option", { value: "json_schema" }, "JSON Schema"), h("option", { value: "json_object" }, "JSON Object"), h("option", { value: "prompt_only" }, "仅 Prompt 约束"))),
         h("label", null, "参数量", h("input", { value: draft.parameter_size || "", onChange: function (event) { setField("parameter_size", event.target.value); } })),
         h("label", null, "默认 Prompt", h("input", { value: draft.default_prompt_id || "", onChange: function (event) { setField("default_prompt_id", event.target.value); } })),
         h("label", null, "Thinking", h("select", { value: draft.thinking_enabled ? "on" : "off", onChange: function (event) { setField("thinking_enabled", event.target.value === "on"); } }, h("option", { value: "off" }, "Thinking OFF"), h("option", { value: "on" }, "Thinking ON"))),
         h("p", null, "关闭 Thinking 模式用于 Ollama / 支持 thinking 参数的模型。关闭后降低推理耗时，减少中间思考内容影响 JSON 输出稳定性。"),
         h("h3", null, "Context Budget"),
         h("div", { className: "budget-grid" }, ["max_templates", "max_template_chars", "max_affected_entities", "max_evidence_chars", "recommended_input_tokens", "max_output_tokens"].map(function (key) {
-          return h("label", { key: key }, h("b", null, key), h("input", { type: "number", value: budget[key] || draft[key] || 0, onChange: function (event) { key in budget ? setBudget(key, event.target.value) : setField(key, Number(event.target.value) || 0); } }));
+          const topLevel = key === "recommended_input_tokens" || key === "max_output_tokens";
+          return h("label", { key: key }, h("b", null, key), h("input", { type: "number", value: topLevel ? (draft[key] || 0) : (budget[key] || 0), onChange: function (event) { const value = Number(event.target.value) || 0; if (key === "max_output_tokens") setField("max_output_tokens", value); else if (key === "recommended_input_tokens") setField("recommended_input_tokens", value); else setBudget(key, value); } }));
         })),
-        h("button", { className: "primary-button", onClick: function () { props.onSave(draft); } }, "保存 Profile"),
+        h("div", { className: "button-row profile-save-row" }, h("button", { className: "primary-button", disabled: saveState === "saving", onClick: saveProfile }, saveState === "saving" ? "保存中…" : "保存 Profile"), saveMessage && h("span", { className: "connection-result " + (saveState === "saved" ? "success" : "failed") }, saveMessage)),
         h("h3", null, "调用配置预览"),
-        h(CodeBlock, { value: { model_profile_id: draft.profile_id, provider: draft.provider, model: draft.model, parameter_size: draft.parameter_size, default_prompt_id: draft.default_prompt_id, thinking_enabled: draft.thinking_enabled, context_budget: budget, model_options: draft.options || {} } })));
-    return h(React.Fragment, null, head, metrics, h("section", { className: "model-profile-grid" }, list, detail));
+        h(CodeBlock, { value: { model_profile_id: draft.profile_id, connection_id: draft.connection_id, provider: draft.provider, model: draft.model, structured_output_mode: draft.structured_output_mode, parameter_size: draft.parameter_size, default_prompt_id: draft.default_prompt_id, thinking_enabled: draft.thinking_enabled, context_budget: Object.assign({}, budget, { recommended_input_tokens: draft.recommended_input_tokens, max_output_tokens: draft.max_output_tokens }), model_options: Object.assign({}, draft.options || {}, { think: !!draft.thinking_enabled, num_predict: draft.max_output_tokens, structured_output_mode: draft.structured_output_mode }), runtime_options: draft.runtime_options || {} } })));
+    return h(React.Fragment, null, head, connectionPanel, metrics, h("section", { className: "model-profile-grid" }, list, detail));
   }
 
   function RuleLibrary(props) {
@@ -741,6 +799,72 @@
           h("div", { className: "config-governance-actions" }, selected.config_id === "baseline" ? h("button", { className: "primary-button", onClick: createCandidate }, "复制为候选") : h(React.Fragment, null, h("button", { className: "secondary-button", disabled: selected.version !== catalogSelected.version, onClick: save }, selected.version === catalogSelected.version ? "保存新版本" : "历史版本只读"), h("button", { className: "secondary-button", onClick: validate }, "配置校验"), h("select", { value: evalRunId, onChange: function (event) { setEvalRunId(event.target.value); } }, h("option", { value: "" }, matchingRuns.length ? "选择关联评测" : "暂无匹配评测"), matchingRuns.map(function (run) { return h("option", { key: run.run_id, value: run.run_id }, run.run_id + " · F1 " + ((run.metrics && run.metrics.labeled && run.metrics.labeled.pairwise_grouping_f1) || "—")); })), h("button", { className: "primary-button", disabled: !evalRunId, onClick: publish }, "人工发布"), h("button", { className: "text-button", onClick: rollback }, "回滚")))) : h("div", { className: "empty-state" }, "暂无 Drain3 配置"))));
   }
 
+  function SemanticDictionaryGovernance(props) {
+    const catalog = props.catalog || { items: [], active: {} };
+    const items = catalog.items || [];
+    const [selectedId, setSelectedId] = useState("");
+    const [loaded, setLoaded] = useState(null);
+    const [customRules, setCustomRules] = useState([]);
+    const [validation, setValidation] = useState(null);
+    const [testInput, setTestInput] = useState("NVRM: Xid 79, GPU has fallen off the bus");
+    const [testComponent, setTestComponent] = useState("kernel");
+    const [testResult, setTestResult] = useState(null);
+    const catalogSelected = items.find(function (item) { return item.dictionary_id === selectedId; }) || items[0] || null;
+    const selected = loaded && catalogSelected && loaded.dictionary_id === catalogSelected.dictionary_id ? loaded : catalogSelected;
+    const editable = Boolean(selected && Number(selected.version) > 1 && Number(selected.version) === Number(catalogSelected.latest_version));
+    useEffect(function () {
+      if (!selected) return;
+      setSelectedId(selected.dictionary_id);
+      setCustomRules((selected.custom_rules || []).map(function (rule) { return Object.assign({}, rule); }));
+      setValidation(null);
+    }, [selected && selected.dictionary_id, selected && selected.version, selected && selected.content_hash]);
+    useEffect(function () {
+      if (!selected) return;
+      const example = SEMANTIC_TEST_EXAMPLES[selected.dictionary_id];
+      if (!example) return;
+      setTestComponent(example.component);
+      setTestInput(example.message);
+      setTestResult(null);
+    }, [selected && selected.dictionary_id]);
+    function selectDictionary(id) { setLoaded(null); setSelectedId(id); }
+    function selectVersion(version) { props.onLoadVersion(selected.dictionary_id, Number(version)).then(setLoaded).catch(function () {}); }
+    function updateRule(index, key, value) {
+      const next = customRules.slice();
+      next[index] = Object.assign({}, next[index], { [key]: key === "priority" ? Number(value) : value });
+      setCustomRules(next);
+    }
+    function addRule() {
+      setCustomRules(customRules.concat([{
+        rule_id: "custom-rule-" + (customRules.length + 1), field: "errno_name", pattern: "error_name=(?<value>[A-Z0-9_]+)", group: "value", value_type: "string", typed_mask: "ERRNO", tags: ["自定义语义"], priority: 50, source_types: [], components: [],
+      }]));
+    }
+    function runTest() {
+      props.onTest({ message_core: testInput, source_type: "unknown", component: testComponent }).then(setTestResult).catch(function () {});
+    }
+    return h("section", { className: "semantic-dictionary-governance" },
+      h("div", { className: "semantic-summary-grid" },
+        h("div", null, h("span", null, "独立词典"), h("b", null, items.length), h("small", null, "按领域独立发布")),
+        h("div", null, h("span", null, "活动规则"), h("b", null, items.reduce(function (sum, item) { return sum + (item.rules || []).length; }, 0)), h("small", null, "内置 + 已发布扩展")),
+        h("div", null, h("span", null, "候选版本"), h("b", null, items.filter(function (item) { return Number(item.latest_version) > Number(item.active_version); }).length), h("small", null, "校验后人工发布"))),
+      h("div", { className: "semantic-governance-layout" },
+        h("aside", { className: "surface semantic-dictionary-list" },
+          h("div", { className: "surface-head" }, h("div", null, h("b", null, "语义词典"), h("span", null, "版本与活动状态"))),
+          items.map(function (item) { return h("button", { key: item.dictionary_id, className: "semantic-dictionary-item " + (selected && selected.dictionary_id === item.dictionary_id ? "active" : ""), onClick: function () { selectDictionary(item.dictionary_id); } }, h("div", null, h("b", null, item.name), h("span", { className: "status-chip " + item.status }, item.status)), h("small", null, item.dictionary_id + " · v" + item.version), h("em", null, (item.rules || []).length + " 条规则 · " + shortHash(item.content_hash))); })),
+        h("div", { className: "surface semantic-dictionary-detail" }, selected ? h(React.Fragment, null,
+          h("div", { className: "surface-head" }, h("div", null, h("b", null, selected.name), h("span", null, selected.dictionary_id + " · " + shortHash(selected.content_hash))), h("div", { className: "semantic-version-actions" }, h("select", { value: selected.version, onChange: function (event) { selectVersion(event.target.value); } }, (catalogSelected.available_versions || [1]).map(function (version) { return h("option", { value: version, key: version }, "版本 v" + version); })), h("span", { className: "status-chip " + selected.status }, selected.status))),
+          h("section", { className: "semantic-rule-section" }, h("div", { className: "section-title" }, h("div", null, h("h3", null, "内置规则（只读）"), h("p", null, "系统规则不可覆盖，只能通过自定义规则扩展。")), h("span", null, (selected.builtin_rules || []).length + " 条")), h("div", { className: "semantic-rule-table" }, h("div", { className: "semantic-rule-row head" }, h("span", null, "字段 / Typed Mask"), h("span", null, "匹配正则"), h("span", null, "范围")), (selected.builtin_rules || []).map(function (rule) { return h("div", { className: "semantic-rule-row", key: rule.rule_id }, h("div", null, h("b", null, rule.field), h("small", null, rule.rule_id + " · <" + rule.typed_mask + ">")), h("code", null, rule.pattern), h("span", null, (rule.components || []).join(", ") || "全部组件")); }))),
+          h("section", { className: "semantic-rule-section custom" }, h("div", { className: "section-title" }, h("div", null, h("h3", null, "自定义扩展规则"), h("p", null, editable ? "当前候选可编辑，保存会追加新版本。" : "内置或历史版本只读，请先创建候选。")), h("span", null, customRules.length + " 条")), customRules.length === 0 && h("div", { className: "empty-state compact" }, "当前没有自定义规则"), customRules.map(function (rule, index) { return h("div", { className: "semantic-custom-rule", key: rule.rule_id + index }, h("input", { value: rule.rule_id, disabled: !editable, title: "规则 ID", onChange: function (event) { updateRule(index, "rule_id", event.target.value); } }), h("select", { value: rule.field, disabled: !editable, onChange: function (event) { updateRule(index, "field", event.target.value); } }, ["http_status", "errno", "errno_name", "exit_code", "signal", "xid_code", "k8s_reason"].map(function (field) { return h("option", { value: field, key: field }, field); })), h("input", { value: rule.typed_mask, disabled: !editable, title: "Typed Mask", onChange: function (event) { updateRule(index, "typed_mask", event.target.value); } }), h("input", { className: "rule-pattern-input", value: rule.pattern, disabled: !editable, title: "正则表达式", onChange: function (event) { updateRule(index, "pattern", event.target.value); } }), h("input", { type: "number", value: rule.priority, disabled: !editable, title: "优先级", onChange: function (event) { updateRule(index, "priority", event.target.value); } }), h("button", { className: "text-button danger-text", disabled: !editable, onClick: function () { setCustomRules(customRules.filter(function (_, ruleIndex) { return ruleIndex !== index; })); } }, "移除")); }), editable && h("button", { className: "secondary-button", onClick: addRule }, "＋ 新增规则")),
+          h("section", { className: "semantic-test-bench" }, h("div", { className: "section-title" }, h("div", null, h("h3", null, "语义测试台"), h("p", null, "输入单条日志，检查结构化字段与 Typed Mask。"))), h("div", { className: "semantic-test-inputs" }, h("input", { value: testComponent, placeholder: "组件，例如 kernel", onChange: function (event) { setTestComponent(event.target.value); } }), h("textarea", { value: testInput, onChange: function (event) { setTestInput(event.target.value); } }), h("button", { className: "secondary-button", onClick: runTest }, "运行测试")), testResult && h("div", { className: "semantic-test-result" }, h("div", null, h("span", null, "字段"), h(CodeBlock, { value: testResult.semantic_fields })), h("div", null, h("span", null, "Typed Mask"), h("code", null, testResult.typed_message || "—")), h("div", null, h("span", null, "标签"), h("p", null, (testResult.semantic_tags || []).join(" · ") || "未命中")))),
+          validation && h("div", { className: "config-validation " + (validation.valid ? "valid" : "invalid") }, validation.valid ? "配置校验通过：六类核心语义用例全部通过" : "配置校验失败：" + (validation.errors || []).join("；")),
+          h("div", { className: "semantic-governance-actions" },
+            h("span", null, "版本历史：" + (catalogSelected.available_versions || []).map(function (version) { return "v" + version; }).join(" → ")),
+            Number(selected.version) === 1 && h("button", { className: "primary-button", onClick: function () { props.onCreate(selected.dictionary_id); } }, "创建候选"),
+            editable && h("button", { className: "secondary-button", onClick: function () { props.onSave(selected.dictionary_id, selected.version, customRules); } }, "保存新版本"),
+            Number(selected.version) > 1 && h("button", { className: "secondary-button", onClick: function () { props.onValidate(selected.dictionary_id, selected.version).then(setValidation).catch(function () {}); } }, "配置校验"),
+            Number(selected.version) > 1 && h("button", { className: "primary-button", disabled: !(validation && validation.valid), onClick: function () { if (window.confirm("确认发布该词典版本给后续新任务？")) props.onPublish(selected.dictionary_id, selected.version); } }, "人工发布"),
+            h("button", { className: "text-button", onClick: function () { const version = Number(window.prompt("回滚到哪个版本？", String(selected.active_version || 1))); if (version && window.confirm("确认回滚版本？")) props.onRollback(selected.dictionary_id, version); } }, "回滚版本"))) : h("div", { className: "empty-state" }, "暂无语义词典"))));
+  }
+
   function DrainQualityPage(props) {
     const data = props.data || { datasets: [], annotations: [], evalRuns: [], profiles: [], templates: [] };
     const [tab, setTab] = useState("overview");
@@ -795,7 +919,7 @@
       if (!version || !window.confirm("确认回滚模板？回滚也会新增一条审计事件。")) return;
       props.onTemplateRollback(item.template_hash, { target_version: version, expected_version: item.version, confirmed: true, operator: "local-operator" });
     }
-    const tabs = [["overview", "质量概览"], ["annotation", "标注工作台"], ["suspicious", "可疑模板"], ["compare", "配置对比"], ["templates", "模板管理"], ["configs", "Drain3 配置"], ["release", "发布管理"]];
+    const tabs = [["overview", "质量概览"], ["annotation", "标注工作台"], ["suspicious", "可疑模板"], ["compare", "配置对比"], ["templates", "模板管理"], ["configs", "Drain3 配置"], ["semantics", "语义词典"], ["release", "发布管理"]];
     const annotationActions = selectedTemplate && h("div", { className: "button-row annotation-actions" },
       h("button", { className: "primary-button", onClick: function () { props.onAnnotate({ cluster_id: selectedTemplate.template_hash, action: "accept", reviewer: "local-operator" }); } }, "接受当前簇"),
       h("button", { className: "secondary-button", onClick: function () { confirmedChange(selectedTemplate, "edit"); } }, "编辑模板"),
@@ -820,6 +944,7 @@
       tab === "compare" && h("section", { className: "surface profile-compare-panel" }, h("div", { className: "surface-head" }, h("div", null, h("b", null, "Profile 配置对比"), h("span", null, "并排检查候选 Drain3 参数差异"))), h("div", { className: "profile-compare-selectors" }, h("label", null, h("span", null, "Profile A"), h("select", { value: selectedProfileA && selectedProfileA.profile_id || "", onChange: function (event) { setProfileA(event.target.value); } }, profiles.map(function (profile) { return h("option", { key: profile.profile_id, value: profile.profile_id }, profile.name); }))), h("span", null, "对比"), h("label", null, h("span", null, "Profile B"), h("select", { value: selectedProfileB && selectedProfileB.profile_id || "", onChange: function (event) { setProfileB(event.target.value); } }, profiles.map(function (profile) { return h("option", { key: profile.profile_id, value: profile.profile_id }, profile.name); })))), profiles.length === 0 ? h("div", { className: "empty-state" }, "暂无可对比的 Profile") : h("div", { className: "profile-parameter-table" }, h("div", { className: "parameter-row head" }, h("span", null, "参数"), h("span", null, selectedProfileA.name), h("span", null, selectedProfileB.name)), [["sim_th", "相似度阈值"], ["depth", "树深度"], ["max_children", "最大子节点"], ["parametrize_numeric_tokens", "数字参数化"], ["extra_delimiters", "额外分隔符"]].map(function (entry) { const a = profileValue(selectedProfileA, entry[0]), b = profileValue(selectedProfileB, entry[0]); return h("div", { className: "parameter-row " + (a !== b ? "different" : ""), key: entry[0] }, h("span", null, h("b", null, entry[1]), h("small", null, entry[0])), h("code", null, a), h("code", null, b)); }))),
       tab === "templates" && h("section", { className: "surface template-management" }, h("div", { className: "surface-head" }, h("div", null, h("b", null, "Drain3 模板管理"), h("span", null, "搜索、筛选并执行受审计的模板操作")), h("span", null, visibleTemplates.length + " / " + templates.length)), h("div", { className: "template-toolbar" }, h("input", { value: templateQuery, placeholder: "搜索组件、Hash 或模板内容", onChange: function (event) { setTemplateQuery(event.target.value); } }), h("select", { value: componentFilter, onChange: function (event) { setComponentFilter(event.target.value); } }, h("option", { value: "all" }, "全部组件"), components.map(function (component) { return h("option", { value: component, key: component }, component); })), h("select", { value: statusFilter, onChange: function (event) { setStatusFilter(event.target.value); } }, h("option", { value: "all" }, "全部状态"), ["active", "ignored", "merged", "deleted"].map(function (status) { return h("option", { value: status, key: status }, status); }))), templates.length === 0 && h("div", { className: "empty-state" }, "导入分析结果中的脱敏模板后进行管理"), h("div", { className: "managed-template-table" }, h("div", { className: "managed-template-row head" }, h("span", null, "模板"), h("span", null, "有效内容"), h("span", null, "状态"), h("span", null, "操作")), visibleTemplates.map(function (item) { return h("div", { className: "managed-template-row", key: item.template_hash }, h("div", null, h("b", null, item.component || "unknown"), h("small", null, item.template_hash + " · v" + item.version + " · " + item.count + " 条")), h("code", null, item.effective_template), h("span", { className: "status-chip " + item.status }, item.status), h("div", { className: "row-actions" }, h("button", { className: "text-button", onClick: function () { confirmedChange(item, "edit"); } }, "编辑"), h("button", { className: "text-button", onClick: function () { confirmedChange(item, "merge"); } }, "合并"), h("button", { className: "text-button", onClick: function () { confirmedChange(item, item.status === "ignored" || item.status === "deleted" ? "restore" : "ignore"); } }, item.status === "ignored" || item.status === "deleted" ? "恢复" : "忽略"), h("button", { className: "text-button danger-text", onClick: function () { confirmedChange(item, "delete"); } }, "软删除"), h("button", { className: "text-button", onClick: function () { rollback(item); } }, "回滚"))); }))),
       tab === "configs" && h(DrainConfigGovernance, { configs: data.configs, evalRuns: data.evalRuns, onCreate: props.onConfigCreate, onLoadVersion: props.onConfigLoadVersion, onSave: props.onConfigSave, onValidate: props.onConfigValidate, onPublish: props.onConfigPublish, onRollback: props.onConfigRollback }),
+      tab === "semantics" && h(SemanticDictionaryGovernance, { catalog: data.semantics, onCreate: props.onSemanticCreate, onLoadVersion: props.onSemanticLoadVersion, onSave: props.onSemanticSave, onValidate: props.onSemanticValidate, onPublish: props.onSemanticPublish, onRollback: props.onSemanticRollback, onTest: props.onSemanticTest }),
       tab === "release" && h("section", { className: "release-stage-grid" }, profiles.length === 0 && h("div", { className: "empty-state" }, "暂无待治理 Profile"), profiles.map(function (profile) { const promoted = profile.status === "promoted"; return h("article", { className: "surface release-card", key: profile.profile_id }, h("div", { className: "release-card-head" }, h("div", null, h("span", { className: "release-icon" }, promoted ? "✓" : "↑"), h("div", null, h("h3", null, profile.name), h("small", null, profile.profile_id))), h("span", { className: "status-chip " + profile.status }, profile.status)), h("div", { className: "release-flow" }, ["候选", "人工确认", "已发布"].map(function (stage, index) { return h("span", { className: index <= (promoted ? 2 : 0) ? "done" : "", key: stage }, stage); })), h("p", null, "发布仅记录旧版 Profile 决策；实际运行配置请在 Drain3 配置页评测并发布。"), h("div", { className: "button-row" }, h("button", { className: "primary-button", disabled: promoted, onClick: function () { if (window.confirm("确认发布 Profile " + profile.profile_id + "？")) props.onProfile(profile.profile_id, "promote"); } }, promoted ? "已发布" : "确认发布"), h("button", { className: "secondary-button", onClick: function () { if (window.confirm("确认回滚 Profile " + profile.profile_id + "？")) props.onProfile(profile.profile_id, "rollback"); } }, "回滚"))); })));
   }
 
@@ -837,7 +962,7 @@
     const [selectedTemplate, setSelectedTemplate] = useState(null);
     const [ruleFocus, setRuleFocus] = useState("");
     const [uploadProgress, setUploadProgress] = useState(null), [preprocessProgress, setPreprocessProgress] = useState(null);
-    const [drainQuality, setDrainQuality] = useState({ datasets: [], annotations: [], evalRuns: [], profiles: [], templates: [], configs: { items: [], active: null } });
+    const [drainQuality, setDrainQuality] = useState({ datasets: [], annotations: [], evalRuns: [], profiles: [], templates: [], configs: { items: [], active: null }, semantics: { items: [], active: {} } });
     const events = useRef(null);
     const selected = useMemo(function () { return snapshot && snapshot.features && snapshot.features.find(function (feature) { return feature.candidate_id === selectedId; }) || null; }, [snapshot, selectedId]);
     useEffect(function () {
@@ -861,8 +986,8 @@
     }
     async function loadHarness(query) { const values = await Promise.all([api.harnessStatus(), api.prompts(), api.traces(query || "?limit=50"), api.modelProfiles()]); setHarness(values[0]); setPrompts(values[1].items || []); setPromptId(values[1].current_prompt_id || "feature_extract_v3_compact_strict_json_en"); setTraces(values[2].items || []); setModelProfiles(values[3]); setModelProfileId(function (current) { return current || values[3].default_profile_id || ""; }); }
     async function loadDrainQuality() {
-      const values = await Promise.all([api.drainDatasets(), api.drainAnnotations(), api.drainEvalRuns(), api.drainProfiles(), api.drainTemplates(), api.drainConfigs()]);
-      setDrainQuality({ datasets: values[0].items || [], annotations: values[1].items || [], annotationState: values[1].state || {}, evalRuns: values[2].items || [], profiles: values[3].items || [], templates: values[4].items || [], configs: values[5] });
+      const values = await Promise.all([api.drainDatasets(), api.drainAnnotations(), api.drainEvalRuns(), api.drainProfiles(), api.drainTemplates(), api.drainConfigs(), api.semanticDictionaries()]);
+      setDrainQuality({ datasets: values[0].items || [], annotations: values[1].items || [], annotationState: values[1].state || {}, evalRuns: values[2].items || [], profiles: values[3].items || [], templates: values[4].items || [], configs: values[5], semantics: values[6] });
     }
     async function loadObservability(id) {
       const summary = await api.observabilitySummary();
@@ -895,12 +1020,12 @@
     function openTrace(traceId) { api.trace(traceId).then(function (item) { setDrawer({ type: "trace", item: item }); applyTraceFilters({ job_id: "", trace_id: traceId, status: "", prompt_id: "" }); }).catch(function (reason) { setError(reason.message); }); }
     function openPrompt(id) { api.prompt(id).then(function (item) { setDrawer({ type: "prompt", item: item }); setView("prompts"); history.pushState({}, "", "/prompts?prompt_id=" + encodeURIComponent(id)); }).catch(function (reason) { setError(reason.message); }); }
     function savePrompt(id, content, note) { api.savePrompt(id, content, note).then(function (item) { setDrawer({ type: "prompt", item: item }); return loadHarness(); }).catch(function (reason) { setError(reason.message); }); }
-    function saveModelProfile(profile) { api.saveModelProfile(profile).then(function (saved) { setModelProfileId(saved.profile_id); setModel(saved.model || model); setPromptId(saved.default_prompt_id || promptId); return loadHarness(); }).catch(function (reason) { setError(reason.message); }); }
+    async function saveModelProfile(profile) { try { const saved = await api.saveModelProfile(profile); setModelProfileId(saved.profile_id); setModel(saved.model || model); setPromptId(saved.default_prompt_id || promptId); await loadHarness(); setError(""); return saved; } catch (reason) { setError(reason.message); throw reason; } }
     function openTraceList(query) { const filters = traceFiltersFromSearch(query || ""); applyTraceFilters(filters); }
     function openObservability(id) { setView("observability"); history.pushState({}, "", "/ai-observability" + (id ? "?job_id=" + encodeURIComponent(id) : "")); loadObservability(id).catch(function (reason) { setError(reason.message); }); }
     function openRule(ruleId) { setDrawer({ type: null, item: null }); setRuleFocus(ruleId); changeView("rules"); }
     async function importCurrentTemplates() {
-      const templates = (result && result.top_templates || []).map(function (item) { return { template_hash: item.template_hash, template: item.template, component: item.component, count: item.count || 0, risk_levels: item.risk_levels || [] }; }).filter(function (item) { return item.template_hash && item.template; });
+      const templates = (result && result.top_templates || []).map(function (item) { return { template_hash: item.template_hash, template_fingerprint: item.template_fingerprint, template: item.template, component: item.component, count: item.count || 0, risk_levels: item.risk_levels || [], semantic_fields: item.semantic_fields || {}, semantic_tags: item.semantic_tags || [], typed_parameters: item.typed_parameters || [], semantic_dictionary_versions: item.semantic_dictionary_versions || {}, semantic_extractor_version: item.semantic_extractor_version || null }; }).filter(function (item) { return item.template_hash && item.template; });
       if (!templates.length) { setError("当前分析结果没有可导入的 Drain3 模板"); return; }
       try { await api.importDrainTemplates(templates); await loadDrainQuality(); } catch (reason) { setError(reason.message); }
     }
@@ -914,9 +1039,17 @@
     async function validateDrainConfig(configId, payload) { try { return await api.validateDrainConfig(configId, payload); } catch (reason) { setError(reason.message); throw reason; } }
     async function publishDrainConfig(configId, payload) { try { await api.publishDrainConfig(configId, payload); await loadDrainQuality(); } catch (reason) { setError(reason.message); } }
     async function rollbackDrainConfig(configId, payload) { try { await api.rollbackDrainConfig(configId, payload); await loadDrainQuality(); } catch (reason) { setError(reason.message); } }
+    async function createSemanticCandidate(dictionaryId) { try { await api.createSemanticCandidate(dictionaryId); await loadDrainQuality(); } catch (reason) { setError(reason.message); } }
+    async function loadSemanticDictionaryVersion(dictionaryId, version) { try { return await api.semanticDictionaryVersion(dictionaryId, version); } catch (reason) { setError(reason.message); throw reason; } }
+    async function saveSemanticDictionary(dictionaryId, version, rules) { try { await api.saveSemanticDictionary(dictionaryId, version, rules); await loadDrainQuality(); } catch (reason) { setError(reason.message); } }
+    async function validateSemanticDictionary(dictionaryId, version) { try { return await api.validateSemanticDictionary(dictionaryId, version); } catch (reason) { setError(reason.message); throw reason; } }
+    async function publishSemanticDictionary(dictionaryId, version) { try { await api.publishSemanticDictionary(dictionaryId, version); await loadDrainQuality(); } catch (reason) { setError(reason.message); } }
+    async function rollbackSemanticDictionary(dictionaryId, version) { try { await api.rollbackSemanticDictionary(dictionaryId, version); await loadDrainQuality(); } catch (reason) { setError(reason.message); } }
+    async function testSemanticDictionary(payload) { try { return await api.testSemanticDictionary(payload); } catch (reason) { setError(reason.message); throw reason; } }
     const workspace = h(Workspace, { snapshot: snapshot, selectedId: selectedId, onSelect: setSelectedId, onRetry: retry, onOpenTraces: openTraceList, onOpenObservability: openObservability });
     const activePrompts = prompts.filter(function (prompt) { return prompt.analysis_type === "feature_extract" && prompt.status === "active"; });
     const activeProfiles = modelProfiles.profiles || [];
+    const selectedModelProfile = activeProfiles.find(function (profile) { return profile.profile_id === modelProfileId; }) || {};
     const traceRule = drawer.item && rules.find(function (rule) { return rule.lineage && rule.lineage.trace_id === drawer.item.trace_id; });
     const drawerContent = !drawer.item ? null : (drawer.type === "prompt" ? h(PromptDrawer, { item: drawer.item, onSave: savePrompt, onOpenTrace: openTrace }) : h(TraceDrawer, { item: drawer.item, rule: traceRule, onOpenRule: openRule }));
     return h("div", { className: "app-shell" },
@@ -926,7 +1059,7 @@
         !["drainQuality", "settings"].includes(view) && h("div", { className: "page-head" }, h("div", null, h("h1", null, "日志特征工作台"), h("p", null, "上传日志、复用规则、识别未知特征并人工审批")), h("label", { className: "new-analysis" }, "＋ 新建分析", h("input", { type: "file", onChange: function (event) { loadFile(event.target.files && event.target.files[0]); } }))),
         error && h("div", { className: "error-banner" }, error, h("button", { onClick: function () { setError(""); } }, "×")),
         view === "overview" && h(React.Fragment, null,
-          h("section", { className: "upload-panel" }, h("div", null, h("b", null, fileName || "选择 result.json、JSONL、TXT、LOG、GZ 或无后缀日志"), h("span", null, result ? (result.risk_entities || []).length + " 个风险实体，已完成本地预处理" : "10MB 以内直接分析；超过 10MB 自动分片上传，Linux messages / syslog 无后缀文件也支持上传")), busy && h("div", { className: "upload-progress" }, uploadProgress && h("span", null, "上传进度：" + Math.round((uploadProgress.progress || 0) * 100) + "%（" + uploadProgress.received_chunks + " / " + uploadProgress.total_chunks + " chunks）"), preprocessProgress && h("span", null, "预处理阶段：" + (preprocessProgress.stage || "queued") + "，记录 " + (preprocessProgress.records_parsed || 0) + (preprocessProgress.drain3_partitions_total ? "，Drain3 分片 " + (preprocessProgress.drain3_partitions_completed || 0) + " / " + preprocessProgress.drain3_partitions_total : ""))), h("div", { className: "analysis-config" }, h("label", null, "分析流程", h("select", { value: "feature_extract", disabled: true }, h("option", { value: "feature_extract" }, "日志特征识别"))), h("label", null, "模型 Profile", h("select", { value: modelProfileId, onChange: function (event) { const profile = activeProfiles.find(function (item) { return item.profile_id === event.target.value; }) || {}; setModelProfileId(event.target.value); if (profile.model) setModel(profile.model); if (profile.default_prompt_id) setPromptId(profile.default_prompt_id); } }, activeProfiles.map(function (profile) { return h("option", { value: profile.profile_id, key: profile.profile_id }, profile.profile_id); }))), h("label", null, "模型", h("input", { value: model, onChange: function (event) { setModel(event.target.value); } })), h("label", null, "Prompt", h("select", { value: promptId, onChange: function (event) { setPromptId(event.target.value); } }, activePrompts.map(function (prompt) { return h("option", { value: prompt.prompt_id, key: prompt.prompt_id }, prompt.prompt_id); }))), h("label", null, "重试次数", h("select", { value: retryCount, onChange: function (event) { setRetryCount(Number(event.target.value)); } }, [0, 1, 2, 3].map(function (count) { return h("option", { value: count, key: count }, count + " 次"); }))), h("label", null, "阈值", h("input", { type: "number", value: threshold, onChange: function (event) { setThreshold(event.target.value); } })), h("button", { className: "primary-button", disabled: !result || busy, onClick: start }, busy ? "处理中…" : "开始识别"))), h(MetricsGrid, { snapshot: snapshot, result: result, daily: systemMetrics }), h(LiveProcessing, { snapshot: snapshot, result: result })),
+          h("section", { className: "upload-panel" }, h("div", null, h("b", null, fileName || "选择 result.json、JSONL、TXT、LOG、GZ 或无后缀日志"), h("span", null, result ? (result.risk_entities || []).length + " 个风险实体，已完成本地预处理" : "10MB 以内直接分析；超过 10MB 自动分片上传，Linux messages / syslog 无后缀文件也支持上传")), busy && h("div", { className: "upload-progress" }, uploadProgress && h("span", null, "上传进度：" + Math.round((uploadProgress.progress || 0) * 100) + "%（" + uploadProgress.received_chunks + " / " + uploadProgress.total_chunks + " chunks）"), preprocessProgress && h("span", null, "预处理阶段：" + (preprocessProgress.stage || "queued") + "，记录 " + (preprocessProgress.records_parsed || 0) + (preprocessProgress.drain3_partitions_total ? "，Drain3 分片 " + (preprocessProgress.drain3_partitions_completed || 0) + " / " + preprocessProgress.drain3_partitions_total : ""))), h("div", { className: "analysis-config" }, h("label", null, "分析流程", h("select", { value: "feature_extract", disabled: true }, h("option", { value: "feature_extract" }, "日志特征识别"))), h("label", null, "模型 Profile", h("select", { value: modelProfileId, onChange: function (event) { const profile = activeProfiles.find(function (item) { return item.profile_id === event.target.value; }) || {}; setModelProfileId(event.target.value); if (profile.model) setModel(profile.model); if (profile.default_prompt_id) setPromptId(profile.default_prompt_id); } }, activeProfiles.map(function (profile) { return h("option", { value: profile.profile_id, key: profile.profile_id }, (profile.display_name || profile.profile_id) + " · " + profile.provider); }))), h("label", null, "Provider / 连接", h("input", { value: (selectedModelProfile.provider || "—") + " / " + (selectedModelProfile.connection_id || "—"), disabled: true })), h("label", null, "模型", h("input", { value: model, onChange: function (event) { setModel(event.target.value); } })), h("label", null, "Prompt", h("select", { value: promptId, onChange: function (event) { setPromptId(event.target.value); } }, activePrompts.map(function (prompt) { return h("option", { value: prompt.prompt_id, key: prompt.prompt_id }, prompt.prompt_id); }))), h("label", null, "重试次数", h("select", { value: retryCount, onChange: function (event) { setRetryCount(Number(event.target.value)); } }, [0, 1, 2, 3].map(function (count) { return h("option", { value: count, key: count }, count + " 次"); }))), h("label", null, "阈值", h("input", { type: "number", value: threshold, onChange: function (event) { setThreshold(event.target.value); } })), h("button", { className: "primary-button", disabled: !result || busy, onClick: start }, busy ? "处理中…" : "开始识别"))), h(MetricsGrid, { snapshot: snapshot, result: result, daily: systemMetrics }), h(LiveProcessing, { snapshot: snapshot, result: result })),
         view === "queue" && h(React.Fragment, null, h(MetricsGrid, { snapshot: snapshot, result: result, daily: systemMetrics }), h(LiveProcessing, { snapshot: snapshot, result: result }), workspace),
         view === "observability" && h(AIObservabilityPage, { summary: obsSummary, progress: obsProgress, events: obsEvents, onRefresh: function () { loadObservability(obsProgress && obsProgress.job_id).catch(function (reason) { setError(reason.message); }); }, onOpenTrace: openTrace, onReview: function () { changeView("review"); }, onRules: function () { changeView("rules"); }, onNewAnalysis: function () { changeView("overview"); } }),
         view === "traces" && h(AITracePage, { traces: traces, harness: harness, traceFilters: traceFilters, onFilter: applyTraceFilters, onOpenTrace: openTrace }),
@@ -937,7 +1070,7 @@
           h(FeatureEvidence, { feature: selected, onSelectTemplate: setSelectedTemplate }),
           h(ReviewEditor, { feature: selected, selectedTemplate: selectedTemplate, onSave: save, onOpenTrace: openTrace })),
         view === "rules" && h(RuleLibrary, { rules: rules, focusRuleId: ruleFocus, onOpenTrace: openTrace }),
-        view === "drainQuality" && h(DrainQualityPage, { data: drainQuality, onRefresh: loadDrainQuality, onImport: importCurrentTemplates, onAnnotate: annotateTemplate, onTemplateChange: changeTemplate, onTemplateRollback: rollbackTemplate, onProfile: changeDrainProfile, onConfigCreate: createDrainConfig, onConfigLoadVersion: loadDrainConfigVersion, onConfigSave: saveDrainConfig, onConfigValidate: validateDrainConfig, onConfigPublish: publishDrainConfig, onConfigRollback: rollbackDrainConfig }),
+        view === "drainQuality" && h(DrainQualityPage, { data: drainQuality, onRefresh: loadDrainQuality, onImport: importCurrentTemplates, onAnnotate: annotateTemplate, onTemplateChange: changeTemplate, onTemplateRollback: rollbackTemplate, onProfile: changeDrainProfile, onConfigCreate: createDrainConfig, onConfigLoadVersion: loadDrainConfigVersion, onConfigSave: saveDrainConfig, onConfigValidate: validateDrainConfig, onConfigPublish: publishDrainConfig, onConfigRollback: rollbackDrainConfig, onSemanticCreate: createSemanticCandidate, onSemanticLoadVersion: loadSemanticDictionaryVersion, onSemanticSave: saveSemanticDictionary, onSemanticValidate: validateSemanticDictionary, onSemanticPublish: publishSemanticDictionary, onSemanticRollback: rollbackSemanticDictionary, onSemanticTest: testSemanticDictionary }),
         view === "settings" && h(BackendSettings, { onSaved: function () { setError(""); } }),
         view === "export" && h("section", { className: "surface export-surface" }, h("h2", null, "导出记录"), h("p", null, "导出包只包含人工批准或历史规则复用的脱敏特征，不包含原始日志和 RCA 结论。"), h("button", { className: "primary-button", disabled: !jobId || !(snapshot && snapshot.features || []).some(function (feature) { return feature.status === "approved"; }), onClick: function () { api.exportApproved(jobId).catch(function (reason) { setError(reason.message); }); } }, "导出已批准特征 JSON"))),
       h(Drawer, { title: drawer.type === "prompt" ? "Prompt 详情" : "Trace 详情", subtitle: drawer.item && (drawer.item.prompt_id || drawer.item.trace_id), item: drawer.item, onClose: function () { setDrawer({ type: null, item: null }); } }, drawerContent));

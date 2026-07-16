@@ -36,7 +36,7 @@ profiles:
     parameter_size: 4b
     context_window_tokens: 16384
     recommended_input_tokens: 9000
-    max_output_tokens: 900
+    max_output_tokens: 1600
     default_prompt_id: feature_extract_v3_compact_strict_json_en
     json_reliability: medium
     reasoning_capacity: medium

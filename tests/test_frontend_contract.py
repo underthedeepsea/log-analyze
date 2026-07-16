@@ -220,6 +220,20 @@ def test_model_profile_page_manages_provider_connections():
         assert text in source
 
 
+def test_model_profile_save_has_feedback_and_edits_top_level_output_budget():
+    source = source_text()
+    for text in (
+        'const [saveState, setSaveState] = useState("idle")',
+        "async function saveProfile()",
+        'saveState === "saving" ? "保存中…" : "保存 Profile"',
+        "Profile 已保存",
+        'setField("max_output_tokens"',
+        'setField("recommended_input_tokens"',
+        "runtime_options",
+    ):
+        assert text in source
+
+
 def test_v3_metrics_and_animations_are_present():
     source = source_text()
     for text in (
@@ -331,7 +345,8 @@ def test_release_docs_describe_current_feature_version():
     assert "## 1.19.1 - 2026-07-15" in release
     assert "## 1.19.2 - 2026-07-16" in release
     assert "## 1.20.0 - 2026-07-16" in release
-    assert "当前版本：`1.20.0`" in readme
+    assert "## 1.20.1 - 2026-07-16" in release
+    assert "当前版本：`1.20.1`" in readme
     assert "state/logrisk.sqlite3" in readme
     assert "database/migrations/" in readme
     assert "database/schema.yaml" in readme

@@ -62,7 +62,7 @@ def test_project_model_profiles_are_loadable():
         "deepseek_v4_flash",
     }
     assert profiles["qwen3_5_4b_mlx"].model == "qwen3.5:4b-mlx"
-    assert profiles["qwen3_5_4b_mlx"].build_model_options()["num_predict"] == 900
+    assert profiles["qwen3_5_4b_mlx"].build_model_options()["num_predict"] == 1600
     assert profiles["deepseek_v4_flash"].model == "deepseek-v4:flash"
 
 
@@ -104,3 +104,23 @@ def test_sqlite_profile_registry_binds_connection_and_structured_mode(tmp_path):
     assert saved.connection_id == "ollama-local"
     assert reloaded.structured_output_mode == "json_object"
     assert reloaded.build_model_options()["structured_output_mode"] == "json_object"
+
+
+def test_profile_save_uses_edited_output_budget_instead_of_stale_runtime_options(tmp_path):
+    database = SQLiteDatabase(tmp_path / "logrisk.sqlite3")
+    ConnectionStore(database).seed_defaults("http://127.0.0.1:11434")
+    registry = ModelProfileRegistry("configs/model_profiles.yaml", database=database)
+    original = registry.get("qwen3_5_4b_mlx").public_dict()
+    edited = {
+        **original,
+        "max_output_tokens": 1600,
+        "options": {**original["runtime_options"], "temperature": 0},
+    }
+
+    saved = registry.save(edited)
+
+    assert saved.max_output_tokens == 1600
+    assert saved.build_model_options()["num_predict"] == 1600
+    assert saved.options == {"temperature": 0}
+    assert saved.public_dict()["runtime_options"]["num_predict"] == 1600
+    assert "num_predict" not in saved.public_dict()["options"]

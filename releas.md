@@ -6,6 +6,16 @@
 - 仅修复 Bug 时提升最后一位，例如 `1.2.0 → 1.2.1`；
 - 每次代码更新必须同步更新本文件。
 
+## 1.20.1 - 2026-07-16
+
+### Fixed
+
+- 修复模型画像页点击“保存 Profile”没有可见反馈的问题；按钮现在显示保存中、成功或错误状态。
+- 修复 `recommended_input_tokens` 和 `max_output_tokens` 错误写入 Evidence Budget、顶层配置未更新的问题。
+- 修复页面回传的派生 `options.num_predict` 覆盖新输出预算的问题；派生的 Thinking、输出长度和结构化模式不再作为可编辑 options 持久化。
+- 将 `qwen3.5:4b-mlx` 默认输出预算从 900 提升至 1600 tokens，降低多特征 JSON 因截断而缺少 `tags` 或 `selection_reason` 的概率。
+- 新增 SQLite 迁移，自动清理历史 Profile 中的派生 options，并仅将仍使用 900 默认值的内置 4B Profile 升级为 1600。
+
 ## 1.20.0 - 2026-07-16
 
 ### Added

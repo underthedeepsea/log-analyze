@@ -1,4 +1,4 @@
-schema_version: 1
+schema_version: 2
 database: logrisk
 description: LOGRISK 运行时业务数据字典；SQLite 为当前实现，postgres_type 用于后续迁移 PostgreSQL。
 authoritative_ddl: database/migrations/0001_initial.sql

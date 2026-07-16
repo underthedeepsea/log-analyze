@@ -515,11 +515,13 @@
     const [connectionDraft, setConnectionDraft] = useState({ connection_id: "", display_name: "", provider: "openai_compatible", base_url: "https://api.example.com/v1", api_key_env: "REMOTE_LLM_API_KEY", timeout_seconds: 120, enabled: true });
     const [connectionStatus, setConnectionStatus] = useState(null);
     const [connectionError, setConnectionError] = useState("");
-    useEffect(function () { setDraft(current); }, [current.profile_id]);
+    const [saveState, setSaveState] = useState("idle");
+    const [saveMessage, setSaveMessage] = useState("");
+    useEffect(function () { setDraft(current); setSaveState("idle"); setSaveMessage(""); }, [current.profile_id]);
     useEffect(function () { api.modelConnections().then(function (value) { const items = value.items || []; setConnections(items); if (items[0]) setConnectionDraft(items[0]); }).catch(function (reason) { setConnectionError(reason.message); }); }, []);
     const budget = draft.evidence_budget || {};
-    function setField(key, value) { setDraft(Object.assign({}, draft, { [key]: value })); }
-    function setBudget(key, value) { setDraft(Object.assign({}, draft, { evidence_budget: Object.assign({}, budget, { [key]: Number(value) || 0 }) })); }
+    function setField(key, value) { setDraft(Object.assign({}, draft, { [key]: value })); setSaveState("idle"); setSaveMessage(""); }
+    function setBudget(key, value) { setDraft(Object.assign({}, draft, { evidence_budget: Object.assign({}, budget, { [key]: Number(value) || 0 }) })); setSaveState("idle"); setSaveMessage(""); }
     function createProfile() {
       const next = Object.assign({}, current, {
         profile_id: (current.profile_id || "custom") + "_copy",
@@ -532,6 +534,19 @@
     function newConnection() { setConnectionDraft({ connection_id: "remote-" + Date.now(), display_name: "远端模型 API", provider: "openai_compatible", base_url: "https://api.example.com/v1", api_key_env: "REMOTE_LLM_API_KEY", timeout_seconds: 120, enabled: true, is_default: false }); setConnectionStatus(null); }
     async function saveConnection() { try { const saved = await api.saveModelConnection(connectionDraft); const value = await api.modelConnections(); setConnections(value.items || []); setConnectionDraft(saved); setConnectionError(""); } catch (reason) { setConnectionError(reason.message); } }
     async function testConnection() { try { setConnectionStatus(await api.testModelConnection(connectionDraft.connection_id)); setConnectionError(""); } catch (reason) { setConnectionError(reason.message); } }
+    async function saveProfile() {
+      setSaveState("saving");
+      setSaveMessage("");
+      try {
+        const saved = await props.onSave(draft);
+        if (saved) setDraft(saved);
+        setSaveState("saved");
+        setSaveMessage("Profile 已保存");
+      } catch (reason) {
+        setSaveState("error");
+        setSaveMessage(reason.message || "Profile 保存失败");
+      }
+    }
     function setConnectionField(key, value) { setConnectionDraft(Object.assign({}, connectionDraft, { [key]: value })); }
     const head = h("div", { className: "page-head obs-head" }, h("div", null, h("h1", null, "模型画像与上下文预算"), h("p", null, "按模型参数量、上下文窗口、Prompt 策略和 Thinking 开关，控制 Evidence 输入规模与调用行为")));
     const metrics = h("section", { className: "metrics-grid" },
@@ -575,11 +590,12 @@
         h("p", null, "关闭 Thinking 模式用于 Ollama / 支持 thinking 参数的模型。关闭后降低推理耗时，减少中间思考内容影响 JSON 输出稳定性。"),
         h("h3", null, "Context Budget"),
         h("div", { className: "budget-grid" }, ["max_templates", "max_template_chars", "max_affected_entities", "max_evidence_chars", "recommended_input_tokens", "max_output_tokens"].map(function (key) {
-          return h("label", { key: key }, h("b", null, key), h("input", { type: "number", value: budget[key] || draft[key] || 0, onChange: function (event) { key in budget ? setBudget(key, event.target.value) : setField(key, Number(event.target.value) || 0); } }));
+          const topLevel = key === "recommended_input_tokens" || key === "max_output_tokens";
+          return h("label", { key: key }, h("b", null, key), h("input", { type: "number", value: topLevel ? (draft[key] || 0) : (budget[key] || 0), onChange: function (event) { const value = Number(event.target.value) || 0; if (key === "max_output_tokens") setField("max_output_tokens", value); else if (key === "recommended_input_tokens") setField("recommended_input_tokens", value); else setBudget(key, value); } }));
         })),
-        h("button", { className: "primary-button", onClick: function () { props.onSave(draft); } }, "保存 Profile"),
+        h("div", { className: "button-row profile-save-row" }, h("button", { className: "primary-button", disabled: saveState === "saving", onClick: saveProfile }, saveState === "saving" ? "保存中…" : "保存 Profile"), saveMessage && h("span", { className: "connection-result " + (saveState === "saved" ? "success" : "failed") }, saveMessage)),
         h("h3", null, "调用配置预览"),
-        h(CodeBlock, { value: { model_profile_id: draft.profile_id, connection_id: draft.connection_id, provider: draft.provider, model: draft.model, structured_output_mode: draft.structured_output_mode, parameter_size: draft.parameter_size, default_prompt_id: draft.default_prompt_id, thinking_enabled: draft.thinking_enabled, context_budget: budget, model_options: draft.options || {} } })));
+        h(CodeBlock, { value: { model_profile_id: draft.profile_id, connection_id: draft.connection_id, provider: draft.provider, model: draft.model, structured_output_mode: draft.structured_output_mode, parameter_size: draft.parameter_size, default_prompt_id: draft.default_prompt_id, thinking_enabled: draft.thinking_enabled, context_budget: Object.assign({}, budget, { recommended_input_tokens: draft.recommended_input_tokens, max_output_tokens: draft.max_output_tokens }), model_options: Object.assign({}, draft.options || {}, { think: !!draft.thinking_enabled, num_predict: draft.max_output_tokens, structured_output_mode: draft.structured_output_mode }), runtime_options: draft.runtime_options || {} } })));
     return h(React.Fragment, null, head, connectionPanel, metrics, h("section", { className: "model-profile-grid" }, list, detail));
   }
 
@@ -1004,7 +1020,7 @@
     function openTrace(traceId) { api.trace(traceId).then(function (item) { setDrawer({ type: "trace", item: item }); applyTraceFilters({ job_id: "", trace_id: traceId, status: "", prompt_id: "" }); }).catch(function (reason) { setError(reason.message); }); }
     function openPrompt(id) { api.prompt(id).then(function (item) { setDrawer({ type: "prompt", item: item }); setView("prompts"); history.pushState({}, "", "/prompts?prompt_id=" + encodeURIComponent(id)); }).catch(function (reason) { setError(reason.message); }); }
     function savePrompt(id, content, note) { api.savePrompt(id, content, note).then(function (item) { setDrawer({ type: "prompt", item: item }); return loadHarness(); }).catch(function (reason) { setError(reason.message); }); }
-    function saveModelProfile(profile) { api.saveModelProfile(profile).then(function (saved) { setModelProfileId(saved.profile_id); setModel(saved.model || model); setPromptId(saved.default_prompt_id || promptId); return loadHarness(); }).catch(function (reason) { setError(reason.message); }); }
+    async function saveModelProfile(profile) { try { const saved = await api.saveModelProfile(profile); setModelProfileId(saved.profile_id); setModel(saved.model || model); setPromptId(saved.default_prompt_id || promptId); await loadHarness(); setError(""); return saved; } catch (reason) { setError(reason.message); throw reason; } }
     function openTraceList(query) { const filters = traceFiltersFromSearch(query || ""); applyTraceFilters(filters); }
     function openObservability(id) { setView("observability"); history.pushState({}, "", "/ai-observability" + (id ? "?job_id=" + encodeURIComponent(id) : "")); loadObservability(id).catch(function (reason) { setError(reason.message); }); }
     function openRule(ruleId) { setDrawer({ type: null, item: null }); setRuleFocus(ruleId); changeView("rules"); }

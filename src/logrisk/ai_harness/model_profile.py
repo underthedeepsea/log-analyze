@@ -66,7 +66,8 @@ class ModelProfile:
             "reasoning_capacity": self.reasoning_capacity,
             "thinking_enabled": self.thinking.enabled,
             "evidence_budget": self.evidence_budget.__dict__,
-            "options": self.build_model_options(),
+            "options": dict(self.options or {}),
+            "runtime_options": self.build_model_options(),
         }
 
 
@@ -163,7 +164,7 @@ class ModelProfileRegistry:
                 "max_affected_entities": int(budget.get("max_affected_entities", 50)),
                 "max_evidence_chars": int(budget.get("max_evidence_chars", 12000)),
             },
-            "options": dict(raw.get("options") or {"temperature": 0}),
+            "options": self._editable_options(raw.get("options")),
         }
         if not profiles[profile_id]["model"]:
             raise ValueError("model 不能为空")
@@ -174,6 +175,13 @@ class ModelProfileRegistry:
     @staticmethod
     def _now() -> str:
         return datetime.now(timezone.utc).isoformat()
+
+    @staticmethod
+    def _editable_options(raw: Any) -> dict[str, Any]:
+        options = dict(raw or {"temperature": 0})
+        for derived in ("think", "num_predict", "structured_output_mode"):
+            options.pop(derived, None)
+        return options
 
     def _seed_database(self) -> None:
         assert self.database is not None
@@ -234,13 +242,13 @@ class ModelProfileRegistry:
         payload.setdefault("display_name", profile_id)
         payload.setdefault("default_prompt_id", "feature_extract_v3_compact_strict_json_en")
         payload.setdefault("structured_output_mode", "json_schema")
-        payload.setdefault("thinking", {
+        payload["thinking"] = {
             "enabled": bool(payload.get("thinking_enabled", False)),
             "provider_option_name": "think",
             "unsupported_behavior": "ignore",
-        })
+        }
         payload.setdefault("evidence_budget", {})
-        payload.setdefault("options", {"temperature": 0})
+        payload["options"] = self._editable_options(payload.get("options"))
         if not str(payload.get("model") or "").strip():
             raise ValueError("model 不能为空")
         if payload["structured_output_mode"] not in {"json_schema", "json_object", "prompt_only"}:

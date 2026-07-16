@@ -1,6 +1,6 @@
 # 日志风险特征分析与审批系统
 
-当前版本：`1.20.0`。变更记录见 [`releas.md`](releas.md)。
+当前版本：`1.20.1`。变更记录见 [`releas.md`](releas.md)。
 
 AI Harness 路线图 M1–M10 已完成；Phase 2 M11 新增 Drain Template Quality Center，M11.5 新增确定性语义增强与词典治理。
 
@@ -90,7 +90,7 @@ Dashboard 上传 10MB 以内文件时继续使用 inline 分析；超过 10MB �
 
 AI Cache 默认启用并保存在 SQLite。同一 evidence hash、Prompt hash、Provider、模型和 Thinking 开关再次分析时会跳过模型调用；调试模型或 Prompt 时可用 `AI_CACHE_ENABLED=0 bash scripts/dashboard.sh restart` 临时关闭。
 
-`configs/model_profiles.yaml` 是首次启动的内置模型画像种子；初始化后以 SQLite 为运行时权威来源。Dashboard 的“模型画像”页面可管理 API 连接、测试连通性、复制 Profile，并为 Profile 选择连接、Prompt、Thinking、Evidence 预算和结构化输出模式。当前内置 `qwen3.5:4b-mlx`、`qwen3:1.7b`、`qwen3.6:35b-a3b` 和 `deepseek-v4:flash` 四类 Profile；默认启用 `qwen3_1_7b_fast`，默认 Prompt 为 `feature_extract_v3_compact_strict_json_en`。Ollama options 会传入 `think: false`、`temperature: 0` 和输出长度限制，其中 `qwen3.5:4b-mlx` 的 `num_predict` 为 900。Evidence 会按当前 Profile 裁剪，并将裁剪结果写入 AI Trace。新建分析时可选择自动重试 0–3 次；重试锁定同一连接、Profile、模型和 Prompt，不会隐式降级。
+`configs/model_profiles.yaml` 是首次启动的内置模型画像种子；初始化后以 SQLite 为运行时权威来源。Dashboard 的“模型画像”页面可管理 API 连接、测试连通性、复制 Profile，并为 Profile 选择连接、Prompt、Thinking、Evidence 预算和结构化输出模式。当前内置 `qwen3.5:4b-mlx`、`qwen3:1.7b`、`qwen3.6:35b-a3b` 和 `deepseek-v4:flash` 四类 Profile；默认启用 `qwen3_1_7b_fast`，默认 Prompt 为 `feature_extract_v3_compact_strict_json_en`。Ollama options 会传入 `think: false`、`temperature: 0` 和输出长度限制，其中 `qwen3.5:4b-mlx` 的 `num_predict` 为 1600，为完整的多特征 8 字段 JSON 预留空间。Evidence 会按当前 Profile 裁剪，并将裁剪结果写入 AI Trace。新建分析时可选择自动重试 0–3 次；缺少字段或结构非法会触发同一 Provider 重试，不会隐式降级。Profile 保存时页面会明确显示保存中、成功或错误状态。
 
 ### API 连接与远端模型
 

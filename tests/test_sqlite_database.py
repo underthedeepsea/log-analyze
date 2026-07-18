@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import shutil
+from pathlib import Path
 
 from logrisk.database import SQLiteDatabase
 
@@ -42,7 +43,7 @@ def test_database_migration_is_idempotent(tmp_path):
     with sqlite3.connect(path) as connection:
         count = connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0]
 
-    assert count == 2
+    assert count == 3
 
 
 def test_output_budget_migration_updates_old_builtin_profile_and_removes_derived_options(tmp_path):
@@ -75,3 +76,38 @@ def test_output_budget_migration_updates_old_builtin_profile_and_removes_derived
         ).fetchone()
     assert max_output == 1600
     assert num_predict is None
+
+
+def test_qwen_9b_profile_migration_seeds_existing_database_without_changing_default(tmp_path):
+    migration = Path("database/migrations/0003_seed_qwen3_5_9b_mlx.sql")
+    assert migration.exists()
+    migrations = tmp_path / "migrations"
+    migrations.mkdir()
+    shutil.copy("database/migrations/0001_initial.sql", migrations / "0001_initial.sql")
+    path = tmp_path / "logrisk.sqlite3"
+    database = SQLiteDatabase(path, migrations_dir=migrations)
+    with database.transaction() as connection:
+        connection.execute(
+            "INSERT INTO provider_connections(connection_id, display_name, provider, base_url, created_at, updated_at) "
+            "VALUES ('ollama-local', 'Ollama', 'ollama', 'http://127.0.0.1:11434', 'now', 'now')"
+        )
+        connection.execute(
+            "INSERT INTO app_settings(setting_key, value_json, updated_at) "
+            "VALUES ('default_model_profile_id', '\"qwen3_1_7b_fast\"', 'now')"
+        )
+    shutil.copy(migration, migrations / migration.name)
+
+    SQLiteDatabase(path, migrations_dir=migrations)
+
+    with sqlite3.connect(path) as connection:
+        row = connection.execute(
+            "SELECT model, profile_json FROM model_profiles WHERE profile_id='qwen3_5_9b_mlx'"
+        ).fetchone()
+        default_profile = connection.execute(
+            "SELECT value_json FROM app_settings WHERE setting_key='default_model_profile_id'"
+        ).fetchone()[0]
+    assert row is not None
+    assert row[0] == "qwen3.5:9b-mlx"
+    assert '"context_window_tokens":262144' in row[1]
+    assert '"max_output_tokens":2000' in row[1]
+    assert default_profile == '"qwen3_1_7b_fast"'

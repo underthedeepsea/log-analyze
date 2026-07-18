@@ -6,6 +6,20 @@
 - 仅修复 Bug 时提升最后一位，例如 `1.2.0 → 1.2.1`；
 - 每次代码更新必须同步更新本文件。
 
+## 1.21.0 - 2026-07-16
+
+### Added
+
+- 新增内置 `qwen3.5:9b-mlx` 模型 Profile，使用本机 Ollama 连接、262144 tokens 上下文、12000 tokens 推荐输入预算和 2000 tokens 输出预算。
+- 新 Profile 默认使用 `feature_extract_v3_compact_strict_json_en`、JSON Schema 结构化输出并关闭 Thinking，现有默认 Profile 保持为 `qwen3_1_7b_fast`。
+- 新增幂等 SQLite 迁移，为已有数据库补充 9B Profile，保留用户当前默认 Profile 和已有同名配置。
+
+### Fixed
+
+- 修复 `feature_extract_v1`、`feature_extract_v2_compact_en` 和 `feature_extract_v2_strict_en` 仍使用六字段示例，导致模型稳定遗漏 `tags` 与 `selection_reason` 的严重输出契约冲突。
+- 统一全部内置特征提取 Prompt 为八字段契约，明确 `feature_type` 使用 `lowercase_snake_case`，并移除 v1 整体 Markdown 代码围栏。
+- 启动时自动把 SQLite 中仍使用旧契约的当前 Prompt 追加升级到修复后的种子版本，保留全部历史版本；后续保存缺少必填字段的特征 Prompt 会被拒绝。
+
 ## 1.20.1 - 2026-07-16
 
 ### Fixed

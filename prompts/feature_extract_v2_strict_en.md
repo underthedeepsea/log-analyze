@@ -252,9 +252,9 @@ Determine the importance field using the following rules:
 ---
 
 <output_language>
-Although this prompt is written in English, your final output content must be in Chinese.
+Although this prompt is written in English, title, summary, tags, selection_reason, and all other natural-language values must be written in Chinese.
 
-All feature_type, title, summary, and any natural-language value fields must be written in Chinese.
+feature_type is an identifier and must use lowercase_snake_case. It must not contain a template hash, template fingerprint, or other input identifier.
 
 Do not output English explanations.
 </output_language>
@@ -262,26 +262,30 @@ Do not output English explanations.
 ---
 
 <output_contract>
-You must output in Chinese.
-
 You must strictly follow the JSON Schema provided by the caller.
+Every feature must contain exactly these 8 fields:
+feature_type, title, summary, importance, template_hashes, components, tags, selection_reason.
 
-A typical output structure is:
+The required output structure is:
 
 {
   "features": [
     {
-      "feature_type": "...",
-      "title": "...",
-      "summary": "...",
-      "importance": "...",
-      "template_hashes": ["..."],
-      "components": ["..."]
+      "feature_type": "lowercase_snake_case",
+      "title": "中文标题",
+      "summary": "中文摘要",
+      "importance": "low|medium|high|critical",
+      "template_hashes": ["hash_from_input"],
+      "components": ["component_from_input"],
+      "tags": ["中文标签1", "中文标签2"],
+      "selection_reason": "中文说明为什么选择这些模板"
     }
   ]
 }
 
-If the caller-provided JSON Schema differs from the example above, follow the caller-provided JSON Schema.
+tags must be a non-empty array containing 2 to 4 short Chinese strings.
+selection_reason must be one non-empty Chinese sentence that explains why the referenced templates were selected.
+Never omit tags or selection_reason.
 
 Do not output Markdown.
 Do not output code fences.

@@ -57,12 +57,18 @@ def test_project_model_profiles_are_loadable():
     profiles = {item.profile_id: item for item in registry.list_enabled()}
     assert set(profiles) >= {
         "qwen3_5_4b_mlx",
+        "qwen3_5_9b_mlx",
         "qwen3_1_7b_fast",
         "qwen3_6_35b_a3b",
         "deepseek_v4_flash",
     }
     assert profiles["qwen3_5_4b_mlx"].model == "qwen3.5:4b-mlx"
     assert profiles["qwen3_5_4b_mlx"].build_model_options()["num_predict"] == 1600
+    assert profiles["qwen3_5_9b_mlx"].model == "qwen3.5:9b-mlx"
+    assert profiles["qwen3_5_9b_mlx"].context_window_tokens == 262144
+    assert profiles["qwen3_5_9b_mlx"].recommended_input_tokens == 12000
+    assert profiles["qwen3_5_9b_mlx"].build_model_options()["num_predict"] == 2000
+    assert profiles["qwen3_5_9b_mlx"].thinking.enabled is False
     assert profiles["deepseek_v4_flash"].model == "deepseek-v4:flash"
 
 

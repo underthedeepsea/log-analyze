@@ -69,17 +69,49 @@ def test_repo_default_uses_compact_strict_json_v3_prompt():
     assert prompts["feature_extract_v2_strict_en"].description == "for 大参数模型"
 
 
+def test_all_repo_feature_prompts_declare_the_complete_output_contract():
+    registry = PromptRegistry("prompts", "configs/ai_harness.yaml")
+    required_fields = (
+        "feature_type",
+        "title",
+        "summary",
+        "importance",
+        "template_hashes",
+        "components",
+        "tags",
+        "selection_reason",
+    )
+
+    for prompt in registry.list_prompts():
+        if prompt.analysis_type != "feature_extract":
+            continue
+        assert all(field in prompt.content for field in required_fields), prompt.prompt_id
+        assert "lowercase_snake_case" in prompt.content, prompt.prompt_id
+        assert not (
+            prompt.content.strip().startswith("```")
+            and prompt.content.strip().endswith("```")
+        ), prompt.prompt_id
+
+
 def test_update_prompt_records_version_history(tmp_path):
     prompt_dir = tmp_path / "prompts"
     prompt_dir.mkdir()
-    (prompt_dir / "feature_extract_v1.md").write_text("old prompt", encoding="utf-8")
+    old_prompt = (
+        "old prompt lowercase_snake_case feature_type title summary importance "
+        "template_hashes components tags selection_reason"
+    )
+    new_prompt = (
+        "new prompt lowercase_snake_case feature_type title summary importance "
+        "template_hashes components tags selection_reason"
+    )
+    (prompt_dir / "feature_extract_v1.md").write_text(old_prompt, encoding="utf-8")
     history = tmp_path / "state" / "prompt_versions.json"
     registry = PromptRegistry(prompt_dir, history_path=history)
 
-    updated = registry.update("feature_extract_v1", "new prompt", note="人工编辑")
+    updated = registry.update("feature_extract_v1", new_prompt, note="人工编辑")
     versions = registry.history("feature_extract_v1")
 
-    assert updated.content == "new prompt"
-    assert versions[0]["content"] == "old prompt"
+    assert updated.content == new_prompt
+    assert versions[0]["content"] == old_prompt
     assert versions[0]["note"] == "人工编辑"
-    assert versions[0]["sha256"] == hashlib.sha256(b"old prompt").hexdigest()
+    assert versions[0]["sha256"] == hashlib.sha256(old_prompt.encode()).hexdigest()

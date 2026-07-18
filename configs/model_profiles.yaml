@@ -52,6 +52,32 @@ profiles:
     options:
       temperature: 0
 
+  qwen3_5_9b_mlx:
+    enabled: true
+    provider: ollama
+    connection_id: ollama-local
+    structured_output_mode: json_schema
+    model: qwen3.5:9b-mlx
+    display_name: Qwen3.5 9B MLX 高质量模式
+    parameter_size: 9b
+    context_window_tokens: 262144
+    recommended_input_tokens: 12000
+    max_output_tokens: 2000
+    default_prompt_id: feature_extract_v3_compact_strict_json_en
+    json_reliability: high
+    reasoning_capacity: medium
+    thinking:
+      enabled: false
+      provider_option_name: think
+      unsupported_behavior: ignore
+    evidence_budget:
+      max_templates: 10
+      max_template_chars: 320
+      max_affected_entities: 45
+      max_evidence_chars: 16000
+    options:
+      temperature: 0
+
   qwen3_6_35b_a3b:
     enabled: true
     provider: ollama

@@ -1,6 +1,6 @@
 # 日志风险特征分析与审批系统
 
-当前版本：`1.20.1`。完整变更记录见 [`releas.md`](releas.md)。
+当前版本：`1.21.0`。完整变更记录见 [`releas.md`](releas.md)。
 
 LOGRISK 在本地完成日志规范化、Drain3 模板化、确定性语义增强、风险评分、规则复用、模型特征识别和人工审批。系统只生成可审查、可导出的日志特征，不执行根因分析（RCA），也不会把原始日志直接发送给模型。
 
@@ -105,7 +105,7 @@ bash scripts/dashboard.sh restart
 
 随后在“模型画像 → API 连接”中新建 `openai_compatible` 连接，将 API Key 环境变量填写为 `REMOTE_LLM_API_KEY`，测试成功后绑定模型 Profile。不支持 `response_format` 的服务请选择 `prompt_only`。
 
-仓库内置 `qwen3.5:4b-mlx`、`qwen3:1.7b`、`qwen3.6:35b-a3b` 和 `deepseek-v4:flash` Profile。默认 Profile 为 `qwen3_1_7b_fast`，默认 Prompt 为 `feature_extract_v3_compact_strict_json_en`。`qwen3.5:4b-mlx` 的默认输出预算为 1600 tokens。
+仓库内置 `qwen3.5:4b-mlx`、`qwen3.5:9b-mlx`、`qwen3:1.7b`、`qwen3.6:35b-a3b` 和 `deepseek-v4:flash` Profile。默认 Profile 仍为 `qwen3_1_7b_fast`，默认 Prompt 为 `feature_extract_v3_compact_strict_json_en`。`qwen3.5:9b-mlx` 使用 262144 tokens 上下文、12000 tokens 推荐输入预算和 2000 tokens 输出预算，默认关闭 Thinking 以提高结构化 JSON 稳定性。
 
 分析任务可配置自动重试 0–3 次。缺少字段、JSON 无效或结构不合法时，会使用同一连接和 Profile 重试，不会隐式降级。AI Cache 默认启用；相同 Evidence、Prompt、Provider、模型和 Thinking 配置会复用结果。调试时可临时关闭：
 
@@ -123,6 +123,8 @@ Dashboard 提供以下工作区：
 - **AI 调用追踪**：按任务、Trace、状态和 Prompt 查询实际调用快照；
 - **人工审批**：逐条选择脱敏模板证据，编辑标题、摘要、标签和审批备注；
 - **批准规则库**：查看规则来源、复用记录和完整 Lineage。
+
+所有启用的特征提取 Prompt 都必须明确声明 `feature_type`、`title`、`summary`、`importance`、`template_hashes`、`components`、`tags` 和 `selection_reason` 八个字段，并要求 `feature_type` 使用 `lowercase_snake_case`。启动时会把仍使用旧六字段契约的内置 Prompt 追加升级为新版本，同时保留原历史；页面保存缺少必填字段的 Prompt 时会返回明确错误。
 
 规则 Lineage 包含来源任务、候选特征、Trace、Prompt、模型、Provider 和 Evidence Hash。批准规则命中后会直接生成复用特征并跳过模型调用。导出包只包含已批准特征和关联风险节点。
 
@@ -159,7 +161,7 @@ Dashboard 提供以下工作区：
 
 ## 部署配置
 
-前端是已提交到 `frontend/dist/` 的纯 React 静态应用，不依赖 Vite、CDN 或运行时编译。前后端可分开部署：默认后端地址在 `frontend/dist/config.js` 设置，页面“系统设置”可保存浏览器级覆盖。
+前端是已提交到 `frontend/dist/` 的纯 React 静态应用，不依赖 CDN 或运行时编译，普通启动不需要 Node.js。前后端可分开部署：默认后端地址在 `frontend/dist/config.js` 设置，页面“系统设置”可保存浏览器级覆盖。
 
 跨域部署时配置允许来源：
 

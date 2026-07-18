@@ -12,6 +12,29 @@ import yaml
 from logrisk.database import SQLiteDatabase, utc_now
 
 
+FEATURE_OUTPUT_FIELDS = (
+    "feature_type",
+    "title",
+    "summary",
+    "importance",
+    "template_hashes",
+    "components",
+    "tags",
+    "selection_reason",
+)
+
+
+def validate_feature_prompt_contract(content: str) -> None:
+    missing = [field for field in FEATURE_OUTPUT_FIELDS if field not in content]
+    if missing:
+        raise ValueError(f"feature_extract Prompt 缺少必填输出字段: {', '.join(missing)}")
+    if "lowercase_snake_case" not in content:
+        raise ValueError("feature_extract Prompt 必须要求 feature_type 使用 lowercase_snake_case")
+    stripped = content.strip()
+    if stripped.startswith("```") and stripped.endswith("```"):
+        raise ValueError("feature_extract Prompt 不能整体包裹在 Markdown 代码围栏中")
+
+
 @dataclass(frozen=True)
 class PromptTemplate:
     prompt_id: str
@@ -96,6 +119,8 @@ class PromptRegistry:
         if not isinstance(content, str) or not content.strip():
             raise ValueError("prompt content must be non-empty")
         current = self.load(prompt_id)
+        if current.analysis_type == "feature_extract":
+            validate_feature_prompt_contract(content)
         path = Path(current.path)
         history = self._all_history()
         history.setdefault(prompt_id, []).insert(0, {
@@ -124,9 +149,6 @@ class SQLitePromptRegistry(PromptRegistry):
         self._seed()
 
     def _seed(self) -> None:
-        with self.database.connect() as connection:
-            if connection.execute("SELECT 1 FROM prompt_templates LIMIT 1").fetchone():
-                return
         config = self._config()
         defaults = set((config.get("defaults") or {}).values())
         configured = [item for item in (config.get("prompts") or []) if item.get("prompt_id")]
@@ -139,24 +161,61 @@ class SQLitePromptRegistry(PromptRegistry):
                 path = self.prompt_dir / f"{prompt_id}.md"
                 content = path.read_text(encoding="utf-8")
                 digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
-                connection.execute(
-                    "INSERT INTO prompt_templates(prompt_id, analysis_type, display_name, description, status, is_default, "
-                    "current_version, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)",
-                    (
-                        prompt_id,
-                        meta.get("analysis_type") or "feature_extract",
-                        meta.get("display_name"),
-                        meta.get("description"),
-                        meta.get("status") or "active",
-                        int(bool(meta.get("is_default") or prompt_id in defaults)),
-                        now,
-                        now,
-                    ),
-                )
-                connection.execute(
-                    "INSERT INTO prompt_versions(prompt_id, version, content, content_sha256, note, created_at) VALUES (?, 1, ?, ?, ?, ?)",
-                    (prompt_id, content, digest, "seed", now),
-                )
+                analysis_type = str(meta.get("analysis_type") or "feature_extract")
+                if analysis_type == "feature_extract":
+                    validate_feature_prompt_contract(content)
+                current = connection.execute(
+                    "SELECT t.current_version, v.content, v.content_sha256 FROM prompt_templates t "
+                    "JOIN prompt_versions v ON v.prompt_id=t.prompt_id AND v.version=t.current_version "
+                    "WHERE t.prompt_id=?",
+                    (prompt_id,),
+                ).fetchone()
+                if current is None:
+                    connection.execute(
+                        "INSERT INTO prompt_templates(prompt_id, analysis_type, display_name, description, status, is_default, "
+                        "current_version, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)",
+                        (
+                            prompt_id,
+                            analysis_type,
+                            meta.get("display_name"),
+                            meta.get("description"),
+                            meta.get("status") or "active",
+                            int(bool(meta.get("is_default") or prompt_id in defaults)),
+                            now,
+                            now,
+                        ),
+                    )
+                    connection.execute(
+                        "INSERT INTO prompt_versions(prompt_id, version, content, content_sha256, note, created_at) "
+                        "VALUES (?, 1, ?, ?, ?, ?)",
+                        (prompt_id, content, digest, "seed", now),
+                    )
+                    continue
+                if analysis_type != "feature_extract":
+                    continue
+                try:
+                    validate_feature_prompt_contract(str(current["content"]))
+                except ValueError:
+                    next_version = int(connection.execute(
+                        "SELECT COALESCE(MAX(version), 0) + 1 FROM prompt_versions WHERE prompt_id=?",
+                        (prompt_id,),
+                    ).fetchone()[0])
+                    connection.execute(
+                        "INSERT INTO prompt_versions(prompt_id, version, content, content_sha256, note, created_at) "
+                        "VALUES (?, ?, ?, ?, ?, ?)",
+                        (
+                            prompt_id,
+                            next_version,
+                            content,
+                            digest,
+                            "系统修复：补齐 8 字段输出契约",
+                            now,
+                        ),
+                    )
+                    connection.execute(
+                        "UPDATE prompt_templates SET current_version=?, updated_at=? WHERE prompt_id=?",
+                        (next_version, now, prompt_id),
+                    )
 
     @staticmethod
     def _template(row: Any) -> PromptTemplate:
@@ -226,10 +285,12 @@ class SQLitePromptRegistry(PromptRegistry):
         now = utc_now()
         with self.database.transaction() as connection:
             row = connection.execute(
-                "SELECT current_version FROM prompt_templates WHERE prompt_id=?", (prompt_id,)
+                "SELECT current_version, analysis_type FROM prompt_templates WHERE prompt_id=?", (prompt_id,)
             ).fetchone()
             if row is None:
                 raise FileNotFoundError(f"prompt not found: {prompt_id}")
+            if row["analysis_type"] == "feature_extract":
+                validate_feature_prompt_contract(content)
             version = int(row[0]) + 1
             connection.execute(
                 "INSERT INTO prompt_versions(prompt_id, version, content, content_sha256, note, created_at) VALUES (?, ?, ?, ?, ?, ?)",

@@ -75,7 +75,7 @@ def test_m11_quality_and_settings_use_workspace_design_contract():
         "secondary-button",
     ):
         assert text in source
-    assert '!["drainQuality", "settings"].includes(view)' in source
+    assert '!["drainQuality", "settings", "rules"].includes(view)' in source
     assert "h(CodeBlock, { value: profile.parameters })" not in source
 
 
@@ -234,6 +234,35 @@ def test_model_profile_save_has_feedback_and_edits_top_level_output_budget():
         assert text in source
 
 
+def test_rule_lifecycle_governance_ui_contract():
+    source = source_text()
+    for text in (
+        "/api/rule-governance/rules",
+        "/api/rule-governance/review-queue",
+        "/status",
+        "/feedback",
+        "/rollback",
+        "规则生命周期治理",
+        "待复审",
+        "ruleReviewQueue",
+        "规则健康度",
+        "7 天命中",
+        "30 天命中",
+        "误报率",
+        "跨集群命中",
+        "版本历史",
+        "复审工作台",
+        "回滚到此版本",
+        "复制诊断信息",
+        "当前权限：本地治理者",
+        "rule-governance-layout",
+        "rule-health-score",
+        "rule-version-tree",
+    ):
+        assert text in source
+    assert 'window.confirm("确认回滚规则' in source
+
+
 def test_v3_metrics_and_animations_are_present():
     source = source_text()
     for text in (
@@ -347,7 +376,8 @@ def test_release_docs_describe_current_feature_version():
     assert "## 1.20.0 - 2026-07-16" in release
     assert "## 1.20.1 - 2026-07-16" in release
     assert "## 1.21.0 - 2026-07-16" in release
-    assert "当前版本：`1.21.0`" in readme
+    assert "## 1.22.0 - 2026-07-18" in release
+    assert "当前版本：`1.22.0`" in readme
     assert "qwen3.5:9b-mlx" in readme
     assert "state/logrisk.sqlite3" in readme
     assert "database/migrations/" in readme

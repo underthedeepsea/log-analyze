@@ -5,7 +5,7 @@ import hashlib
 import json
 import os
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict
 
@@ -19,6 +19,10 @@ _PROCESS_LOCK = threading.RLock()
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _next_review(timestamp: str) -> str:
+    return (datetime.fromisoformat(timestamp) + timedelta(days=30)).isoformat()
 
 
 def _template_pairs(items: list[Dict[str, Any]]) -> list[Dict[str, str]]:
@@ -67,6 +71,22 @@ def _lineage(feature: Dict[str, Any]) -> Dict[str, str]:
         if value:
             lineage[field] = str(value)
     return lineage
+
+
+def _versioned_fields(rule: Dict[str, Any]) -> Dict[str, Any]:
+    fields = (
+        "signature",
+        "feature_type",
+        "title",
+        "summary",
+        "importance",
+        "tags",
+        "selection_reason",
+        "components",
+        "template_signatures",
+        "lineage",
+    )
+    return {field: copy.deepcopy(rule.get(field)) for field in fields}
 
 
 class ApprovedRuleStore:
@@ -134,15 +154,23 @@ class ApprovedRuleStore:
                 "components": sorted({str(item) for item in (feature.get("components") or []) if item}),
                 "template_signatures": _template_pairs(feature.get("source_templates") or []),
                 "approved_at": existing.get("approved_at") if existing else now,
+                "created_at": existing.get("created_at") or existing.get("approved_at") if existing else now,
                 "updated_at": now,
                 "reuse_count": int(existing.get("reuse_count") or 0) if existing else 0,
                 "last_reused_at": existing.get("last_reused_at") if existing else None,
+                "schema_version": "approved_rule_v2",
+                "status": str(existing.get("status") or "active") if existing else "active",
+                "next_review_at": existing.get("next_review_at") if existing else _next_review(now),
             }
             lineage = _lineage(feature)
             if lineage:
                 rule["lineage"] = lineage
             elif existing and isinstance(existing.get("lineage"), dict):
                 rule["lineage"] = copy.deepcopy(existing["lineage"])
+            current_version = int(existing.get("current_version") or 1) if existing else 1
+            if existing and _versioned_fields(existing) != _versioned_fields(rule):
+                current_version += 1
+            rule["current_version"] = current_version
             if existing:
                 rules[rules.index(existing)] = rule
             else:
@@ -159,6 +187,8 @@ class ApprovedRuleStore:
         with _PROCESS_LOCK:
             matches = []
             for rule in self._read_locked():
+                if str(rule.get("status") or "active") != "active":
+                    continue
                 required = {
                     _identity_pair(item)
                     for item in (rule.get("template_signatures") or [])
@@ -167,7 +197,14 @@ class ApprovedRuleStore:
                     matches.append(copy.deepcopy(rule))
             return matches
 
-    def record_reuse(self, rule_id: str) -> Dict[str, Any]:
+    def record_reuse(
+        self,
+        rule_id: str,
+        *,
+        job_id: str | None = None,
+        entity_id: str | None = None,
+        cluster: str | None = None,
+    ) -> Dict[str, Any]:
         with _PROCESS_LOCK:
             rules = self._read_locked()
             rule = next((item for item in rules if item.get("rule_id") == rule_id), None)

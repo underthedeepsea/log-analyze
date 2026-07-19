@@ -112,23 +112,79 @@ class SQLiteApprovedRuleStore(ApprovedRuleStore):
 
     def _read_locked(self) -> list[dict[str, Any]]:
         with self.database.connect() as connection:
-            return [json.loads(row[0]) for row in connection.execute("SELECT rule_json FROM approved_rules ORDER BY rule_id")]
+            rows = connection.execute(
+                "SELECT rule_json, status, current_version, next_review_at, schema_version, approved_at, updated_at "
+                "FROM approved_rules ORDER BY rule_id"
+            )
+            rules = []
+            for row in rows:
+                rule = json.loads(row["rule_json"])
+                rule.update({
+                    "status": row["status"],
+                    "current_version": int(row["current_version"]),
+                    "next_review_at": row["next_review_at"],
+                    "schema_version": row["schema_version"],
+                    "approved_at": row["approved_at"],
+                    "created_at": rule.get("created_at") or row["approved_at"],
+                    "updated_at": row["updated_at"],
+                })
+                rules.append(rule)
+            return rules
 
     def _write_locked(self, rules: list[dict[str, Any]]) -> None:
         with self.database.transaction() as connection:
-            connection.execute("DELETE FROM approved_rules")
             for rule in rules:
                 connection.execute(
-                    "INSERT INTO approved_rules(rule_id, signature, feature_type, rule_json, approved_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
-                    (rule["rule_id"], rule["signature"], rule["feature_type"], _json(rule), rule["approved_at"], rule["updated_at"]),
+                    "INSERT INTO approved_rules(rule_id, signature, feature_type, rule_json, approved_at, updated_at, "
+                    "status, current_version, next_review_at, schema_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(rule_id) DO UPDATE SET signature=excluded.signature, feature_type=excluded.feature_type, "
+                    "rule_json=excluded.rule_json, updated_at=excluded.updated_at, status=excluded.status, "
+                    "current_version=excluded.current_version, next_review_at=excluded.next_review_at, "
+                    "schema_version=excluded.schema_version",
+                    (
+                        rule["rule_id"], rule["signature"], rule["feature_type"], _json(rule),
+                        rule["approved_at"], rule["updated_at"], rule.get("status", "active"),
+                        int(rule.get("current_version") or 1), rule.get("next_review_at"),
+                        rule.get("schema_version", "approved_rule_v2"),
+                    ),
                 )
+                version = int(rule.get("current_version") or 1)
+                change_type = "rule_created" if version == 1 else "rule_updated"
+                created = connection.execute(
+                    "INSERT OR IGNORE INTO rule_versions(rule_id, version, rule_json, change_type, change_reason, "
+                    "operator, created_at, schema_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        rule["rule_id"], version, _json(rule), change_type,
+                        "人工批准特征" if version == 1 else "人工审批更新规则",
+                        "manual-approval", rule["updated_at"], "rule_version_v1",
+                    ),
+                )
+                if created.rowcount:
+                    connection.execute(
+                        "INSERT INTO rule_audit_events(event_id, rule_id, event_type, from_version, to_version, "
+                        "event_json, operator, created_at, schema_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            f"rule-event-{uuid.uuid4().hex}", rule["rule_id"], change_type,
+                            version - 1 if version > 1 else None, version,
+                            _json({"reason": "人工审批写入规则库"}), "manual-approval",
+                            rule["updated_at"], "rule_audit_event_v1",
+                        ),
+                    )
 
-    def record_reuse(self, rule_id: str) -> dict[str, Any]:
-        rule = super().record_reuse(rule_id)
+    def record_reuse(
+        self,
+        rule_id: str,
+        *,
+        job_id: str | None = None,
+        entity_id: str | None = None,
+        cluster: str | None = None,
+    ) -> dict[str, Any]:
+        rule = super().record_reuse(rule_id, job_id=job_id, entity_id=entity_id, cluster=cluster)
         with self.database.transaction() as connection:
             connection.execute(
-                "INSERT INTO rule_reuse_events(rule_id, reused_at) VALUES (?, ?)",
-                (rule_id, rule["last_reused_at"]),
+                "INSERT INTO rule_reuse_events(rule_id, job_id, entity_id, reused_at, cluster, schema_version) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (rule_id, job_id, entity_id, rule["last_reused_at"], cluster, "rule_reuse_event_v2"),
             )
         return rule
 

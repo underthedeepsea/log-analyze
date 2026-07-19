@@ -24,7 +24,12 @@
       headers: Object.assign({ "Content-Type": "application/json" }, (options && options.headers) || {}),
     }));
     const payload = await response.json().catch(function () { return {}; });
-    if (!response.ok) throw new Error(payload.error || "请求失败 (" + response.status + ")");
+    if (!response.ok) {
+      const error = new Error(payload.error || "请求失败 (" + response.status + ")");
+      error.code = payload.code || "http_" + response.status;
+      error.requestId = payload.request_id || "";
+      throw error;
+    }
     return payload;
   }
 
@@ -33,6 +38,12 @@
     config: function () { return jsonRequest("/api/config"); },
     status: function () { return jsonRequest("/api/ollama/status"); },
     rules: function () { return jsonRequest("/api/rules"); },
+    governedRules: function (query) { return jsonRequest("/api/rule-governance/rules" + (query || "")); },
+    ruleReviewQueue: function () { return jsonRequest("/api/rule-governance/review-queue"); },
+    ruleDetail: function (ruleId) { return jsonRequest("/api/rule-governance/rules/" + encodeURIComponent(ruleId)); },
+    changeRuleStatus: function (ruleId, payload) { return jsonRequest("/api/rule-governance/rules/" + encodeURIComponent(ruleId) + "/status", { method: "POST", body: JSON.stringify(payload) }); },
+    addRuleFeedback: function (ruleId, payload) { return jsonRequest("/api/rule-governance/rules/" + encodeURIComponent(ruleId) + "/feedback", { method: "POST", body: JSON.stringify(payload) }); },
+    rollbackRule: function (ruleId, payload) { return jsonRequest("/api/rule-governance/rules/" + encodeURIComponent(ruleId) + "/rollback", { method: "POST", body: JSON.stringify(payload) }); },
     metrics: function () { return jsonRequest("/api/metrics"); },
     drainDatasets: function () { return jsonRequest("/api/drain-quality/datasets"); },
     drainAnnotations: function () { return jsonRequest("/api/drain-quality/annotations"); },
@@ -143,7 +154,7 @@
 
   const navItems = [
     ["overview", "▦", "特征总览"], ["queue", "◫", "识别队列"], ["observability", "◉", "AI 分析观测"], ["traces", "⌁", "AI 调用追踪"], ["prompts", "{}", "Prompt 管理"], ["modelProfiles", "◌", "模型画像"], ["review", "✓", "人工审批"],
-    ["rules", "⌘", "批准规则库"], ["drainQuality", "◇", "评测中心 · 模板质量"], ["export", "⇩", "导出记录"], ["settings", "⚙", "系统设置"],
+    ["rules", "⌘", "规则治理"], ["drainQuality", "◇", "评测中心 · 模板质量"], ["export", "⇩", "导出记录"], ["settings", "⚙", "系统设置"],
   ];
   const statusNames = { queued: "等待分析", running: "识别中", completed: "Ollama 完成", failed: "识别失败", skipped: "低风险跳过", rule_matched: "规则复用" };
 
@@ -163,8 +174,8 @@
 
   function shortHash(value) { return value ? String(value).slice(0, 10) : "—"; }
   function timeText(value) { return value ? new Date(value).toLocaleString() : "—"; }
-  function pathToView(path) { return path === "/prompts" ? "prompts" : (path === "/model-profiles" ? "modelProfiles" : (path === "/ai-traces" ? "traces" : (path === "/ai-observability" ? "observability" : (path === "/drain-quality" ? "drainQuality" : (path === "/settings" ? "settings" : "overview"))))); }
-  function routeForView(view) { return view === "prompts" ? "/prompts" : (view === "modelProfiles" ? "/model-profiles" : (view === "traces" ? "/ai-traces" : (view === "observability" ? "/ai-observability" : (view === "drainQuality" ? "/drain-quality" : (view === "settings" ? "/settings" : "/"))))); }
+  function pathToView(path) { return path === "/prompts" ? "prompts" : (path === "/model-profiles" ? "modelProfiles" : (path === "/ai-traces" ? "traces" : (path === "/ai-observability" ? "observability" : (path === "/drain-quality" ? "drainQuality" : (path === "/rules" ? "rules" : (path === "/settings" ? "settings" : "overview")))))); }
+  function routeForView(view) { return view === "prompts" ? "/prompts" : (view === "modelProfiles" ? "/model-profiles" : (view === "traces" ? "/ai-traces" : (view === "observability" ? "/ai-observability" : (view === "drainQuality" ? "/drain-quality" : (view === "rules" ? "/rules" : (view === "settings" ? "/settings" : "/")))))); }
   function traceFiltersFromSearch(search) {
     const params = new URLSearchParams(search || "");
     return { job_id: params.get("job_id") || "", trace_id: params.get("trace_id") || "", status: params.get("status") || "", prompt_id: params.get("prompt_id") || "" };
@@ -600,10 +611,67 @@
   }
 
   function RuleLibrary(props) {
-    const [selected, setSelected] = useState(null);
+    const [selectedId, setSelectedId] = useState("");
+    const [detail, setDetail] = useState(null);
+    const [statusFilter, setStatusFilter] = useState("all");
+    const [nextStatus, setNextStatus] = useState("under_review");
+    const [reason, setReason] = useState("");
+    const [feedbackOutcome, setFeedbackOutcome] = useState("false_positive");
+    const [feedbackNote, setFeedbackNote] = useState("");
+    const [loading, setLoading] = useState(false);
+    const [failure, setFailure] = useState(null);
+    const [busy, setBusy] = useState(false);
     useEffect(function () {
-      if (props.focusRuleId) setSelected(props.rules.find(function (rule) { return rule.rule_id === props.focusRuleId; }) || null);
+      const preferred = props.focusRuleId && props.rules.some(function (rule) { return rule.rule_id === props.focusRuleId; }) ? props.focusRuleId : selectedId;
+      setSelectedId(preferred && props.rules.some(function (rule) { return rule.rule_id === preferred; }) ? preferred : (props.rules[0] && props.rules[0].rule_id || ""));
     }, [props.focusRuleId, props.rules]);
+    useEffect(function () {
+      if (!selectedId) { setDetail(null); return; }
+      loadDetail(selectedId);
+    }, [selectedId]);
+    async function loadDetail(ruleId) {
+      setLoading(true); setFailure(null);
+      try { setDetail(await api.ruleDetail(ruleId)); }
+      catch (error) { setFailure({ message: error.message, code: error.code || "request_failed", request_id: error.requestId || "", rule_id: ruleId }); }
+      finally { setLoading(false); }
+    }
+    async function refresh(ruleId) {
+      await props.onChanged();
+      await loadDetail(ruleId || selectedId);
+    }
+    async function changeStatus(status) {
+      if (!detail || !reason.trim()) { window.alert("请填写状态变更原因"); return; }
+      setBusy(true); setFailure(null);
+      try {
+        await api.changeRuleStatus(detail.rule.rule_id, { status: status, expected_version: detail.rule.current_version, operator: "local-operator", reason: reason.trim() });
+        setReason(""); await refresh(detail.rule.rule_id);
+      } catch (error) { setFailure({ message: error.message, code: error.code || "request_failed", request_id: error.requestId || "", rule_id: detail.rule.rule_id }); }
+      finally { setBusy(false); }
+    }
+    async function recordFeedback() {
+      if (!detail) return;
+      setBusy(true); setFailure(null);
+      try {
+        await api.addRuleFeedback(detail.rule.rule_id, { outcome: feedbackOutcome, operator: "local-operator", note: feedbackNote.trim() });
+        setFeedbackNote(""); await refresh(detail.rule.rule_id);
+      } catch (error) { setFailure({ message: error.message, code: error.code || "request_failed", request_id: error.requestId || "", rule_id: detail.rule.rule_id }); }
+      finally { setBusy(false); }
+    }
+    async function rollbackVersion(version) {
+      if (!detail || !window.confirm("确认回滚规则 " + detail.rule.rule_id + " 到 v" + version + "？系统会创建新版本，不覆盖历史记录。")) return;
+      const rollbackReason = reason.trim() || "人工确认回滚到 v" + version;
+      setBusy(true); setFailure(null);
+      try {
+        await api.rollbackRule(detail.rule.rule_id, { target_version: version, expected_version: detail.rule.current_version, confirmed: true, operator: "local-operator", reason: rollbackReason });
+        setReason(""); await refresh(detail.rule.rule_id);
+      } catch (error) { setFailure({ message: error.message, code: error.code || "request_failed", request_id: error.requestId || "", rule_id: detail.rule.rule_id }); }
+      finally { setBusy(false); }
+    }
+    function copyDiagnostic() {
+      const text = JSON.stringify({ page: "rule-governance", api_base: currentApiBase(), diagnostic: failure }, null, 2);
+      if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text);
+      else window.prompt("复制诊断信息", text);
+    }
     function lineageStatus(rule) {
       const lineage = rule.lineage;
       if (!lineage) return ["历史规则", "history"];
@@ -611,28 +679,43 @@
       return ["部分可追溯", "partial"];
     }
     function identity(item) { return item.template_fingerprint || item.template_hash || "—"; }
-    const detail = selected && h(React.Fragment, null,
-      h("h3", null, "基础信息"), h(CodeBlock, { value: { rule_id: selected.rule_id, feature_type: selected.feature_type, title: selected.title, importance: selected.importance, approved_at: selected.approved_at } }),
-      h("h3", null, "匹配条件"), h(CodeBlock, { value: selected.template_signatures || [] }),
-      h("h3", null, "来源链路"), h("div", { className: "lineage-timeline" }, ["Input Job", "Candidate", "AI Trace", "Prompt / Model / Evidence", "Evaluator", "Manual Approval", "Approved Rule", "Reuse"].map(function (step) { return h("span", { key: step }, step); })),
-      h(CodeBlock, { value: selected.lineage || { status: "历史规则，无 Lineage 数据" } }),
-      selected.lineage && selected.lineage.trace_id && h("button", { className: "primary-button lineage-trace", onClick: function () { props.onOpenTrace(selected.lineage.trace_id); } }, "查看来源 AI Trace"),
-      h("h3", null, "复用记录"), h(CodeBlock, { value: { reuse_count: selected.reuse_count || 0, last_reused_at: selected.last_reused_at || null } }));
-    return h(React.Fragment, null,
-      h("section", { className: "surface rules-surface" },
-        h("div", { className: "surface-head" }, h("b", null, "批准规则库"), h("span", null, "全局跨集群复用 · " + props.rules.length + " 条规则")),
-        h("div", { className: "rule-table" },
-          h("div", { className: "rule-head" }, h("span", null, "规则"), h("span", null, "模板 / 类别"), h("span", null, "来源模型 / Prompt"), h("span", null, "Lineage 状态 / 复用")),
-          props.rules.length === 0 && h("div", { className: "empty-state" }, "批准首条 Ollama 特征后建立规则库"),
-          props.rules.map(function (rule) {
-            const status = lineageStatus(rule), lineage = rule.lineage || {};
-            return h("button", { className: "rule-row", key: rule.rule_id, onClick: function () { setSelected(rule); } },
-              h("div", null, h("b", null, rule.title), h("span", null, rule.rule_id + " · " + rule.feature_type)),
-              h("div", null, (rule.template_signatures || []).map(function (item) { const value = identity(item); return h("span", { className: "signature", key: value + "-" + item.category }, value.slice(0, 10) + " · " + (item.category || "未分类")); })),
-              h("div", null, h("b", null, lineage.model || "历史数据"), h("span", null, lineage.prompt_id || "未记录 Prompt"), h("span", null, "质量门禁：来源候选已通过")),
-              h("div", null, h("span", { className: "lineage-badge " + status[1] }, status[0]), h("b", null, (rule.reuse_count || 0) + " 次复用")));
+    const statusNames = { active: "启用", disabled: "停用", under_review: "复审中", deprecated: "已废弃", archived: "已归档" };
+    const reviewIds = new Set((props.reviewQueue && props.reviewQueue.items || []).map(function (rule) { return rule.rule_id; }));
+    const visible = props.rules.filter(function (rule) { return statusFilter === "all" || (statusFilter === "review" ? reviewIds.has(rule.rule_id) : rule.status === statusFilter); });
+    const totalHits = props.rules.reduce(function (sum, rule) { return sum + Number(rule.health && rule.health.hits_30d || 0); }, 0);
+    const risky = props.rules.filter(function (rule) { return rule.health && rule.health.level !== "healthy"; }).length;
+    const selectedRule = detail && detail.rule;
+    const health = detail && detail.health || {};
+    return h("div", { className: "rule-governance-page" },
+      h("section", { className: "rule-governance-hero" }, h("div", null, h("span", { className: "eyebrow" }, "RULE LIFECYCLE GOVERNANCE"), h("h2", null, "规则生命周期治理"), h("p", null, "管理人工批准规则的状态、健康度、复审、版本与审计回滚。")), h("span", { className: "permission-chip" }, "当前权限：本地治理者")),
+      h("section", { className: "rule-governance-metrics" },
+        h("div", null, h("span", null, "规则资产"), h("b", null, props.rules.length), h("small", null, "全部人工批准规则")),
+        h("div", null, h("span", null, "启用中"), h("b", null, props.rules.filter(function (rule) { return rule.status === "active"; }).length), h("small", null, "参与特征匹配")),
+        h("div", null, h("span", null, "待复审"), h("b", null, props.reviewQueue && props.reviewQueue.total != null ? props.reviewQueue.total : risky), h("small", null, "健康度或复审异常")),
+        h("div", null, h("span", null, "30 天命中"), h("b", null, totalHits), h("small", null, "规则复用事件"))),
+      failure && h("section", { className: "rule-diagnostic" }, h("div", null, h("b", null, "规则治理请求失败"), h("span", null, failure.message), h("code", null, (failure.code || "unknown") + (failure.request_id ? " · " + failure.request_id : ""))), h("button", { className: "secondary-button", onClick: copyDiagnostic }, "复制诊断信息")),
+      h("div", { className: "rule-governance-layout" },
+        h("section", { className: "surface rule-catalog" },
+          h("div", { className: "surface-head" }, h("div", null, h("b", null, "批准规则库"), h("span", null, "状态筛选与规则健康度")), h("span", null, visible.length + " 条")),
+          h("div", { className: "rule-status-filters" }, [["all", "全部"], ["review", "待复审"], ["active", "启用"], ["under_review", "复审中"], ["disabled", "停用"], ["deprecated", "废弃"], ["archived", "归档"]].map(function (item) { return h("button", { key: item[0], className: statusFilter === item[0] ? "active" : "", onClick: function () { setStatusFilter(item[0]); } }, item[1]); })),
+          props.loading && h("div", { className: "empty-state compact" }, "正在加载规则资产…"),
+          !props.loading && visible.length === 0 && h("div", { className: "empty-state" }, props.rules.length ? "当前筛选条件下没有规则" : "批准首条特征后建立规则资产库"),
+          h("div", { className: "rule-catalog-list" }, visible.map(function (rule) {
+            const score = Number(rule.health && rule.health.score || 0), status = lineageStatus(rule);
+            return h("button", { className: "rule-catalog-item " + (selectedId === rule.rule_id ? "active" : ""), key: rule.rule_id, onClick: function () { setSelectedId(rule.rule_id); } },
+              h("div", { className: "rule-health-score " + (rule.health && rule.health.level || "attention"), style: { "--score": score + "%" } }, h("b", null, score), h("span", null, "健康")),
+              h("div", { className: "rule-catalog-copy" }, h("div", null, h("b", null, rule.title || rule.feature_type), h("span", { className: "status-chip " + rule.status }, statusNames[rule.status] || rule.status)), h("small", null, rule.rule_id + " · v" + rule.current_version), h("p", null, rule.summary || "暂无摘要"), h("div", { className: "rule-mini-meta" }, h("span", null, "7 天命中 " + (rule.health && rule.health.hits_7d || 0)), h("span", null, "误报率 " + Math.round(Number(rule.health && rule.health.false_positive_rate_30d || 0) * 100) + "%"), h("span", { className: "lineage-badge " + status[1] }, status[0]))));
           }))),
-      selected && h(Drawer, { title: "规则详情", subtitle: selected.rule_id, item: selected, onClose: function () { setSelected(null); } }, detail));
+        h("section", { className: "surface rule-detail-panel" },
+          loading && h("div", { className: "empty-state" }, "正在加载规则详情…"),
+          !loading && !selectedRule && h("div", { className: "empty-state" }, "请选择规则查看健康度和版本历史"),
+          !loading && selectedRule && h(React.Fragment, null,
+            h("div", { className: "rule-detail-head" }, h("div", null, h("span", { className: "eyebrow" }, selectedRule.feature_type), h("h3", null, selectedRule.title), h("p", null, selectedRule.rule_id + " · 当前 v" + selectedRule.current_version)), h("span", { className: "status-chip " + selectedRule.status }, statusNames[selectedRule.status] || selectedRule.status)),
+            h("section", { className: "rule-health-section" }, h("div", { className: "section-title" }, h("div", null, h("h3", null, "规则健康度"), h("p", null, "基于命中、误报、跨集群复用与复审时间计算")), h("b", { className: "health-level " + health.level }, health.score + " / 100")), h("div", { className: "rule-health-grid" }, [["7 天命中", health.hits_7d || 0], ["30 天命中", health.hits_30d || 0], ["误报率", Math.round(Number(health.false_positive_rate_30d || 0) * 100) + "%"], ["跨集群命中", health.cluster_count_30d || 0]].map(function (item) { return h("div", { key: item[0] }, h("span", null, item[0]), h("b", null, item[1])); })), health.review_reasons && health.review_reasons.length > 0 && h("div", { className: "review-reasons" }, health.review_reasons.map(function (item) { return h("span", { key: item }, item); }))),
+            h("section", { className: "rule-facts" }, h("div", { className: "section-title" }, h("div", null, h("h3", null, "规则事实"), h("p", null, "审批内容、匹配签名和来源链路均保持脱敏"))), h("p", null, selectedRule.summary || "暂无摘要"), h("small", { className: "lineage-state" }, "Lineage 状态：" + lineageStatus(selectedRule)[0]), h("div", { className: "rule-tag-row" }, (selectedRule.tags || []).map(function (tag) { return h("span", { key: tag }, tag); })), h("div", { className: "rule-signature-list" }, (selectedRule.template_signatures || []).map(function (item) { const value = identity(item); return h("code", { key: value + item.category }, value + " · " + (item.category || "未分类")); })), selectedRule.lineage && selectedRule.lineage.trace_id && h("button", { className: "text-button", onClick: function () { props.onOpenTrace(selectedRule.lineage.trace_id); } }, "查看来源 AI Trace")),
+            h("section", { className: "rule-review-workbench" }, h("div", { className: "section-title" }, h("div", null, h("h3", null, "复审工作台"), h("p", null, "所有状态变更和反馈均写入追加式审计记录"))), h("div", { className: "review-control-grid" }, h("label", null, h("span", null, "目标状态"), h("select", { value: nextStatus, onChange: function (event) { setNextStatus(event.target.value); } }, Object.keys(statusNames).map(function (status) { return h("option", { key: status, value: status }, statusNames[status]); }))), h("label", { className: "review-reason-field" }, h("span", null, "变更或回滚原因"), h("input", { value: reason, placeholder: "填写可审计的操作原因", onChange: function (event) { setReason(event.target.value); } })), h("button", { className: "primary-button", disabled: busy, onClick: function () { changeStatus(nextStatus); } }, busy ? "提交中…" : "应用状态")), h("div", { className: "review-control-grid feedback" }, h("label", null, h("span", null, "反馈结论"), h("select", { value: feedbackOutcome, onChange: function (event) { setFeedbackOutcome(event.target.value); } }, h("option", { value: "false_positive" }, "误报"), h("option", { value: "confirmed" }, "命中有效"))), h("label", { className: "review-reason-field" }, h("span", null, "反馈备注"), h("input", { value: feedbackNote, placeholder: "记录集群差异或复核依据", onChange: function (event) { setFeedbackNote(event.target.value); } })), h("button", { className: "secondary-button", disabled: busy, onClick: recordFeedback }, "记录反馈"))),
+            h("section", { className: "rule-version-section" }, h("div", { className: "section-title" }, h("div", null, h("h3", null, "版本历史"), h("p", null, "回滚会追加新版本，不会覆盖历史快照")), h("span", null, (detail.versions || []).length + " 个版本")), h("div", { className: "rule-version-tree" }, (detail.versions || []).map(function (version) { return h("article", { key: version.version, className: version.version === selectedRule.current_version ? "current" : "" }, h("i", null), h("div", null, h("div", null, h("b", null, "v" + version.version), h("span", null, version.change_type)), h("p", null, version.change_reason || "无备注"), h("small", null, timeText(version.created_at) + " · " + version.operator)), h("button", { className: "text-button", disabled: busy || version.version === selectedRule.current_version, onClick: function () { rollbackVersion(version.version); } }, version.version === selectedRule.current_version ? "当前版本" : "回滚到此版本")); }))),
+            h("section", { className: "rule-audit-section" }, h("div", { className: "section-title" }, h("div", null, h("h3", null, "最近审计"), h("p", null, "状态、反馈、审批更新与回滚事件"))), (detail.audit_events || []).slice(0, 6).map(function (event) { return h("div", { className: "rule-audit-row", key: event.event_id }, h("b", null, event.event_type), h("span", null, "v" + (event.from_version || "—") + " → v" + event.to_version), h("small", null, timeText(event.created_at) + " · " + event.operator)); }))))));
   }
 
   function BackendSettings(props) {
@@ -952,6 +1035,7 @@
     const [view, setView] = useState(pathToView(window.location.pathname)), [model, setModel] = useState("qwen3:1.7b"), [threshold, setThreshold] = useState(40), [promptId, setPromptId] = useState("feature_extract_v3_compact_strict_json_en"), [retryCount, setRetryCount] = useState(1);
     const [ollama, setOllama] = useState({ online: false }), [result, setResult] = useState(null), [fileName, setFileName] = useState("");
     const [snapshot, setSnapshot] = useState(null), [jobId, setJobId] = useState(null), [rules, setRules] = useState([]);
+    const [ruleLoading, setRuleLoading] = useState(false), [ruleReviewQueue, setRuleReviewQueue] = useState({ items: [], total: 0 });
     const [systemMetrics, setSystemMetrics] = useState({ today_llm_logs: 0 });
     const [harness, setHarness] = useState({ trace_enabled: true, current_prompt_id: "feature_extract_v3_compact_strict_json_en" }), [prompts, setPrompts] = useState([]), [traces, setTraces] = useState([]);
     const [modelProfiles, setModelProfiles] = useState({ default_profile_id: "", profiles: [] }), [modelProfileId, setModelProfileId] = useState("");
@@ -976,6 +1060,7 @@
       setView(next);
       history.pushState({}, "", routeForView(next));
       if (next === "drainQuality") loadDrainQuality().catch(function (reason) { setError(reason.message); });
+      if (next === "rules") loadRules().catch(function (reason) { setError(reason.message); });
     }
     function applyTraceFilters(next) {
       const query = traceFilterQuery(next);
@@ -989,6 +1074,11 @@
       const values = await Promise.all([api.drainDatasets(), api.drainAnnotations(), api.drainEvalRuns(), api.drainProfiles(), api.drainTemplates(), api.drainConfigs(), api.semanticDictionaries()]);
       setDrainQuality({ datasets: values[0].items || [], annotations: values[1].items || [], annotationState: values[1].state || {}, evalRuns: values[2].items || [], profiles: values[3].items || [], templates: values[4].items || [], configs: values[5], semantics: values[6] });
     }
+    async function loadRules() {
+      setRuleLoading(true);
+      try { const values = await Promise.all([api.governedRules("?page_size=100"), api.ruleReviewQueue()]); setRules(values[0].items || []); setRuleReviewQueue(values[1]); return values[0]; }
+      finally { setRuleLoading(false); }
+    }
     async function loadObservability(id) {
       const summary = await api.observabilitySummary();
       const target = id || new URLSearchParams(window.location.search).get("job_id") || summary.current_job_id;
@@ -1001,8 +1091,8 @@
     async function refresh(id) { const next = await api.job(id || jobId); setSnapshot(next); if (["completed", "completed_with_errors"].includes(next.status) && events.current) events.current.close(); loadHarness().catch(function () {}); }
     useEffect(function () {
       const query = window.location.pathname === "/ai-traces" ? traceFilterQuery(traceFiltersFromSearch(window.location.search)) : "?limit=50";
-      Promise.all([api.config(), api.status(), api.rules(), api.metrics(), api.harnessStatus(), api.prompts(), api.traces(query), api.modelProfiles()]).then(function (values) { setModel(values[0].default_model); setOllama(values[1]); setRules(values[2].rules || []); setSystemMetrics(values[3]); setHarness(values[4]); setPrompts(values[5].items || []); setPromptId(values[5].current_prompt_id || values[4].current_prompt_id || "feature_extract_v3_compact_strict_json_en"); setTraces(values[6].items || []); setModelProfiles(values[7]); setModelProfileId(values[7].default_profile_id || ""); if (window.location.pathname === "/ai-observability") loadObservability().catch(function (reason) { setError(reason.message); }); if (window.location.pathname === "/drain-quality") loadDrainQuality().catch(function (reason) { setError(reason.message); }); }).catch(function (reason) { setError(reason.message); });
-      function onPop() { const filters = traceFiltersFromSearch(window.location.search); setView(pathToView(window.location.pathname)); setTraceFilters(filters); if (window.location.pathname === "/ai-traces") loadHarness(traceFilterQuery(filters)).catch(function () {}); if (window.location.pathname === "/ai-observability") loadObservability().catch(function () {}); if (window.location.pathname === "/drain-quality") loadDrainQuality().catch(function () {}); }
+      Promise.all([api.config(), api.status(), Promise.all([api.governedRules("?page_size=100"), api.ruleReviewQueue()]), api.metrics(), api.harnessStatus(), api.prompts(), api.traces(query), api.modelProfiles()]).then(function (values) { setModel(values[0].default_model); setOllama(values[1]); setRules(values[2][0].items || []); setRuleReviewQueue(values[2][1]); setSystemMetrics(values[3]); setHarness(values[4]); setPrompts(values[5].items || []); setPromptId(values[5].current_prompt_id || values[4].current_prompt_id || "feature_extract_v3_compact_strict_json_en"); setTraces(values[6].items || []); setModelProfiles(values[7]); setModelProfileId(values[7].default_profile_id || ""); if (window.location.pathname === "/ai-observability") loadObservability().catch(function (reason) { setError(reason.message); }); if (window.location.pathname === "/drain-quality") loadDrainQuality().catch(function (reason) { setError(reason.message); }); }).catch(function (reason) { setError(reason.message); });
+      function onPop() { const filters = traceFiltersFromSearch(window.location.search); setView(pathToView(window.location.pathname)); setTraceFilters(filters); if (window.location.pathname === "/ai-traces") loadHarness(traceFilterQuery(filters)).catch(function () {}); if (window.location.pathname === "/ai-observability") loadObservability().catch(function () {}); if (window.location.pathname === "/drain-quality") loadDrainQuality().catch(function () {}); if (window.location.pathname === "/rules") loadRules().catch(function () {}); }
       window.addEventListener("popstate", onPop);
       return function () { window.removeEventListener("popstate", onPop); if (events.current) events.current.close(); };
     }, []);
@@ -1015,7 +1105,7 @@
     }, [view, obsProgress && obsProgress.job_id, obsProgress && obsProgress.status]);
     async function loadFile(file) { if (!file) return; setBusy(true); setError(""); setUploadProgress(null); setPreprocessProgress(null); try { const next = file.size > INLINE_MAX_BYTES ? await api.uploadAndAnalyzeLargeFile(file, { onUploadProgress: setUploadProgress, onPreprocessProgress: setPreprocessProgress }) : await api.analyzeFile(file); setResult(next); setFileName(file.name); setSnapshot(null); setJobId(null); changeView("overview"); } catch (reason) { setError(reason.message); } finally { setBusy(false); } }
     async function start() { if (!result) return; setBusy(true); setError(""); try { const created = await api.createJob(result, model, threshold, promptId, modelProfileId, retryCount); setJobId(created.job_id); changeView("queue"); await refresh(created.job_id); if (events.current) events.current.close(); events.current = api.subscribe(created.job_id, function () { refresh(created.job_id).catch(function (reason) { setError(reason.message); }); }); } catch (reason) { setError(reason.message); } finally { setBusy(false); } }
-    async function save(changes) { try { await api.update(jobId, selectedId, changes); await refresh(); setRules((await api.rules()).rules || []); } catch (reason) { setError(reason.message); } }
+    async function save(changes) { try { await api.update(jobId, selectedId, changes); await refresh(); await loadRules(); } catch (reason) { setError(reason.message); } }
     function retry(entityId) { api.retry(jobId, entityId).then(function () { return refresh(); }).catch(function (reason) { setError(reason.message); }); }
     function openTrace(traceId) { api.trace(traceId).then(function (item) { setDrawer({ type: "trace", item: item }); applyTraceFilters({ job_id: "", trace_id: traceId, status: "", prompt_id: "" }); }).catch(function (reason) { setError(reason.message); }); }
     function openPrompt(id) { api.prompt(id).then(function (item) { setDrawer({ type: "prompt", item: item }); setView("prompts"); history.pushState({}, "", "/prompts?prompt_id=" + encodeURIComponent(id)); }).catch(function (reason) { setError(reason.message); }); }
@@ -1056,7 +1146,7 @@
       h("header", { className: "topbar" }, h("div", { className: "brand" }, h("i", null, "L"), h("div", null, h("b", null, "LOGRISK"), h("span", null, "FEATURE REVIEW"))), h("div", { className: "system-status" }, h("span", { className: ollama.online ? "online" : "offline" }, "● Ollama " + (ollama.online ? "在线" : "离线")), h("span", null, model), h("button", { className: "prompt-pill", onClick: function () { changeView("prompts"); } }, "Prompt " + (harness.current_prompt_id || promptId)), h("span", { className: harness.trace_enabled ? "trace-on" : "trace-off" }, "● Trace " + (harness.trace_enabled ? "ON" : "OFF")))),
       h(Sidebar, { active: view, onChange: changeView }),
       h("main", null,
-        !["drainQuality", "settings"].includes(view) && h("div", { className: "page-head" }, h("div", null, h("h1", null, "日志特征工作台"), h("p", null, "上传日志、复用规则、识别未知特征并人工审批")), h("label", { className: "new-analysis" }, "＋ 新建分析", h("input", { type: "file", onChange: function (event) { loadFile(event.target.files && event.target.files[0]); } }))),
+        !["drainQuality", "settings", "rules"].includes(view) && h("div", { className: "page-head" }, h("div", null, h("h1", null, "日志特征工作台"), h("p", null, "上传日志、复用规则、识别未知特征并人工审批")), h("label", { className: "new-analysis" }, "＋ 新建分析", h("input", { type: "file", onChange: function (event) { loadFile(event.target.files && event.target.files[0]); } }))),
         error && h("div", { className: "error-banner" }, error, h("button", { onClick: function () { setError(""); } }, "×")),
         view === "overview" && h(React.Fragment, null,
           h("section", { className: "upload-panel" }, h("div", null, h("b", null, fileName || "选择 result.json、JSONL、TXT、LOG、GZ 或无后缀日志"), h("span", null, result ? (result.risk_entities || []).length + " 个风险实体，已完成本地预处理" : "10MB 以内直接分析；超过 10MB 自动分片上传，Linux messages / syslog 无后缀文件也支持上传")), busy && h("div", { className: "upload-progress" }, uploadProgress && h("span", null, "上传进度：" + Math.round((uploadProgress.progress || 0) * 100) + "%（" + uploadProgress.received_chunks + " / " + uploadProgress.total_chunks + " chunks）"), preprocessProgress && h("span", null, "预处理阶段：" + (preprocessProgress.stage || "queued") + "，记录 " + (preprocessProgress.records_parsed || 0) + (preprocessProgress.drain3_partitions_total ? "，Drain3 分片 " + (preprocessProgress.drain3_partitions_completed || 0) + " / " + preprocessProgress.drain3_partitions_total : ""))), h("div", { className: "analysis-config" }, h("label", null, "分析流程", h("select", { value: "feature_extract", disabled: true }, h("option", { value: "feature_extract" }, "日志特征识别"))), h("label", null, "模型 Profile", h("select", { value: modelProfileId, onChange: function (event) { const profile = activeProfiles.find(function (item) { return item.profile_id === event.target.value; }) || {}; setModelProfileId(event.target.value); if (profile.model) setModel(profile.model); if (profile.default_prompt_id) setPromptId(profile.default_prompt_id); } }, activeProfiles.map(function (profile) { return h("option", { value: profile.profile_id, key: profile.profile_id }, (profile.display_name || profile.profile_id) + " · " + profile.provider); }))), h("label", null, "Provider / 连接", h("input", { value: (selectedModelProfile.provider || "—") + " / " + (selectedModelProfile.connection_id || "—"), disabled: true })), h("label", null, "模型", h("input", { value: model, onChange: function (event) { setModel(event.target.value); } })), h("label", null, "Prompt", h("select", { value: promptId, onChange: function (event) { setPromptId(event.target.value); } }, activePrompts.map(function (prompt) { return h("option", { value: prompt.prompt_id, key: prompt.prompt_id }, prompt.prompt_id); }))), h("label", null, "重试次数", h("select", { value: retryCount, onChange: function (event) { setRetryCount(Number(event.target.value)); } }, [0, 1, 2, 3].map(function (count) { return h("option", { value: count, key: count }, count + " 次"); }))), h("label", null, "阈值", h("input", { type: "number", value: threshold, onChange: function (event) { setThreshold(event.target.value); } })), h("button", { className: "primary-button", disabled: !result || busy, onClick: start }, busy ? "处理中…" : "开始识别"))), h(MetricsGrid, { snapshot: snapshot, result: result, daily: systemMetrics }), h(LiveProcessing, { snapshot: snapshot, result: result })),
@@ -1069,7 +1159,7 @@
           h(FeatureList, { features: snapshot && snapshot.features || [], selectedId: selectedId, onSelect: setSelectedId }),
           h(FeatureEvidence, { feature: selected, onSelectTemplate: setSelectedTemplate }),
           h(ReviewEditor, { feature: selected, selectedTemplate: selectedTemplate, onSave: save, onOpenTrace: openTrace })),
-        view === "rules" && h(RuleLibrary, { rules: rules, focusRuleId: ruleFocus, onOpenTrace: openTrace }),
+        view === "rules" && h(RuleLibrary, { rules: rules, reviewQueue: ruleReviewQueue, loading: ruleLoading, focusRuleId: ruleFocus, onOpenTrace: openTrace, onChanged: loadRules }),
         view === "drainQuality" && h(DrainQualityPage, { data: drainQuality, onRefresh: loadDrainQuality, onImport: importCurrentTemplates, onAnnotate: annotateTemplate, onTemplateChange: changeTemplate, onTemplateRollback: rollbackTemplate, onProfile: changeDrainProfile, onConfigCreate: createDrainConfig, onConfigLoadVersion: loadDrainConfigVersion, onConfigSave: saveDrainConfig, onConfigValidate: validateDrainConfig, onConfigPublish: publishDrainConfig, onConfigRollback: rollbackDrainConfig, onSemanticCreate: createSemanticCandidate, onSemanticLoadVersion: loadSemanticDictionaryVersion, onSemanticSave: saveSemanticDictionary, onSemanticValidate: validateSemanticDictionary, onSemanticPublish: publishSemanticDictionary, onSemanticRollback: rollbackSemanticDictionary, onSemanticTest: testSemanticDictionary }),
         view === "settings" && h(BackendSettings, { onSaved: function () { setError(""); } }),
         view === "export" && h("section", { className: "surface export-surface" }, h("h2", null, "导出记录"), h("p", null, "导出包只包含人工批准或历史规则复用的脱敏特征，不包含原始日志和 RCA 结论。"), h("button", { className: "primary-button", disabled: !jobId || !(snapshot && snapshot.features || []).some(function (feature) { return feature.status === "approved"; }), onClick: function () { api.exportApproved(jobId).catch(function (reason) { setError(reason.message); }); } }, "导出已批准特征 JSON"))),

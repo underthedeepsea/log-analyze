@@ -26,6 +26,9 @@ def test_database_applies_migrations_and_enables_safety_pragmas(tmp_path):
         "prompt_templates",
         "feature_jobs",
         "approved_rules",
+        "rule_versions",
+        "rule_feedback",
+        "rule_audit_events",
         "ai_traces",
         "upload_sessions",
         "drain_config_versions",
@@ -43,7 +46,7 @@ def test_database_migration_is_idempotent(tmp_path):
     with sqlite3.connect(path) as connection:
         count = connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0]
 
-    assert count == 3
+    assert count == 4
 
 
 def test_output_budget_migration_updates_old_builtin_profile_and_removes_derived_options(tmp_path):
@@ -111,3 +114,41 @@ def test_qwen_9b_profile_migration_seeds_existing_database_without_changing_defa
     assert '"context_window_tokens":262144' in row[1]
     assert '"max_output_tokens":2000' in row[1]
     assert default_profile == '"qwen3_1_7b_fast"'
+
+
+def test_schema_dictionary_describes_rule_lifecycle_tables():
+    schema = Path("database/schema.yaml").read_text(encoding="utf-8")
+
+    assert "schema_version: 4" in schema
+    assert "rule_versions:" in schema
+    assert "rule_feedback:" in schema
+    assert "rule_audit_events:" in schema
+    assert "current_version: 当前规则版本" in schema
+
+
+def test_rule_governance_migration_versions_existing_rules_with_lifecycle_defaults(tmp_path):
+    migration = Path("database/migrations/0004_rule_lifecycle_governance.sql")
+    migrations = tmp_path / "migrations"
+    migrations.mkdir()
+    shutil.copy("database/migrations/0001_initial.sql", migrations / "0001_initial.sql")
+    path = tmp_path / "logrisk.sqlite3"
+    database = SQLiteDatabase(path, migrations_dir=migrations)
+    with database.transaction() as connection:
+        connection.execute(
+            "INSERT INTO approved_rules(rule_id, signature, feature_type, rule_json, approved_at, updated_at) "
+            "VALUES ('rule-old', 'sig-old', 'kernel_error', ?, '2026-06-01T00:00:00+00:00', '2026-06-01T00:00:00+00:00')",
+            ('{"rule_id":"rule-old","signature":"sig-old","feature_type":"kernel_error"}',),
+        )
+    shutil.copy(migration, migrations / migration.name)
+
+    SQLiteDatabase(path, migrations_dir=migrations)
+
+    with sqlite3.connect(path) as connection:
+        status, version, snapshot = connection.execute(
+            "SELECT r.status, v.version, v.rule_json FROM approved_rules r JOIN rule_versions v USING(rule_id) "
+            "WHERE r.rule_id='rule-old'"
+        ).fetchone()
+    assert status == "active"
+    assert version == 1
+    assert '"schema_version":"approved_rule_v2"' in snapshot
+    assert '"status":"active"' in snapshot

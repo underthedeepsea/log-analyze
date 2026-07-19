@@ -62,7 +62,47 @@ def test_sqlite_trace_cache_metrics_and_rules_survive_new_store_instances(tmp_pa
         "source_templates": [{"template_hash": "hash-1", "category": "kernel"}],
     }
     saved = rules.upsert_feature(feature)
-    assert SQLiteApprovedRuleStore(database).list_rules()[0]["rule_id"] == saved["rule_id"]
+    persisted = SQLiteApprovedRuleStore(database).list_rules()[0]
+
+    assert persisted["rule_id"] == saved["rule_id"]
+    assert persisted["schema_version"] == "approved_rule_v2"
+    assert persisted["status"] == "active"
+    assert persisted["current_version"] == 1
+    with database.connect() as connection:
+        version = connection.execute(
+            "SELECT version, change_type FROM rule_versions WHERE rule_id=?",
+            (saved["rule_id"],),
+        ).fetchone()
+    assert tuple(version) == (1, "rule_created")
+
+
+def test_sqlite_rule_store_only_matches_active_rules(tmp_path):
+    database = SQLiteDatabase(tmp_path / "logrisk.sqlite3")
+    rules = SQLiteApprovedRuleStore(database)
+    feature = {
+        "feature_type": "kernel_error",
+        "title": "内核错误",
+        "summary": "检测到内核错误",
+        "importance": "high",
+        "tags": ["内核"],
+        "components": ["kernel"],
+        "source_templates": [{"template_hash": "hash-1", "category": "kernel"}],
+    }
+    saved = rules.upsert_feature(feature)
+    entity = {
+        "entity_id": "node-a",
+        "cluster": "prod-a",
+        "top_templates": [{"template_hash": "hash-1", "category": "kernel"}],
+    }
+
+    assert rules.match_entity(entity)[0]["rule_id"] == saved["rule_id"]
+    with database.transaction() as connection:
+        connection.execute(
+            "UPDATE approved_rules SET status='disabled' WHERE rule_id=?",
+            (saved["rule_id"],),
+        )
+
+    assert rules.match_entity(entity) == []
 
 
 def test_sqlite_upload_and_input_job_keep_metadata_in_database(tmp_path):

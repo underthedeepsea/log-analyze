@@ -305,7 +305,14 @@ def reusable_candidate(source):
 
 def test_matching_rule_skips_extractor_and_uses_current_entity_facts(tmp_path):
     calls = []
-    store = ApprovedRuleStore(tmp_path / "rules.json")
+    reuse_events = []
+
+    class RecordingRuleStore(ApprovedRuleStore):
+        def record_reuse(self, rule_id, **metadata):
+            reuse_events.append({"rule_id": rule_id, **metadata})
+            return super().record_reuse(rule_id, **metadata)
+
+    store = RecordingRuleStore(tmp_path / "rules.json")
     store.upsert_feature(reusable_candidate(reusable_entity("seed-node")))
     manager = FeatureJobManager(
         extractor=lambda source, **kwargs: calls.append(source) or [],
@@ -338,6 +345,12 @@ def test_matching_rule_skips_extractor_and_uses_current_entity_facts(tmp_path):
     assert reused["entity"] == {"type": "node", "id": "new-node"}
     assert reused["cluster"] == "another-cluster"
     assert reused["occurrence_count"] == 8
+    assert reuse_events == [{
+        "rule_id": reused["rule_id"],
+        "job_id": job_id,
+        "entity_id": "new-node",
+        "cluster": "another-cluster",
+    }]
     assert reused["source_templates"][0]["template_hash"] == "hash-oom"
 
 

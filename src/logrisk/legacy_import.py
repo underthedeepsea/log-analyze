@@ -74,11 +74,30 @@ class LegacyStateImporter:
         if path.name == "approved_rules.json":
             rules = self._read_json(path).get("rules") or []
             for rule in rules:
+                snapshot = {
+                    **rule,
+                    "schema_version": "approved_rule_v2",
+                    "status": str(rule.get("status") or "active"),
+                    "current_version": int(rule.get("current_version") or 1),
+                    "created_at": rule.get("created_at") or rule["approved_at"],
+                    "next_review_at": rule.get("next_review_at"),
+                }
                 connection.execute(
-                    "INSERT OR IGNORE INTO approved_rules(rule_id, signature, feature_type, rule_json, approved_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    "INSERT OR IGNORE INTO approved_rules(rule_id, signature, feature_type, rule_json, approved_at, "
+                    "updated_at, status, current_version, next_review_at, schema_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         rule["rule_id"], rule["signature"], rule["feature_type"],
-                        json.dumps(rule, ensure_ascii=False), rule["approved_at"], rule["updated_at"],
+                        json.dumps(snapshot, ensure_ascii=False), rule["approved_at"], rule["updated_at"],
+                        snapshot["status"], snapshot["current_version"], snapshot["next_review_at"],
+                        "approved_rule_v2",
+                    ),
+                )
+                connection.execute(
+                    "INSERT OR IGNORE INTO rule_versions(rule_id, version, rule_json, change_type, change_reason, "
+                    "operator, created_at, schema_version) VALUES (?, ?, ?, 'legacy_import', ?, 'legacy-importer', ?, 'rule_version_v1')",
+                    (
+                        rule["rule_id"], snapshot["current_version"], json.dumps(snapshot, ensure_ascii=False),
+                        "由旧批准规则文件导入", rule["updated_at"],
                     ),
                 )
             return len(rules)

@@ -256,6 +256,92 @@ def test_rule_list_route(dashboard):
     assert payload == {"rules": []}
 
 
+def test_rule_governance_api_versions_status_feedback_and_rollback(dashboard):
+    base_url, _ = dashboard
+    _, created, _ = request_json(base_url + "/api/jobs", "POST", {
+        "result": {"summary": {}, "risk_entities": [entity()]},
+        "model": "qwen3:1.7b",
+    })
+    job_id = created["job_id"]
+    for _ in range(50):
+        _, snapshot, _ = request_json(base_url + f"/api/jobs/{job_id}")
+        if snapshot["features"]:
+            break
+    request_json(
+        base_url + f"/api/jobs/{job_id}/features/feature-node-a",
+        "PATCH",
+        {"status": "approved"},
+    )
+
+    list_status, listed, _ = request_json(base_url + "/api/rule-governance/rules")
+    rule = listed["items"][0]
+    status_code, changed, _ = request_json(
+        base_url + f"/api/rule-governance/rules/{rule['rule_id']}/status",
+        "POST",
+        {"status": "disabled", "expected_version": 1, "operator": "reviewer-a", "reason": "复审停用"},
+    )
+    feedback_status, feedback, _ = request_json(
+        base_url + f"/api/rule-governance/rules/{rule['rule_id']}/feedback",
+        "POST",
+        {"outcome": "false_positive", "operator": "reviewer-a", "note": "预期行为"},
+    )
+    detail_status, detail, _ = request_json(base_url + f"/api/rule-governance/rules/{rule['rule_id']}")
+    queue_status, queue, _ = request_json(base_url + "/api/rule-governance/review-queue")
+    rollback_status, rollback, _ = request_json(
+        base_url + f"/api/rule-governance/rules/{rule['rule_id']}/rollback",
+        "POST",
+        {"target_version": 1, "expected_version": 2, "confirmed": True, "operator": "reviewer-a", "reason": "恢复首版"},
+    )
+
+    assert list_status == 200
+    assert listed["schema_version"] == "rule_asset_list_v1"
+    assert rule["status"] == "active"
+    assert status_code == 200
+    assert changed["request_id"].startswith("request-")
+    assert changed["version"] == 2
+    assert feedback_status == 201
+    assert feedback["version"] == 2
+    assert detail_status == 200
+    assert [item["version"] for item in detail["versions"]] == [2, 1]
+    assert queue_status == 200
+    assert queue["items"][0]["rule_id"] == rule["rule_id"]
+    assert rollback_status == 200
+    assert rollback["version"] == 3
+
+
+def test_rule_governance_api_returns_conflict_for_stale_version(dashboard):
+    base_url, _ = dashboard
+    _, created, _ = request_json(base_url + "/api/jobs", "POST", {
+        "result": {"summary": {}, "risk_entities": [entity()]},
+        "model": "qwen3:1.7b",
+    })
+    job_id = created["job_id"]
+    for _ in range(50):
+        _, snapshot, _ = request_json(base_url + f"/api/jobs/{job_id}")
+        if snapshot["features"]:
+            break
+    request_json(base_url + f"/api/jobs/{job_id}/features/feature-node-a", "PATCH", {"status": "approved"})
+    _, listed, _ = request_json(base_url + "/api/rule-governance/rules")
+    rule_id = listed["items"][0]["rule_id"]
+    request_json(
+        base_url + f"/api/rule-governance/rules/{rule_id}/status",
+        "POST",
+        {"status": "disabled", "expected_version": 1, "operator": "reviewer-a", "reason": "停用"},
+    )
+
+    with pytest.raises(HTTPError) as conflict:
+        request_json(
+            base_url + f"/api/rule-governance/rules/{rule_id}/status",
+            "POST",
+            {"status": "active", "expected_version": 1, "operator": "reviewer-b", "reason": "恢复"},
+        )
+
+    assert conflict.value.code == 409
+    error = json.load(conflict.value)
+    assert error["code"] == "version_conflict"
+    assert error["request_id"].startswith("request-")
+
+
 def test_system_metrics_route_returns_daily_llm_volume(dashboard):
     base_url, _ = dashboard
 
@@ -428,7 +514,7 @@ def test_create_job_route_forwards_retry_count(dashboard):
 def test_serves_frontend_for_ai_harness_routes(dashboard):
     base_url, _ = dashboard
 
-    for path in ("/prompts", "/ai-traces", "/ai-observability", "/model-profiles"):
+    for path in ("/prompts", "/ai-traces", "/ai-observability", "/model-profiles", "/rules"):
         with urlopen(base_url + path, timeout=3) as response:
             html = response.read().decode()
         assert "Feature Dashboard" in html

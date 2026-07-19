@@ -261,6 +261,7 @@ class FeatureJobManager:
         if normalized_retry_count < 0:
             raise FeatureJobError("自动重试次数必须是非负整数")
 
+        job_id = uuid.uuid4().hex
         records = []
         initial_features: Dict[str, Dict[str, Any]] = {}
         started_monotonic = self.monotonic()
@@ -294,12 +295,16 @@ class FeatureJobManager:
                 feature = _feature_from_rule(rule, source)
                 initial_features[feature["candidate_id"]] = feature
                 record["feature_ids"].append(feature["candidate_id"])
-                self.rule_store.record_reuse(str(rule["rule_id"]))
+                self.rule_store.record_reuse(
+                    str(rule["rule_id"]),
+                    job_id=job_id,
+                    entity_id=record["entity_id"],
+                    cluster=record.get("cluster"),
+                )
             if matches:
                 processed_samples.append((started_monotonic, record["log_count"]))
             records.append(record)
 
-        job_id = uuid.uuid4().hex
         condition = threading.Condition(self._lock)
         with self._lock:
             self._jobs[job_id] = {

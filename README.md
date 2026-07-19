@@ -1,6 +1,6 @@
 # 日志风险特征分析与审批系统
 
-当前版本：`1.21.0`。完整变更记录见 [`releas.md`](releas.md)。
+当前版本：`1.22.0`。完整变更记录见 [`releas.md`](releas.md)。
 
 LOGRISK 在本地完成日志规范化、Drain3 模板化、确定性语义增强、风险评分、规则复用、模型特征识别和人工审批。系统只生成可审查、可导出的日志特征，不执行根因分析（RCA），也不会把原始日志直接发送给模型。
 
@@ -8,7 +8,7 @@ LOGRISK 在本地完成日志规范化、Drain3 模板化、确定性语义增�
 
 - 支持 JSON、JSONL、纯文本、无后缀 Linux 日志和 Gzip 大文件。
 - 使用 Drain3 压缩日志，并保留 HTTP 状态码、errno、exit code、signal、NVIDIA Xid 和 Kubernetes Reason 等关键语义。
-- 已批准规则优先匹配，命中后跳过模型调用；未知特征才进入 AI 分析和人工审批。
+- 已批准且处于启用状态的规则优先匹配，命中后跳过模型调用；未知特征才进入 AI 分析和人工审批。
 - 支持本地 Ollama 与 OpenAI-compatible `/v1/chat/completions` 服务。
 - 提供 Prompt 版本、模型 Profile、AI Trace、缓存、评测、Drain3 配置和语义词典治理。
 - 只导出人工批准的特征及关联风险节点，供外部 RCA 专家系统使用。
@@ -122,11 +122,23 @@ Dashboard 提供以下工作区：
 - **AI 分析观测**：查看任务阶段、裁剪预算、缓存命中、质量门禁和失败原因；
 - **AI 调用追踪**：按任务、Trace、状态和 Prompt 查询实际调用快照；
 - **人工审批**：逐条选择脱敏模板证据，编辑标题、摘要、标签和审批备注；
-- **批准规则库**：查看规则来源、复用记录和完整 Lineage。
+- **规则治理**：查看规则健康度、生命周期状态、版本历史、误报反馈、复审队列和完整 Lineage。
 
 所有启用的特征提取 Prompt 都必须明确声明 `feature_type`、`title`、`summary`、`importance`、`template_hashes`、`components`、`tags` 和 `selection_reason` 八个字段，并要求 `feature_type` 使用 `lowercase_snake_case`。启动时会把仍使用旧六字段契约的内置 Prompt 追加升级为新版本，同时保留原历史；页面保存缺少必填字段的 Prompt 时会返回明确错误。
 
-规则 Lineage 包含来源任务、候选特征、Trace、Prompt、模型、Provider 和 Evidence Hash。批准规则命中后会直接生成复用特征并跳过模型调用。导出包只包含已批准特征和关联风险节点。
+规则 Lineage 包含来源任务、候选特征、Trace、Prompt、模型、Provider 和 Evidence Hash。只有 `active` 规则参与匹配；命中后会直接生成复用特征并跳过模型调用。导出包只包含已批准特征和关联风险节点。
+
+## 规则生命周期治理
+
+“规则治理”页面将批准规则作为版本化资产管理：
+
+- 生命周期状态包括 `active`、`disabled`、`under_review`、`deprecated` 和 `archived`；
+- 健康度展示 7/30 天命中、最后命中、跨集群命中、30 天误报率和下次复审时间；
+- 人工反馈支持“命中有效”和“误报”，异常健康度会进入复审队列；
+- 状态变更和回滚要求填写原因并校验当前版本，避免并发覆盖；
+- 回滚通过追加新版本实现，历史快照和审计事件不会被覆盖。
+
+旧规则首次迁移后默认设为 `active` 和版本 `v1`。兼容接口 `/api/rules` 继续可用；治理接口统一位于 `/api/rule-governance/`。
 
 ## Drain3 与语义治理
 
@@ -144,7 +156,7 @@ Dashboard 提供以下工作区：
 
 ## SQLite 存储
 
-运行期业务状态默认保存在 `state/logrisk.sqlite3`。启动时自动应用 `database/migrations/` 中的版本化 SQL；`database/schema.yaml` 描述表结构、字段用途和未来 PostgreSQL 类型映射。SQLite 启用外键、WAL、`busy_timeout` 和事务写入。
+运行期业务状态默认保存在 `state/logrisk.sqlite3`。启动时自动应用 `database/migrations/` 中的版本化 SQL；`database/schema.yaml` 描述表结构、字段用途和未来 PostgreSQL 类型映射。SQLite 启用外键、WAL、`busy_timeout` 和事务写入。规则当前状态、不可变版本、反馈、复用记录和追加式审计事件分别关系化保存。
 
 仓库中的配置和 Prompt 只作为首次启动种子，初始化后以 SQLite 为运行时权威来源。旧 JSON、JSONL、YAML 和 Prompt 历史会按 SHA256 幂等导入。原始上传文件、分片、Drain3 `.bin` 和导出物继续保存在文件系统，SQLite 仅登记元数据。
 

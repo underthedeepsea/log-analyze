@@ -27,6 +27,13 @@ def test_legacy_importer_imports_core_files_once(tmp_path):
 
     with database.connect() as connection:
         assert connection.execute("SELECT COUNT(*) FROM approved_rules").fetchone()[0] == 1
+        imported_rule = connection.execute(
+            "SELECT status, current_version, schema_version FROM approved_rules WHERE rule_id='rule-1'"
+        ).fetchone()
+        assert tuple(imported_rule) == ("active", 1, "approved_rule_v2")
+        assert connection.execute(
+            "SELECT change_type FROM rule_versions WHERE rule_id='rule-1' AND version=1"
+        ).fetchone()[0] == "legacy_import"
         assert connection.execute("SELECT COUNT(*) FROM ai_traces").fetchone()[0] == 1
         assert connection.execute("SELECT COUNT(*) FROM legacy_imports").fetchone()[0] == 2
     assert first["records_imported"] == 2

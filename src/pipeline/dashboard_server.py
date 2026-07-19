@@ -6,6 +6,7 @@ import mimetypes
 import os
 import re
 import threading
+import uuid
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -28,6 +29,7 @@ from logrisk.input_jobs import InputJobConfig, InputJobStore
 from logrisk.input_parser import parse_log_content
 from logrisk.large_file_pipeline import run_large_file_pipeline
 from logrisk.processing_metrics import ProcessingMetricsError, ProcessingMetricsStore
+from logrisk.rule_governance import RuleGovernanceError, RuleGovernanceRepository, RuleGovernanceService
 from logrisk.semantic.schema import SemanticValidationError
 from logrisk.semantic.store import SemanticDictionaryStore
 from logrisk.upload_sessions import UploadConfig, UploadSessionStore
@@ -151,12 +153,16 @@ def build_server(
     server = DashboardHTTPServer((host, port), DashboardHandler)
     server.database = database  # type: ignore[attr-defined]
     server.connections = connections  # type: ignore[attr-defined]
+    rule_store = SQLiteApprovedRuleStore(database)
+    if manager is not None and manager.rule_store is None:
+        manager.rule_store = rule_store
     server.manager = manager or FeatureJobManager(  # type: ignore[attr-defined]
         extractor=configured_extractor,
-        rule_store=SQLiteApprovedRuleStore(database),
+        rule_store=rule_store,
         metrics_store=SQLiteProcessingMetricsStore(database),
         persistence=SQLiteFeatureJobStore(database),
     )
+    server.rule_governance = RuleGovernanceService(RuleGovernanceRepository(database))  # type: ignore[attr-defined]
     server.frontend_path = Path(frontend_path or root / "frontend" / "dist" / "index.html")  # type: ignore[attr-defined]
     server.default_model = default_model  # type: ignore[attr-defined]
     server.default_ollama_url = default_ollama_url  # type: ignore[attr-defined]
@@ -312,7 +318,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         path, query = self._route_parts()
         try:
-            if path in {"/", "/prompts", "/ai-traces", "/ai-observability", "/model-profiles", "/drain-quality", "/settings"}:
+            if path in {"/", "/prompts", "/ai-traces", "/ai-observability", "/model-profiles", "/drain-quality", "/rules", "/settings"}:
                 self._serve_frontend()
                 return
             if path == "/config.js":
@@ -331,7 +337,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 })
                 return
             if path == "/api/health":
-                self._json(HTTPStatus.OK, {"schema_version": "logrisk_health_v1", "service": "logrisk-dashboard", "status": "ok", "version": "1.21.0", "storage": "sqlite"})
+                self._json(HTTPStatus.OK, {"schema_version": "logrisk_health_v1", "service": "logrisk-dashboard", "status": "ok", "version": "1.22.0", "storage": "sqlite"})
                 return
             if path == "/api/drain-quality/datasets":
                 self._json(HTTPStatus.OK, {"schema_version": "drain_dataset_list_v1", "items": self.server.drain_quality.datasets.list()})  # type: ignore[attr-defined]
@@ -413,6 +419,20 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if path == "/api/ollama/status":
                 self._json(HTTPStatus.OK, self.server.ollama_checker())  # type: ignore[attr-defined]
                 return
+            if path == "/api/rule-governance/rules":
+                self._json(HTTPStatus.OK, self.server.rule_governance.list_rules(  # type: ignore[attr-defined]
+                    status=query.get("status", [None])[0],
+                    page=int(query.get("page", ["1"])[0]),
+                    page_size=int(query.get("page_size", ["50"])[0]),
+                ))
+                return
+            if path == "/api/rule-governance/review-queue":
+                self._json(HTTPStatus.OK, self.server.rule_governance.review_queue())  # type: ignore[attr-defined]
+                return
+            match = re.fullmatch(r"/api/rule-governance/rules/([A-Za-z0-9_-]+)", path)
+            if match:
+                self._json(HTTPStatus.OK, self.server.rule_governance.get_rule(match.group(1)))  # type: ignore[attr-defined]
+                return
             if path == "/api/rules":
                 self._json(HTTPStatus.OK, {"rules": self.server.manager.list_rules()})  # type: ignore[attr-defined]
                 return
@@ -479,6 +499,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._serve_events(match.group(1), max(0, cursor))
                 return
             self._json(HTTPStatus.NOT_FOUND, {"error": "资源不存在"})
+        except RuleGovernanceError as exc:
+            self._json(exc.status_code, {"error": str(exc), "code": exc.code, "request_id": f"request-{uuid.uuid4().hex}"})
         except (FeatureJobError, ApprovedRuleError, ProcessingMetricsError, DrainQualityError, SemanticValidationError) as exc:
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
         except (TypeError, ValueError) as exc:
@@ -488,6 +510,46 @@ class DashboardHandler(BaseHTTPRequestHandler):
         path, _ = self._route_parts()
         try:
             payload = self._read_json()
+            governance_match = re.fullmatch(
+                r"/api/rule-governance/rules/([A-Za-z0-9_-]+)/(status|feedback|rollback)",
+                path,
+            )
+            if governance_match:
+                if not isinstance(payload, dict):
+                    raise RuleGovernanceError("请求体必须是 JSON object", status_code=400)
+                rule_id, action = governance_match.groups()
+                if action == "status":
+                    result = self.server.rule_governance.change_status(  # type: ignore[attr-defined]
+                        rule_id,
+                        status=str(payload.get("status") or ""),
+                        expected_version=int(payload.get("expected_version") or 0),
+                        operator=str(payload.get("operator") or ""),
+                        reason=str(payload.get("reason") or ""),
+                    )
+                    response_status = HTTPStatus.OK
+                elif action == "feedback":
+                    result = self.server.rule_governance.record_feedback(  # type: ignore[attr-defined]
+                        rule_id,
+                        outcome=str(payload.get("outcome") or ""),
+                        operator=str(payload.get("operator") or ""),
+                        note=str(payload.get("note") or ""),
+                        cluster=payload.get("cluster"),
+                        job_id=payload.get("job_id"),
+                        entity_id=payload.get("entity_id"),
+                    )
+                    response_status = HTTPStatus.CREATED
+                else:
+                    result = self.server.rule_governance.rollback(  # type: ignore[attr-defined]
+                        rule_id,
+                        target_version=int(payload.get("target_version") or 0),
+                        expected_version=int(payload.get("expected_version") or 0),
+                        confirmed=payload.get("confirmed") is True,
+                        operator=str(payload.get("operator") or ""),
+                        reason=str(payload.get("reason") or ""),
+                    )
+                    response_status = HTTPStatus.OK
+                self._json(response_status, result)
+                return
             if path == "/api/drain-quality/datasets":
                 self._json(HTTPStatus.CREATED, self.server.drain_quality.datasets.create(payload))  # type: ignore[attr-defined]
                 return
@@ -702,6 +764,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 )
                 return
             self._json(HTTPStatus.NOT_FOUND, {"error": "资源不存在"})
+        except RuleGovernanceError as exc:
+            self._json(exc.status_code, {"error": str(exc), "code": exc.code, "request_id": f"request-{uuid.uuid4().hex}"})
         except (FeatureJobError, ApprovedRuleError, ProcessingMetricsError, DrainQualityError, SemanticValidationError) as exc:
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
         except (TypeError, ValueError) as exc:

@@ -1,7 +1,7 @@
-schema_version: 3
+schema_version: 4
 database: logrisk
 description: LOGRISK 运行时业务数据字典；SQLite 为当前实现，postgres_type 用于后续迁移 PostgreSQL。
-authoritative_ddl: database/migrations/0001_initial.sql
+authoritative_ddl: database/migrations/
 conventions:
   timestamps: UTC ISO-8601 text
   booleans: SQLite INTEGER 0/1; PostgreSQL BOOLEAN
@@ -67,15 +67,34 @@ tables:
     foreign_keys: {job_id: feature_jobs.job_id ON DELETE CASCADE}
     columns: {job_id: 所属任务, sequence: 任务内递增序号, event_type: 事件类型, event_json: 事件详情, created_at: 发生时间}
   approved_rules:
-    description: 人工批准且可复用的特征规则
+    description: 人工批准且可复用的版本化规则资产；仅 active 状态参与匹配
     primary_key: rule_id
-    constraints: signature 唯一
-    columns: {rule_id: 规则标识, signature: 去重和匹配签名, feature_type: 特征类别, rule_json: 规则、Evidence 和 Lineage, approved_at: 批准时间, updated_at: 更新时间}
+    constraints: signature 唯一；status 为 active/disabled/under_review/deprecated/archived；current_version 大于 0
+    indexes: [idx_approved_rules_status(status)]
+    columns: {rule_id: 规则标识, signature: 去重和匹配签名, feature_type: 特征类别, rule_json: 当前规则、Evidence 和 Lineage 快照, approved_at: 首次批准时间, updated_at: 更新时间, status: 生命周期状态, current_version: 当前规则版本, next_review_at: 下次复审时间, schema_version: 规则资产结构版本}
+  rule_versions:
+    description: 不可变的批准规则版本快照；状态变更、审批更新和回滚均追加新版本
+    primary_key: [rule_id, version]
+    foreign_keys: {rule_id: approved_rules.rule_id ON DELETE CASCADE}
+    columns: {rule_id: 规则标识, version: 单规则递增版本, rule_json: 不可变规则快照, change_type: rule_created/rule_updated/status_changed/rolled_back, change_reason: 人工变更原因, operator: 操作者, created_at: 版本创建时间, schema_version: 版本结构标识}
+  rule_feedback:
+    description: 人工确认有效或误报的追加式复核反馈
+    primary_key: feedback_id
+    foreign_keys: {rule_id: approved_rules.rule_id ON DELETE CASCADE}
+    indexes: [idx_rule_feedback_rule_time(rule_id, created_at DESC)]
+    columns: {feedback_id: 反馈标识, rule_id: 规则标识, outcome: confirmed/false_positive, cluster: 反馈关联集群, job_id: 关联任务, entity_id: 关联实体, note: 复核备注, operator: 操作者, created_at: 反馈时间, schema_version: 反馈结构标识}
+  rule_audit_events:
+    description: 规则审批、状态、反馈和回滚操作的追加式审计事件
+    primary_key: event_id
+    foreign_keys: {rule_id: approved_rules.rule_id ON DELETE CASCADE}
+    indexes: [idx_rule_audit_rule_time(rule_id, created_at DESC)]
+    columns: {event_id: 审计事件标识, rule_id: 规则标识, event_type: 事件类型, from_version: 变更前版本, to_version: 变更后或关联版本, event_json: 脱敏事件详情, operator: 操作者, created_at: 事件时间, schema_version: 审计结构标识}
   rule_reuse_events:
     description: 批准规则复用审计记录
     primary_key: event_id
     foreign_keys: {rule_id: approved_rules.rule_id}
-    columns: {event_id: 自增事件标识, rule_id: 命中规则, job_id: 命中任务, entity_id: 命中实体, reused_at: 复用时间}
+    indexes: [idx_rule_reuse_rule_time(rule_id, reused_at DESC)]
+    columns: {event_id: 自增事件标识, rule_id: 命中规则, job_id: 命中任务, entity_id: 命中实体, reused_at: 复用时间, cluster: 命中集群, schema_version: 复用事件结构标识}
   ai_traces:
     description: 脱敏后的模型调用观测记录
     primary_key: trace_id

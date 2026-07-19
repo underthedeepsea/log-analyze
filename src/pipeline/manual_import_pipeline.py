@@ -10,6 +10,8 @@ from logrisk.io_utils import read_json_or_jsonl, write_json
 from logrisk.normalizer import normalize_records
 from logrisk.risk_engine import load_rules, score_risk_entities
 from logrisk.semantic.extractor import SemanticExtractor
+from logrisk.node_risk import NodeRiskError, NodeRiskService
+from logrisk.risk_semantics import RiskSemanticError, RiskSemanticService
 
 
 def _process_records(
@@ -22,6 +24,9 @@ def _process_records(
     drain_partition_by_node: bool = False,
     drain_progress_callback: Callable[[Dict[str, int]], None] | None = None,
     semantic_snapshot: Dict[str, Any] | None = None,
+    risk_semantics: RiskSemanticService | None = None,
+    node_risks: NodeRiskService | None = None,
+    source_job_id: str | None = None,
 ) -> tuple[Dict[str, Any], Dict[str, Any]]:
     normalized = normalize_records(records)
     if semantic_snapshot:
@@ -36,6 +41,30 @@ def _process_records(
         progress_callback=drain_progress_callback,
         return_metadata=True,
     )
+    semantic_matches = 0
+    node_risk_ingestions = 0
+    if risk_semantics:
+        for event in template_events:
+            try:
+                semantic_event = risk_semantics.match(event)
+            except RiskSemanticError as exc:
+                if exc.code != "semantic_unclassified":
+                    raise
+                risk_semantics.record_unclassified(event)
+                continue
+            event["risk_semantic"] = semantic_event
+            semantic_matches += 1
+            if node_risks and event.get("node"):
+                try:
+                    node_risks.ingest(
+                        semantic_event,
+                        source_record=event,
+                        source_job_id=source_job_id,
+                    )
+                    node_risk_ingestions += 1
+                except NodeRiskError:
+                    # 节点台账故障不阻断现有日志分析主链路。
+                    continue
     template_windows = aggregate_template_events(
         template_events,
         window_seconds=window_seconds,
@@ -61,6 +90,8 @@ def _process_records(
             "high_entities": sum(1 for x in risk_entities if x.get("risk_level") == "high"),
             "semantic_enrichment": semantic_snapshot is not None,
             "semantic_dictionary_versions": (semantic_snapshot or {}).get("versions", {}),
+            "risk_semantic_matches": semantic_matches,
+            "node_risk_ingestions": node_risk_ingestions,
         },
         "risk_entities": risk_entities,
         "top_templates": sorted(template_windows, key=lambda x: x.get("count", 0), reverse=True)[:20],
@@ -83,6 +114,9 @@ def analyze_records(
     drain_partition_by_node: bool = False,
     drain_progress_callback: Callable[[Dict[str, int]], None] | None = None,
     semantic_snapshot: Dict[str, Any] | None = None,
+    risk_semantics: RiskSemanticService | None = None,
+    node_risks: NodeRiskService | None = None,
+    source_job_id: str | None = None,
 ) -> Dict[str, Any]:
     result, _ = _process_records(
         records,
@@ -94,6 +128,9 @@ def analyze_records(
         drain_partition_by_node,
         drain_progress_callback,
         semantic_snapshot,
+        risk_semantics,
+        node_risks,
+        source_job_id,
     )
     return result
 

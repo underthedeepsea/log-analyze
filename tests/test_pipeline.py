@@ -2,6 +2,9 @@ import json
 from pathlib import Path
 
 from logrisk.semantic.store import SemanticDictionaryStore
+from logrisk.database import SQLiteDatabase
+from logrisk.node_risk import NodeRiskService
+from logrisk.risk_semantics import RiskSemanticService
 from pipeline.manual_import_pipeline import analyze_records, parse_args, run_pipeline
 
 
@@ -102,3 +105,30 @@ def test_pipeline_keeps_structural_template_and_distinct_semantic_values(tmp_pat
         {"value": 503, "count": 1},
     ]
     assert "状态码" in result["top_templates"][0]["semantic_tags"]
+
+
+def test_pipeline_classifies_xid_and_updates_node_risk_ledger(tmp_path):
+    database = SQLiteDatabase(tmp_path / "state" / "logrisk.sqlite3")
+    semantics = RiskSemanticService(database, "configs/risk_semantics/builtin.yaml")
+    node_risks = NodeRiskService(database, "configs/node_risk.yaml")
+
+    result = analyze_records(
+        records=[
+            {"message": "Jul 19 10:00:00 gpu-01 kernel: NVRM: Xid (0000:65:00): 35, Video processor exception", "raw_log_id": "xid-35"},
+            {"message": "Jul 19 10:00:01 gpu-01 kernel: NVRM: Xid (0000:65:00): 79, GPU has fallen off the bus", "raw_log_id": "xid-79"},
+        ],
+        config_path="configs/drain3_recommended.ini",
+        rules_path="configs/risk_rules.yaml",
+        state_dir=str(tmp_path / "drain"),
+        risk_semantics=semantics,
+        node_risks=node_risks,
+        source_job_id="job-xid",
+    )
+
+    assert result["summary"]["risk_semantic_matches"] == 2
+    assert {item["risk_semantic"]["risk_type"] for item in result["top_templates"]} == {
+        "gpu.video_processor_exception", "gpu.fallen_off_bus",
+    }
+    profile = node_risks.get_node("default", "gpu-01")
+    assert profile["statistics"]["event_count_30d"] == 2
+    assert profile["snapshot"]["overall_level"] == "critical"

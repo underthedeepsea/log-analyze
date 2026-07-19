@@ -125,6 +125,24 @@ def test_serves_frontend_and_ollama_status(dashboard):
     assert payload == {"online": True, "models": ["qwen3:1.7b"]}
 
 
+def test_risk_semantic_and_node_risk_routes(dashboard):
+    base_url, _ = dashboard
+
+    semantic_status, semantics, _ = request_json(base_url + "/api/semantics")
+    test_status, tested, _ = request_json(base_url + "/api/semantics/test", "POST", {
+        "rule": next(item for item in semantics["items"] if item["id"] == "builtin.gpu.xid.79"),
+        "positive_samples": ["NVRM: Xid (0000:65:00): 79, GPU has fallen off the bus"],
+        "negative_samples": ["NVRM: Xid (0000:65:00): 35, Video processor exception"],
+    })
+    node_status, nodes, _ = request_json(base_url + "/api/node-risks")
+
+    assert semantic_status == 200
+    assert tested["valid"] is True
+    assert tested["results"][0]["semantic_fields"] == {"pci_bdf": "0000:65:00", "xid_code": 79}
+    assert test_status == node_status == 200
+    assert nodes["items"] == []
+
+
 def test_create_job_snapshot_and_sse_events(dashboard):
     base_url, _ = dashboard
     result = {"summary": {"total_raw_logs": 10}, "risk_entities": [entity()]}

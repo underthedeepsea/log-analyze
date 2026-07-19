@@ -1,6 +1,6 @@
 # 日志风险特征分析与审批系统
 
-当前版本：`1.22.0`。完整变更记录见 [`releas.md`](releas.md)。
+当前版本：`1.23.0`。完整变更记录见 [`releas.md`](releas.md)。
 
 LOGRISK 在本地完成日志规范化、Drain3 模板化、确定性语义增强、风险评分、规则复用、模型特征识别和人工审批。系统只生成可审查、可导出的日志特征，不执行根因分析（RCA），也不会把原始日志直接发送给模型。
 
@@ -11,6 +11,7 @@ LOGRISK 在本地完成日志规范化、Drain3 模板化、确定性语义增�
 - 已批准且处于启用状态的规则优先匹配，命中后跳过模型调用；未知特征才进入 AI 分析和人工审批。
 - 支持本地 Ollama 与 OpenAI-compatible `/v1/chat/completions` 服务。
 - 提供 Prompt 版本、模型 Profile、AI Trace、缓存、评测、Drain3 配置和语义词典治理。
+- 提供服务器风险总览、风险事件台账、可解释评分，以及可编辑、可发布、可回滚的风险语义库。
 - 只导出人工批准的特征及关联风险节点，供外部 RCA 专家系统使用。
 
 ```text
@@ -154,9 +155,17 @@ Dashboard 提供以下工作区：
 
 “语义词典”页面支持创建候选版本、编辑自定义规则、输入单条日志测试、校验、发布和回滚。内置规则只读，自定义规则用于扩展业务日志语义；发布只影响后续任务。
 
+### 风险语义与服务器风险
+
+“风险语义库”与上述字段词典分工不同：字段词典保留 HTTP 状态码、errno 等 Typed Parameters；风险语义库把日志模式分类为稳定的 `risk_type`，例如 Xid 35 为 `gpu.video_processor_exception`、Xid 79 为 `gpu.fallen_off_bus`。两条日志即使共享同一 Drain3 结构模板，也不会被合并成相同风险含义。
+
+内置风险语义位于 `configs/risk_semantics/builtin.yaml`，首批覆盖 NVIDIA Xid/SXid、Kubernetes Node/Pod 状态、Linux 内存/存储/网络/进程以及容器运行时。页面支持正负样例测试、内置规则覆盖、版本保存、人工发布和回滚。风险语义与节点事件写入统一的 `state/logrisk.sqlite3`，历史事件锁定命中时的语义版本。
+
+“服务器风险”页面区分风险事件数、日志命中次数（`occurrence_count`）和风险类型数，并展示未恢复事件、主要风险及确定性评分贡献。Xid 79 等直接基础设施故障可触发配置化 Hard Override；评分不由 AI 决定，页面中的动作代码也只用于审计和外部流程参考，不会自动执行运维操作。
+
 ## SQLite 存储
 
-运行期业务状态默认保存在 `state/logrisk.sqlite3`。启动时自动应用 `database/migrations/` 中的版本化 SQL；`database/schema.yaml` 描述表结构、字段用途和未来 PostgreSQL 类型映射。SQLite 启用外键、WAL、`busy_timeout` 和事务写入。规则当前状态、不可变版本、反馈、复用记录和追加式审计事件分别关系化保存。
+运行期业务状态默认保存在 `state/logrisk.sqlite3`。启动时自动应用 `database/migrations/` 中的版本化 SQL；`database/schema.yaml` 描述表结构、字段用途和未来 PostgreSQL 类型映射。SQLite 启用外键、WAL、`busy_timeout` 和事务写入。批准规则、风险语义、节点风险台账、不可变版本、反馈、复用记录和追加式审计事件分别关系化保存。
 
 仓库中的配置和 Prompt 只作为首次启动种子，初始化后以 SQLite 为运行时权威来源。旧 JSON、JSONL、YAML 和 Prompt 历史会按 SHA256 幂等导入。原始上传文件、分片、Drain3 `.bin` 和导出物继续保存在文件系统，SQLite 仅登记元数据。
 

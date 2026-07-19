@@ -10,6 +10,8 @@ from logrisk.risk_engine import load_rules, score_risk_entities
 from logrisk.stream_input_parser import iter_log_records_from_file
 from logrisk.streaming_drain_pipeline import mine_spooled_partitions
 from logrisk.semantic.extractor import SemanticExtractor
+from logrisk.node_risk import NodeRiskError, NodeRiskService
+from logrisk.risk_semantics import RiskSemanticError, RiskSemanticService
 
 
 ProgressCallback = Callable[[dict[str, Any]], None]
@@ -36,6 +38,8 @@ def run_large_file_pipeline(
     reserve_cpu_cores: int = 1,
     process_start_method: str = "spawn",
     semantic_snapshot: dict[str, Any] | None = None,
+    risk_semantics: RiskSemanticService | None = None,
+    node_risks: NodeRiskService | None = None,
 ) -> dict[str, Any]:
     input_path = Path(input_path)
     started = time.monotonic()
@@ -105,6 +109,31 @@ def run_large_file_pipeline(
         process_start_method=process_start_method,
         progress_callback=report_mining,
     )
+    semantic_matches = 0
+    node_risk_ingestions = 0
+    if risk_semantics:
+        for window in template_windows:
+            try:
+                semantic_event = risk_semantics.match(window)
+            except RiskSemanticError as exc:
+                if exc.code != "semantic_unclassified":
+                    raise
+                risk_semantics.record_unclassified(window)
+                continue
+            window["risk_semantic"] = semantic_event
+            semantic_matches += int(window.get("count") or 1)
+            if node_risks and window.get("entity_type") == "node":
+                source_record = dict(window, node=window.get("entity_id"))
+                try:
+                    node_risks.ingest(
+                        semantic_event,
+                        source_record=source_record,
+                        source_job_id=input_job_id,
+                        occurrence_count=int(window.get("count") or 1),
+                    )
+                    node_risk_ingestions += int(window.get("count") or 1)
+                except NodeRiskError:
+                    continue
     update_manifest_status(spool_dir, manifest, "AGGREGATING")
     risk_entities = score_risk_entities(template_windows, load_rules(rules_path))
     reduced = max(0, parsed - len(template_windows))
@@ -131,6 +160,8 @@ def run_large_file_pipeline(
             "streaming_spool": True,
             "semantic_enrichment": semantic_snapshot is not None,
             "semantic_dictionary_versions": (semantic_snapshot or {}).get("versions", {}),
+            "risk_semantic_matches": semantic_matches,
+            "node_risk_ingestions": node_risk_ingestions,
         },
         "risk_entities": risk_entities,
         "top_templates": sorted(template_windows, key=lambda item: item.get("count", 0), reverse=True)[:20],

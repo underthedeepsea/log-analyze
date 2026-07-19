@@ -29,11 +29,23 @@ TEMPLATE_FIELDS = (
 
 
 def sanitized_templates(entity: Dict[str, Any]) -> list[Dict[str, Any]]:
-    return [
-        {key: template.get(key) for key in TEMPLATE_FIELDS if key in template}
-        for template in (entity.get("top_templates") or [])
-        if isinstance(template, dict)
-    ]
+    sanitized = []
+    for template in entity.get("top_templates") or []:
+        if not isinstance(template, dict):
+            continue
+        item = {key: template.get(key) for key in TEMPLATE_FIELDS if key in template}
+        semantic = template.get("risk_semantic")
+        if isinstance(semantic, dict):
+            item["risk_semantic"] = {
+                key: semantic.get(key)
+                for key in (
+                    "semantic_rule_id", "semantic_rule_version", "domain", "category", "risk_type",
+                    "risk_subtype", "severity", "base_score", "confidence", "semantic_fields", "tags",
+                )
+                if key in semantic
+            }
+        sanitized.append(item)
+    return sanitized
 
 
 def _json_chars(value: Dict[str, Any]) -> int:

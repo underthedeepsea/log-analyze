@@ -75,7 +75,7 @@ def test_m11_quality_and_settings_use_workspace_design_contract():
         "secondary-button",
     ):
         assert text in source
-    assert '!["drainQuality", "settings", "rules"].includes(view)' in source
+    assert '!["drainQuality", "settings", "rules", "nodeRisks", "semanticLibrary"].includes(view)' in source
     assert "h(CodeBlock, { value: profile.parameters })" not in source
 
 
@@ -377,7 +377,8 @@ def test_release_docs_describe_current_feature_version():
     assert "## 1.20.1 - 2026-07-16" in release
     assert "## 1.21.0 - 2026-07-16" in release
     assert "## 1.22.0 - 2026-07-18" in release
-    assert "当前版本：`1.22.0`" in readme
+    assert "## 1.23.0 - 2026-07-19" in release
+    assert "当前版本：`1.23.0`" in readme
     assert "qwen3.5:9b-mlx" in readme
     assert "state/logrisk.sqlite3" in readme
     assert "database/migrations/" in readme
@@ -390,3 +391,19 @@ def test_release_docs_describe_current_feature_version():
         assert text in readme
     assert "普通启动不需要 Node.js" in readme
     assert "Vite" not in readme
+
+
+def test_node_risk_and_editable_semantic_ui_contract():
+    source = source_text()
+    for text in (
+        '"nodeRisks", "△", "服务器风险"',
+        '"semanticLibrary", "≋", "风险语义库"',
+        'function NodeRiskPage',
+        'function SemanticLibraryPage',
+        '"/api/node-risks"',
+        '"/api/semantics"',
+        '"创建覆盖草稿"',
+        '"24h 风险事件数"',
+        'occurrence_count',
+    ):
+        assert text in source

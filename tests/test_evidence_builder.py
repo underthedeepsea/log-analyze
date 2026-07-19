@@ -30,6 +30,17 @@ def entity():
                 "semantic_tags": ["容器", "异常退出"],
                 "typed_parameters": [{"field": "exit_code", "typed_mask": "<EXIT_CODE>", "count": 3}],
                 "semantic_dictionary_versions": {"container_runtime": {"version": 1, "content_hash": "abc"}},
+                "risk_semantic": {
+                    "semantic_rule_id": "builtin.linux.memory.cgroup_oom",
+                    "semantic_rule_version": 1,
+                    "domain": "memory",
+                    "category": "cgroup",
+                    "risk_type": "linux.memory.cgroup_oom",
+                    "severity": "high",
+                    "semantic_fields": {"cgroup": "pod-a"},
+                    "recommendation": {"action_code": "observe"},
+                    "hard_override": {"node_level": "critical"},
+                },
                 "samples": ["SECRET RAW LOG"],
                 "raw_sample": "SECRET RAW SAMPLE",
             },
@@ -55,6 +66,15 @@ def test_sanitized_templates_keep_only_allowed_fields():
         "semantic_tags": ["容器", "异常退出"],
         "typed_parameters": [{"field": "exit_code", "typed_mask": "<EXIT_CODE>", "count": 3}],
         "semantic_dictionary_versions": {"container_runtime": {"version": 1, "content_hash": "abc"}},
+        "risk_semantic": {
+            "semantic_rule_id": "builtin.linux.memory.cgroup_oom",
+            "semantic_rule_version": 1,
+            "domain": "memory",
+            "category": "cgroup",
+            "risk_type": "linux.memory.cgroup_oom",
+            "severity": "high",
+            "semantic_fields": {"cgroup": "pod-a"},
+        },
     }]
 
 

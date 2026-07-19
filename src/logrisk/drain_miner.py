@@ -122,6 +122,7 @@ def mine_template_event(
         "typed_parameters": record.get("typed_parameters") or [],
         "semantic_extractor_version": record.get("semantic_extractor_version"),
         "semantic_dictionary_versions": record.get("semantic_dictionary_versions") or {},
+        "risk_semantic": record.get("risk_semantic"),
         "message_core": message_core,
         "raw_sample": record.get("raw_log"),
         "change_type": result.get("change_type"),

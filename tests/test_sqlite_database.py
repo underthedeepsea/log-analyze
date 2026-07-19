@@ -33,6 +33,11 @@ def test_database_applies_migrations_and_enables_safety_pragmas(tmp_path):
         "upload_sessions",
         "drain_config_versions",
         "semantic_dictionary_versions",
+        "risk_semantic_rules",
+        "risk_semantic_rule_versions",
+        "node_risk_events",
+        "node_risk_daily",
+        "node_risk_snapshots",
     } <= tables
     assert foreign_keys == 1
     assert journal_mode == "wal"
@@ -46,7 +51,7 @@ def test_database_migration_is_idempotent(tmp_path):
     with sqlite3.connect(path) as connection:
         count = connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0]
 
-    assert count == 4
+    assert count == 5
 
 
 def test_output_budget_migration_updates_old_builtin_profile_and_removes_derived_options(tmp_path):
@@ -119,7 +124,7 @@ def test_qwen_9b_profile_migration_seeds_existing_database_without_changing_defa
 def test_schema_dictionary_describes_rule_lifecycle_tables():
     schema = Path("database/schema.yaml").read_text(encoding="utf-8")
 
-    assert "schema_version: 4" in schema
+    assert "schema_version: 5" in schema
     assert "rule_versions:" in schema
     assert "rule_feedback:" in schema
     assert "rule_audit_events:" in schema

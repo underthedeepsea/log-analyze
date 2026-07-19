@@ -1,4 +1,4 @@
-schema_version: 4
+schema_version: 5
 database: logrisk
 description: LOGRISK 运行时业务数据字典；SQLite 为当前实现，postgres_type 用于后续迁移 PostgreSQL。
 authoritative_ddl: database/migrations/
@@ -180,6 +180,51 @@ tables:
     description: 语义词典保存、发布和回滚事件
     primary_key: event_id
     columns: {event_id: 自增事件标识, dictionary_id: 词典标识, version: 目标版本, event_type: 保存/校验/发布/回滚动作, event_json: 操作详情, created_at: 发生时间}
+  risk_semantic_rules:
+    description: 可编辑风险语义当前版本；内置规则与用户覆盖共同组成 Effective Semantics
+    primary_key: rule_id
+    foreign_keys: {override_of: risk_semantic_rules.rule_id}
+    indexes: [idx_risk_semantic_status(status, enabled), idx_risk_semantic_override(override_of)]
+    columns: {rule_id: 风险语义标识, source: builtin/user/imported/ai_candidate, override_of: 被覆盖的内置规则, status: draft/published/disabled/deprecated, enabled: 是否进入有效注册表, current_version: 当前版本, content_json: 完整语义规则快照, content_hash: 规则摘要, created_at: 创建时间, updated_at: 更新时间}
+  risk_semantic_rule_versions:
+    description: 风险语义不可变版本历史
+    primary_key: [rule_id, version]
+    foreign_keys: {rule_id: risk_semantic_rules.rule_id ON DELETE CASCADE}
+    columns: {rule_id: 风险语义标识, version: 递增版本, content_json: 完整规则快照, content_hash: 规则摘要, changed_by: 操作人, change_reason: 变更原因, created_at: 创建时间}
+  risk_semantic_events:
+    description: 风险语义创建、编辑、发布、停用、恢复默认和回滚审计
+    primary_key: event_id
+    columns: {event_id: 审计标识, rule_id: 目标规则, event_type: 治理动作, from_version: 变更前版本, to_version: 变更后版本, before_json: 变更前快照, after_json: 变更后快照, operator: 操作人, reason: 原因, created_at: 发生时间}
+  risk_semantic_validations:
+    description: 风险语义发布前正负样例验证结果
+    primary_key: [rule_id, version]
+    columns: {rule_id: 风险语义标识, version: 被验证版本, valid: 是否通过, validation_json: 验证详情, content_hash: 被验证内容摘要, created_at: 验证时间}
+  risk_semantic_unclassified:
+    description: 尚未分类但可进入人工补充流程的语义候选
+    primary_key: candidate_id
+    columns: {candidate_id: 候选标识, component: 日志组件, template_hash: Drain3 模板摘要, typed_message: 脱敏模板, occurrence_count: 命中次数, first_seen: 首次出现, last_seen: 最近出现, status: 候选状态, candidate_json: 候选上下文}
+  node_risk_events:
+    description: 节点确定性风险事件台账；event_count 与 occurrence_count 分离
+    primary_key: event_id
+    indexes: [idx_node_risk_node_time(cluster, node_id, last_seen DESC), idx_node_risk_type_status(risk_type, status), idx_node_risk_window(dedup_key, window_start)]
+    columns: {event_id: 风险事件标识, cluster: 集群, node_id: 节点, risk_domain: 风险域, risk_category: 风险类别, risk_type: 稳定风险类型, severity: 默认严重度, base_score: 规则基础分, confidence: 规则置信度, semantic_rule_id: 命中语义规则, semantic_rule_version: 命中时版本, dedup_key: 去重键, occurrence_count: 合并的日志命中次数, first_seen: 首次发生, last_seen: 最近发生, window_start: 去重窗口起点, window_end: 去重窗口终点, status: active/acknowledged/recovered, semantic_fields_json: Xid/PCI 等提取字段, evidence_refs_json: 脱敏证据引用, source_job_id: 来源任务, source_trace_id: 来源追踪, created_at: 创建时间, updated_at: 更新时间}
+  node_risk_ingestions:
+    description: 来源事件幂等写入账本
+    primary_key: source_event_fingerprint
+    foreign_keys: {event_id: node_risk_events.event_id ON DELETE CASCADE}
+    columns: {source_event_fingerprint: 来源事件摘要, event_id: 合并后的风险事件, source_job_id: 来源任务, occurrence_count: 本次写入日志数, ingested_at: 写入时间}
+  node_risk_daily:
+    description: 节点风险按日聚合，用于趋势和历史查询
+    primary_key: [cluster, node_id, date]
+    columns: {cluster: 集群, node_id: 节点, date: UTC 日期, event_count: 风险事件数, occurrence_count: 日志命中数, distinct_risk_types: 风险类型数, active_count: 未恢复事件数, recovered_count: 已恢复事件数, max_event_score: 最高事件基础分, max_overall_score: 当日综合分, domain_distribution_json: 风险域分布, type_distribution_json: 风险类型分布, updated_at: 更新时间}
+  node_risk_snapshots:
+    description: 节点当前综合风险快照及可解释评分
+    primary_key: [cluster, node_id]
+    columns: {cluster: 集群, node_id: 节点, overall_score: 综合分, overall_level: 综合等级, confidence: 规则置信度, trend: 趋势, active_event_count: 未恢复风险事件数, event_count_24h: 24h 事件数, event_count_7d: 7d 事件数, event_count_30d: 30d 事件数, occurrence_count_24h: 24h 日志命中数, distinct_risk_types_7d: 7d 风险类型数, primary_risks_json: 主要风险, assessment_reasons_json: 判断依据, score_breakdown_json: 评分维度与贡献, latest_risk_at: 最近风险时间, calculated_at: 计算时间}
+  node_risk_audit_events:
+    description: 节点风险人工确认、恢复等操作审计
+    primary_key: audit_id
+    columns: {audit_id: 审计标识, event_id: 风险事件, event_type: acknowledge/recover 等动作, event_json: 操作详情, operator: 操作人, created_at: 操作时间}
 postgres_type_mapping:
   TEXT: text
   TEXT_identifier: text

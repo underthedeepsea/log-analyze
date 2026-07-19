@@ -30,6 +30,8 @@ from logrisk.input_parser import parse_log_content
 from logrisk.large_file_pipeline import run_large_file_pipeline
 from logrisk.processing_metrics import ProcessingMetricsError, ProcessingMetricsStore
 from logrisk.rule_governance import RuleGovernanceError, RuleGovernanceRepository, RuleGovernanceService
+from logrisk.node_risk import NodeRiskError, NodeRiskService
+from logrisk.risk_semantics import RiskSemanticError, RiskSemanticService, validate_rule
 from logrisk.semantic.schema import SemanticValidationError
 from logrisk.semantic.store import SemanticDictionaryStore
 from logrisk.upload_sessions import UploadConfig, UploadSessionStore
@@ -122,6 +124,8 @@ def build_server(
         SemanticDictionaryStore(semantic_root, root / "configs" / "semantic_dictionary")
         if semantic_root else SQLiteSemanticDictionaryStore(database, root / "configs" / "semantic_dictionary")
     )
+    risk_semantics = RiskSemanticService(database, root / "configs" / "risk_semantics" / "builtin.yaml")
+    node_risks = NodeRiskService(database, root / "configs" / "node_risk.yaml")
     LegacyStateImporter(database, state_root, root / "output" / "uploads").run()
 
     def configured_extractor(entity: dict[str, Any], **kwargs: Any) -> list[dict[str, Any]]:
@@ -174,6 +178,8 @@ def build_server(
     server.input_jobs = SQLiteInputJobStore(InputJobConfig(output_dir=root / "output" / "uploads"), database)  # type: ignore[attr-defined]
     server.drain_quality = drain_quality  # type: ignore[attr-defined]
     server.semantic_dictionaries = semantic_dictionaries  # type: ignore[attr-defined]
+    server.risk_semantics = risk_semantics  # type: ignore[attr-defined]
+    server.node_risks = node_risks  # type: ignore[attr-defined]
     configured_origins = cors_origins if cors_origins is not None else os.getenv("DASHBOARD_CORS_ORIGINS", "").split(",")
     server.cors_origins = {str(origin).strip().rstrip("/") for origin in configured_origins if str(origin).strip()}  # type: ignore[attr-defined]
     server.ollama_checker = ollama_checker or (  # type: ignore[attr-defined]
@@ -217,6 +223,8 @@ def build_server(
                 rules_path=str(root / "configs" / "risk_rules.yaml"),
                 state_dir=str(state_root / "dashboard_drain3"),
                 semantic_snapshot=semantic_snapshot,
+                risk_semantics=risk_semantics,
+                node_risks=node_risks,
             )
 
     server.input_analyzer = input_analyzer or default_input_analyzer  # type: ignore[attr-defined]
@@ -237,6 +245,8 @@ def build_server(
                 state_dir=state_root / "dashboard_drain3_large" / input_job_id,
                 progress_callback=lambda progress: store.write_progress(input_job_id, progress),
                 semantic_snapshot=job.get("semantic_dictionary_snapshot"),
+                risk_semantics=risk_semantics,
+                node_risks=node_risks,
             )
             result = server.govern_drain_result(result)  # type: ignore[attr-defined]
             store.write_result(input_job_id, result)
@@ -318,7 +328,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         path, query = self._route_parts()
         try:
-            if path in {"/", "/prompts", "/ai-traces", "/ai-observability", "/model-profiles", "/drain-quality", "/rules", "/settings"}:
+            if path in {"/", "/prompts", "/ai-traces", "/ai-observability", "/model-profiles", "/drain-quality", "/rules", "/settings", "/node-risks", "/semantic-library"} or path.startswith("/node-risks/"):
                 self._serve_frontend()
                 return
             if path == "/config.js":
@@ -336,8 +346,49 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "max_upload_bytes": MAX_UPLOAD_BYTES,
                 })
                 return
+            if path == "/api/node-risks":
+                self._json(HTTPStatus.OK, self.server.node_risks.list_nodes(  # type: ignore[attr-defined]
+                    cluster=query.get("cluster", [None])[0], level=query.get("level", [None])[0], domain=query.get("domain", [None])[0],
+                    trend=query.get("trend", [None])[0], search=query.get("search", [None])[0],
+                    active_only=query.get("status", [None])[0] == "active",
+                    page=int(query.get("page", ["1"])[0]), page_size=int(query.get("page_size", ["50"])[0]),
+                ))
+                return
+            if path == "/api/semantics":
+                self._json(HTTPStatus.OK, {"schema_version": "risk_semantic_list_v1", "items": self.server.risk_semantics.list_rules()})  # type: ignore[attr-defined]
+                return
+            if path == "/api/semantics/effective":
+                self._json(HTTPStatus.OK, {"schema_version": "risk_semantic_registry_v1", "items": self.server.risk_semantics.effective_rules()})  # type: ignore[attr-defined]
+                return
+            if path == "/api/semantics/export":
+                self._json(HTTPStatus.OK, self.server.risk_semantics.export_bundle())  # type: ignore[attr-defined]
+                return
+            if path == "/api/semantics/unclassified":
+                self._json(HTTPStatus.OK, {"items": self.server.risk_semantics.list_unclassified()})  # type: ignore[attr-defined]
+                return
+            match = re.fullmatch(r"/api/node-risks/([^/]+)/([^/]+)(?:/(events|timeline|daily|score-explanation))?", path)
+            if match:
+                cluster, node_id, subresource = (unquote(value) if value else value for value in match.groups())
+                if subresource == "events":
+                    result = self.server.node_risks.list_events(cluster, node_id, risk_type=query.get("risk_type", [None])[0], severity=query.get("severity", [None])[0], status=query.get("status", [None])[0], page=int(query.get("page", ["1"])[0]), page_size=int(query.get("page_size", ["50"])[0]))  # type: ignore[attr-defined]
+                elif subresource == "timeline":
+                    result = {"items": self.server.node_risks.timeline(cluster, node_id)}  # type: ignore[attr-defined]
+                elif subresource == "daily":
+                    result = {"items": self.server.node_risks.daily(cluster, node_id)}  # type: ignore[attr-defined]
+                elif subresource == "score-explanation":
+                    result = self.server.node_risks.get_node(cluster, node_id)["snapshot"]["score_breakdown"]  # type: ignore[attr-defined]
+                else:
+                    result = self.server.node_risks.get_node(cluster, node_id)  # type: ignore[attr-defined]
+                self._json(HTTPStatus.OK, result)
+                return
+            match = re.fullmatch(r"/api/semantics/([^/]+)(?:/versions)?", path)
+            if match:
+                rule_id = unquote(match.group(1))
+                result = self.server.risk_semantics.versions(rule_id) if path.endswith("/versions") else self.server.risk_semantics.get_rule(rule_id)  # type: ignore[attr-defined]
+                self._json(HTTPStatus.OK, {"items": result} if path.endswith("/versions") else result)
+                return
             if path == "/api/health":
-                self._json(HTTPStatus.OK, {"schema_version": "logrisk_health_v1", "service": "logrisk-dashboard", "status": "ok", "version": "1.22.0", "storage": "sqlite"})
+                self._json(HTTPStatus.OK, {"schema_version": "logrisk_health_v1", "service": "logrisk-dashboard", "status": "ok", "version": "1.23.0", "storage": "sqlite"})
                 return
             if path == "/api/drain-quality/datasets":
                 self._json(HTTPStatus.OK, {"schema_version": "drain_dataset_list_v1", "items": self.server.drain_quality.datasets.list()})  # type: ignore[attr-defined]
@@ -499,6 +550,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._serve_events(match.group(1), max(0, cursor))
                 return
             self._json(HTTPStatus.NOT_FOUND, {"error": "资源不存在"})
+        except (RiskSemanticError, NodeRiskError) as exc:
+            self._json(exc.status_code, {"error": str(exc), "code": exc.code})
         except RuleGovernanceError as exc:
             self._json(exc.status_code, {"error": str(exc), "code": exc.code, "request_id": f"request-{uuid.uuid4().hex}"})
         except (FeatureJobError, ApprovedRuleError, ProcessingMetricsError, DrainQualityError, SemanticValidationError) as exc:
@@ -510,6 +563,52 @@ class DashboardHandler(BaseHTTPRequestHandler):
         path, _ = self._route_parts()
         try:
             payload = self._read_json()
+            if path == "/api/semantics":
+                if not isinstance(payload, dict):
+                    raise RiskSemanticError("请求体必须是 object")
+                rule_payload = {key: value for key, value in payload.items() if key not in {"operator", "reason"}}
+                self._json(HTTPStatus.CREATED, self.server.risk_semantics.create_rule(rule_payload, operator=str(payload.get("operator") or "local-operator"), reason=str(payload.get("reason") or "创建风险语义")))  # type: ignore[attr-defined]
+                return
+            if path == "/api/semantics/validate":
+                self._json(HTTPStatus.OK, self.server.risk_semantics.validate_payload(payload))  # type: ignore[attr-defined]
+                return
+            if path == "/api/semantics/test":
+                self._json(HTTPStatus.OK, self.server.risk_semantics.test_payload(payload))  # type: ignore[attr-defined]
+                return
+            if path == "/api/semantics/import":
+                self._json(HTTPStatus.CREATED, self.server.risk_semantics.import_bundle(payload, operator=str(payload.get("operator") or "local-operator"), reason=str(payload.get("reason") or "导入风险语义")))  # type: ignore[attr-defined]
+                return
+            match = re.fullmatch(r"/api/semantics/unclassified/([^/]+)/create-candidate", path)
+            if match:
+                result = self.server.risk_semantics.create_from_unclassified(unquote(match.group(1)), payload, operator=str(payload.get("operator") or "local-operator"), reason=str(payload.get("reason") or "从待补充语义创建草稿"))  # type: ignore[attr-defined]
+                self._json(HTTPStatus.CREATED, result)
+                return
+            match = re.fullmatch(r"/api/semantics/([^/]+)/(publish|disable|restore-default)", path)
+            if match:
+                rule_id, action = unquote(match.group(1)), match.group(2)
+                common = {"expected_version": int(payload.get("expected_version") or 0), "confirmed": payload.get("confirmed") is True, "operator": str(payload.get("operator") or ""), "reason": str(payload.get("reason") or "")}
+                if action == "publish":
+                    result = self.server.risk_semantics.publish(rule_id, **common)  # type: ignore[attr-defined]
+                elif action == "disable":
+                    result = self.server.risk_semantics.disable(rule_id, **common)  # type: ignore[attr-defined]
+                else:
+                    result = self.server.risk_semantics.restore_default(rule_id, **common)  # type: ignore[attr-defined]
+                self._json(HTTPStatus.OK, result)
+                return
+            match = re.fullmatch(r"/api/semantics/([^/]+)/rollback/(\d+)", path)
+            if match:
+                result = self.server.risk_semantics.rollback(unquote(match.group(1)), target_version=int(match.group(2)), expected_version=int(payload.get("expected_version") or 0), confirmed=payload.get("confirmed") is True, operator=str(payload.get("operator") or ""), reason=str(payload.get("reason") or ""))  # type: ignore[attr-defined]
+                self._json(HTTPStatus.OK, result)
+                return
+            match = re.fullmatch(r"/api/node-risks/([^/]+)/([^/]+)/recalculate", path)
+            if match:
+                self._json(HTTPStatus.OK, self.server.node_risks.recalculate(unquote(match.group(1)), unquote(match.group(2))))  # type: ignore[attr-defined]
+                return
+            match = re.fullmatch(r"/api/node-risks/events/([^/]+)/(acknowledge|recover)", path)
+            if match:
+                method = self.server.node_risks.acknowledge_event if match.group(2) == "acknowledge" else self.server.node_risks.recover_event  # type: ignore[attr-defined]
+                self._json(HTTPStatus.OK, method(unquote(match.group(1)), operator=str(payload.get("operator") or ""), reason=str(payload.get("reason") or "")))
+                return
             governance_match = re.fullmatch(
                 r"/api/rule-governance/rules/([A-Za-z0-9_-]+)/(status|feedback|rollback)",
                 path,
@@ -764,6 +863,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 )
                 return
             self._json(HTTPStatus.NOT_FOUND, {"error": "资源不存在"})
+        except (RiskSemanticError, NodeRiskError) as exc:
+            self._json(exc.status_code, {"error": str(exc), "code": exc.code})
         except RuleGovernanceError as exc:
             self._json(exc.status_code, {"error": str(exc), "code": exc.code, "request_id": f"request-{uuid.uuid4().hex}"})
         except (FeatureJobError, ApprovedRuleError, ProcessingMetricsError, DrainQualityError, SemanticValidationError) as exc:
@@ -774,6 +875,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def do_PUT(self) -> None:
         path, _ = self._route_parts()
         try:
+            match = re.fullmatch(r"/api/semantics/([^/]+)", path)
+            if match:
+                payload = self._read_json()
+                if not isinstance(payload, dict):
+                    raise RiskSemanticError("请求体必须是 object")
+                result = self.server.risk_semantics.update_rule(unquote(match.group(1)), payload.get("changes") or payload, expected_version=int(payload.get("expected_version") or 0), operator=str(payload.get("operator") or ""), reason=str(payload.get("reason") or ""))  # type: ignore[attr-defined]
+                self._json(HTTPStatus.OK, result)
+                return
             semantic_match = re.fullmatch(r"/api/semantic/dictionaries/([A-Za-z0-9_-]+)/candidates/(\d+)", path)
             if semantic_match:
                 payload = self._read_json()
@@ -803,8 +912,21 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 "total_chunks": total,
                 "progress": received / total if total else 1.0,
             })
-        except (FeatureJobError, DrainQualityError, SemanticValidationError, KeyError, ValueError, OSError) as exc:
+        except (FeatureJobError, DrainQualityError, SemanticValidationError, RiskSemanticError, NodeRiskError, KeyError, ValueError, OSError) as exc:
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+
+    def do_DELETE(self) -> None:
+        path, _ = self._route_parts()
+        try:
+            match = re.fullmatch(r"/api/semantics/([^/]+)", path)
+            if not match:
+                self._json(HTTPStatus.NOT_FOUND, {"error": "资源不存在"})
+                return
+            payload = self._read_json()
+            self.server.risk_semantics.delete(unquote(match.group(1)), confirmed=payload.get("confirmed") is True, operator=str(payload.get("operator") or ""), reason=str(payload.get("reason") or ""))  # type: ignore[attr-defined]
+            self._json(HTTPStatus.OK, {"deleted": True})
+        except RiskSemanticError as exc:
+            self._json(exc.status_code, {"error": str(exc), "code": exc.code})
 
     def do_PATCH(self) -> None:
         path, _ = self._route_parts()

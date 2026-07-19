@@ -1,0 +1,40 @@
+schema_version: node_risk_config_v1
+enabled: true
+retention_days: 365
+snapshot_refresh_seconds: 30
+scoring:
+  weights:
+    max_active_severity: 0.35
+    recurrence: 0.20
+    diversity: 0.15
+    duration: 0.10
+    recency: 0.10
+    impact: 0.10
+  thresholds: {critical: 90, high: 70, medium: 40, low: 0}
+  recurrence: {cap: 100, recent_hours: 24, history_hours: 168}
+  diversity: {cap_types: 5, cap_domains: 4}
+  decay:
+    active: 1.0
+    recovered_0_24h: 0.7
+    recovered_1_7d: 0.4
+    recovered_7_30d: 0.15
+    recovered_over_30d: 0.0
+hard_overrides:
+  - id: active_gpu_fallen_off_bus
+    risk_type: gpu.fallen_off_bus
+    status: active
+    force_level: critical
+    minimum_score: 95
+    reason: 存在未恢复的 GPU fallen off bus 风险
+  - id: active_uncontained_gpu_error
+    risk_type: gpu.uncontained_error
+    status: active
+    force_level: critical
+    minimum_score: 98
+    reason: 存在未恢复的 GPU uncontained error
+  - id: node_not_ready
+    risk_type: k8s.node.not_ready
+    status: active
+    force_level: critical
+    minimum_score: 95
+    reason: Kubernetes 节点处于 NotReady

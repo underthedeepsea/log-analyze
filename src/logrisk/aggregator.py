@@ -52,6 +52,7 @@ class TemplateEventAggregator:
             entity_id,
             event.get("component"),
             event.get("template_hash"),
+            (event.get("risk_semantic") or {}).get("risk_type"),
         )
 
         if key not in self.windows:
@@ -80,6 +81,7 @@ class TemplateEventAggregator:
                 "typed_parameter_counts": {},
                 "semantic_extractor_version": event.get("semantic_extractor_version"),
                 "semantic_dictionary_versions": event.get("semantic_dictionary_versions") or {},
+                "risk_semantic": event.get("risk_semantic"),
             }
 
         w = self.windows[key]

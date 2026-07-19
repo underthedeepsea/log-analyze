@@ -1,0 +1,125 @@
+schema_version: risk_semantic_catalog_v1
+xid_catalog:
+  - {code: 13, risk_type: gpu.graphics_engine_exception, severity: high, base_score: 75, display_name: GPU 图形引擎异常}
+  - {code: 31, risk_type: gpu.memory_page_fault, severity: high, base_score: 75, display_name: GPU 内存页错误}
+  - {code: 32, risk_type: gpu.pbdma_error, severity: high, base_score: 75, display_name: GPU PBDMA 通信错误}
+  - {code: 35, risk_type: gpu.video_processor_exception, severity: medium, base_score: 45, display_name: GPU 视频处理器异常}
+  - {code: 43, risk_type: gpu.application_channel_terminated, severity: medium, base_score: 45, display_name: GPU 应用通道异常终止}
+  - {code: 45, risk_type: gpu.preemptive_channel_removal, severity: low, base_score: 20, display_name: GPU 通道主动移除}
+  - {code: 48, risk_type: gpu.double_bit_ecc_error, severity: critical, base_score: 100, display_name: GPU 双比特 ECC 错误}
+  - {code: 54, risk_type: gpu.power_cable_unplugged, severity: critical, base_score: 100, display_name: GPU 外部供电异常}
+  - {code: 63, risk_type: gpu.ecc_page_retirement_recorded, severity: medium, base_score: 45, display_name: GPU ECC 页退休记录}
+  - {code: 64, risk_type: gpu.ecc_page_retirement_failure, severity: high, base_score: 75, display_name: GPU ECC 页退休失败}
+  - {code: 74, risk_type: gpu.nvlink_error, severity: high, base_score: 75, display_name: GPU NVLink 错误}
+  - {code: 79, risk_type: gpu.fallen_off_bus, severity: critical, base_score: 100, display_name: GPU 无法通过 PCIe 访问}
+  - {code: 92, risk_type: gpu.high_single_bit_ecc_rate, severity: high, base_score: 75, display_name: GPU 单比特 ECC 率过高}
+  - {code: 94, risk_type: gpu.contained_error, severity: high, base_score: 75, display_name: GPU Contained Error}
+  - {code: 95, risk_type: gpu.uncontained_error, severity: critical, base_score: 100, display_name: GPU Uncontained Error}
+  - {code: 119, risk_type: gpu.gsp_rpc_timeout, severity: high, base_score: 75, display_name: GPU GSP RPC 超时}
+  - {code: 120, risk_type: gpu.gsp_error, severity: high, base_score: 75, display_name: GPU GSP 错误}
+  - {code: 121, risk_type: gpu.c2c_link_corrected_error, severity: medium, base_score: 45, display_name: GPU C2C 链路纠错}
+  - {code: 140, risk_type: gpu.ecc_unrecovered_error, severity: critical, base_score: 100, display_name: GPU ECC 未恢复错误}
+  - {code: 154, risk_type: gpu.recovery_action_required, severity: high, base_score: 75, display_name: GPU 需要恢复动作}
+pattern_catalog:
+  - {risk_type: nvswitch.unknown_sxid, domain: nvswitch, category: sxid, severity: high, display_name: NVSwitch SXid 事件, pattern: '(?i)\bSXid\b.*?(?P<sxid_code>\d+)', extract: {sxid_code: {type: integer, from_group: sxid_code}}, sample: 'NVSwitch SXid 1001 port 2'}
+  - {risk_type: k8s.node.memory_pressure, domain: kubernetes, category: node_condition, severity: high, display_name: Kubernetes 节点内存压力, pattern: '(?i)MemoryPressure\s*[=:]\s*True', sample: 'MemoryPressure=True'}
+  - {risk_type: k8s.node.disk_pressure, domain: kubernetes, category: node_condition, severity: high, display_name: Kubernetes 节点磁盘压力, pattern: '(?i)DiskPressure\s*[=:]\s*True', sample: 'DiskPressure=True'}
+  - {risk_type: k8s.node.pid_pressure, domain: kubernetes, category: node_condition, severity: high, display_name: Kubernetes 节点 PID 压力, pattern: '(?i)PIDPressure\s*[=:]\s*True', sample: 'PIDPressure=True'}
+  - {risk_type: k8s.node.ready_unknown, domain: kubernetes, category: node_condition, severity: high, display_name: Kubernetes 节点状态未知, pattern: '(?i)Ready\s*[=:]\s*Unknown', sample: 'Ready=Unknown'}
+  - {risk_type: k8s.node.network_unavailable, domain: kubernetes, category: node_condition, severity: high, display_name: Kubernetes 节点网络不可用, pattern: '(?i)NetworkUnavailable\s*[=:]\s*True', sample: 'NetworkUnavailable=True'}
+  - {risk_type: k8s.container.oom_killed, domain: kubernetes, category: container_reason, severity: high, display_name: 容器被 OOM 终止, pattern: '(?i)\bOOMKilled\b', sample: 'Reason=OOMKilled'}
+  - {risk_type: k8s.pod.crash_loop_backoff, domain: kubernetes, category: pod_reason, severity: high, display_name: Pod 反复崩溃, pattern: '(?i)\bCrashLoopBackOff\b', sample: 'Reason=CrashLoopBackOff'}
+  - {risk_type: k8s.pod.image_pull_backoff, domain: kubernetes, category: pod_reason, severity: medium, display_name: Pod 镜像拉取退避, pattern: '(?i)\bImagePullBackOff\b', sample: 'Reason=ImagePullBackOff'}
+  - {risk_type: k8s.pod.image_pull_error, domain: kubernetes, category: pod_reason, severity: medium, display_name: Pod 镜像拉取错误, pattern: '(?i)\bErrImagePull\b', sample: 'Reason=ErrImagePull'}
+  - {risk_type: k8s.container.create_error, domain: kubernetes, category: container_reason, severity: high, display_name: 容器创建错误, pattern: '(?i)\bCreateContainerError\b', sample: 'Reason=CreateContainerError'}
+  - {risk_type: k8s.container.run_error, domain: kubernetes, category: container_reason, severity: high, display_name: 容器运行错误, pattern: '(?i)\bRunContainerError\b', sample: 'Reason=RunContainerError'}
+  - {risk_type: k8s.pod.evicted, domain: kubernetes, category: pod_reason, severity: high, display_name: Pod 被驱逐, pattern: '(?i)\bEvicted\b', sample: 'Reason=Evicted'}
+  - {risk_type: k8s.pod.failed_scheduling, domain: kubernetes, category: pod_reason, severity: medium, display_name: Pod 调度失败, pattern: '(?i)\bFailedScheduling\b', sample: 'Reason=FailedScheduling'}
+  - {risk_type: k8s.workload.deadline_exceeded, domain: kubernetes, category: workload_reason, severity: high, display_name: 工作负载超过期限, pattern: '(?i)\bDeadlineExceeded\b', sample: 'Reason=DeadlineExceeded'}
+  - {risk_type: k8s.pod.node_lost, domain: kubernetes, category: pod_reason, severity: critical, display_name: Pod 所在节点丢失, pattern: '(?i)\bNodeLost\b', sample: 'Reason=NodeLost'}
+  - {risk_type: k8s.pod.preempted, domain: kubernetes, category: pod_reason, severity: medium, display_name: Pod 被抢占, pattern: '(?i)\bPreempted\b', sample: 'Reason=Preempted'}
+  - {risk_type: k8s.container.cannot_run, domain: kubernetes, category: container_reason, severity: high, display_name: 容器无法运行, pattern: '(?i)\bContainerCannotRun\b', sample: 'Reason=ContainerCannotRun'}
+  - {risk_type: linux.memory.page_allocation_failure, domain: memory, category: allocation, severity: high, display_name: Linux 内存页分配失败, pattern: '(?i)page allocation failure', sample: 'page allocation failure order:4'}
+  - {risk_type: linux.memory.cgroup_oom, domain: memory, category: cgroup, severity: high, display_name: Cgroup 内存超限, pattern: '(?i)(memory cgroup out of memory|cgroup.*oom)', sample: 'memory cgroup out of memory'}
+  - {risk_type: linux.memory.process_oom_killed, domain: memory, category: oom, severity: high, priority: 20, display_name: 进程被 OOM 终止, pattern: '(?i)Killed process\s+\d+.*out of memory', sample: 'Killed process 123 due to out of memory'}
+  - {risk_type: linux.memory.psi_pressure, domain: memory, category: pressure, severity: medium, display_name: Linux 内存 PSI 压力, pattern: '(?i)memory pressure stall', sample: 'memory pressure stall detected'}
+  - {risk_type: linux.memory.slab_allocation_failure, domain: memory, category: allocation, severity: high, display_name: Slab 分配失败, pattern: '(?i)slab.*allocation fail', sample: 'slab allocation failed'}
+  - {risk_type: linux.filesystem.read_only, domain: storage, category: filesystem, severity: critical, display_name: 文件系统只读, pattern: '(?i)(read-only file system|remounting filesystem read-only)', sample: 'Remounting filesystem read-only'}
+  - {risk_type: linux.filesystem.ext4_error, domain: storage, category: filesystem, severity: high, display_name: EXT4 文件系统错误, pattern: '(?i)\bEXT4-fs error\b', sample: 'EXT4-fs error device sda1'}
+  - {risk_type: linux.filesystem.xfs_error, domain: storage, category: filesystem, severity: critical, display_name: XFS 文件系统错误, pattern: '(?i)\bXFS.*(corruption|shutdown|error)', sample: 'XFS metadata corruption detected'}
+  - {risk_type: linux.storage.io_error, domain: storage, category: io, severity: high, display_name: 存储 I/O 错误, pattern: '(?i)\bI/O error\b', sample: 'Buffer I/O error on device sda'}
+  - {risk_type: linux.storage.block_io_error, domain: storage, category: io, severity: high, priority: 20, display_name: 块设备 I/O 错误, pattern: '(?i)blk_update_request.*error', sample: 'blk_update_request I/O error dev sda'}
+  - {risk_type: linux.filesystem.inode_exhausted, domain: storage, category: capacity, severity: high, display_name: 文件系统 Inode 耗尽, pattern: '(?i)(no free inodes|inode.*exhausted)', sample: 'filesystem has no free inodes'}
+  - {risk_type: linux.filesystem.mount_failed, domain: storage, category: mount, severity: high, display_name: 文件系统挂载失败, pattern: '(?i)(failed to mount|mount.*failed)', sample: 'failed to mount /data'}
+  - {risk_type: linux.storage.device_timeout, domain: storage, category: device, severity: high, display_name: 存储设备超时, pattern: '(?i)(device|disk).*?(timeout|reset)', sample: 'disk device timeout reset'}
+  - {risk_type: linux.network.link_down, domain: network, category: link, severity: high, display_name: 网络链路断开, pattern: '(?i)\b(link is down|link down)\b', sample: 'eth0 link is down'}
+  - {risk_type: linux.network.bond_slave_down, domain: network, category: bond, severity: high, display_name: Bond 从接口断开, pattern: '(?i)bond.*slave.*down', sample: 'bond0 slave eth1 is down'}
+  - {risk_type: linux.network.nic_reset, domain: network, category: nic, severity: high, display_name: 网卡复位, pattern: '(?i)(NIC|network interface).*reset', sample: 'NIC reset detected'}
+  - {risk_type: linux.network.tx_timeout, domain: network, category: transmit, severity: high, display_name: 网络发送超时, pattern: '(?i)(transmit queue.*timed out|NETDEV WATCHDOG)', sample: 'NETDEV WATCHDOG transmit queue timed out'}
+  - {risk_type: linux.network.conntrack_full, domain: network, category: conntrack, severity: critical, display_name: Conntrack 表已满, pattern: '(?i)nf_conntrack.*table full', sample: 'nf_conntrack: table full dropping packet'}
+  - {risk_type: linux.network.neighbor_overflow, domain: network, category: neighbor, severity: high, display_name: 邻居表溢出, pattern: '(?i)neighbor table overflow', sample: 'neighbor table overflow'}
+  - {risk_type: linux.network.syn_backlog_overflow, domain: network, category: tcp, severity: high, display_name: TCP SYN 队列溢出, pattern: '(?i)(SYN.*backlog.*overflow|possible SYN flooding)', sample: 'possible SYN flooding backlog overflow'}
+  - {risk_type: linux.network.packet_drop_burst, domain: network, category: packet, severity: medium, display_name: 网络丢包突增, pattern: '(?i)(packet drop burst|dropping packets rapidly)', sample: 'packet drop burst detected'}
+  - {risk_type: linux.network.dns_resolution_failure, domain: network, category: dns, severity: medium, display_name: DNS 解析失败, pattern: '(?i)(temporary failure in name resolution|DNS.*failed)', sample: 'temporary failure in name resolution'}
+  - {risk_type: systemd.unit.start_timeout, domain: system_service, category: unit, severity: high, display_name: systemd 服务启动超时, pattern: '(?i)start operation timed out', sample: 'foo.service start operation timed out'}
+  - {risk_type: linux.process.segmentation_fault, domain: process, category: crash, severity: high, display_name: 进程段错误, pattern: '(?i)\bsegfault\b', sample: 'process[123] segfault at 0'}
+  - {risk_type: linux.process.core_dumped, domain: process, category: crash, severity: high, display_name: 进程 Core Dump, pattern: '(?i)(core dumped|dumped core)', sample: 'process dumped core'}
+  - {risk_type: linux.process.fd_exhaustion, domain: process, category: resource, severity: high, display_name: 文件描述符耗尽, pattern: '(?i)too many open files', sample: 'accept failed too many open files'}
+  - {risk_type: linux.process.fork_failed, domain: process, category: resource, severity: critical, display_name: 进程创建失败, pattern: '(?i)(fork failed|cannot fork)', sample: 'fork failed resource unavailable'}
+  - {risk_type: linux.process.zombie_burst, domain: process, category: lifecycle, severity: medium, display_name: 僵尸进程突增, pattern: '(?i)(zombie process burst|too many zombie processes)', sample: 'too many zombie processes'}
+  - {risk_type: runtime.container_create_failed, domain: container_runtime, category: container, severity: high, display_name: 容器创建失败, pattern: '(?i)(failed to create (containerd )?task|container create failed)', sample: 'failed to create containerd task'}
+  - {risk_type: runtime.shim_disconnected, domain: container_runtime, category: shim, severity: high, display_name: Runtime Shim 断开, pattern: '(?i)shim disconnected', sample: 'containerd shim disconnected'}
+  - {risk_type: runtime.sandbox_create_failed, domain: container_runtime, category: sandbox, severity: high, display_name: Sandbox 创建失败, pattern: '(?i)failed to create pod sandbox', sample: 'failed to create pod sandbox'}
+  - {risk_type: runtime.cni_setup_failed, domain: container_runtime, category: cni, severity: high, display_name: CNI 配置失败, pattern: '(?i)(CNI.*failed|failed to setup network)', sample: 'CNI setup failed'}
+  - {risk_type: runtime.image_unpack_failed, domain: container_runtime, category: image, severity: medium, display_name: 镜像解包失败, pattern: '(?i)failed to (unpack|extract) image', sample: 'failed to unpack image'}
+  - {risk_type: runtime.overlay_mount_failed, domain: container_runtime, category: storage, severity: high, display_name: Overlay 挂载失败, pattern: '(?i)overlay.*mount.*failed', sample: 'overlay mount failed'}
+  - {risk_type: runtime.operation_timeout, domain: container_runtime, category: timeout, severity: high, display_name: Runtime 操作超时, pattern: '(?i)(containerd|runtime).*timed? out', sample: 'containerd operation timed out'}
+rules:
+  - id: builtin.linux.memory.oom_killer
+    display_name: Linux OOM Killer 触发
+    description: 内核触发 OOM Killer
+    domain: memory
+    category: oom
+    risk_type: linux.memory.oom_killer_invoked
+    match: {source_types: [syslog, kernel], components: [kernel], message_regex: ['(?i)\bout of memory\b|\boom-killer\b']}
+    classification: {default_severity: critical, base_score: 100, confidence: 1.0}
+    dedup: {key_fields: [cluster, node_id, risk_type], window_seconds: 300}
+    lifecycle: {recovery_mode: explicit_or_timeout, recovery_timeout_seconds: 3600}
+    test_samples: {positive: ['Out of memory: Killed process 123'], negative: ['memory initialization complete']}
+    tags: [Linux, 内存, OOM]
+  - id: builtin.linux.storage.no_space
+    display_name: 磁盘空间耗尽
+    description: 文件系统返回 No space left on device
+    domain: storage
+    category: capacity
+    risk_type: linux.storage.no_space_left
+    match: {source_types: [], components: [], message_regex: ['(?i)no space left on device']}
+    classification: {default_severity: critical, base_score: 100, confidence: 1.0}
+    dedup: {key_fields: [cluster, node_id, risk_type], window_seconds: 300}
+    lifecycle: {recovery_mode: explicit_or_timeout, recovery_timeout_seconds: 3600}
+    test_samples: {positive: ['write failed: No space left on device'], negative: ['disk has free space']}
+    tags: [Linux, 磁盘, 容量]
+  - id: builtin.k8s.node.not_ready
+    display_name: Kubernetes 节点 NotReady
+    description: 节点 Ready Condition 为 False
+    domain: kubernetes
+    category: node_condition
+    risk_type: k8s.node.not_ready
+    match: {source_types: [], components: [kubelet, node-controller], message_regex: ['(?i)Ready\s*[=:]\s*False|NodeNotReady']}
+    classification: {default_severity: critical, base_score: 100, confidence: 1.0}
+    dedup: {key_fields: [cluster, node_id, risk_type], window_seconds: 300}
+    lifecycle: {recovery_mode: explicit_or_timeout, recovery_timeout_seconds: 600}
+    test_samples: {positive: ['Node condition Ready=False'], negative: ['Node condition Ready=True']}
+    tags: [Kubernetes, 节点, NotReady]
+  - id: builtin.systemd.unit.failed
+    display_name: systemd 服务失败
+    description: systemd Unit 进入 failed 状态
+    domain: system_service
+    category: unit
+    risk_type: systemd.unit.failed
+    match: {source_types: [], components: [systemd], message_regex: ['(?i)(?P<unit>[A-Za-z0-9_.@-]+)\s+failed|Failed to start (?P<unit_alt>[^.]+)']}
+    classification: {default_severity: high, base_score: 75, confidence: 0.95}
+    dedup: {key_fields: [cluster, node_id, risk_type], window_seconds: 300}
+    lifecycle: {recovery_mode: explicit_or_timeout, recovery_timeout_seconds: 1800}
+    test_samples: {positive: ['docker.service failed'], negative: ['docker.service started']}
+    tags: [systemd, 服务, 失败]

@@ -5,11 +5,14 @@
 .approval-feature-list .feature-list,.evidence-body{max-height:650px;overflow:auto}
 .evidence-body{padding:12px}
 .evidence-notice{padding:9px 10px;border:1px solid #ffd7c1;background:#fff8f4;color:#955331;border-radius:8px;font-size:9px;line-height:1.5;margin-bottom:10px}
+.evidence-relation{display:grid;grid-template-columns:auto 1fr;gap:5px 10px;align-items:center;padding:10px;margin-bottom:10px;border:1px solid #e5e8ec;background:#f7f8fa;border-radius:9px}.evidence-relation b{font-size:9px;color:var(--orange-dark)}.evidence-relation span{font-size:9px;color:#4d5967}.evidence-relation small{grid-column:2;font-size:8px;color:var(--muted)}
 .evidence-template{width:100%;text-align:left;border:1px solid #e7e9ed;background:#fafbfc;border-radius:9px;padding:10px;margin-bottom:9px;cursor:pointer}
 .evidence-template.active{border-color:#ffd7c1;background:#fff8f4;box-shadow:inset 3px 0 var(--orange)}
 .evidence-meta{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-bottom:8px}
 .evidence-meta span{font-size:8px;background:#eef1f4;color:#66717d;border-radius:999px;padding:4px 6px}
+.evidence-meta .evidence-number{background:#fff0e8;color:var(--orange-dark);font-weight:800}
 .evidence-meta b{font-size:9px;color:#df5712;margin-left:auto}
+.semantic-evidence-summary{display:grid;grid-template-columns:1fr auto;gap:4px 8px;align-items:center;margin:1px 0 9px}.semantic-evidence-summary>b{font-size:11px;color:#26313d}.semantic-evidence-summary>span{grid-column:1;font-size:8px;color:#66717d;overflow-wrap:anywhere}.semantic-evidence-summary>em{grid-column:2;grid-row:1/3;align-self:center}
 .evidence-template code{display:block;white-space:pre-wrap;overflow-wrap:anywhere;font-size:10px;line-height:1.6;color:#33404d;margin-bottom:8px}
 .evidence-template small{display:block;color:#8b949f;font-size:8px;line-height:1.55}
 @media(max-width:1180px){.approval-workspace{grid-template-columns:1fr}.approval-feature-list,.evidence-panel,.review-editor{min-height:auto}.approval-feature-list .feature-list,.evidence-body{max-height:420px}}

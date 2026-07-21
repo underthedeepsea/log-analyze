@@ -337,6 +337,30 @@ def test_feature_evidence_contains_sanitized_template_fields_and_notice():
     assert "dangerouslySetInnerHTML" not in source
 
 
+def test_review_draft_preserves_model_title_and_tags_and_combines_drain3_summary():
+    source = source_text()
+    assert 'title: feature.title || ""' in source
+    assert 'tags: (feature.tags || []).join(", ")' in source
+    assert 'const templateSummary = "Drain3 模板：" + (selectedTemplate.template || "暂无模板文本");' in source
+    assert 'summary: [feature.summary || "", templateSummary].filter(Boolean).join("\\n\\n")' in source
+    assert 'title: component + " " + category + " 特征日志"' not in source
+    assert 'tags: tags.join(", ")' not in source
+
+
+def test_feature_evidence_distinguishes_candidate_from_semantic_templates():
+    source = source_text()
+    assert "当前特征关联的证据模板" in source
+    assert 'templates.length + " 个证据模板"' in source
+    assert "当前选择的是 1 个候选特征" in source
+    assert "同属当前候选特征" in source
+    assert "function evidenceSemanticLabel(template, index)" in source
+    assert "risk_semantic" in source
+    assert "risk_type" in source
+    assert "semantic_fields" in source
+    assert "evidence-relation" in source
+    assert "semantic-evidence-summary" in source
+
+
 def test_feature_selection_defaults_and_recovers_from_stale_id():
     source = source_text()
     assert "setSelectedId(function (current)" in source
@@ -378,7 +402,8 @@ def test_release_docs_describe_current_feature_version():
     assert "## 1.21.0 - 2026-07-16" in release
     assert "## 1.22.0 - 2026-07-18" in release
     assert "## 1.23.0 - 2026-07-19" in release
-    assert "当前版本：`1.23.0`" in readme
+    assert "## 1.23.1 - 2026-07-21" in release
+    assert "当前版本：`1.23.1`" in readme
     assert "qwen3.5:9b-mlx" in readme
     assert "state/logrisk.sqlite3" in readme
     assert "database/migrations/" in readme

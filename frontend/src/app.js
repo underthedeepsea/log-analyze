@@ -288,29 +288,51 @@
     );
   }
 
+  function evidenceSemanticLabel(template, index) {
+    const riskSemantic = template && template.risk_semantic || {};
+    const semanticFields = riskSemantic.semantic_fields || {};
+    const extractedFields = template && template.semantic_fields || {};
+    const extractedXid = Array.isArray(extractedFields.xid_code) && extractedFields.xid_code.length
+      ? extractedFields.xid_code[0].value : extractedFields.xid_code;
+    const xidCode = semanticFields.xid_code != null ? semanticFields.xid_code : extractedXid;
+    return {
+      name: xidCode != null ? "Xid " + xidCode : "证据模板 " + String(index + 1).padStart(2, "0"),
+      riskType: riskSemantic.risk_type || template.category || "未分类语义",
+      severity: riskSemantic.severity || template.severity || "unknown",
+    };
+  }
+
   function FeatureEvidence(props) {
     const feature = props.feature;
     const templates = feature && feature.source_templates || [];
+    const semanticLabels = templates.map(evidenceSemanticLabel);
     const [selectedTemplateIndex, setSelectedTemplateIndex] = useState(0);
     useEffect(function () {
       setSelectedTemplateIndex(0);
       props.onSelectTemplate && props.onSelectTemplate(templates[0] || null);
     }, [feature && feature.candidate_id]);
     return h("section", { className: "surface evidence-panel" },
-      h("div", { className: "surface-head" }, h("b", null, "特征日志证据"), h("span", null, templates.length + " 个模板")),
+      h("div", { className: "surface-head" }, h("b", null, "当前特征关联的证据模板"), h("span", null, templates.length + " 个证据模板")),
       h("div", { className: "evidence-body" },
-        h("div", { className: "evidence-notice" }, "当前展示 Drain3 脱敏特征模板，系统未保存原始日志"),
+        h("div", { className: "evidence-notice" }, feature ? "当前选择的是 1 个候选特征；以下 " + templates.length + " 个 Drain3 模板是它的脱敏证据，不是 " + templates.length + " 个候选特征。系统未保存原始日志。" : "当前展示 Drain3 脱敏特征模板，系统未保存原始日志"),
         !feature && h("div", { className: "empty-state" }, "选择特征后查看日志证据"),
         feature && templates.length === 0 && h("div", { className: "empty-state" }, "暂无脱敏模板证据"),
+        feature && templates.length > 1 && h("div", { className: "evidence-relation" },
+          h("b", null, "归并关系"),
+          h("span", null, semanticLabels.map(function (item) { return item.name; }).join(" + ") + " → " + (feature.title || "当前候选特征")),
+          h("small", null, "同属当前候选特征，分别保留模板 Hash 与确定性风险语义")),
         templates.map(function (template, index) {
           const firstSeen = template.first_seen || feature.window_start || "—";
           const lastSeen = template.last_seen || feature.window_end || "—";
+          const semantic = semanticLabels[index];
           return h("button", { className: "evidence-template " + (selectedTemplateIndex === index ? "active" : ""), key: (template.template_hash || "template") + "-" + index, onClick: function () { setSelectedTemplateIndex(index); props.onSelectTemplate && props.onSelectTemplate(template); } },
             h("div", { className: "evidence-meta" },
+              h("span", { className: "evidence-number" }, "证据模板 " + String(index + 1).padStart(2, "0")),
               h("span", null, template.component || "unknown"),
               h("span", null, template.category || "unknown"),
               h("span", null, template.severity || "unknown"),
               h("b", null, String(template.count || 0) + " 次")),
+            h("div", { className: "semantic-evidence-summary" }, h("b", null, semantic.name), h("span", null, "风险语义 " + semantic.riskType), h("em", { className: "risk-level " + String(semantic.severity).toLowerCase() }, String(semantic.severity).toUpperCase())),
             h("code", null, template.template || "无模板文本"),
             h("small", null, "Hash " + (template.template_hash || "—")),
             h("small", null, firstSeen + " — " + lastSeen));
@@ -324,16 +346,13 @@
     if (!selectedTemplate || !selectedTemplate.template_hash) {
       return { title: feature.title || "", summary: feature.summary || "", importance: feature.importance || "medium", tags: (feature.tags || []).join(", "), reviewer_note: feature.reviewer_note || "" };
     }
-    const component = selectedTemplate.component || "unknown";
-    const category = selectedTemplate.category || selectedTemplate.severity || "日志";
-    const template = selectedTemplate.template || "暂无模板文本";
-    const tags = Array.from(new Set([component, selectedTemplate.severity, selectedTemplate.category].filter(Boolean)));
+    const templateSummary = "Drain3 模板：" + (selectedTemplate.template || "暂无模板文本");
     return {
-      title: component + " " + category + " 特征日志",
-      summary: "检测到 " + component + " 组件的 " + category + " 日志模板：" + template,
+      title: feature.title || "",
+      summary: [feature.summary || "", templateSummary].filter(Boolean).join("\n\n"),
       importance: feature.importance || "medium",
-      tags: tags.join(", "),
-      reviewer_note: "基于当前证据模板生成审批草稿：" + selectedTemplate.template_hash,
+      tags: (feature.tags || []).join(", "),
+      reviewer_note: feature.reviewer_note || "基于当前证据模板生成审批草稿：" + selectedTemplate.template_hash,
     };
   }
 
@@ -349,7 +368,7 @@
       return h("label", null, label, type === "textarea" ? h("textarea", controlProps) : h("input", controlProps));
     }
     function save(status) { props.onSave(Object.assign({}, draft, { tags: draft.tags.split(",").map(function (tag) { return tag.trim(); }).filter(Boolean), status: status })); }
-    return h("section", { className: "surface review-editor" }, h("div", { className: "surface-head" }, h("b", null, "人工审批"), h("span", null, props.feature.origin === "approved_rule" ? "来自批准规则库" : "来自 Ollama")), h("div", { className: "editor-body" }, field("特征标题", "title"), field("特征摘要", "summary", "textarea"), field("标签（逗号分隔）", "tags"), field("审批备注", "reviewer_note", "textarea"), h("div", { className: "fact-box" }, "当前证据模板：", selectedTemplate.template_hash || "—", h("br"), "组件 " + (selectedTemplate.component || "—") + " · 类别 " + (selectedTemplate.category || "—") + " · 次数 " + (selectedTemplate.count || 0), h("br"), selectedTemplate.template || "暂无模板文本"), h("div", { className: "fact-box" }, "质量门禁：已通过", h("br"), "Evaluator Score：" + (props.feature.evaluator_result && props.feature.evaluator_result.score != null ? props.feature.evaluator_result.score : "—"), h("br"), "实体 " + (props.feature.entity && props.feature.entity.id || "") + " · 风险分 " + props.feature.risk_score + " · 出现 " + props.feature.occurrence_count + " 次", h("br"), props.feature.trace_id ? "来源 " + (props.feature.prompt_id || "feature_extract_v3_compact_strict_json_en") + " · " + (props.feature.model || "—") + " · " + props.feature.trace_id : "来源：历史数据 / 未记录 Trace"), props.feature.trace_id && h("button", { className: "text-button trace-link", onClick: function () { props.onOpenTrace(props.feature.trace_id); } }, "查看 AI Trace"), h("div", { className: "editor-actions" }, h("button", { className: "reject-button", onClick: function () { save("rejected"); } }, "驳回"), h("button", { className: "primary-button", onClick: function () { save("approved"); } }, "批准并写入规则库"))));
+    return h("section", { className: "surface review-editor" }, h("div", { className: "surface-head" }, h("b", null, "人工审批"), h("span", null, props.feature.origin === "approved_rule" ? "来自批准规则库" : "来自模型 + Drain3")), h("div", { className: "editor-body" }, field("特征标题（来自模型）", "title"), field("特征摘要（模型语义 + 当前 Drain3 模板）", "summary", "textarea"), field("标签（来自模型，逗号分隔）", "tags"), field("审批备注", "reviewer_note", "textarea"), h("div", { className: "fact-box" }, "当前证据模板：", selectedTemplate.template_hash || "—", h("br"), "组件 " + (selectedTemplate.component || "—") + " · 类别 " + (selectedTemplate.category || "—") + " · 次数 " + (selectedTemplate.count || 0), h("br"), selectedTemplate.template || "暂无模板文本"), h("div", { className: "fact-box" }, "质量门禁：已通过", h("br"), "Evaluator Score：" + (props.feature.evaluator_result && props.feature.evaluator_result.score != null ? props.feature.evaluator_result.score : "—"), h("br"), "实体 " + (props.feature.entity && props.feature.entity.id || "") + " · 风险分 " + props.feature.risk_score + " · 出现 " + props.feature.occurrence_count + " 次", h("br"), props.feature.trace_id ? "来源 " + (props.feature.prompt_id || "feature_extract_v3_compact_strict_json_en") + " · " + (props.feature.model || "—") + " · " + props.feature.trace_id : "来源：历史数据 / 未记录 Trace"), props.feature.trace_id && h("button", { className: "text-button trace-link", onClick: function () { props.onOpenTrace(props.feature.trace_id); } }, "查看 AI Trace"), h("div", { className: "editor-actions" }, h("button", { className: "reject-button", onClick: function () { save("rejected"); } }, "驳回"), h("button", { className: "primary-button", onClick: function () { save("approved"); } }, "批准并写入规则库"))));
   }
 
   function PromptManagement(props) {

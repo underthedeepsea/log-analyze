@@ -20,7 +20,9 @@ from logrisk.ai_harness.model_profile import ModelProfileRegistry
 from logrisk.ai_harness.prompt_registry import PromptRegistry, PromptTemplate, SQLitePromptRegistry
 from logrisk.ai_harness.providers import create_model_client
 from logrisk.ai_harness.trace_logger import AITraceLogger
+from logrisk.ai_eval.runner import load_cases
 from logrisk.approved_rules import ApprovedRuleError, ApprovedRuleStore
+from logrisk.benchmark_center import BenchmarkError, BenchmarkRepository, BenchmarkService
 from logrisk.drain_eval.schema import DrainQualityError
 from logrisk.drain_eval.service import DrainQualityService
 from logrisk.feature_extractor_ollama import DEFAULT_OLLAMA_URL, FEATURE_PROMPT_ID
@@ -135,6 +137,8 @@ def build_server(
         profile = profiles.from_snapshot(profile_snapshot) if isinstance(profile_snapshot, dict) else profiles.get(kwargs.get("model_profile_id"))
         connection_snapshot = kwargs.get("connection_snapshot")
         connection = dict(connection_snapshot) if isinstance(connection_snapshot, dict) else connections.get(profile.connection_id)
+        prompt_snapshot = kwargs.get("prompt_snapshot")
+        prompt_template = PromptTemplate(**prompt_snapshot) if isinstance(prompt_snapshot, dict) else None
         if not connection["enabled"]:
             raise FeatureJobError(f"模型连接已停用: {profile.connection_id}")
         feature_extractor.PROMPT_REGISTRY = prompts
@@ -144,15 +148,45 @@ def build_server(
             entity,
             model=profile.model,
             base_url=connection["base_url"],
-            timeout=float(connection["timeout_seconds"]),
+            timeout=float(kwargs.get("timeout") or connection["timeout_seconds"]),
             model_client=create_model_client(connection),
             prompt_id=kwargs.get("prompt_id") or profile.default_prompt_id,
+            prompt_template=prompt_template,
             job_id=kwargs.get("job_id"),
             cache_enabled=bool(kwargs.get("cache_enabled", True)),
             model_profile_id=profile.profile_id,
             provider=connection["provider"],
             model_profile=profile,
         )
+
+    benchmark_cases = load_cases()
+
+    def benchmark_asset_inventory() -> dict[str, int]:
+        table_names = {
+            "ai_traces": "ai_traces",
+            "model_profiles": "model_profiles",
+            "prompt_templates": "prompt_templates",
+            "drain_eval_runs": "drain_eval_runs",
+            "drain_templates": "drain_templates",
+            "ai_cache_entries": "ai_cache_entries",
+        }
+        with database.connect() as connection:
+            counts = {
+                key: int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+                for key, table in table_names.items()
+            }
+        counts["canonical_eval_cases"] = len(benchmark_cases)
+        return counts
+
+    benchmark_center = BenchmarkService(
+        BenchmarkRepository(database),
+        canonical_cases=benchmark_cases,
+        real_extractor=configured_extractor,
+        asset_inventory=benchmark_asset_inventory,
+        profile_resolver=lambda profile_id: profiles.get(profile_id).public_dict(),
+        connection_resolver=connections.get,
+        prompt_resolver=lambda prompt_id: dict(prompts.load(prompt_id).__dict__),
+    )
 
     server = DashboardHTTPServer((host, port), DashboardHandler)
     server.database = database  # type: ignore[attr-defined]
@@ -180,6 +214,7 @@ def build_server(
     server.semantic_dictionaries = semantic_dictionaries  # type: ignore[attr-defined]
     server.risk_semantics = risk_semantics  # type: ignore[attr-defined]
     server.node_risks = node_risks  # type: ignore[attr-defined]
+    server.benchmark_center = benchmark_center  # type: ignore[attr-defined]
     configured_origins = cors_origins if cors_origins is not None else os.getenv("DASHBOARD_CORS_ORIGINS", "").split(",")
     server.cors_origins = {str(origin).strip().rstrip("/") for origin in configured_origins if str(origin).strip()}  # type: ignore[attr-defined]
     server.ollama_checker = ollama_checker or (  # type: ignore[attr-defined]
@@ -328,7 +363,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         path, query = self._route_parts()
         try:
-            if path in {"/", "/prompts", "/ai-traces", "/ai-observability", "/model-profiles", "/drain-quality", "/rules", "/settings", "/node-risks", "/semantic-library"} or path.startswith("/node-risks/"):
+            if path in {"/", "/prompts", "/ai-traces", "/ai-observability", "/model-profiles", "/drain-quality", "/benchmark-center", "/rules", "/settings", "/node-risks", "/semantic-library"} or path.startswith("/node-risks/"):
                 self._serve_frontend()
                 return
             if path == "/config.js":
@@ -388,7 +423,41 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._json(HTTPStatus.OK, {"items": result} if path.endswith("/versions") else result)
                 return
             if path == "/api/health":
-                self._json(HTTPStatus.OK, {"schema_version": "logrisk_health_v1", "service": "logrisk-dashboard", "status": "ok", "version": "1.23.0", "storage": "sqlite"})
+                self._json(HTTPStatus.OK, {"schema_version": "logrisk_health_v1", "service": "logrisk-dashboard", "status": "ok", "version": "1.24.2", "storage": "sqlite"})
+                return
+            if path == "/api/benchmark-center/overview":
+                self._json(HTTPStatus.OK, self.server.benchmark_center.overview())  # type: ignore[attr-defined]
+                return
+            if path == "/api/benchmark-center/trends":
+                self._json(HTTPStatus.OK, self.server.benchmark_center.trends())  # type: ignore[attr-defined]
+                return
+            if path == "/api/benchmark-center/leaderboard":
+                self._json(HTTPStatus.OK, self.server.benchmark_center.leaderboard())  # type: ignore[attr-defined]
+                return
+            if path == "/api/benchmark-center/suites":
+                self._json(HTTPStatus.OK, self.server.benchmark_center.list_suites(  # type: ignore[attr-defined]
+                    page=int(query.get("page", ["1"])[0]), page_size=int(query.get("page_size", ["50"])[0]),
+                ))
+                return
+            if path == "/api/benchmark-center/runs":
+                self._json(HTTPStatus.OK, self.server.benchmark_center.list_runs(  # type: ignore[attr-defined]
+                    page=int(query.get("page", ["1"])[0]), page_size=int(query.get("page_size", ["50"])[0]),
+                    status=query.get("status", [None])[0],
+                ))
+                return
+            match = re.fullmatch(r"/api/benchmark-center/runs/([A-Za-z0-9_-]+)(?:/(cases|artifacts))?", path)
+            if match:
+                run_id, subresource = match.groups()
+                if subresource == "cases":
+                    result = self.server.benchmark_center.repository.list_case_results(  # type: ignore[attr-defined]
+                        run_id, page=int(query.get("page", ["1"])[0]), page_size=int(query.get("page_size", ["50"])[0]),
+                        passed=(query.get("passed", [""])[0].lower() == "true") if query.get("passed") else None,
+                    )
+                elif subresource == "artifacts":
+                    result = self.server.benchmark_center.repository.list_artifacts(run_id)  # type: ignore[attr-defined]
+                else:
+                    result = self.server.benchmark_center.get_run(run_id)  # type: ignore[attr-defined]
+                self._json(HTTPStatus.OK, result)
                 return
             if path == "/api/drain-quality/datasets":
                 self._json(HTTPStatus.OK, {"schema_version": "drain_dataset_list_v1", "items": self.server.drain_quality.datasets.list()})  # type: ignore[attr-defined]
@@ -550,6 +619,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._serve_events(match.group(1), max(0, cursor))
                 return
             self._json(HTTPStatus.NOT_FOUND, {"error": "资源不存在"})
+        except BenchmarkError as exc:
+            self._json(exc.status_code, {"error": str(exc), "code": exc.code, "request_id": f"request-{uuid.uuid4().hex}"})
         except (RiskSemanticError, NodeRiskError) as exc:
             self._json(exc.status_code, {"error": str(exc), "code": exc.code})
         except RuleGovernanceError as exc:
@@ -563,6 +634,30 @@ class DashboardHandler(BaseHTTPRequestHandler):
         path, _ = self._route_parts()
         try:
             payload = self._read_json()
+            if path == "/api/benchmark-center/suites":
+                if not isinstance(payload, dict):
+                    raise BenchmarkError("请求体必须是 JSON object")
+                self._json(HTTPStatus.CREATED, self.server.benchmark_center.create_suite(payload))  # type: ignore[attr-defined]
+                return
+            if path == "/api/benchmark-center/runs":
+                if not isinstance(payload, dict):
+                    raise BenchmarkError("请求体必须是 JSON object")
+                run = self.server.benchmark_center.create_run(payload)  # type: ignore[attr-defined]
+                threading.Thread(target=self.server.benchmark_center.execute_run, args=(run["run_id"],), daemon=True).start()  # type: ignore[attr-defined]
+                self._json(HTTPStatus.ACCEPTED, run)
+                return
+            match = re.fullmatch(r"/api/benchmark-center/runs/([A-Za-z0-9_-]+)/cancel", path)
+            if match:
+                self._json(HTTPStatus.OK, self.server.benchmark_center.cancel_run(  # type: ignore[attr-defined]
+                    match.group(1), operator=str(payload.get("operator") or "local-operator"),
+                ))
+                return
+            if path == "/api/benchmark-center/comparisons":
+                self._json(HTTPStatus.OK, self.server.benchmark_center.compare(payload))  # type: ignore[attr-defined]
+                return
+            if path == "/api/benchmark-center/gates/evaluate":
+                self._json(HTTPStatus.CREATED, self.server.benchmark_center.evaluate_gate(payload))  # type: ignore[attr-defined]
+                return
             if path == "/api/semantics":
                 if not isinstance(payload, dict):
                     raise RiskSemanticError("请求体必须是 object")
@@ -863,6 +958,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 )
                 return
             self._json(HTTPStatus.NOT_FOUND, {"error": "资源不存在"})
+        except BenchmarkError as exc:
+            self._json(exc.status_code, {"error": str(exc), "code": exc.code, "request_id": f"request-{uuid.uuid4().hex}"})
         except (RiskSemanticError, NodeRiskError) as exc:
             self._json(exc.status_code, {"error": str(exc), "code": exc.code})
         except RuleGovernanceError as exc:
@@ -1028,9 +1125,26 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def _model_profiles(self) -> dict[str, Any]:
         registry = self.server.model_profiles  # type: ignore[attr-defined]
+        profiles = []
+        for profile in registry.list_enabled():
+            item = profile.public_dict()
+            try:
+                connection = self.server.connections.get(profile.connection_id)  # type: ignore[attr-defined]
+                item["connection_enabled"] = bool(connection.get("enabled"))
+                item["connection_ready"] = bool(
+                    connection.get("enabled")
+                    and (
+                        connection.get("provider") == "ollama"
+                        or connection.get("api_key_configured")
+                    )
+                )
+            except KeyError:
+                item["connection_enabled"] = False
+                item["connection_ready"] = False
+            profiles.append(item)
         return {
             "default_profile_id": registry.default_profile_id,
-            "profiles": [profile.public_dict() for profile in registry.list_enabled()],
+            "profiles": profiles,
         }
 
     def _compact_traces(self, traces: list[dict[str, Any]]) -> list[dict[str, Any]]:

@@ -1,6 +1,6 @@
 # 日志风险特征分析与审批系统
 
-当前版本：`1.23.1`。完整变更记录见 [`releas.md`](releas.md)。
+当前版本：`1.24.2`。完整变更记录见 [`releas.md`](releas.md)。
 
 LOGRISK 在本地完成日志规范化、Drain3 模板化、确定性语义增强、风险评分、规则复用、模型特征识别和人工审批。系统只生成可审查、可导出的日志特征，不执行根因分析（RCA），也不会把原始日志直接发送给模型。
 
@@ -11,6 +11,7 @@ LOGRISK 在本地完成日志规范化、Drain3 模板化、确定性语义增�
 - 已批准且处于启用状态的规则优先匹配，命中后跳过模型调用；未知特征才进入 AI 分析和人工审批。
 - 支持本地 Ollama 与 OpenAI-compatible `/v1/chat/completions` 服务。
 - 提供 Prompt 版本、模型 Profile、AI Trace、缓存、评测、Drain3 配置和语义词典治理。
+- 提供统一的评测与基准中心，可比较 Prompt、模型 Profile、失败 Case、趋势及发布门禁。
 - 提供服务器风险总览、风险事件台账、可解释评分，以及可编辑、可发布、可回滚的风险语义库。
 - 只导出人工批准的特征及关联风险节点，供外部 RCA 专家系统使用。
 
@@ -196,6 +197,16 @@ DASHBOARD_CORS_ORIGINS=https://logrisk.example.internal \
 常用环境变量包括 `LOGRISK_DB_PATH`、`OLLAMA_MODEL`、`OLLAMA_HOST`、`OLLAMA_TIMEOUT`、`DASHBOARD_HOST` 和 `DASHBOARD_PORT`。Dashboard 默认仅监听 `127.0.0.1`。
 
 ## 评测与测试
+
+Dashboard 的“评测与基准”工作区统一读取现有 Eval、AI Trace、模型 Profile、Cache、Evaluator 和 Drain3 Quality 数据，并提供：
+
+- Fake Model、历史 Trace 回放和人工确认的真实模型三种运行模式；
+- Prompt 对比、模型排行榜、失败 Case 分类和质量趋势；
+- 通过率、JSON/Schema 有效率、模板引用准确率、平均/P95 延迟、缓存命中和规则跳过指标；
+- 基线与候选版本门禁，结论为 `passed`、`blocked` 或 `manual_review`。
+- AI Trace、模型 Profile、Prompt、Drain3 评测、Drain3 模板与 Canonical Case 的统一资产计数。
+
+真实模型评测必须锁定 Suite、Prompt 内容、模型 Profile、Provider 连接、Case 数、超时、重试和调用预算，并在页面二次确认。停用连接或缺少 API Key 环境变量的远端连接不能启动；创建后即使配置发生变化，Run 仍使用已保存快照。Benchmark Gate 只记录决策依据，不会自动发布 Prompt、模型 Profile、Drain3 配置或批准规则。运行状态保存在 SQLite 的 `benchmark_*` 表中，Case 只包含聚合、脱敏 Evidence。
 
 内置评测用例位于 `eval_cases/canonical/`，覆盖 OOM 驱逐、containerd runtime 失败、磁盘压力、Pod 业务错误和普通 warning 误报控制。
 

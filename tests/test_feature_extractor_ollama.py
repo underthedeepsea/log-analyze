@@ -3,9 +3,9 @@ import json
 import pytest
 
 from logrisk.ai_harness.cache import AICache
-from logrisk.ai_harness.prompt_registry import PromptRegistry
+from logrisk.ai_harness.prompt_registry import PromptRegistry, PromptTemplate
 from logrisk.ai_harness.trace_logger import AITraceLogger
-from logrisk.feature_extractor_ollama import FeatureExtractionError, generate_feature_candidates
+from logrisk.feature_extractor_ollama import FeatureExtractionError, extract_features_for_entity, generate_feature_candidates
 
 
 def entity(score=96):
@@ -140,6 +140,34 @@ def test_generate_features_uses_prompt_registry_and_writes_trace(monkeypatch, tm
     assert len(result[0]["evidence_hash"]) == 64
     assert trace["evaluator_result"]["passed"] is True
     assert trace["status"] == "success"
+
+
+def test_extract_features_can_use_locked_prompt_snapshot(monkeypatch):
+    captured = {}
+
+    def fake_urlopen(request, timeout):
+        captured["body"] = json.loads(request.data)
+        return response([model_feature()])
+
+    monkeypatch.setattr("logrisk.ai_harness.providers.ollama.urlopen", fake_urlopen)
+    locked = PromptTemplate(
+        prompt_id="prompt-locked",
+        content="locked benchmark prompt",
+        sha256="a" * 64,
+        path="database:prompt/prompt-locked/v3",
+        version="v3",
+    )
+
+    result = extract_features_for_entity(
+        entity(),
+        model="qwen3:1.7b",
+        prompt_id="prompt-locked",
+        prompt_template=locked,
+        cache_enabled=False,
+    )
+
+    assert captured["body"]["messages"][0]["content"] == "locked benchmark prompt"
+    assert result[0]["prompt_hash"] == "a" * 64
 
 
 def test_generate_features_records_selected_remote_provider(monkeypatch, tmp_path):

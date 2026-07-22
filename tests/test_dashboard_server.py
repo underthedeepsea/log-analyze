@@ -387,6 +387,8 @@ def test_model_profiles_route_exposes_default_profile(dashboard):
     assert payload["default_profile_id"] == "qwen3_1_7b_fast"
     assert payload["profiles"][0]["thinking_enabled"] is False
     assert payload["profiles"][0]["evidence_budget"]["max_templates"] == 6
+    assert payload["profiles"][0]["connection_enabled"] is True
+    assert payload["profiles"][0]["connection_ready"] is True
 
 
 def test_model_profiles_route_creates_profile(dashboard):

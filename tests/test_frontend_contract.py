@@ -75,7 +75,7 @@ def test_m11_quality_and_settings_use_workspace_design_contract():
         "secondary-button",
     ):
         assert text in source
-    assert '!["drainQuality", "settings", "rules", "nodeRisks", "semanticLibrary"].includes(view)' in source
+    assert '!["drainQuality", "benchmarkCenter", "settings", "rules", "nodeRisks", "semanticLibrary"].includes(view)' in source
     assert "h(CodeBlock, { value: profile.parameters })" not in source
 
 
@@ -361,6 +361,36 @@ def test_feature_evidence_distinguishes_candidate_from_semantic_templates():
     assert "semantic-evidence-summary" in source
 
 
+def test_benchmark_center_has_route_api_and_six_decision_views():
+    source = source_text()
+    assert '["benchmarkCenter", "◎", "评测与基准"]' in source
+    assert 'path === "/benchmark-center" ? "benchmarkCenter"' in source
+    assert 'view === "benchmarkCenter" ? "/benchmark-center"' in source
+    assert 'function BenchmarkCenterPage(props)' in source
+    assert "/api/benchmark-center/overview" in source
+    assert "/api/benchmark-center/leaderboard" in source
+    assert "/api/benchmark-center/gates/evaluate" in source
+    for label in ("质量总览", "Prompt 对比", "模型排行榜", "失败 Case", "质量趋势", "发布门禁"):
+        assert label in source
+
+
+def test_real_benchmark_requires_explicit_confirmation_and_diagnostics():
+    source = source_text()
+    assert "真实模型运行会产生调用成本，必须人工确认" in source
+    assert 'type: "checkbox"' in source
+    assert "复制诊断信息" in source
+    assert "Benchmark 数据加载失败" in source
+    assert "连接不可用，不能启动真实模型评测" in source
+    assert "connection_ready" in source
+
+
+def test_benchmark_overview_displays_unified_source_asset_inventory():
+    source = source_text()
+    assert "统一资产来源" in source
+    for label in ("AI Trace", "模型 Profile", "Prompt", "Drain3 评测", "Drain3 模板", "Canonical Case"):
+        assert label in source
+
+
 def test_feature_selection_defaults_and_recovers_from_stale_id():
     source = source_text()
     assert "setSelectedId(function (current)" in source
@@ -403,7 +433,10 @@ def test_release_docs_describe_current_feature_version():
     assert "## 1.22.0 - 2026-07-18" in release
     assert "## 1.23.0 - 2026-07-19" in release
     assert "## 1.23.1 - 2026-07-21" in release
-    assert "当前版本：`1.23.1`" in readme
+    assert "当前版本：`1.24.2`" in readme
+    assert "## 1.24.0 - 2026-07-22" in release
+    assert "## 1.24.1 - 2026-07-22" in release
+    assert "## 1.24.2 - 2026-07-22" in release
     assert "qwen3.5:9b-mlx" in readme
     assert "state/logrisk.sqlite3" in readme
     assert "database/migrations/" in readme
@@ -432,3 +465,38 @@ def test_node_risk_and_editable_semantic_ui_contract():
         'occurrence_count',
     ):
         assert text in source
+
+
+def test_sidebar_is_collapsible_scrollable_and_uses_dynamic_glass_selection():
+    source = (FRONTEND / "src" / "app.js").read_text(encoding="utf-8")
+    styles = (FRONTEND / "src" / "styles.css").read_text(encoding="utf-8")
+
+    assert 'className: "sidebar-scroll"' in source
+    assert 'className: "sidebar-rail "' in source
+    assert 'className: "sidebar-thumb"' in source
+    assert 'className: "sidebar-toggle"' in source
+    assert 'className: "sidebar-overlay"' in source
+    assert 'className: "nav-icon"' not in source
+    assert "boundary-note" not in source
+    assert "sidebarCollapsed" in source
+    assert "mobileMenuOpen" in source
+    assert "startSidebarThumbDrag" in source
+    for marker in (
+        ".sidebar-scroll",
+        ".app-shell.sidebar-collapsed",
+        ".app-shell.mobile-menu-open",
+        "@keyframes navGlassShine",
+        "@keyframes navGlassLift",
+        "prefers-reduced-motion:reduce",
+    ):
+        assert marker in styles
+
+
+def test_active_navigation_glass_is_light_and_does_not_bold_text():
+    styles = (FRONTEND / "src" / "styles.css").read_text(encoding="utf-8")
+    active_rule = styles.rsplit(".sidebar .nav-item.active{", 1)[1].split("}", 1)[0]
+
+    assert "font-weight:400" in active_rule
+    assert "rgba(255,226,207,.28)" in active_rule
+    assert "background:linear-gradient(180deg" in active_rule
+    assert "inset 0 2px 0 #fff" not in active_rule

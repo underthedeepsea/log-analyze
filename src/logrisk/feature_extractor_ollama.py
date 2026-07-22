@@ -244,8 +244,9 @@ def _request_features(
     cache_enabled: bool = True,
     model_profile: ModelProfile | None = None,
     provider: str = "ollama",
+    prompt_template: PromptTemplate | None = None,
 ) -> tuple[list[Dict[str, Any]], str | None, Dict[str, Any], bool, Dict[str, Any]]:
-    prompt = PROMPT_REGISTRY.load(prompt_id)
+    prompt = prompt_template or PROMPT_REGISTRY.load(prompt_id)
     if model_profile:
         evidence, evidence_meta = build_feature_evidence(
             entity,
@@ -411,6 +412,7 @@ def extract_features_for_entity(
     profile_config_path: str | Path | None = None,
     provider: str = "ollama",
     model_profile: ModelProfile | None = None,
+    prompt_template: PromptTemplate | None = None,
 ) -> list[Dict[str, Any]]:
     if model_profile is None:
         registry = ModelProfileRegistry(profile_config_path) if profile_config_path else MODEL_PROFILES
@@ -426,7 +428,17 @@ def extract_features_for_entity(
     model_name = resolved_model.strip()
     selected_prompt = prompt_id or profile.default_prompt_id or FEATURE_PROMPT_ID
     features, trace_id, evaluator_result, cache_hit, request_meta = _request_features(
-        entity, model_name, normalized_url, timeout, model_client, selected_prompt, job_id, cache_enabled, profile, provider
+        entity,
+        model_name,
+        normalized_url,
+        timeout,
+        model_client,
+        selected_prompt,
+        job_id,
+        cache_enabled,
+        profile,
+        provider,
+        prompt_template,
     )
     attached = [_attach_source_facts(entity, feature, model_name, provider) for feature in features]
     for feature in attached:

@@ -1,4 +1,4 @@
-schema_version: 5
+schema_version: 6
 database: logrisk
 description: LOGRISK 运行时业务数据字典；SQLite 为当前实现，postgres_type 用于后续迁移 PostgreSQL。
 authoritative_ddl: database/migrations/
@@ -225,6 +225,38 @@ tables:
     description: 节点风险人工确认、恢复等操作审计
     primary_key: audit_id
     columns: {audit_id: 审计标识, event_id: 风险事件, event_type: acknowledge/recover 等动作, event_json: 操作详情, operator: 操作人, created_at: 操作时间}
+  benchmark_suites:
+    description: Benchmark Case 集合及其不可变执行来源快照
+    primary_key: suite_id
+    columns: {suite_id: Suite 标识, name: 显示名称, source_type: canonical/trace/custom, case_count: Case 数量, suite_json: 聚合脱敏 Case 与来源快照, version: Suite 版本, created_at: 创建时间, updated_at: 更新时间, schema_version: 结构版本}
+  benchmark_runs:
+    description: Fake、历史回放或真实模型 Benchmark 的配置锁定、状态、进度和归一化指标
+    primary_key: run_id
+    foreign_keys: {suite_id: benchmark_suites.suite_id ON DELETE RESTRICT}
+    indexes: [idx_benchmark_runs_status_updated(status, updated_at DESC), idx_benchmark_runs_suite_created(suite_id, created_at DESC)]
+    columns: {run_id: Run 标识, suite_id: 锁定的 Suite, mode: fake/history/real, status: pending/running/completed/failed/cancelled, idempotency_key: 创建请求幂等键, snapshot_json: Prompt/Profile/Provider/预算执行快照, metrics_json: 统一质量性能指标, progress_completed: 已完成 Case 数, progress_total: 总 Case 数, error: 失败原因, version: 状态版本, created_at: 创建时间, updated_at: 更新时间, schema_version: 结构版本}
+  benchmark_case_results:
+    description: 单个 Benchmark Case 的质量结果、失败分类和脱敏模型结果
+    primary_key: result_id
+    foreign_keys: {run_id: benchmark_runs.run_id ON DELETE CASCADE}
+    indexes: [idx_benchmark_case_run_passed(run_id, passed, case_id)]
+    columns: {result_id: Case 结果标识, run_id: 所属 Run, case_id: Case 标识, passed: 是否通过, json_valid: JSON 是否有效, schema_valid: Schema 是否有效, template_reference_ok: 模板引用是否正确, duration_ms: 执行耗时, error_type: 失败分类, result_json: 脱敏评测结果, created_at: 创建时间, schema_version: 结构版本}
+  benchmark_gates:
+    description: 基线与候选 Run 的门禁阈值、差异、理由和人工决策记录
+    primary_key: gate_id
+    foreign_keys: {baseline_run_id: benchmark_runs.run_id ON DELETE RESTRICT, candidate_run_id: benchmark_runs.run_id ON DELETE RESTRICT}
+    columns: {gate_id: Gate 标识, baseline_run_id: 基线 Run, candidate_run_id: 候选 Run, decision: passed/blocked/manual_review, thresholds_json: 门禁阈值, deltas_json: 指标差异, reasons_json: 可解释理由, operator: 操作者, created_at: 创建时间, schema_version: 结构版本}
+  benchmark_artifacts:
+    description: Benchmark 产物的路径、类型、大小和校验值；不保存原始日志
+    primary_key: artifact_id
+    foreign_keys: {run_id: benchmark_runs.run_id ON DELETE CASCADE}
+    columns: {artifact_id: Artifact 标识, run_id: 所属 Run, artifact_type: 产物类型, path: 本地文件路径, size_bytes: 文件大小, sha256: 内容摘要, created_at: 创建时间, schema_version: 结构版本}
+  benchmark_audit_events:
+    description: Suite、Run、Case 和 Gate 操作的追加式审计事件
+    primary_key: event_id
+    foreign_keys: {run_id: benchmark_runs.run_id ON DELETE CASCADE}
+    indexes: [idx_benchmark_audit_run_created(run_id, created_at DESC)]
+    columns: {event_id: 审计事件标识, run_id: 可选关联 Run, event_type: 事件类型, event_json: 脱敏事件详情, operator: 操作者, created_at: 创建时间, schema_version: 结构版本}
 postgres_type_mapping:
   TEXT: text
   TEXT_identifier: text

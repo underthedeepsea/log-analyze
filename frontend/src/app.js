@@ -48,6 +48,16 @@
     drainDatasets: function () { return jsonRequest("/api/drain-quality/datasets"); },
     drainAnnotations: function () { return jsonRequest("/api/drain-quality/annotations"); },
     drainEvalRuns: function () { return jsonRequest("/api/drain-quality/eval-runs"); },
+    benchmarkOverview: function () { return jsonRequest("/api/benchmark-center/overview"); },
+    benchmarkSuites: function () { return jsonRequest("/api/benchmark-center/suites?page_size=100"); },
+    benchmarkRuns: function () { return jsonRequest("/api/benchmark-center/runs?page_size=100"); },
+    benchmarkTrends: function () { return jsonRequest("/api/benchmark-center/trends"); },
+    benchmarkLeaderboard: function () { return jsonRequest("/api/benchmark-center/leaderboard"); },
+    benchmarkRun: function (runId) { return jsonRequest("/api/benchmark-center/runs/" + encodeURIComponent(runId)); },
+    createBenchmarkRun: function (payload) { return jsonRequest("/api/benchmark-center/runs", { method: "POST", body: JSON.stringify(payload) }); },
+    cancelBenchmarkRun: function (runId) { return jsonRequest("/api/benchmark-center/runs/" + encodeURIComponent(runId) + "/cancel", { method: "POST", body: JSON.stringify({ operator: "local-operator" }) }); },
+    compareBenchmarkRuns: function (payload) { return jsonRequest("/api/benchmark-center/comparisons", { method: "POST", body: JSON.stringify(payload) }); },
+    evaluateBenchmarkGate: function (payload) { return jsonRequest("/api/benchmark-center/gates/evaluate", { method: "POST", body: JSON.stringify(payload) }); },
     drainProfiles: function () { return jsonRequest("/api/drain-quality/profiles"); },
     drainTemplates: function () { return jsonRequest("/api/drain-quality/templates"); },
     drainConfigs: function () { return jsonRequest("/api/drain-quality/configs"); },
@@ -166,18 +176,65 @@
 
   const navItems = [
     ["overview", "▦", "特征总览"], ["queue", "◫", "识别队列"], ["observability", "◉", "AI 分析观测"], ["traces", "⌁", "AI 调用追踪"], ["prompts", "{}", "Prompt 管理"], ["modelProfiles", "◌", "模型画像"], ["review", "✓", "人工审批"],
-    ["rules", "⌘", "规则治理"], ["nodeRisks", "△", "服务器风险"], ["semanticLibrary", "≋", "风险语义库"], ["drainQuality", "◇", "评测中心 · 模板质量"], ["export", "⇩", "导出记录"], ["settings", "⚙", "系统设置"],
+    ["rules", "⌘", "规则治理"], ["nodeRisks", "△", "服务器风险"], ["semanticLibrary", "≋", "风险语义库"], ["drainQuality", "◇", "评测中心 · 模板质量"], ["benchmarkCenter", "◎", "评测与基准"], ["export", "⇩", "导出记录"], ["settings", "⚙", "系统设置"],
   ];
   const statusNames = { queued: "等待分析", running: "识别中", completed: "Ollama 完成", failed: "识别失败", skipped: "低风险跳过", rule_matched: "规则复用" };
 
   function Sidebar(props) {
-    return h("aside", { className: "sidebar" },
-      h("div", { className: "nav-label" }, "工作区"),
-      navItems.map(function (item) {
-        return h("button", { key: item[0], type: "button", className: "nav-item " + (props.active === item[0] ? "active" : ""), onClick: function () { props.onChange(item[0]); } },
-          h("span", { className: "nav-icon" }, item[1]), h("span", null, item[2]));
-      }),
-      h("div", { className: "boundary-note" }, h("strong", null, "系统边界"), "Ollama 只识别聚合日志特征，本系统不输出 RCA 结论。"));
+    const scrollRef = useRef(null), railRef = useRef(null), dragRef = useRef(null);
+    const [scrollbar, setScrollbar] = useState({ visible: false, height: 46, top: 0 });
+    function updateSidebarScroll() {
+      const scroll = scrollRef.current, rail = railRef.current;
+      if (!scroll || !rail) return;
+      const visible = scroll.scrollHeight > scroll.clientHeight + 1;
+      const height = Math.max(46, rail.clientHeight * scroll.clientHeight / Math.max(1, scroll.scrollHeight));
+      const travel = Math.max(0, rail.clientHeight - height);
+      const top = travel * scroll.scrollTop / Math.max(1, scroll.scrollHeight - scroll.clientHeight);
+      setScrollbar({ visible: visible, height: height, top: top });
+    }
+    useEffect(function () {
+      const scroll = scrollRef.current;
+      if (!scroll) return undefined;
+      const observer = window.ResizeObserver ? new window.ResizeObserver(updateSidebarScroll) : null;
+      scroll.addEventListener("scroll", updateSidebarScroll, { passive: true });
+      window.addEventListener("resize", updateSidebarScroll);
+      if (observer) observer.observe(scroll);
+      requestAnimationFrame(updateSidebarScroll);
+      return function () {
+        scroll.removeEventListener("scroll", updateSidebarScroll);
+        window.removeEventListener("resize", updateSidebarScroll);
+        if (observer) observer.disconnect();
+      };
+    }, []);
+    function startSidebarThumbDrag(event) {
+      event.stopPropagation();
+      event.currentTarget.setPointerCapture(event.pointerId);
+      dragRef.current = { y: event.clientY, scrollTop: scrollRef.current.scrollTop };
+    }
+    function moveSidebarThumb(event) {
+      if (!dragRef.current || !event.currentTarget.hasPointerCapture(event.pointerId)) return;
+      const scroll = scrollRef.current, rail = railRef.current;
+      const maxScroll = scroll.scrollHeight - scroll.clientHeight;
+      const travel = rail.clientHeight - scrollbar.height;
+      scroll.scrollTop = dragRef.current.scrollTop + (event.clientY - dragRef.current.y) * maxScroll / Math.max(1, travel);
+    }
+    function stopSidebarThumbDrag(event) {
+      dragRef.current = null;
+      if (event.currentTarget.hasPointerCapture(event.pointerId)) event.currentTarget.releasePointerCapture(event.pointerId);
+    }
+    function jumpSidebarScroll(event) {
+      if (event.target !== event.currentTarget) return;
+      const scroll = scrollRef.current, rect = railRef.current.getBoundingClientRect();
+      scroll.scrollTop = (event.clientY - rect.top) / Math.max(1, rect.height) * (scroll.scrollHeight - scroll.clientHeight);
+    }
+    return h("aside", { className: "sidebar", id: "primary-navigation" },
+      h("div", { className: "nav-label" }, "功能导航"),
+      h("div", { className: "sidebar-frame" },
+        h("nav", { className: "sidebar-scroll", ref: scrollRef }, navItems.map(function (item) {
+          return h("button", { key: item[0], type: "button", className: "nav-item " + (props.active === item[0] ? "active" : ""), onClick: function () { props.onChange(item[0]); } }, h("span", null, item[2]));
+        })),
+        h("div", { className: "sidebar-rail " + (scrollbar.visible ? "visible" : ""), ref: railRef, onPointerDown: jumpSidebarScroll, "aria-hidden": "true" },
+          h("span", { className: "sidebar-thumb", style: { height: scrollbar.height + "px", transform: "translateY(" + scrollbar.top + "px)" }, onPointerDown: startSidebarThumbDrag, onPointerMove: moveSidebarThumb, onPointerUp: stopSidebarThumbDrag, onPointerCancel: stopSidebarThumbDrag }))));
   }
 
   function Metric(props) {
@@ -186,8 +243,8 @@
 
   function shortHash(value) { return value ? String(value).slice(0, 10) : "—"; }
   function timeText(value) { return value ? new Date(value).toLocaleString() : "—"; }
-  function pathToView(path) { return path === "/prompts" ? "prompts" : (path === "/model-profiles" ? "modelProfiles" : (path === "/ai-traces" ? "traces" : (path === "/ai-observability" ? "observability" : (path === "/drain-quality" ? "drainQuality" : (path === "/rules" ? "rules" : (path.startsWith("/node-risks") ? "nodeRisks" : (path === "/semantic-library" ? "semanticLibrary" : (path === "/settings" ? "settings" : "overview")))))))); }
-  function routeForView(view) { return view === "prompts" ? "/prompts" : (view === "modelProfiles" ? "/model-profiles" : (view === "traces" ? "/ai-traces" : (view === "observability" ? "/ai-observability" : (view === "drainQuality" ? "/drain-quality" : (view === "rules" ? "/rules" : (view === "nodeRisks" ? "/node-risks" : (view === "semanticLibrary" ? "/semantic-library" : (view === "settings" ? "/settings" : "/")))))))); }
+  function pathToView(path) { return path === "/benchmark-center" ? "benchmarkCenter" : (path === "/prompts" ? "prompts" : (path === "/model-profiles" ? "modelProfiles" : (path === "/ai-traces" ? "traces" : (path === "/ai-observability" ? "observability" : (path === "/drain-quality" ? "drainQuality" : (path === "/rules" ? "rules" : (path.startsWith("/node-risks") ? "nodeRisks" : (path === "/semantic-library" ? "semanticLibrary" : (path === "/settings" ? "settings" : "overview"))))))))); }
+  function routeForView(view) { return view === "benchmarkCenter" ? "/benchmark-center" : (view === "prompts" ? "/prompts" : (view === "modelProfiles" ? "/model-profiles" : (view === "traces" ? "/ai-traces" : (view === "observability" ? "/ai-observability" : (view === "drainQuality" ? "/drain-quality" : (view === "rules" ? "/rules" : (view === "nodeRisks" ? "/node-risks" : (view === "semanticLibrary" ? "/semantic-library" : (view === "settings" ? "/settings" : "/"))))))))); }
   function traceFiltersFromSearch(search) {
     const params = new URLSearchParams(search || "");
     return { job_id: params.get("job_id") || "", trace_id: params.get("trace_id") || "", status: params.get("status") || "", prompt_id: params.get("prompt_id") || "" };
@@ -1098,6 +1155,71 @@
     );
   }
 
+  function BenchmarkCenterPage(props) {
+    const data = props.data || {};
+    const suites = data.suites || [], runs = data.runs || [], leaderboard = data.leaderboard || [], trends = data.trends || [];
+    const completedRuns = runs.filter(function (run) { return run.status === "completed"; });
+    const [tab, setTab] = useState("overview"), [suiteId, setSuiteId] = useState(""), [mode, setMode] = useState("fake");
+    const [caseLimit, setCaseLimit] = useState(1), [prompt, setPrompt] = useState(""), [profile, setProfile] = useState("");
+    const [budget, setBudget] = useState(4000), [confirmed, setConfirmed] = useState(false), [baseline, setBaseline] = useState(""), [candidate, setCandidate] = useState("");
+    const [working, setWorking] = useState(false), [gateResult, setGateResult] = useState(null);
+    useEffect(function () {
+      if (!suiteId && suites[0]) { setSuiteId(suites[0].suite_id); setCaseLimit(Math.max(1, suites[0].case_count || 1)); }
+      if (!baseline && completedRuns[1]) setBaseline(completedRuns[1].run_id);
+      if (!candidate && completedRuns[0]) setCandidate(completedRuns[0].run_id);
+      if (!prompt && props.prompts && props.prompts[0]) setPrompt(props.prompts[0].prompt_id);
+      if (!profile && props.profiles && props.profiles[0]) setProfile(props.profiles[0].profile_id);
+    }, [suites.length, completedRuns.length, props.prompts && props.prompts.length, props.profiles && props.profiles.length]);
+    const tabs = [["overview", "质量总览"], ["prompts", "Prompt 对比"], ["models", "模型排行榜"], ["failures", "失败 Case"], ["trends", "质量趋势"], ["gates", "发布门禁"]];
+    const latest = data.overview && data.overview.latest_metrics || {};
+    const assets = data.overview && data.overview.source_assets || {};
+    const selectedProfile = (props.profiles || []).find(function (item) { return item.profile_id === profile; }) || {};
+    const failures = data.selectedRun && data.selectedRun.cases && data.selectedRun.cases.items ? data.selectedRun.cases.items.filter(function (item) { return !item.passed; }) : [];
+    function percent(value) { return Math.round(Number(value || 0) * 100) + "%"; }
+    function diagnostic() {
+      const value = JSON.stringify({ page: "benchmark-center", api_base: currentApiBase(), failure: data.failure || null }, null, 2);
+      if (navigator.clipboard) navigator.clipboard.writeText(value);
+    }
+    async function createRun() {
+      const suite = suites.find(function (item) { return item.suite_id === suiteId; }) || {};
+      const payload = { suite_id: suiteId, mode: mode, case_limit: Math.min(Number(caseLimit), Number(suite.case_count || caseLimit)), prompt_id: prompt || null, model_profile_id: profile || null, timeout_seconds: 120, retry_count: 1, budget_units: Number(budget), confirmed: mode !== "real" || confirmed, idempotency_key: "ui-" + Date.now() };
+      setWorking(true);
+      try { await props.onCreateRun(payload); }
+      finally { setWorking(false); }
+    }
+    async function evaluateGate() {
+      setWorking(true);
+      try { setGateResult(await props.onEvaluateGate({ baseline_run_id: baseline, candidate_run_id: candidate, thresholds: { min_pass_rate: 0.8, min_schema_valid_rate: 0.95, min_template_reference_accuracy: 0.95, max_pass_rate_drop: 0.05, max_latency_increase_percent: 20 }, operator: "local-reviewer" })); }
+      finally { setWorking(false); }
+    }
+    if (data.loading) return h("div", { className: "benchmark-page" }, h("div", { className: "benchmark-state" }, h("b", null, "正在加载评测资产"), h("span", null, "统一读取 Eval、Trace、模型 Profile 与 Drain3 质量数据…")));
+    if (data.failure) return h("div", { className: "benchmark-page" }, h("div", { className: "benchmark-state error" }, h("b", null, "Benchmark 数据加载失败"), h("span", null, data.failure), h("div", null, h("button", { className: "secondary-button", onClick: props.onRefresh }, "重试"), h("button", { className: "text-button", onClick: diagnostic }, "复制诊断信息"))));
+    return h("div", { className: "benchmark-page" },
+      h("section", { className: "benchmark-hero" }, h("div", null, h("span", { className: "eyebrow" }, "EVAL & BENCHMARK CENTER"), h("h2", null, "评测与基准"), h("p", null, "统一比较 Prompt、模型与版本质量；门禁只输出人工决策依据，不自动修改生产资产。")), h("button", { className: "secondary-button", onClick: props.onRefresh }, "刷新数据")),
+      h("nav", { className: "benchmark-tabs" }, tabs.map(function (item) { return h("button", { key: item[0], className: tab === item[0] ? "active" : "", onClick: function () { setTab(item[0]); } }, item[1]); })),
+      h("section", { className: "surface benchmark-launcher" }, h("div", { className: "surface-head" }, h("div", null, h("b", null, "新建 Benchmark Run"), h("span", null, "Fake/历史回放默认安全；真实模型必须锁定预算并人工确认")), h("span", { className: "status-chip active" }, working ? "执行中" : "待创建")),
+        h("div", { className: "benchmark-form" },
+          h("label", null, h("span", null, "Suite"), h("select", { value: suiteId, onChange: function (event) { const value = event.target.value; const suite = suites.find(function (item) { return item.suite_id === value; }) || {}; setSuiteId(value); setCaseLimit(Math.max(1, suite.case_count || 1)); } }, suites.map(function (suite) { return h("option", { value: suite.suite_id, key: suite.suite_id }, suite.name + " · " + suite.case_count + " cases"); }))),
+          h("label", null, h("span", null, "运行模式"), h("select", { value: mode, onChange: function (event) { setMode(event.target.value); setConfirmed(false); } }, h("option", { value: "fake" }, "Fake Model"), h("option", { value: "history" }, "历史 Trace 回放"), h("option", { value: "real" }, "真实模型矩阵"))),
+          h("label", null, h("span", null, "Case 数"), h("input", { type: "number", min: 1, value: caseLimit, onChange: function (event) { setCaseLimit(event.target.value); } })),
+          h("label", null, h("span", null, "Prompt"), h("select", { value: prompt, onChange: function (event) { setPrompt(event.target.value); } }, h("option", { value: "" }, "未锁定"), (props.prompts || []).map(function (item) { return h("option", { value: item.prompt_id, key: item.prompt_id }, item.prompt_id); }))),
+          h("label", null, h("span", null, "模型 Profile"), h("select", { value: profile, onChange: function (event) { setProfile(event.target.value); } }, h("option", { value: "" }, "未锁定"), (props.profiles || []).map(function (item) { return h("option", { value: item.profile_id, key: item.profile_id }, item.display_name || item.profile_id); }))),
+          h("label", null, h("span", null, "运行连接"), h("div", { className: "benchmark-connection-state " + (selectedProfile.connection_ready ? "ready" : "unavailable") }, selectedProfile.connection_ready ? ((selectedProfile.provider || "Provider") + " · " + (selectedProfile.connection_id || "连接可用")) : "连接不可用，不能启动真实模型评测")),
+          h("label", null, h("span", null, "预算单位"), h("input", { type: "number", min: 1, value: budget, onChange: function (event) { setBudget(event.target.value); } })),
+          mode === "real" && h("label", { className: "benchmark-confirm" }, h("input", { type: "checkbox", checked: confirmed, onChange: function (event) { setConfirmed(event.target.checked); } }), h("span", null, "真实模型运行会产生调用成本，必须人工确认")),
+          h("button", { className: "primary-button", disabled: working || !suiteId || (mode === "real" && (!confirmed || !prompt || !profile || !selectedProfile.connection_ready)), onClick: createRun }, working ? "创建中…" : "创建评测"))),
+      !runs.length && h("div", { className: "benchmark-state" }, h("b", null, "暂无评测运行"), h("span", null, "先使用 Fake Model 建立第一条可比较基线。")),
+      tab === "overview" && h(React.Fragment, null,
+        h("section", { className: "benchmark-metrics" }, [[percent(latest.pass_rate), "通过率"], [percent(latest.schema_valid_rate), "Schema 有效率"], [percent(latest.template_reference_accuracy), "模板引用准确率"], [String(latest.latency_p95_ms || 0) + " ms", "P95 延迟"], [String(data.overview && data.overview.completed_run_count || 0), "已完成 Run"]].map(function (item) { return h("div", { key: item[1] }, h("b", null, item[0]), h("span", null, item[1])); })),
+        h("section", { className: "surface benchmark-source-assets" }, h("div", { className: "surface-head" }, h("div", null, h("b", null, "统一资产来源"), h("span", null, "只统计脱敏评测资产，不读取或展示原始日志"))), h("div", null, [["AI Trace", assets.ai_traces], ["模型 Profile", assets.model_profiles], ["Prompt", assets.prompt_templates], ["Drain3 评测", assets.drain_eval_runs], ["Drain3 模板", assets.drain_templates], ["Canonical Case", assets.canonical_eval_cases]].map(function (item) { return h("span", { key: item[0] }, h("b", null, String(item[1] || 0)), h("small", null, item[0])); }))),
+        h("section", { className: "surface benchmark-run-table" }, h("div", { className: "surface-head" }, h("b", null, "最近运行"), h("span", null, runs.length + " 条")), runs.slice(0, 8).map(function (run) { return h("button", { key: run.run_id, onClick: function () { props.onSelectRun(run.run_id); } }, h("span", null, h("b", null, run.run_id), h("small", null, run.mode + " · " + timeText(run.created_at))), h("span", { className: "status-chip " + run.status }, run.status), h("span", null, percent(run.metrics && run.metrics.pass_rate), h("small", null, "通过率")), h("span", null, run.progress.completed + "/" + run.progress.total)); }))),
+      tab === "prompts" && h("section", { className: "surface benchmark-card-grid" }, completedRuns.map(function (run) { return h("article", { key: run.run_id }, h("span", { className: "eyebrow" }, "PROMPT SNAPSHOT"), h("h3", null, run.snapshot.prompt_id || "未锁定 Prompt"), h("p", null, (run.snapshot.model_profile_id || "未锁定模型") + " · " + run.run_id), h("b", null, percent(run.metrics.pass_rate)), h("small", null, "通过率 · Schema " + percent(run.metrics.schema_valid_rate))); })),
+      tab === "models" && h("section", { className: "surface benchmark-leaderboard" }, h("div", { className: "surface-head" }, h("b", null, "模型排行榜"), h("span", null, "固定 Dataset 与 Prompt 后比较")), leaderboard.map(function (item, index) { return h("div", { key: item.run_id }, h("b", null, "#" + (index + 1)), h("span", null, h("strong", null, item.model_profile_id), h("small", null, item.prompt_id || "未锁定 Prompt")), h("span", null, percent(item.pass_rate)), h("span", null, item.latency_p95_ms + " ms")); })),
+      tab === "failures" && h("section", { className: "surface benchmark-failures" }, h("div", { className: "surface-head" }, h("b", null, "失败 Case"), h("select", { value: data.selectedRun && data.selectedRun.run && data.selectedRun.run.run_id || "", onChange: function (event) { props.onSelectRun(event.target.value); } }, runs.map(function (run) { return h("option", { key: run.run_id, value: run.run_id }, run.run_id); }))), !failures.length && h("div", { className: "empty-state compact" }, "当前 Run 没有失败 Case"), failures.map(function (item) { return h("article", { key: item.case_id }, h("div", null, h("b", null, item.case_id), h("span", { className: "status-chip failed" }, item.error_type || "failed")), h("p", null, (item.result.errors || []).join("；") || "未记录失败详情"), h("small", null, "Schema " + (item.schema_valid ? "通过" : "失败") + " · Template Ref " + (item.template_reference_ok ? "通过" : "失败"))); })),
+      tab === "trends" && h("section", { className: "surface benchmark-trends" }, h("div", { className: "surface-head" }, h("b", null, "质量趋势"), h("span", null, trends.length + " 个数据点")), trends.map(function (item) { const value = Number(item.metrics.pass_rate || 0); return h("div", { key: item.run_id }, h("span", null, timeText(item.created_at)), h("i", null, h("em", { style: { width: Math.round(value * 100) + "%" } })), h("b", null, percent(value)), h("small", null, item.snapshot.model_profile_id || item.run_id)); })),
+      tab === "gates" && h("section", { className: "surface benchmark-gate" }, h("div", { className: "surface-head" }, h("div", null, h("b", null, "发布门禁"), h("span", null, "比较基线和候选；结果不会自动发布任何生产资产"))), h("div", { className: "gate-form" }, h("label", null, "基线 Run", h("select", { value: baseline, onChange: function (event) { setBaseline(event.target.value); } }, completedRuns.map(function (run) { return h("option", { value: run.run_id, key: run.run_id }, run.run_id); }))), h("span", null, "→"), h("label", null, "候选 Run", h("select", { value: candidate, onChange: function (event) { setCandidate(event.target.value); } }, completedRuns.map(function (run) { return h("option", { value: run.run_id, key: run.run_id }, run.run_id); }))), h("button", { className: "primary-button", disabled: working || !baseline || !candidate, onClick: evaluateGate }, "执行门禁")), gateResult && h("div", { className: "gate-result " + gateResult.decision }, h("b", null, gateResult.decision), h("p", null, (gateResult.reasons || []).join("；")), h("code", null, JSON.stringify(gateResult.deltas)))));
+  }
+
   function App() {
     const [view, setView] = useState(pathToView(window.location.pathname)), [model, setModel] = useState("qwen3:1.7b"), [threshold, setThreshold] = useState(40), [promptId, setPromptId] = useState("feature_extract_v3_compact_strict_json_en"), [retryCount, setRetryCount] = useState(1);
     const [ollama, setOllama] = useState({ online: false }), [result, setResult] = useState(null), [fileName, setFileName] = useState("");
@@ -1117,6 +1239,9 @@
     const [nodeRiskCatalog, setNodeRiskCatalog] = useState({ items: [], total: 0 }), [selectedNodeRisk, setSelectedNodeRisk] = useState(null);
     const [riskSemanticCatalog, setRiskSemanticCatalog] = useState({ items: [] }), [selectedRiskSemanticId, setSelectedRiskSemanticId] = useState("");
     const [riskSemanticVersions, setRiskSemanticVersions] = useState([]), [unclassifiedRiskSemantics, setUnclassifiedRiskSemantics] = useState([]);
+    const [benchmarkData, setBenchmarkData] = useState({ overview: {}, suites: [], runs: [], trends: [], leaderboard: [], selectedRun: null, loading: false, failure: "" });
+    const [sidebarCollapsed, setSidebarCollapsed] = useState(false), [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+    const [narrowSidebar, setNarrowSidebar] = useState(function () { return window.matchMedia("(max-width: 900px)").matches; });
     const events = useRef(null);
     const selected = useMemo(function () { return snapshot && snapshot.features && snapshot.features.find(function (feature) { return feature.candidate_id === selectedId; }) || null; }, [snapshot, selectedId]);
     useEffect(function () {
@@ -1126,13 +1251,25 @@
         return features.length ? features[0].candidate_id : null;
       });
     }, [snapshot]);
+    useEffect(function () {
+      const media = window.matchMedia("(max-width: 900px)");
+      function updateSidebarMode(event) { setNarrowSidebar(event.matches); setMobileMenuOpen(false); }
+      media.addEventListener("change", updateSidebarMode);
+      return function () { media.removeEventListener("change", updateSidebarMode); };
+    }, []);
     function changeView(next) {
       setView(next);
+      setMobileMenuOpen(false);
       history.pushState({}, "", routeForView(next));
       if (next === "drainQuality") loadDrainQuality().catch(function (reason) { setError(reason.message); });
       if (next === "rules") loadRules().catch(function (reason) { setError(reason.message); });
       if (next === "nodeRisks") loadNodeRisks().catch(function (reason) { setError(reason.message); });
       if (next === "semanticLibrary") loadRiskSemantics().catch(function (reason) { setError(reason.message); });
+      if (next === "benchmarkCenter") loadBenchmark().catch(function () {});
+    }
+    function toggleSidebar() {
+      if (narrowSidebar) setMobileMenuOpen(function (open) { return !open; });
+      else setSidebarCollapsed(function (collapsed) { return !collapsed; });
     }
     function applyTraceFilters(next) {
       const query = traceFilterQuery(next);
@@ -1151,6 +1288,22 @@
     async function changeNodeEvent(eventId, action) { await (action === "acknowledge" ? api.acknowledgeNodeEvent : api.recoverNodeEvent)(eventId, { operator: "local-operator", reason: action === "acknowledge" ? "人工确认风险事件" : "人工确认风险已恢复" }); await loadNodeRisks(); if (selectedNodeRisk) await selectNodeRisk(selectedNodeRisk); }
     async function selectRiskSemantic(id) { setSelectedRiskSemanticId(id); const value = await api.riskSemanticVersions(id); setRiskSemanticVersions(value.items || []); }
     async function loadRiskSemantics() { const values = await Promise.all([api.riskSemantics(), api.unclassifiedRiskSemantics()]); const value = values[0]; setRiskSemanticCatalog(value); setUnclassifiedRiskSemantics(values[1].items || []); const target = selectedRiskSemanticId || value.items && value.items[0] && value.items[0].id; if (target) await selectRiskSemantic(target); return value; }
+    async function loadBenchmark(selectedRunId) {
+      setBenchmarkData(function (current) { return Object.assign({}, current, { loading: true, failure: "" }); });
+      try {
+        const values = await Promise.all([api.benchmarkOverview(), api.benchmarkSuites(), api.benchmarkRuns(), api.benchmarkTrends(), api.benchmarkLeaderboard()]);
+        const runs = values[2].items || [];
+        const target = selectedRunId || (benchmarkData.selectedRun && benchmarkData.selectedRun.run && benchmarkData.selectedRun.run.run_id) || (runs[0] && runs[0].run_id);
+        const detail = target ? await api.benchmarkRun(target) : null;
+        setBenchmarkData({ overview: values[0], suites: values[1].items || [], runs: runs, trends: values[3].items || [], leaderboard: values[4].items || [], selectedRun: detail, loading: false, failure: "" });
+        return detail;
+      } catch (reason) {
+        setBenchmarkData(function (current) { return Object.assign({}, current, { loading: false, failure: reason.message || "未知错误" }); });
+        throw reason;
+      }
+    }
+    async function createBenchmarkRun(payload) { const created = await api.createBenchmarkRun(payload); await loadBenchmark(created.run_id); return created; }
+    async function evaluateBenchmarkGate(payload) { const gate = await api.evaluateBenchmarkGate(payload); await loadBenchmark(payload.candidate_run_id); return gate; }
     async function saveRiskSemantic(selectedRule, content) { let target = selectedRule.id; if (selectedRule.source === "builtin") { const override = Object.assign({}, content, { id: "user." + selectedRule.id.replace(/^builtin\./, ""), source: "user", override_of: selectedRule.id, operator: "local-operator", reason: "创建内置语义覆盖" }); await api.createRiskSemantic(override); target = override.id; setSelectedRiskSemanticId(target); } else { await api.updateRiskSemantic(selectedRule.id, { changes: content, expected_version: selectedRule.version, operator: "local-operator", reason: "编辑风险语义" }); } await loadRiskSemantics(); await selectRiskSemantic(target); }
     async function publishRiskSemantic(rule) { await api.publishRiskSemantic(rule.id, { expected_version: rule.version, confirmed: true, operator: "local-operator", reason: "人工验证后发布" }); await loadRiskSemantics(); }
     async function loadRules() {
@@ -1170,8 +1323,8 @@
     async function refresh(id) { const next = await api.job(id || jobId); setSnapshot(next); if (["completed", "completed_with_errors"].includes(next.status) && events.current) events.current.close(); loadHarness().catch(function () {}); }
     useEffect(function () {
       const query = window.location.pathname === "/ai-traces" ? traceFilterQuery(traceFiltersFromSearch(window.location.search)) : "?limit=50";
-      Promise.all([api.config(), api.status(), Promise.all([api.governedRules("?page_size=100"), api.ruleReviewQueue()]), api.metrics(), api.harnessStatus(), api.prompts(), api.traces(query), api.modelProfiles()]).then(function (values) { setModel(values[0].default_model); setOllama(values[1]); setRules(values[2][0].items || []); setRuleReviewQueue(values[2][1]); setSystemMetrics(values[3]); setHarness(values[4]); setPrompts(values[5].items || []); setPromptId(values[5].current_prompt_id || values[4].current_prompt_id || "feature_extract_v3_compact_strict_json_en"); setTraces(values[6].items || []); setModelProfiles(values[7]); setModelProfileId(values[7].default_profile_id || ""); if (window.location.pathname === "/ai-observability") loadObservability().catch(function (reason) { setError(reason.message); }); if (window.location.pathname === "/drain-quality") loadDrainQuality().catch(function (reason) { setError(reason.message); }); if (window.location.pathname.startsWith("/node-risks")) loadNodeRisks().catch(function (reason) { setError(reason.message); }); if (window.location.pathname === "/semantic-library") loadRiskSemantics().catch(function (reason) { setError(reason.message); }); }).catch(function (reason) { setError(reason.message); });
-      function onPop() { const filters = traceFiltersFromSearch(window.location.search); setView(pathToView(window.location.pathname)); setTraceFilters(filters); if (window.location.pathname === "/ai-traces") loadHarness(traceFilterQuery(filters)).catch(function () {}); if (window.location.pathname === "/ai-observability") loadObservability().catch(function () {}); if (window.location.pathname === "/drain-quality") loadDrainQuality().catch(function () {}); if (window.location.pathname === "/rules") loadRules().catch(function () {}); if (window.location.pathname.startsWith("/node-risks")) loadNodeRisks().catch(function () {}); if (window.location.pathname === "/semantic-library") loadRiskSemantics().catch(function () {}); }
+      Promise.all([api.config(), api.status(), Promise.all([api.governedRules("?page_size=100"), api.ruleReviewQueue()]), api.metrics(), api.harnessStatus(), api.prompts(), api.traces(query), api.modelProfiles()]).then(function (values) { setModel(values[0].default_model); setOllama(values[1]); setRules(values[2][0].items || []); setRuleReviewQueue(values[2][1]); setSystemMetrics(values[3]); setHarness(values[4]); setPrompts(values[5].items || []); setPromptId(values[5].current_prompt_id || values[4].current_prompt_id || "feature_extract_v3_compact_strict_json_en"); setTraces(values[6].items || []); setModelProfiles(values[7]); setModelProfileId(values[7].default_profile_id || ""); if (window.location.pathname === "/ai-observability") loadObservability().catch(function (reason) { setError(reason.message); }); if (window.location.pathname === "/drain-quality") loadDrainQuality().catch(function (reason) { setError(reason.message); }); if (window.location.pathname.startsWith("/node-risks")) loadNodeRisks().catch(function (reason) { setError(reason.message); }); if (window.location.pathname === "/semantic-library") loadRiskSemantics().catch(function (reason) { setError(reason.message); }); if (window.location.pathname === "/benchmark-center") loadBenchmark().catch(function () {}); }).catch(function (reason) { setError(reason.message); });
+      function onPop() { const filters = traceFiltersFromSearch(window.location.search); setView(pathToView(window.location.pathname)); setTraceFilters(filters); if (window.location.pathname === "/ai-traces") loadHarness(traceFilterQuery(filters)).catch(function () {}); if (window.location.pathname === "/ai-observability") loadObservability().catch(function () {}); if (window.location.pathname === "/drain-quality") loadDrainQuality().catch(function () {}); if (window.location.pathname === "/rules") loadRules().catch(function () {}); if (window.location.pathname.startsWith("/node-risks")) loadNodeRisks().catch(function () {}); if (window.location.pathname === "/semantic-library") loadRiskSemantics().catch(function () {}); if (window.location.pathname === "/benchmark-center") loadBenchmark().catch(function () {}); }
       window.addEventListener("popstate", onPop);
       return function () { window.removeEventListener("popstate", onPop); if (events.current) events.current.close(); };
     }, []);
@@ -1182,6 +1335,11 @@
       const timer = setInterval(function () { if (!document.hidden) loadObservability(obsProgress.job_id).catch(function (reason) { setError(reason.message); }); }, 2000);
       return function () { clearInterval(timer); };
     }, [view, obsProgress && obsProgress.job_id, obsProgress && obsProgress.status]);
+    useEffect(function () {
+      if (view !== "benchmarkCenter" || !(benchmarkData.runs || []).some(function (run) { return run.status === "pending" || run.status === "running"; })) return;
+      const timer = setInterval(function () { if (!document.hidden) loadBenchmark().catch(function () {}); }, 1500);
+      return function () { clearInterval(timer); };
+    }, [view, (benchmarkData.runs || []).map(function (run) { return run.run_id + ":" + run.status; }).join("|")]);
     async function loadFile(file) { if (!file) return; setBusy(true); setError(""); setUploadProgress(null); setPreprocessProgress(null); try { const next = file.size > INLINE_MAX_BYTES ? await api.uploadAndAnalyzeLargeFile(file, { onUploadProgress: setUploadProgress, onPreprocessProgress: setPreprocessProgress }) : await api.analyzeFile(file); setResult(next); setFileName(file.name); setSnapshot(null); setJobId(null); changeView("overview"); } catch (reason) { setError(reason.message); } finally { setBusy(false); } }
     async function start() { if (!result) return; setBusy(true); setError(""); try { const created = await api.createJob(result, model, threshold, promptId, modelProfileId, retryCount); setJobId(created.job_id); changeView("queue"); await refresh(created.job_id); if (events.current) events.current.close(); events.current = api.subscribe(created.job_id, function () { refresh(created.job_id).catch(function (reason) { setError(reason.message); }); }); } catch (reason) { setError(reason.message); } finally { setBusy(false); } }
     async function save(changes) { try { await api.update(jobId, selectedId, changes); await refresh(); await loadRules(); } catch (reason) { setError(reason.message); } }
@@ -1221,11 +1379,12 @@
     const selectedModelProfile = activeProfiles.find(function (profile) { return profile.profile_id === modelProfileId; }) || {};
     const traceRule = drawer.item && rules.find(function (rule) { return rule.lineage && rule.lineage.trace_id === drawer.item.trace_id; });
     const drawerContent = !drawer.item ? null : (drawer.type === "prompt" ? h(PromptDrawer, { item: drawer.item, onSave: savePrompt, onOpenTrace: openTrace }) : h(TraceDrawer, { item: drawer.item, rule: traceRule, onOpenRule: openRule }));
-    return h("div", { className: "app-shell" },
-      h("header", { className: "topbar" }, h("div", { className: "brand" }, h("i", null, "L"), h("div", null, h("b", null, "LOGRISK"), h("span", null, "FEATURE REVIEW"))), h("div", { className: "system-status" }, h("span", { className: ollama.online ? "online" : "offline" }, "● Ollama " + (ollama.online ? "在线" : "离线")), h("span", null, model), h("button", { className: "prompt-pill", onClick: function () { changeView("prompts"); } }, "Prompt " + (harness.current_prompt_id || promptId)), h("span", { className: harness.trace_enabled ? "trace-on" : "trace-off" }, "● Trace " + (harness.trace_enabled ? "ON" : "OFF")))),
+    return h("div", { className: "app-shell" + (sidebarCollapsed ? " sidebar-collapsed" : "") + (mobileMenuOpen ? " mobile-menu-open" : "") },
+      h("header", { className: "topbar" }, h("div", { className: "topbar-left" }, h("button", { className: "sidebar-toggle", type: "button", "aria-label": narrowSidebar ? (mobileMenuOpen ? "关闭菜单" : "打开菜单") : (sidebarCollapsed ? "展开菜单" : "折叠菜单"), "aria-controls": "primary-navigation", "aria-expanded": narrowSidebar ? mobileMenuOpen : !sidebarCollapsed, onClick: toggleSidebar }, h("i"), h("i"), h("i")), h("div", { className: "brand" }, h("i", null, "L"), h("div", null, h("b", null, "LOGRISK"), h("span", null, "FEATURE REVIEW")))), h("div", { className: "system-status" }, h("span", { className: ollama.online ? "online" : "offline" }, "● Ollama " + (ollama.online ? "在线" : "离线")), h("span", null, model), h("button", { className: "prompt-pill", onClick: function () { changeView("prompts"); } }, "Prompt " + (harness.current_prompt_id || promptId)), h("span", { className: harness.trace_enabled ? "trace-on" : "trace-off" }, "● Trace " + (harness.trace_enabled ? "ON" : "OFF")))),
       h(Sidebar, { active: view, onChange: changeView }),
+      h("button", { className: "sidebar-overlay", type: "button", "aria-label": "关闭菜单", onClick: function () { setMobileMenuOpen(false); } }),
       h("main", null,
-        !["drainQuality", "settings", "rules", "nodeRisks", "semanticLibrary"].includes(view) && h("div", { className: "page-head" }, h("div", null, h("h1", null, "日志特征工作台"), h("p", null, "上传日志、复用规则、识别未知特征并人工审批")), h("label", { className: "new-analysis" }, "＋ 新建分析", h("input", { type: "file", onChange: function (event) { loadFile(event.target.files && event.target.files[0]); } }))),
+        !["drainQuality", "benchmarkCenter", "settings", "rules", "nodeRisks", "semanticLibrary"].includes(view) && h("div", { className: "page-head" }, h("div", null, h("h1", null, "日志特征工作台"), h("p", null, "上传日志、复用规则、识别未知特征并人工审批")), h("label", { className: "new-analysis" }, "＋ 新建分析", h("input", { type: "file", onChange: function (event) { loadFile(event.target.files && event.target.files[0]); } }))),
         error && h("div", { className: "error-banner" }, error, h("button", { onClick: function () { setError(""); } }, "×")),
         view === "overview" && h(React.Fragment, null,
           h("section", { className: "upload-panel" }, h("div", null, h("b", null, fileName || "选择 result.json、JSONL、TXT、LOG、GZ 或无后缀日志"), h("span", null, result ? (result.risk_entities || []).length + " 个风险实体，已完成本地预处理" : "10MB 以内直接分析；超过 10MB 自动分片上传，Linux messages / syslog 无后缀文件也支持上传")), busy && h("div", { className: "upload-progress" }, uploadProgress && h("span", null, "上传进度：" + Math.round((uploadProgress.progress || 0) * 100) + "%（" + uploadProgress.received_chunks + " / " + uploadProgress.total_chunks + " chunks）"), preprocessProgress && h("span", null, "预处理阶段：" + (preprocessProgress.stage || "queued") + "，记录 " + (preprocessProgress.records_parsed || 0) + (preprocessProgress.drain3_partitions_total ? "，Drain3 分片 " + (preprocessProgress.drain3_partitions_completed || 0) + " / " + preprocessProgress.drain3_partitions_total : ""))), h("div", { className: "analysis-config" }, h("label", null, "分析流程", h("select", { value: "feature_extract", disabled: true }, h("option", { value: "feature_extract" }, "日志特征识别"))), h("label", null, "模型 Profile", h("select", { value: modelProfileId, onChange: function (event) { const profile = activeProfiles.find(function (item) { return item.profile_id === event.target.value; }) || {}; setModelProfileId(event.target.value); if (profile.model) setModel(profile.model); if (profile.default_prompt_id) setPromptId(profile.default_prompt_id); } }, activeProfiles.map(function (profile) { return h("option", { value: profile.profile_id, key: profile.profile_id }, (profile.display_name || profile.profile_id) + " · " + profile.provider); }))), h("label", null, "Provider / 连接", h("input", { value: (selectedModelProfile.provider || "—") + " / " + (selectedModelProfile.connection_id || "—"), disabled: true })), h("label", null, "模型", h("input", { value: model, onChange: function (event) { setModel(event.target.value); } })), h("label", null, "Prompt", h("select", { value: promptId, onChange: function (event) { setPromptId(event.target.value); } }, activePrompts.map(function (prompt) { return h("option", { value: prompt.prompt_id, key: prompt.prompt_id }, prompt.prompt_id); }))), h("label", null, "重试次数", h("select", { value: retryCount, onChange: function (event) { setRetryCount(Number(event.target.value)); } }, [0, 1, 2, 3].map(function (count) { return h("option", { value: count, key: count }, count + " 次"); }))), h("label", null, "阈值", h("input", { type: "number", value: threshold, onChange: function (event) { setThreshold(event.target.value); } })), h("button", { className: "primary-button", disabled: !result || busy, onClick: start }, busy ? "处理中…" : "开始识别"))), h(MetricsGrid, { snapshot: snapshot, result: result, daily: systemMetrics }), h(LiveProcessing, { snapshot: snapshot, result: result })),
@@ -1242,6 +1401,7 @@
         view === "nodeRisks" && h(NodeRiskPage, { catalog: nodeRiskCatalog, selected: selectedNodeRisk, onRefresh: loadNodeRisks, onSelect: function (item) { selectNodeRisk(item).catch(function (reason) { setError(reason.message); }); }, onEvent: function (eventId, action) { changeNodeEvent(eventId, action).catch(function (reason) { setError(reason.message); }); } }),
         view === "semanticLibrary" && h(SemanticLibraryPage, { catalog: riskSemanticCatalog, selectedId: selectedRiskSemanticId, versions: riskSemanticVersions, unclassified: unclassifiedRiskSemantics, onSelect: function (id) { selectRiskSemantic(id).catch(function (reason) { setError(reason.message); }); }, onRefresh: loadRiskSemantics, onSave: function (rule, content) { saveRiskSemantic(rule, content).catch(function (reason) { setError(reason.message); }); }, onPublish: function (rule) { publishRiskSemantic(rule).catch(function (reason) { setError(reason.message); }); }, onTest: api.testRiskSemantic }),
         view === "drainQuality" && h(DrainQualityPage, { data: drainQuality, onRefresh: loadDrainQuality, onImport: importCurrentTemplates, onAnnotate: annotateTemplate, onTemplateChange: changeTemplate, onTemplateRollback: rollbackTemplate, onProfile: changeDrainProfile, onConfigCreate: createDrainConfig, onConfigLoadVersion: loadDrainConfigVersion, onConfigSave: saveDrainConfig, onConfigValidate: validateDrainConfig, onConfigPublish: publishDrainConfig, onConfigRollback: rollbackDrainConfig, onSemanticCreate: createSemanticCandidate, onSemanticLoadVersion: loadSemanticDictionaryVersion, onSemanticSave: saveSemanticDictionary, onSemanticValidate: validateSemanticDictionary, onSemanticPublish: publishSemanticDictionary, onSemanticRollback: rollbackSemanticDictionary, onSemanticTest: testSemanticDictionary }),
+        view === "benchmarkCenter" && h(BenchmarkCenterPage, { data: benchmarkData, prompts: activePrompts, profiles: activeProfiles, onRefresh: loadBenchmark, onCreateRun: createBenchmarkRun, onSelectRun: loadBenchmark, onEvaluateGate: evaluateBenchmarkGate }),
         view === "settings" && h(BackendSettings, { onSaved: function () { setError(""); } }),
         view === "export" && h("section", { className: "surface export-surface" }, h("h2", null, "导出记录"), h("p", null, "导出包只包含人工批准或历史规则复用的脱敏特征，不包含原始日志和 RCA 结论。"), h("button", { className: "primary-button", disabled: !jobId || !(snapshot && snapshot.features || []).some(function (feature) { return feature.status === "approved"; }), onClick: function () { api.exportApproved(jobId).catch(function (reason) { setError(reason.message); }); } }, "导出已批准特征 JSON"))),
       h(Drawer, { title: drawer.type === "prompt" ? "Prompt 详情" : "Trace 详情", subtitle: drawer.item && (drawer.item.prompt_id || drawer.item.trace_id), item: drawer.item, onClose: function () { setDrawer({ type: null, item: null }); } }, drawerContent));

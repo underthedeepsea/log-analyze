@@ -88,12 +88,12 @@ class SQLiteFeatureJobStore:
                 job = json.loads(row["job_json"])
                 job["entities"] = [
                     json.loads(item[0]) for item in connection.execute(
-                        "SELECT entity_json FROM feature_job_entities WHERE job_id=? ORDER BY rowid", (row["job_id"],)
+                        "SELECT entity_json FROM feature_job_entities WHERE job_id=? ORDER BY updated_at, entity_id", (row["job_id"],)
                     )
                 ]
                 job["features"] = {
                     item[0]: json.loads(item[1]) for item in connection.execute(
-                        "SELECT candidate_id, candidate_json FROM feature_candidates WHERE job_id=? ORDER BY rowid", (row["job_id"],)
+                        "SELECT candidate_id, candidate_json FROM feature_candidates WHERE job_id=? ORDER BY created_at, candidate_id", (row["job_id"],)
                     )
                 }
                 job["events"] = [
@@ -151,8 +151,9 @@ class SQLiteApprovedRuleStore(ApprovedRuleStore):
                 version = int(rule.get("current_version") or 1)
                 change_type = "rule_created" if version == 1 else "rule_updated"
                 created = connection.execute(
-                    "INSERT OR IGNORE INTO rule_versions(rule_id, version, rule_json, change_type, change_reason, "
-                    "operator, created_at, schema_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO rule_versions(rule_id, version, rule_json, change_type, change_reason, "
+                    "operator, created_at, schema_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(rule_id, version) DO NOTHING",
                     (
                         rule["rule_id"], version, _json(rule), change_type,
                         "人工批准特征" if version == 1 else "人工审批更新规则",
@@ -192,7 +193,7 @@ class SQLiteApprovedRuleStore(ApprovedRuleStore):
 class SQLiteAITraceLogger(AITraceLogger):
     def __init__(self, database: SQLiteDatabase, enabled: bool = True) -> None:
         self.database = database
-        self.path = database.path
+        self.path = database.state_root / "ai_traces.jsonl"
         self.enabled = enabled
 
     def append(self, trace: dict[str, Any]) -> None:
@@ -203,8 +204,11 @@ class SQLiteAITraceLogger(AITraceLogger):
             raise ValueError("trace_id 不能为空")
         with self.database.transaction() as connection:
             connection.execute(
-                "INSERT OR REPLACE INTO ai_traces(trace_id, job_id, provider, model, status, prompt_id, prompt_hash, latency_ms, trace_json, created_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO ai_traces(trace_id, job_id, provider, model, status, prompt_id, prompt_hash, latency_ms, trace_json, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(trace_id) DO UPDATE SET "
+                "job_id=excluded.job_id, provider=excluded.provider, model=excluded.model, status=excluded.status, "
+                "prompt_id=excluded.prompt_id, prompt_hash=excluded.prompt_hash, latency_ms=excluded.latency_ms, "
+                "trace_json=excluded.trace_json, created_at=excluded.created_at",
                 (
                     trace_id,
                     trace.get("job_id"),
@@ -381,7 +385,7 @@ class SQLiteInputJobStore(InputJobStore):
 class SQLiteSemanticDictionaryStore(SemanticDictionaryStore):
     def __init__(self, database: SQLiteDatabase, builtin_root: str | Path) -> None:
         self.database = database
-        super().__init__(database.path.parent / "semantic-artifacts", builtin_root)
+        super().__init__(database.state_root / "semantic-artifacts", builtin_root)
         self._seed_database()
 
     def _seed_database(self) -> None:
@@ -390,12 +394,14 @@ class SQLiteSemanticDictionaryStore(SemanticDictionaryStore):
             for dictionary_id, builtin in self._builtins.items():
                 metadata = {"latest_version": 1, "active_version": 1, "versions": [1]}
                 connection.execute(
-                    "INSERT OR IGNORE INTO semantic_dictionaries(dictionary_id, display_name, active_version, dictionary_json, updated_at) VALUES (?, ?, 1, ?, ?)",
+                    "INSERT INTO semantic_dictionaries(dictionary_id, display_name, active_version, dictionary_json, updated_at) VALUES (?, ?, 1, ?, ?) "
+                    "ON CONFLICT(dictionary_id) DO NOTHING",
                     (dictionary_id, builtin.get("name"), _json(metadata), now),
                 )
                 payload = {"dictionary_id": dictionary_id, "version": 1, "custom_rules": []}
                 connection.execute(
-                    "INSERT OR IGNORE INTO semantic_dictionary_versions(dictionary_id, version, status, dictionary_json, content_hash, created_at) VALUES (?, 1, 'published', ?, ?, ?)",
+                    "INSERT INTO semantic_dictionary_versions(dictionary_id, version, status, dictionary_json, content_hash, created_at) VALUES (?, 1, 'published', ?, ?, ?) "
+                    "ON CONFLICT(dictionary_id, version) DO NOTHING",
                     (dictionary_id, _json(payload), builtin.get("content_hash") or hashlib.sha256(_json(builtin).encode()).hexdigest(), now),
                 )
 
@@ -438,7 +444,8 @@ class SQLiteSemanticDictionaryStore(SemanticDictionaryStore):
     def _write_validation(self, dictionary_id: str, version: int, report: dict[str, Any]) -> None:
         with self.database.transaction() as connection:
             connection.execute(
-                "INSERT OR REPLACE INTO semantic_validation_runs(dictionary_id, version, validation_json, created_at) VALUES (?, ?, ?, ?)",
+                "INSERT INTO semantic_validation_runs(dictionary_id, version, validation_json, created_at) VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(dictionary_id, version) DO UPDATE SET validation_json=excluded.validation_json, created_at=excluded.created_at",
                 (dictionary_id, int(version), _json(report), utc_now()),
             )
 
@@ -579,7 +586,8 @@ class SQLiteTemplateStore(TemplateStore):
                     (template_hash, item.get("component"), item.get("status"), _json(item), item.get("updated_at") or utc_now()),
                 )
                 connection.execute(
-                    "INSERT OR IGNORE INTO drain_template_versions(template_hash, version, template_json, created_at) VALUES (?, ?, ?, ?)",
+                    "INSERT INTO drain_template_versions(template_hash, version, template_json, created_at) VALUES (?, ?, ?, ?) "
+                    "ON CONFLICT(template_hash, version) DO NOTHING",
                     (template_hash, int(item.get("version", 1)), _json(item), item.get("updated_at") or utc_now()),
                 )
 
@@ -598,7 +606,7 @@ class SQLiteTemplateStore(TemplateStore):
 class SQLiteDrainConfigStore(DrainConfigStore):
     def __init__(self, database: SQLiteDatabase, baseline_path: str | Path) -> None:
         self.database = database
-        super().__init__(database.path.parent / "drain-config-artifacts", baseline_path)
+        super().__init__(database.state_root / "drain-config-artifacts", baseline_path)
 
     def _catalog(self) -> dict[str, Any]:
         with self.database.connect() as connection:
@@ -653,7 +661,8 @@ class SQLiteDrainConfigStore(DrainConfigStore):
         reference = {"schema_version": "drain_active_config_v1", "config_id": config_id, "version": int(version), "content_hash": snapshot["content_hash"], "updated_at": now, "updated_by": str(payload.get("operator") or "local-operator")}
         with self.database.transaction() as connection:
             connection.execute(
-                "INSERT OR REPLACE INTO app_settings(setting_key, value_json, updated_at) VALUES ('active_drain_config', ?, ?)",
+                "INSERT INTO app_settings(setting_key, value_json, updated_at) VALUES ('active_drain_config', ?, ?) "
+                "ON CONFLICT(setting_key) DO UPDATE SET value_json=excluded.value_json, updated_at=excluded.updated_at",
                 (_json(reference), now),
             )
         self._append_event({"schema_version": "drain_config_event_v1", "event_id": f"config_event_{uuid.uuid4().hex}", "action": action, **reference})
@@ -662,7 +671,7 @@ class SQLiteDrainConfigStore(DrainConfigStore):
 
 class SQLiteDrainQualityService(DrainQualityService):
     def __init__(self, database: SQLiteDatabase, profiles_root: str | Path, baseline_path: str | Path) -> None:
-        super().__init__(database.path.parent / "drain-quality-artifacts", profiles_root, baseline_path)
+        super().__init__(database.state_root / "drain-quality-artifacts", profiles_root, baseline_path)
         self.database = database
         self.datasets = SQLiteDatasetStore(database)
         self.annotations = SQLiteAnnotationStore(database)

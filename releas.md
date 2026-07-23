@@ -11,11 +11,16 @@
 ### Added
 
 - 新增 LOGRISK 橙色应用图标资源，并作为浏览器标签页、Edge 快捷方式和移动端图标使用。
+- 新增 SQLite/PostgreSQL 双模式运行数据库；SQLite 继续为默认本地 Provider，PostgreSQL 通过显式环境变量或命令行配置启用，且不会自动回退。
+- 新增 PostgreSQL 版本化迁移、可选 `psycopg[binary]` 依赖、连接候选配置页面和停机 SQLite→PostgreSQL 元数据迁移工具（`--dry-run`、`--execute`、`--verify`）。
 
 ### Changed
 
 - README 顶部展示新的 LOGRISK 应用图标，确保 GitHub 项目首页使用统一品牌标识。
+- 首页顶栏改用新的 LOGRISK 应用图标，并移除 `FEATURE REVIEW` 副标题。
 - GitHub 发布流程补充标准 Markdown 正文、可读 Release 标题与累积版本说明校验规则。
+- 数据访问层统一支持 SQLite qmark 与 PostgreSQL 参数、UTC 时间、JSONB、布尔值、稳定排序和跨库 `ON CONFLICT`；迁移只保留文件路径元数据，不复制原始日志或产物本体。
+- PostgreSQL 集成测试改用符合 libpq URI 规范的参数编码，并已在本机隔离 PostgreSQL 容器完成真实 SQLite→PostgreSQL 迁移校验。
 
 ## 1.24.2 - 2026-07-22
 

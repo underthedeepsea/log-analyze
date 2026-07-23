@@ -319,10 +319,15 @@ class NodeRiskService:
                 domains = Counter(item["risk_domain"] for item in items)
                 types = Counter(item["risk_type"] for item in items)
                 connection.execute(
-                    "INSERT OR REPLACE INTO node_risk_daily(cluster, node_id, date, event_count, occurrence_count, "
+                    "INSERT INTO node_risk_daily(cluster, node_id, date, event_count, occurrence_count, "
                     "distinct_risk_types, critical_count, high_count, medium_count, low_count, active_count, recovered_count, "
                     "max_event_score, max_overall_score, latest_risk_at, domain_distribution_json, type_distribution_json, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(cluster, node_id, date) DO UPDATE SET event_count=excluded.event_count, occurrence_count=excluded.occurrence_count, "
+                    "distinct_risk_types=excluded.distinct_risk_types, critical_count=excluded.critical_count, high_count=excluded.high_count, "
+                    "medium_count=excluded.medium_count, low_count=excluded.low_count, active_count=excluded.active_count, recovered_count=excluded.recovered_count, "
+                    "max_event_score=excluded.max_event_score, max_overall_score=excluded.max_overall_score, latest_risk_at=excluded.latest_risk_at, "
+                    "domain_distribution_json=excluded.domain_distribution_json, type_distribution_json=excluded.type_distribution_json, updated_at=excluded.updated_at",
                     (
                         cluster, node_id, day, len(items), sum(int(item["occurrence_count"]) for item in items),
                         len(types), severity["critical"], severity["high"], severity["medium"], severity["low"],

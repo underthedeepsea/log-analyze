@@ -15,10 +15,13 @@ mkdir -p "$STATE_DIR"
 export PYTHONPATH="${PYTHONPATH:-}:$ROOT_DIR/src"
 
 dashboard_command() {
+  local database_args=(--database "$DATABASE")
+  [[ -n "${LOGRISK_DATABASE_PROVIDER:-}" ]] && database_args+=(--database-provider "$LOGRISK_DATABASE_PROVIDER")
+  [[ -n "${LOGRISK_DATABASE_URL:-}" ]] && database_args+=(--database-url "$LOGRISK_DATABASE_URL")
   exec "$PYTHON" -m pipeline.dashboard_server \
     --host "$HOST" \
     --port "$PORT" \
-    --database "$DATABASE" \
+    "${database_args[@]}" \
     --model "${OLLAMA_MODEL:-qwen3:1.7b}" \
     --ollama-url "${OLLAMA_HOST:-http://127.0.0.1:11434}" \
     --ollama-timeout "${OLLAMA_TIMEOUT:-120}"
@@ -71,10 +74,13 @@ start_dashboard() {
     return 1
   fi
   cd "$ROOT_DIR"
+  local database_args=(--database "$DATABASE")
+  [[ -n "${LOGRISK_DATABASE_PROVIDER:-}" ]] && database_args+=(--database-provider "$LOGRISK_DATABASE_PROVIDER")
+  [[ -n "${LOGRISK_DATABASE_URL:-}" ]] && database_args+=(--database-url "$LOGRISK_DATABASE_URL")
   nohup "$PYTHON" -m pipeline.dashboard_server \
     --host "$HOST" \
     --port "$PORT" \
-    --database "$DATABASE" \
+    "${database_args[@]}" \
     --model "${OLLAMA_MODEL:-qwen3:1.7b}" \
     --ollama-url "${OLLAMA_HOST:-http://127.0.0.1:11434}" \
     --ollama-timeout "${OLLAMA_TIMEOUT:-120}" </dev/null >> "$LOG_FILE" 2>&1 &

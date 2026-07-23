@@ -48,7 +48,7 @@ class ConnectionStore:
         is_default = bool(raw.get("is_default", False))
         with self.database.transaction() as connection:
             if is_default:
-                connection.execute("UPDATE provider_connections SET is_default = 0")
+                connection.execute("UPDATE provider_connections SET is_default = FALSE")
             connection.execute(
                 "INSERT INTO provider_connections(connection_id, display_name, provider, base_url, api_key_env, "
                 "timeout_seconds, enabled, is_default, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
@@ -62,8 +62,8 @@ class ConnectionStore:
                     base_url,
                     api_key_env,
                     timeout,
-                    int(bool(raw.get("enabled", True))),
-                    int(is_default),
+                    bool(raw.get("enabled", True)),
+                    is_default,
                     now,
                     now,
                 ),

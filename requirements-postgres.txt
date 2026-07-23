@@ -1,0 +1,4 @@
+-r requirements.txt
+
+# 仅 PostgreSQL 部署需要；SQLite 本地模式不安装此可选依赖。
+psycopg[binary]>=3.2,<4

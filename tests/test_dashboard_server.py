@@ -12,7 +12,7 @@ from logrisk.ai_harness.prompt_registry import PromptRegistry
 from logrisk.ai_harness.model_profile import ModelProfileRegistry
 from logrisk.ai_harness.trace_logger import AITraceLogger
 from logrisk.feature_jobs import FeatureJobManager
-from pipeline.dashboard_server import build_server
+from pipeline.dashboard_server import build_server, parse_args
 
 
 def entity(entity_id="node-a", score=90):
@@ -123,6 +123,40 @@ def test_serves_frontend_and_ollama_status(dashboard):
     assert "Feature Dashboard" in html
     assert status == 200
     assert payload == {"online": True, "models": ["qwen3:1.7b"]}
+
+
+def test_database_status_and_restart_candidate_configuration_are_available(dashboard):
+    base_url, _ = dashboard
+
+    status, current, _ = request_json(base_url + "/api/system/database")
+    saved_status, saved, _ = request_json(base_url + "/api/system/database/config", "POST", {
+        "provider": "postgres",
+        "host": "postgres.internal",
+        "port": 5432,
+        "database": "logrisk",
+        "user": "logrisk_app",
+        "sslmode": "require",
+        "password_env": "LOGRISK_POSTGRES_PASSWORD",
+        "password": "never-store-this",
+    })
+    health_status, health, _ = request_json(base_url + "/api/health")
+
+    assert status == saved_status == health_status == 200
+    assert current["runtime"]["provider"] == "sqlite"
+    assert saved["candidate"]["provider"] == "postgres"
+    assert saved["candidate"]["password_configured"] is False
+    assert saved["restart_required"] is True
+    assert health["storage"] == "sqlite"
+
+
+def test_dashboard_cli_accepts_explicit_postgres_provider_and_url():
+    args = parse_args([
+        "--database-provider", "postgres",
+        "--database-url", "postgresql://user:secret@db.example/logrisk",
+    ])
+
+    assert args.database_provider == "postgres"
+    assert args.database_url == "postgresql://user:secret@db.example/logrisk"
 
 
 def test_risk_semantic_and_node_risk_routes(dashboard):

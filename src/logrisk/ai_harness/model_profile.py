@@ -205,7 +205,7 @@ class ModelProfileRegistry:
                         raw["connection_id"],
                         str(raw.get("model") or ""),
                         str(raw.get("display_name") or raw.get("model") or profile_id),
-                        int(bool(raw.get("enabled", True))),
+                        bool(raw.get("enabled", True)),
                         raw["structured_output_mode"],
                         json.dumps(raw, ensure_ascii=False),
                         now,
@@ -214,7 +214,8 @@ class ModelProfileRegistry:
                 )
             if default_id:
                 connection.execute(
-                    "INSERT OR REPLACE INTO app_settings(setting_key, value_json, updated_at) VALUES ('default_model_profile_id', ?, ?)",
+                    "INSERT INTO app_settings(setting_key, value_json, updated_at) VALUES ('default_model_profile_id', ?, ?) "
+                    "ON CONFLICT(setting_key) DO UPDATE SET value_json=excluded.value_json, updated_at=excluded.updated_at",
                     (json.dumps(default_id), now),
                 )
 
@@ -266,7 +267,7 @@ class ModelProfileRegistry:
                     payload["connection_id"],
                     str(payload["model"]).strip(),
                     str(payload["display_name"]),
-                    int(bool(payload["enabled"])),
+                    bool(payload["enabled"]),
                     payload["structured_output_mode"],
                     json.dumps(payload, ensure_ascii=False),
                     now,

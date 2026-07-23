@@ -42,3 +42,20 @@ Use focused Conventional Commit subjects such as `feat: add feature approval exp
 Keep `docs/` and internal design, specification, milestone, and implementation-plan documents local only. Before every push, inspect `git diff --cached --name-only` and remove any such files from the commit.
 
 Every code update must also update `releas.md`. Versions use `1.<feature>.<bug>`: feature releases increment the middle number and reset the final number; bug-only releases increment the final number.
+
+## Required GitHub Release Workflow
+
+Use this workflow whenever the user asks to update GitHub. Create the version branch *before* development; name it exactly after the release, such as `1.24.2`. Keep it both locally and on GitHub after merge: it is the permanent version reference.
+
+1. Update `releas.md` (and `README.md` when its version or user-facing behavior changes). Stage only explicit source, test, config, migration, bundle, and release files.
+2. Before committing, run `git diff --cached --name-only` and `git diff --cached --check`. Remove `docs/`, internal plans/specifications, `state/`, database/WAL files, logs, uploads, exports, secrets, and generated artifacts. Never use broad `git add .`.
+3. Create one Conventional Commit, then publish the branch with `git push -u origin <version>`. Confirm the branch exists remotely before opening the PR.
+4. Create a Chinese GitHub PR with `gh pr create --base main --head <version>`. Its body must state new capabilities, fixes, and only verification that was actually run.
+5. Merge with `gh pr merge <number> --merge`. **Do not pass `--delete-branch`**: deleting the remote version branch is prohibited.
+6. Confirm merge state and commit with `gh pr view <number> --json state,mergeCommit,url`. If ordinary Git network commands are unreliable, use `gh api` to check refs; do not blindly repeat pushes. If a version branch was accidentally removed, recreate `refs/heads/<version>` at the release commit through `gh api`.
+7. Create both the immutable tag and Release on the merged `main` commit. Keep the tag as `<version>` and set the Release title to `v<version> · <简短中文主题>`, matching existing Releases. Release notes must be standard Markdown with actual line breaks: a `##` summary heading, blank lines, `### Added`/`### Fixed` sections, and bullet lists. Write notes to a temporary UTF-8 `.md` file and use `gh release create <version> --target <merge-sha> --title "v<version> · <主题>" --notes-file <notes.md>`; never pass an escaped `\\n` string to `--notes`, because GitHub renders it as literal text.
+8. Confirm both the tag and rendered Release name/body with `gh release view <version> --json name,body,url`. If the title is generic or `body` contains literal `\\n`, immediately repair it with `gh release edit <version> --title "v<version> · <主题>" --notes-file <notes.md>` before handoff.
+
+Release notes are cumulative from the latest existing GitHub Release through the current version. If an intermediate version has no Release, include every `releas.md` entry in that gap. For example, the `1.24.2` Release must include the complete changes from `1.23.1`, `1.24.0`, `1.24.1`, and `1.24.2`, because `v1.23.0` was the preceding published Release. Start the body with a concise range note, such as `> 包含 1.23.1 至 1.24.2 的全部更新。`.
+
+Do not rerun already-passed tests solely for a GitHub update. Run verification again only when code changed after the last acceptance, a prior verification found a problem, or the user explicitly requests it. In the final handoff, provide the branch, PR, and Release links.

@@ -59,6 +59,20 @@ def test_runtime_backend_address_contract():
     assert (FRONTEND / "dist" / "config.js").is_file()
 
 
+def test_brand_icon_is_published_for_readme_and_browser():
+    icon_name = "logrisk-app-icon-orange-v2.png"
+    source_icon = FRONTEND / "logo" / icon_name
+    runtime_icon = FRONTEND / "dist" / "assets" / icon_name
+
+    assert source_icon.is_file()
+    assert runtime_icon.is_file()
+    assert runtime_icon.read_bytes() == source_icon.read_bytes()
+
+    assert f"frontend/logo/{icon_name}" in Path("README.md").read_text(encoding="utf-8")
+    for html_path in (FRONTEND / "index.html", FRONTEND / "dist" / "index.html"):
+        assert f'rel="icon" type="image/png" href="/assets/{icon_name}"' in html_path.read_text(encoding="utf-8")
+
+
 def test_m11_quality_and_settings_use_workspace_design_contract():
     source = source_text()
     for text in (
@@ -433,10 +447,11 @@ def test_release_docs_describe_current_feature_version():
     assert "## 1.22.0 - 2026-07-18" in release
     assert "## 1.23.0 - 2026-07-19" in release
     assert "## 1.23.1 - 2026-07-21" in release
-    assert "当前版本：`1.24.2`" in readme
+    assert "当前版本：`1.25.0`" in readme
     assert "## 1.24.0 - 2026-07-22" in release
     assert "## 1.24.1 - 2026-07-22" in release
     assert "## 1.24.2 - 2026-07-22" in release
+    assert "## 1.25.0 - 2026-07-23" in release
     assert "qwen3.5:9b-mlx" in readme
     assert "state/logrisk.sqlite3" in readme
     assert "database/migrations/" in readme

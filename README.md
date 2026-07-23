@@ -170,11 +170,39 @@ Dashboard 提供以下工作区：
 
 “服务器风险”页面区分风险事件数、日志命中次数（`occurrence_count`）和风险类型数，并展示未恢复事件、主要风险及确定性评分贡献。Xid 79 等直接基础设施故障可触发配置化 Hard Override；评分不由 AI 决定，页面中的动作代码也只用于审计和外部流程参考，不会自动执行运维操作。
 
-## SQLite 存储
+## 运行期存储：SQLite 与 PostgreSQL
 
-运行期业务状态默认保存在 `state/logrisk.sqlite3`。启动时自动应用 `database/migrations/` 中的版本化 SQL；`database/schema.yaml` 描述表结构、字段用途和未来 PostgreSQL 类型映射。SQLite 启用外键、WAL、`busy_timeout` 和事务写入。批准规则、风险语义、节点风险台账、不可变版本、反馈、复用记录和追加式审计事件分别关系化保存。
+默认使用 `state/logrisk.sqlite3`。启动时应用 `database/migrations/`；SQLite 启用外键、WAL、`busy_timeout` 和短事务写入。`database/schema.yaml` 是双模式数据字典，PostgreSQL 对应迁移保存在 `database/postgres/migrations/`。批准规则、风险语义、节点风险、版本、反馈、Trace、评测和审计记录均使用同一运行数据库。
 
-仓库中的配置和 Prompt 只作为首次启动种子，初始化后以 SQLite 为运行时权威来源。旧 JSON、JSONL、YAML 和 Prompt 历史会按 SHA256 幂等导入。原始上传文件、分片、Drain3 `.bin` 和导出物继续保存在文件系统，SQLite 仅登记元数据。
+生产环境可显式改用外部 PostgreSQL，不提供 Docker Compose，也不会自动回退到 SQLite：
+
+```bash
+pip install -r requirements-postgres.txt
+export LOGRISK_DATABASE_PROVIDER=postgres
+export LOGRISK_DATABASE_URL='postgresql://logrisk:replace-with-secret@db.example:5432/logrisk?sslmode=require'
+bash scripts/dashboard.sh start
+```
+
+`LOGRISK_DATABASE_URL` 优先于页面候选配置；命令行 `--database-provider postgres --database-url ...` 优先于环境变量。页面“系统设置 → PostgreSQL 运行数据库”可保存不含密码的主机、端口、库名、用户、SSL 模式和密码环境变量名，测试连接后仍需重启才会切换。密码、完整 DSN 不会保存到数据库、配置文件、Trace、日志或前端响应。
+
+### 停机迁移到 PostgreSQL
+
+迁移只复制数据库元数据；不会复制原始日志、上传分片、Drain3 `.bin` 或导出文件。先停服务并备份原 SQLite 文件，再执行：
+
+```bash
+bash scripts/dashboard.sh stop
+.venv/bin/python -m pipeline.database_migrate --source-sqlite state/logrisk.sqlite3 --dry-run
+LOGRISK_DATABASE_URL="$LOGRISK_DATABASE_URL" .venv/bin/python -m pipeline.database_migrate \
+  --source-sqlite state/logrisk.sqlite3 --execute
+LOGRISK_DATABASE_URL="$LOGRISK_DATABASE_URL" .venv/bin/python -m pipeline.database_migrate \
+  --source-sqlite state/logrisk.sqlite3 --verify
+LOGRISK_DATABASE_PROVIDER=postgres LOGRISK_DATABASE_URL="$LOGRISK_DATABASE_URL" \
+  bash scripts/dashboard.sh start
+```
+
+`--execute` 在提交前核对每张表的行数、主键集合和规范化摘要，并由 PostgreSQL 外键约束验证关系；任一步失败会回滚目标导入。报告还会检查已登记 Artifact 路径是否存在。若需回滚，停服务、移除 `LOGRISK_DATABASE_PROVIDER` 和 `LOGRISK_DATABASE_URL` 后重新启动，即可继续使用未被修改的原 SQLite 文件。
+
+仓库中的配置和 Prompt 只作为首次启动种子，初始化后以当前 Provider 为运行时权威来源。旧 JSON、JSONL、YAML 和 Prompt 历史会按 SHA256 幂等导入。原始上传文件、分片、Drain3 `.bin` 和导出物继续保存在文件系统，数据库仅登记元数据。
 
 以下基础种子会提交到仓库：
 

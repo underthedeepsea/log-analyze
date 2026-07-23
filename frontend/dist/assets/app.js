@@ -36,6 +36,9 @@
   const api = {
     health: function () { return jsonRequest("/api/health"); },
     config: function () { return jsonRequest("/api/config"); },
+    databaseRuntime: function () { return jsonRequest("/api/system/database"); },
+    saveDatabaseCandidate: function (payload) { return jsonRequest("/api/system/database/config", { method: "POST", body: JSON.stringify(payload) }); },
+    testDatabaseCandidate: function (payload) { return jsonRequest("/api/system/database/test", { method: "POST", body: JSON.stringify(payload) }); },
     status: function () { return jsonRequest("/api/ollama/status"); },
     rules: function () { return jsonRequest("/api/rules"); },
     governedRules: function (query) { return jsonRequest("/api/rule-governance/rules" + (query || "")); },
@@ -806,6 +809,49 @@
             h("section", { className: "rule-audit-section" }, h("div", { className: "section-title" }, h("div", null, h("h3", null, "最近审计"), h("p", null, "状态、反馈、审批更新与回滚事件"))), (detail.audit_events || []).slice(0, 6).map(function (event) { return h("div", { className: "rule-audit-row", key: event.event_id }, h("b", null, event.event_type), h("span", null, "v" + (event.from_version || "—") + " → v" + event.to_version), h("small", null, timeText(event.created_at) + " · " + event.operator)); }))))));
   }
 
+  function DatabaseStorageSettings() {
+    const [state, setState] = useState(null), [notice, setNotice] = useState(""), [busy, setBusy] = useState(false);
+    const [form, setForm] = useState({ provider: "postgres", host: "", port: 5432, database: "logrisk", user: "logrisk", sslmode: "prefer", password_env: "LOGRISK_POSTGRES_PASSWORD" });
+    function update(key, value) { setForm(function (previous) { return Object.assign({}, previous, { [key]: value }); }); }
+    function load() {
+      return api.databaseRuntime().then(function (payload) {
+        setState(payload);
+        if (payload.candidate) setForm(function (previous) { return Object.assign({}, previous, payload.candidate); });
+      }).catch(function (reason) { setNotice("无法读取数据库配置：" + reason.message); });
+    }
+    useEffect(function () { load(); }, []);
+    async function submit(testOnly) {
+      setBusy(true); setNotice("");
+      try {
+        const result = testOnly ? await api.testDatabaseCandidate(form) : await api.saveDatabaseCandidate(form);
+        setNotice(testOnly ? result.message : "候选配置已保存；重启 Dashboard 后才会切换运行数据库。");
+        if (!testOnly) await load();
+      } catch (reason) { setNotice("操作失败：" + reason.message); }
+      finally { setBusy(false); }
+    }
+    const runtime = state && state.runtime;
+    return h("section", { className: "surface settings-panel database-settings-panel" },
+      h("div", { className: "surface-head" },
+        h("div", null, h("b", null, "PostgreSQL 运行数据库"), h("span", null, "SQLite 默认本地存储；保存后重启生效")),
+        h("span", { className: "connection-chip" }, runtime ? "● 当前 " + runtime.provider : "● 读取中")),
+      h("div", { className: "settings-body" },
+        h("div", { className: "settings-notice" }, h("b", null, "停机切换"), h("span", null, "不进行热切换或自动回退。先执行迁移工具校验，再重启服务启用 PostgreSQL。")),
+        h("div", { className: "database-runtime-row" }, h("span", null, "当前 Provider"), h("code", null, runtime ? runtime.provider : "—"), h("small", null, runtime && runtime.source === "environment" ? "由环境变量指定" : "SQLite 是默认运行模式")),
+        h("label", { className: "settings-field" }, h("span", null, "Provider"), h("select", { value: form.provider, onChange: function (event) { update("provider", event.target.value); } }, h("option", { value: "postgres" }, "PostgreSQL"), h("option", { value: "sqlite" }, "SQLite（默认）"))),
+        form.provider === "postgres" && h("div", { className: "database-form-grid" },
+          h("label", { className: "settings-field" }, h("span", null, "主机"), h("input", { value: form.host, placeholder: "postgres.internal", onChange: function (event) { update("host", event.target.value); } })),
+          h("label", { className: "settings-field" }, h("span", null, "端口"), h("input", { type: "number", value: form.port, min: 1, max: 65535, onChange: function (event) { update("port", event.target.value); } })),
+          h("label", { className: "settings-field" }, h("span", null, "数据库"), h("input", { value: form.database, onChange: function (event) { update("database", event.target.value); } })),
+          h("label", { className: "settings-field" }, h("span", null, "用户"), h("input", { value: form.user, onChange: function (event) { update("user", event.target.value); } })),
+          h("label", { className: "settings-field" }, h("span", null, "SSL 模式"), h("select", { value: form.sslmode, onChange: function (event) { update("sslmode", event.target.value); } }, ["disable", "prefer", "require", "verify-ca", "verify-full"].map(function (mode) { return h("option", { key: mode, value: mode }, mode); }))),
+          h("label", { className: "settings-field database-password-env" }, h("span", null, "密码环境变量名"), h("small", null, "只填写变量名；密码不会发送、保存或展示"), h("input", { value: form.password_env, placeholder: "LOGRISK_POSTGRES_PASSWORD", onChange: function (event) { update("password_env", event.target.value); } }))),
+        h("div", { className: "button-row" },
+          h("button", { className: "secondary-button", disabled: busy, onClick: function () { submit(true); } }, busy ? "连接测试中…" : "测试连接"),
+          h("button", { className: "primary-button", disabled: busy, onClick: function () { submit(false); } }, "保存候选配置")),
+        notice && h("div", { className: "settings-status" }, notice),
+        h("p", { className: "settings-help" }, "优先级：命令行参数 → LOGRISK_DATABASE_PROVIDER / LOGRISK_DATABASE_URL → 此候选配置 → SQLite。数据库 URL 与密码不会写入页面或运行状态。")));
+  }
+
   function BackendSettings(props) {
     const [address, setAddress] = useState(currentApiBase());
     const [status, setStatus] = useState("");
@@ -842,7 +888,8 @@
             h("button", { className: "text-button", onClick: reset }, "恢复默认")),
           status && h("div", { className: "settings-status" }, status),
           h("div", { className: "effective-address" }, h("span", null, "当前生效地址"), h("code", null, currentApiBase() || "同源")),
-          h("p", { className: "settings-help" }, "跨域部署时，后端需将本页面来源加入 DASHBOARD_CORS_ORIGINS。"))));
+          h("p", { className: "settings-help" }, "跨域部署时，后端需将本页面来源加入 DASHBOARD_CORS_ORIGINS。"))),
+      h(DatabaseStorageSettings));
   }
 
   function replaceIniValue(content, section, key, value) {
@@ -1380,7 +1427,7 @@
     const traceRule = drawer.item && rules.find(function (rule) { return rule.lineage && rule.lineage.trace_id === drawer.item.trace_id; });
     const drawerContent = !drawer.item ? null : (drawer.type === "prompt" ? h(PromptDrawer, { item: drawer.item, onSave: savePrompt, onOpenTrace: openTrace }) : h(TraceDrawer, { item: drawer.item, rule: traceRule, onOpenRule: openRule }));
     return h("div", { className: "app-shell" + (sidebarCollapsed ? " sidebar-collapsed" : "") + (mobileMenuOpen ? " mobile-menu-open" : "") },
-      h("header", { className: "topbar" }, h("div", { className: "topbar-left" }, h("button", { className: "sidebar-toggle", type: "button", "aria-label": narrowSidebar ? (mobileMenuOpen ? "关闭菜单" : "打开菜单") : (sidebarCollapsed ? "展开菜单" : "折叠菜单"), "aria-controls": "primary-navigation", "aria-expanded": narrowSidebar ? mobileMenuOpen : !sidebarCollapsed, onClick: toggleSidebar }, h("i"), h("i"), h("i")), h("div", { className: "brand" }, h("i", null, "L"), h("div", null, h("b", null, "LOGRISK"), h("span", null, "FEATURE REVIEW")))), h("div", { className: "system-status" }, h("span", { className: ollama.online ? "online" : "offline" }, "● Ollama " + (ollama.online ? "在线" : "离线")), h("span", null, model), h("button", { className: "prompt-pill", onClick: function () { changeView("prompts"); } }, "Prompt " + (harness.current_prompt_id || promptId)), h("span", { className: harness.trace_enabled ? "trace-on" : "trace-off" }, "● Trace " + (harness.trace_enabled ? "ON" : "OFF")))),
+      h("header", { className: "topbar" }, h("div", { className: "topbar-left" }, h("button", { className: "sidebar-toggle", type: "button", "aria-label": narrowSidebar ? (mobileMenuOpen ? "关闭菜单" : "打开菜单") : (sidebarCollapsed ? "展开菜单" : "折叠菜单"), "aria-controls": "primary-navigation", "aria-expanded": narrowSidebar ? mobileMenuOpen : !sidebarCollapsed, onClick: toggleSidebar }, h("i"), h("i"), h("i")), h("div", { className: "brand" }, h("img", { className: "brand-logo", src: "/assets/logrisk-app-icon-orange-v2.png", alt: "LOGRISK" }), h("div", null, h("b", null, "LOGRISK")))), h("div", { className: "system-status" }, h("span", { className: ollama.online ? "online" : "offline" }, "● Ollama " + (ollama.online ? "在线" : "离线")), h("span", null, model), h("button", { className: "prompt-pill", onClick: function () { changeView("prompts"); } }, "Prompt " + (harness.current_prompt_id || promptId)), h("span", { className: harness.trace_enabled ? "trace-on" : "trace-off" }, "● Trace " + (harness.trace_enabled ? "ON" : "OFF")))),
       h(Sidebar, { active: view, onChange: changeView }),
       h("button", { className: "sidebar-overlay", type: "button", "aria-label": "关闭菜单", onClick: function () { setMobileMenuOpen(false); } }),
       h("main", null,

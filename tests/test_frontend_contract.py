@@ -73,6 +73,18 @@ def test_brand_icon_is_published_for_readme_and_browser():
         assert f'rel="icon" type="image/png" href="/assets/{icon_name}"' in html_path.read_text(encoding="utf-8")
 
 
+def test_topbar_uses_brand_icon_without_legacy_subtitle():
+    icon_path = "/assets/logrisk-app-icon-orange-v2.png"
+    styles = (FRONTEND / "src" / "styles.css").read_text(encoding="utf-8")
+
+    for app_path in (FRONTEND / "src" / "app.js", FRONTEND / "dist" / "assets" / "app.js"):
+        app = app_path.read_text(encoding="utf-8")
+        assert 'className: "brand-logo"' in app
+        assert f'src: "{icon_path}"' in app
+        assert "FEATURE REVIEW" not in app
+    assert ".brand-logo" in styles
+
+
 def test_m11_quality_and_settings_use_workspace_design_contract():
     source = source_text()
     for text in (
@@ -515,3 +527,13 @@ def test_active_navigation_glass_is_light_and_does_not_bold_text():
     assert "rgba(255,226,207,.28)" in active_rule
     assert "background:linear-gradient(180deg" in active_rule
     assert "inset 0 2px 0 #fff" not in active_rule
+
+
+def test_system_settings_exposes_postgres_candidate_configuration_without_password_field():
+    app = (FRONTEND / "src" / "app.js").read_text(encoding="utf-8")
+
+    assert "/api/system/database" in app
+    assert "/api/system/database/config" in app
+    assert "PostgreSQL 运行数据库" in app
+    assert "密码环境变量名" in app
+    assert 'type: "password"' not in app

@@ -180,7 +180,7 @@ class SQLitePromptRegistry(PromptRegistry):
                             meta.get("display_name"),
                             meta.get("description"),
                             meta.get("status") or "active",
-                            int(bool(meta.get("is_default") or prompt_id in defaults)),
+                            bool(meta.get("is_default") or prompt_id in defaults),
                             now,
                             now,
                         ),

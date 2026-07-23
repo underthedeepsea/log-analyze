@@ -244,8 +244,8 @@ class BenchmarkRepository:
                 "schema_valid=excluded.schema_valid, template_reference_ok=excluded.template_reference_ok, "
                 "duration_ms=excluded.duration_ms, error_type=excluded.error_type, result_json=excluded.result_json, created_at=excluded.created_at",
                 (
-                    result_id, run_id, case_id, int(bool(payload.get("passed"))), int(bool(payload.get("json_valid"))),
-                    int(bool(payload.get("schema_valid"))), int(bool(payload.get("template_reference_ok"))),
+                    result_id, run_id, case_id, bool(payload.get("passed")), bool(payload.get("json_valid")),
+                    bool(payload.get("schema_valid")), bool(payload.get("template_reference_ok")),
                     float(payload.get("duration_ms") or 0), payload.get("error_type"), _json(payload.get("result") or {}), now,
                 ),
             )
@@ -256,7 +256,7 @@ class BenchmarkRepository:
         self.get_run(run_id)
         limit, offset = self._page(page, page_size)
         where = "run_id=?" + (" AND passed=?" if passed is not None else "")
-        params: list[Any] = [run_id] + ([int(passed)] if passed is not None else [])
+        params: list[Any] = [run_id] + ([passed] if passed is not None else [])
         with self.database.connect() as connection:
             total = int(connection.execute("SELECT COUNT(*) FROM benchmark_case_results WHERE " + where, params).fetchone()[0])
             rows = connection.execute(
@@ -351,7 +351,7 @@ class BenchmarkRepository:
     def list_audit_events(self, run_id: str | None = None) -> list[dict[str, Any]]:
         with self.database.connect() as connection:
             if run_id:
-                rows = connection.execute("SELECT * FROM benchmark_audit_events WHERE run_id=? ORDER BY created_at, rowid", (run_id,)).fetchall()
+                rows = connection.execute("SELECT * FROM benchmark_audit_events WHERE run_id=? ORDER BY created_at, event_id", (run_id,)).fetchall()
             else:
-                rows = connection.execute("SELECT * FROM benchmark_audit_events ORDER BY created_at, rowid").fetchall()
+                rows = connection.execute("SELECT * FROM benchmark_audit_events ORDER BY created_at, event_id").fetchall()
         return [dict(row) | {"event": _object(row["event_json"], {})} for row in rows]

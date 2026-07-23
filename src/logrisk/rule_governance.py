@@ -179,7 +179,7 @@ class RuleGovernanceRepository:
     def audit_events(self, rule_id: str) -> list[dict[str, Any]]:
         with self.database.connect() as connection:
             rows = connection.execute(
-                "SELECT * FROM rule_audit_events WHERE rule_id=? ORDER BY created_at DESC, rowid DESC",
+                "SELECT * FROM rule_audit_events WHERE rule_id=? ORDER BY to_version DESC, created_at DESC, event_id DESC",
                 (rule_id,),
             ).fetchall()
         return [dict(row) | {"event": json.loads(row["event_json"])} for row in rows]

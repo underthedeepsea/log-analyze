@@ -37,7 +37,8 @@ from logrisk.risk_semantics import RiskSemanticError, RiskSemanticService, valid
 from logrisk.semantic.schema import SemanticValidationError
 from logrisk.semantic.store import SemanticDictionaryStore
 from logrisk.upload_sessions import UploadConfig, UploadSessionStore
-from logrisk.database import SQLiteDatabase
+from logrisk.database import DatabaseError, PostgresDatabase, create_database
+from logrisk.database_config import DatabaseConnectionSettings, database_url_from_candidate, resolve_database_runtime
 from logrisk.legacy_import import LegacyStateImporter
 from logrisk.sqlite_stores import (
     SQLiteAICache,
@@ -108,10 +109,25 @@ def build_server(
     semantic_root: str | Path | None = None,
     cors_origins: list[str] | tuple[str, ...] | set[str] | None = None,
     database_path: str | Path | None = None,
+    database_provider: str | None = None,
+    database_url: str | None = None,
+    state_root: str | Path | None = None,
 ) -> DashboardHTTPServer:
     root = Path(__file__).resolve().parents[2]
-    state_root = Path(database_path).parent if database_path else root / "state"
-    database = SQLiteDatabase(database_path or os.getenv("LOGRISK_DB_PATH") or state_root / "logrisk.sqlite3")
+    state_root = Path(state_root) if state_root else (Path(database_path).parent if database_path else root / "state")
+    database_settings = DatabaseConnectionSettings(state_root / "database_connection.json")
+    database_runtime = resolve_database_runtime(
+        provider=database_provider,
+        database_url=database_url,
+        database_path=database_path or os.getenv("LOGRISK_DB_PATH") or state_root / "logrisk.sqlite3",
+        settings=database_settings,
+    )
+    database = create_database(
+        provider=database_runtime.provider,
+        sqlite_path=database_runtime.sqlite_path,
+        database_url=database_runtime.database_url,
+        state_root=state_root,
+    )
     connections = ConnectionStore(database)
     connections.seed_defaults(default_ollama_url)
     profiles = ModelProfileRegistry(root / "configs" / "model_profiles.yaml", database=database)
@@ -190,6 +206,8 @@ def build_server(
 
     server = DashboardHTTPServer((host, port), DashboardHandler)
     server.database = database  # type: ignore[attr-defined]
+    server.database_runtime = database_runtime  # type: ignore[attr-defined]
+    server.database_settings = database_settings  # type: ignore[attr-defined]
     server.connections = connections  # type: ignore[attr-defined]
     rule_store = SQLiteApprovedRuleStore(database)
     if manager is not None and manager.rule_store is None:
@@ -381,6 +399,14 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "max_upload_bytes": MAX_UPLOAD_BYTES,
                 })
                 return
+            if path == "/api/system/database":
+                candidate = self.server.database_settings.load()  # type: ignore[attr-defined]
+                self._json(HTTPStatus.OK, {
+                    "runtime": self.server.database_runtime.public_dict(),  # type: ignore[attr-defined]
+                    "candidate": self.server.database_settings.public_dict(candidate) if candidate else None,  # type: ignore[attr-defined]
+                    "restart_required": False,
+                })
+                return
             if path == "/api/node-risks":
                 self._json(HTTPStatus.OK, self.server.node_risks.list_nodes(  # type: ignore[attr-defined]
                     cluster=query.get("cluster", [None])[0], level=query.get("level", [None])[0], domain=query.get("domain", [None])[0],
@@ -423,7 +449,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._json(HTTPStatus.OK, {"items": result} if path.endswith("/versions") else result)
                 return
             if path == "/api/health":
-                self._json(HTTPStatus.OK, {"schema_version": "logrisk_health_v1", "service": "logrisk-dashboard", "status": "ok", "version": "1.24.2", "storage": "sqlite"})
+                self._json(HTTPStatus.OK, {
+                    "schema_version": "logrisk_health_v1",
+                    "service": "logrisk-dashboard",
+                    "status": "ok",
+                    "version": "1.25.0",
+                    "storage": self.server.database_runtime.provider,  # type: ignore[attr-defined]
+                })
                 return
             if path == "/api/benchmark-center/overview":
                 self._json(HTTPStatus.OK, self.server.benchmark_center.overview())  # type: ignore[attr-defined]
@@ -634,6 +666,26 @@ class DashboardHandler(BaseHTTPRequestHandler):
         path, _ = self._route_parts()
         try:
             payload = self._read_json()
+            if path == "/api/system/database/config":
+                if not isinstance(payload, dict):
+                    raise ValueError("数据库配置必须是 JSON object")
+                candidate = self.server.database_settings.save(payload)  # type: ignore[attr-defined]
+                self._json(HTTPStatus.OK, {"candidate": candidate, "restart_required": True, "message": "连接候选配置已保存，重启 Dashboard 后生效"})
+                return
+            if path == "/api/system/database/test":
+                if not isinstance(payload, dict):
+                    raise ValueError("数据库配置必须是 JSON object")
+                candidate = self.server.database_settings.validate(payload)  # type: ignore[attr-defined]
+                if candidate["provider"] == "sqlite":
+                    self._json(HTTPStatus.OK, {"online": True, "provider": "sqlite", "message": "SQLite 本地路径配置有效"})
+                    return
+                candidate_url = database_url_from_candidate(candidate, os.environ)
+                try:
+                    PostgresDatabase(candidate_url, state_root=self.server.database.state_root, migrate=False).test_connection()  # type: ignore[attr-defined]
+                except DatabaseError:
+                    raise ValueError("无法连接 PostgreSQL；请检查地址、网络、SSL 和密码环境变量")
+                self._json(HTTPStatus.OK, {"online": True, "provider": "postgres", "message": "PostgreSQL 连接成功"})
+                return
             if path == "/api/benchmark-center/suites":
                 if not isinstance(payload, dict):
                     raise BenchmarkError("请求体必须是 JSON object")
@@ -1486,7 +1538,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--model", default=os.getenv("OLLAMA_MODEL", DEFAULT_MODEL))
     parser.add_argument("--ollama-url", default=os.getenv("OLLAMA_HOST", DEFAULT_OLLAMA_URL))
     parser.add_argument("--ollama-timeout", type=float, default=float(os.getenv("OLLAMA_TIMEOUT", "120")))
-    parser.add_argument("--database", default=os.getenv("LOGRISK_DB_PATH", "state/logrisk.sqlite3"), help="SQLite 数据库路径")
+    parser.add_argument("--database", default=os.getenv("LOGRISK_DB_PATH", "state/logrisk.sqlite3"), help="SQLite 数据库路径（PostgreSQL 模式仍用于本机状态目录）")
+    parser.add_argument("--database-provider", choices=("sqlite", "postgres"), default=None, help="运行数据库 Provider；未指定时读取环境变量或保存的候选配置")
+    parser.add_argument("--database-url", default=None, help="PostgreSQL DSN；优先于 LOGRISK_DATABASE_URL，禁止写入配置文件")
     parser.add_argument("--cors-origins", default=os.getenv("DASHBOARD_CORS_ORIGINS", ""), help="逗号分隔的允许跨域来源")
     return parser.parse_args(argv)
 
@@ -1501,6 +1555,8 @@ def main() -> None:
         default_timeout=args.ollama_timeout,
         cors_origins=args.cors_origins.split(","),
         database_path=args.database,
+        database_provider=args.database_provider,
+        database_url=args.database_url,
     )
     print(f"Feature review dashboard: http://{args.host}:{args.port}")
     try:

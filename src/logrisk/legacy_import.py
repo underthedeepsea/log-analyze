@@ -64,7 +64,8 @@ class LegacyStateImporter:
             for path, digest in pending:
                 count = self._import_path(connection, path)
                 connection.execute(
-                    "INSERT OR REPLACE INTO legacy_imports(source_path, source_sha256, records_imported, imported_at) VALUES (?, ?, ?, ?)",
+                    "INSERT INTO legacy_imports(source_path, source_sha256, records_imported, imported_at) VALUES (?, ?, ?, ?) "
+                    "ON CONFLICT(source_path) DO UPDATE SET source_sha256=excluded.source_sha256, records_imported=excluded.records_imported, imported_at=excluded.imported_at",
                     (str(path), digest, count, utc_now()),
                 )
                 records += count
@@ -83,8 +84,8 @@ class LegacyStateImporter:
                     "next_review_at": rule.get("next_review_at"),
                 }
                 connection.execute(
-                    "INSERT OR IGNORE INTO approved_rules(rule_id, signature, feature_type, rule_json, approved_at, "
-                    "updated_at, status, current_version, next_review_at, schema_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO approved_rules(rule_id, signature, feature_type, rule_json, approved_at, "
+                    "updated_at, status, current_version, next_review_at, schema_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
                     (
                         rule["rule_id"], rule["signature"], rule["feature_type"],
                         json.dumps(snapshot, ensure_ascii=False), rule["approved_at"], rule["updated_at"],
@@ -93,8 +94,8 @@ class LegacyStateImporter:
                     ),
                 )
                 connection.execute(
-                    "INSERT OR IGNORE INTO rule_versions(rule_id, version, rule_json, change_type, change_reason, "
-                    "operator, created_at, schema_version) VALUES (?, ?, ?, 'legacy_import', ?, 'legacy-importer', ?, 'rule_version_v1')",
+                    "INSERT INTO rule_versions(rule_id, version, rule_json, change_type, change_reason, "
+                    "operator, created_at, schema_version) VALUES (?, ?, ?, 'legacy_import', ?, 'legacy-importer', ?, 'rule_version_v1') ON CONFLICT DO NOTHING",
                     (
                         rule["rule_id"], snapshot["current_version"], json.dumps(snapshot, ensure_ascii=False),
                         "由旧批准规则文件导入", rule["updated_at"],
@@ -105,8 +106,8 @@ class LegacyStateImporter:
             traces = self._read_jsonl(path)
             for trace in traces:
                 connection.execute(
-                    "INSERT OR IGNORE INTO ai_traces(trace_id, job_id, provider, model, status, prompt_id, prompt_hash, latency_ms, trace_json, created_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO ai_traces(trace_id, job_id, provider, model, status, prompt_id, prompt_hash, latency_ms, trace_json, created_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
                     (
                         trace["trace_id"], trace.get("job_id"), trace.get("provider"), trace.get("model"),
                         trace.get("status"), trace.get("prompt_id"), trace.get("prompt_hash"), trace.get("latency_ms"),
@@ -119,7 +120,7 @@ class LegacyStateImporter:
             now = utc_now()
             for signature, value in values.items():
                 connection.execute(
-                    "INSERT OR IGNORE INTO ai_cache_entries(signature, value_json, created_at, updated_at) VALUES (?, ?, ?, ?)",
+                    "INSERT INTO ai_cache_entries(signature, value_json, created_at, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING",
                     (signature, json.dumps(value, ensure_ascii=False), now, now),
                 )
             return len(values)
@@ -127,7 +128,7 @@ class LegacyStateImporter:
             days = self._read_json(path).get("days") or {}
             for metric_date, count in days.items():
                 connection.execute(
-                    "INSERT OR IGNORE INTO processing_metrics_daily(metric_date, llm_logs, updated_at) VALUES (?, ?, ?)",
+                    "INSERT INTO processing_metrics_daily(metric_date, llm_logs, updated_at) VALUES (?, ?, ?) ON CONFLICT DO NOTHING",
                     (metric_date, int(count), utc_now()),
                 )
             return len(days)
@@ -164,22 +165,22 @@ class LegacyStateImporter:
             events = self._read_jsonl(events_path) if events_path.is_file() else []
             snapshot = dict(job)
             connection.execute(
-                "INSERT OR IGNORE INTO feature_jobs(job_id, status, model_profile_id, job_json, created_at, completed_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO feature_jobs(job_id, status, model_profile_id, job_json, created_at, completed_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
                 (job["job_id"], job.get("status", "unknown"), job.get("model_profile_id"), json.dumps(snapshot, ensure_ascii=False), job.get("created_at") or utc_now(), job.get("completed_at"), utc_now()),
             )
             for entity in job.get("entities", []):
                 connection.execute(
-                    "INSERT OR IGNORE INTO feature_job_entities(job_id, entity_id, status, risk_score, entity_json, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO feature_job_entities(job_id, entity_id, status, risk_score, entity_json, updated_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
                     (job["job_id"], entity["entity_id"], entity.get("status", "unknown"), entity.get("risk_score"), json.dumps(entity, ensure_ascii=False), utc_now()),
                 )
             for candidate_id, candidate in (job.get("features") or {}).items():
                 connection.execute(
-                    "INSERT OR IGNORE INTO feature_candidates(candidate_id, job_id, entity_id, status, candidate_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO feature_candidates(candidate_id, job_id, entity_id, status, candidate_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
                     (candidate_id, job["job_id"], (candidate.get("entity") or {}).get("id"), candidate.get("status"), json.dumps(candidate, ensure_ascii=False), candidate.get("created_at") or utc_now(), utc_now()),
                 )
             for event in events:
                 connection.execute(
-                    "INSERT OR IGNORE INTO feature_job_events(job_id, sequence, event_type, event_json, created_at) VALUES (?, ?, ?, ?, ?)",
+                    "INSERT INTO feature_job_events(job_id, sequence, event_type, event_json, created_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
                     (job["job_id"], int(event.get("sequence", 0)), event.get("type", "event"), json.dumps(event, ensure_ascii=False), event.get("timestamp") or utc_now()),
                 )
             return 1 + len(events)
@@ -187,7 +188,7 @@ class LegacyStateImporter:
             manifest = self._read_json(path)
             source = path.parent / "source.log"
             connection.execute(
-                "INSERT OR IGNORE INTO upload_sessions(upload_id, status, filename, source_path, size_bytes, sha256, manifest_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO upload_sessions(upload_id, status, filename, source_path, size_bytes, sha256, manifest_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
                 (
                     manifest["upload_id"], manifest["status"], manifest["filename"], str(source) if source.is_file() else None,
                     int(manifest["size_bytes"]), manifest.get("sha256"), json.dumps(manifest, ensure_ascii=False),
@@ -206,7 +207,7 @@ class LegacyStateImporter:
             ).fetchone() is None:
                 upload_id = None
             connection.execute(
-                "INSERT OR IGNORE INTO input_jobs(input_job_id, upload_id, status, stage, job_json, progress_json, result_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO input_jobs(input_job_id, upload_id, status, stage, job_json, progress_json, result_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
                 (job["input_job_id"], upload_id, job.get("status", "unknown"), job.get("stage", "unknown"), json.dumps(job, ensure_ascii=False), json.dumps(progress, ensure_ascii=False), json.dumps(result, ensure_ascii=False) if result is not None else None, job.get("created_at") or utc_now(), job.get("completed_at") or utc_now()),
             )
             return 1
@@ -214,11 +215,11 @@ class LegacyStateImporter:
             items = self._read_json(path).get("items") or {}
             for template_hash, item in items.items():
                 connection.execute(
-                    "INSERT OR IGNORE INTO drain_templates(template_hash, component, status, template_json, updated_at) VALUES (?, ?, ?, ?, ?)",
+                    "INSERT INTO drain_templates(template_hash, component, status, template_json, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
                     (template_hash, item.get("component"), item.get("status"), json.dumps(item, ensure_ascii=False), item.get("updated_at") or utc_now()),
                 )
                 connection.execute(
-                    "INSERT OR IGNORE INTO drain_template_versions(template_hash, version, template_json, created_at) VALUES (?, ?, ?, ?)",
+                    "INSERT INTO drain_template_versions(template_hash, version, template_json, created_at) VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING",
                     (template_hash, int(item.get("version", 1)), json.dumps(item, ensure_ascii=False), item.get("updated_at") or utc_now()),
                 )
             return len(items)
@@ -234,7 +235,7 @@ class LegacyStateImporter:
             items = self._read_json(path).get("items") or []
             for item in items:
                 connection.execute(
-                    "INSERT OR IGNORE INTO drain_datasets(dataset_id, name, version, dataset_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO drain_datasets(dataset_id, name, version, dataset_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
                     (item["dataset_id"], item["name"], item.get("version"), json.dumps(item, ensure_ascii=False), item.get("created_at") or utc_now(), item.get("updated_at") or utc_now()),
                 )
             return len(items)
@@ -243,12 +244,12 @@ class LegacyStateImporter:
             for item in items:
                 if path.name == "annotations.jsonl":
                     connection.execute(
-                        "INSERT OR IGNORE INTO drain_annotations(annotation_id, annotation_json, created_at, updated_at) VALUES (?, ?, ?, ?)",
+                        "INSERT INTO drain_annotations(annotation_id, annotation_json, created_at, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING",
                         (item["annotation_id"], json.dumps(item, ensure_ascii=False), item.get("created_at") or utc_now(), item.get("created_at") or utc_now()),
                     )
                 else:
                     connection.execute(
-                        "INSERT OR IGNORE INTO drain_reviews(review_id, annotation_id, review_json, created_at) VALUES (?, ?, ?, ?)",
+                        "INSERT INTO drain_reviews(review_id, annotation_id, review_json, created_at) VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING",
                         (item["review_id"], item.get("annotation_id"), json.dumps(item, ensure_ascii=False), item.get("created_at") or utc_now()),
                     )
             return len(items)
@@ -262,19 +263,19 @@ class LegacyStateImporter:
                         continue
                     content = ini.read_text(encoding="utf-8")
                     connection.execute(
-                        "INSERT OR IGNORE INTO drain_config_versions(config_id, version, status, content, content_hash, config_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO drain_config_versions(config_id, version, status, content, content_hash, config_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
                         (config_id, version, metadata.get("status", "candidate"), content, hashlib.sha256(content.encode()).hexdigest(), json.dumps(metadata, ensure_ascii=False), version_meta.get("created_at") or utc_now()),
                     )
             return len(items)
         if path.name == "active_config.json":
-            connection.execute("INSERT OR REPLACE INTO app_settings(setting_key, value_json, updated_at) VALUES ('active_drain_config', ?, ?)", (path.read_text(encoding="utf-8"), utc_now()))
+            connection.execute("INSERT INTO app_settings(setting_key, value_json, updated_at) VALUES ('active_drain_config', ?, ?) ON CONFLICT(setting_key) DO UPDATE SET value_json=excluded.value_json, updated_at=excluded.updated_at", (path.read_text(encoding="utf-8"), utc_now()))
             return 1
         if path.name == "summary.json" and path.parent.parent.name in {"eval_runs", "tune_runs"}:
             item = self._read_json(path)
             if path.parent.parent.name == "eval_runs":
-                connection.execute("INSERT OR IGNORE INTO drain_eval_runs(evaluation_id, status, evaluation_json, created_at, completed_at) VALUES (?, ?, ?, ?, ?)", (item["run_id"], item.get("status", "completed"), json.dumps(item, ensure_ascii=False), item.get("created_at") or utc_now(), item.get("updated_at")))
+                connection.execute("INSERT INTO drain_eval_runs(evaluation_id, status, evaluation_json, created_at, completed_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT DO NOTHING", (item["run_id"], item.get("status", "completed"), json.dumps(item, ensure_ascii=False), item.get("created_at") or utc_now(), item.get("updated_at")))
             else:
-                connection.execute("INSERT OR IGNORE INTO drain_tune_runs(tune_run_id, status, tune_json, created_at, completed_at) VALUES (?, ?, ?, ?, ?)", (item["run_id"], item.get("status", "completed"), json.dumps(item, ensure_ascii=False), item.get("created_at") or utc_now(), item.get("updated_at")))
+                connection.execute("INSERT INTO drain_tune_runs(tune_run_id, status, tune_json, created_at, completed_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT DO NOTHING", (item["run_id"], item.get("status", "completed"), json.dumps(item, ensure_ascii=False), item.get("created_at") or utc_now(), item.get("updated_at")))
             return 1
         if path.name == "catalog.json" and path.parent.name == "semantic_dictionaries":
             catalog = self._read_json(path).get("items") or {}
@@ -285,11 +286,11 @@ class LegacyStateImporter:
             item = self._read_json(path)
             dictionary_id, version = item["dictionary_id"], int(item["version"])
             digest = hashlib.sha256(json.dumps(item, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
-            connection.execute("INSERT OR IGNORE INTO semantic_dictionary_versions(dictionary_id, version, status, dictionary_json, content_hash, created_at) VALUES (?, ?, 'candidate', ?, ?, ?)", (dictionary_id, version, json.dumps(item, ensure_ascii=False), digest, utc_now()))
+            connection.execute("INSERT INTO semantic_dictionary_versions(dictionary_id, version, status, dictionary_json, content_hash, created_at) VALUES (?, ?, 'candidate', ?, ?, ?) ON CONFLICT DO NOTHING", (dictionary_id, version, json.dumps(item, ensure_ascii=False), digest, utc_now()))
             return 1
         if path.parent.parent.name == "validations":
             item = self._read_json(path)
-            connection.execute("INSERT OR REPLACE INTO semantic_validation_runs(dictionary_id, version, validation_json, created_at) VALUES (?, ?, ?, ?)", (item["dictionary_id"], int(item["version"]), json.dumps(item, ensure_ascii=False), utc_now()))
+            connection.execute("INSERT INTO semantic_validation_runs(dictionary_id, version, validation_json, created_at) VALUES (?, ?, ?, ?) ON CONFLICT(dictionary_id, version) DO UPDATE SET validation_json=excluded.validation_json, created_at=excluded.created_at", (item["dictionary_id"], int(item["version"]), json.dumps(item, ensure_ascii=False), utc_now()))
             return 1
         if path.name == "events.jsonl" and path.parent.name == "semantic_dictionaries":
             events = self._read_jsonl(path)

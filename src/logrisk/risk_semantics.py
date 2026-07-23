@@ -224,7 +224,7 @@ class RiskSemanticService:
                     "INSERT INTO risk_semantic_rules(rule_id, source, override_of, status, enabled, current_version, "
                     "content_json, content_hash, created_at, updated_at) VALUES (?, 'builtin', NULL, 'published', 1, ?, ?, ?, ?, ?) "
                     "ON CONFLICT(rule_id) DO UPDATE SET current_version=excluded.current_version, content_json=excluded.content_json, "
-                    "content_hash=excluded.content_hash, status='published', enabled=1, updated_at=excluded.updated_at",
+                    "content_hash=excluded.content_hash, status='published', enabled=TRUE, updated_at=excluded.updated_at",
                     (snapshot["id"], version, _json(snapshot), digest, now, now),
                 )
                 connection.execute(
@@ -368,7 +368,7 @@ class RiskSemanticService:
             connection.execute(
                 "INSERT INTO risk_semantic_rules(rule_id, source, override_of, status, enabled, current_version, "
                 "content_json, content_hash, created_at, updated_at) VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?)",
-                (snapshot["id"], snapshot["source"], snapshot.get("override_of"), snapshot["status"], int(snapshot["enabled"]), _json(snapshot), digest, now, now),
+                (snapshot["id"], snapshot["source"], snapshot.get("override_of"), snapshot["status"], bool(snapshot["enabled"]), _json(snapshot), digest, now, now),
             )
             connection.execute(
                 "INSERT INTO risk_semantic_rule_versions(rule_id, version, content_json, content_hash, changed_by, change_reason, created_at) "
@@ -417,7 +417,7 @@ class RiskSemanticService:
             result = connection.execute(
                 "UPDATE risk_semantic_rules SET status='draft', enabled=?, current_version=?, content_json=?, content_hash=?, updated_at=? "
                 "WHERE rule_id=? AND current_version=?",
-                (int(updated["enabled"]), version, _json(updated), _hash(updated), now, rule_id, expected_version),
+                (bool(updated["enabled"]), version, _json(updated), _hash(updated), now, rule_id, expected_version),
             )
             if result.rowcount != 1:
                 raise RiskSemanticError("语义版本冲突", code="version_conflict", status_code=409)
@@ -441,10 +441,12 @@ class RiskSemanticService:
         now = self.clock()
         with self.database.transaction() as connection:
             connection.execute(
-                "INSERT OR REPLACE INTO risk_semantic_validations(rule_id, version, valid, validation_json, content_hash, created_at) "
-                "VALUES (?, ?, 1, ?, ?, ?)", (rule_id, current["version"], _json(report), current["content_hash"], now),
+                "INSERT INTO risk_semantic_validations(rule_id, version, valid, validation_json, content_hash, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(rule_id, version) DO UPDATE SET valid=excluded.valid, "
+                "validation_json=excluded.validation_json, content_hash=excluded.content_hash, created_at=excluded.created_at",
+                (rule_id, current["version"], True, _json(report), current["content_hash"], now),
             )
-            connection.execute("UPDATE risk_semantic_rules SET status='published', enabled=1, updated_at=? WHERE rule_id=?", (now, rule_id))
+            connection.execute("UPDATE risk_semantic_rules SET status='published', enabled=TRUE, updated_at=? WHERE rule_id=?", (now, rule_id))
             self._audit(connection, rule_id, "published", current["version"], current["version"], current, dict(current, status="published"), operator, reason, now)
         self.reload()
         return self.get_rule(rule_id)
@@ -461,7 +463,7 @@ class RiskSemanticService:
             raise RiskSemanticError("语义版本冲突", code="version_conflict", status_code=409)
         now = self.clock()
         with self.database.transaction() as connection:
-            connection.execute("UPDATE risk_semantic_rules SET status='disabled', enabled=0, updated_at=? WHERE rule_id=?", (now, current["id"]))
+            connection.execute("UPDATE risk_semantic_rules SET status='disabled', enabled=FALSE, updated_at=? WHERE rule_id=?", (now, current["id"]))
             self._audit(connection, current["id"], "restored_default", current["version"], current["version"], current, dict(current, status="disabled", enabled=False), operator, reason, now)
         self.reload()
         return self.get_rule(current["id"])
@@ -527,7 +529,7 @@ class RiskSemanticService:
             raise RiskSemanticError("语义版本冲突", code="version_conflict", status_code=409)
         now = self.clock()
         with self.database.transaction() as connection:
-            connection.execute("UPDATE risk_semantic_rules SET status='disabled', enabled=0, updated_at=? WHERE rule_id=?", (now, rule_id))
+            connection.execute("UPDATE risk_semantic_rules SET status='disabled', enabled=FALSE, updated_at=? WHERE rule_id=?", (now, rule_id))
             self._audit(connection, rule_id, "disabled", current["version"], current["version"], current, dict(current, status="disabled", enabled=False), operator, reason, now)
         self.reload()
         return self.get_rule(rule_id)

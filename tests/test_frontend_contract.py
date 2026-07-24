@@ -246,6 +246,20 @@ def test_model_profile_page_manages_provider_connections():
         assert text in source
 
 
+def test_model_profile_page_configures_registered_extension_adapters_without_token_inputs():
+    source = source_text()
+    for text in (
+        "/api/ai-harness/extensions",
+        "modelExtensions",
+        'value: "extension"',
+        "adapter_id",
+        "credential_envs",
+        "extension_config",
+        "实际 Token 不会保存或展示",
+    ):
+        assert text in source
+
+
 def test_model_profile_save_has_feedback_and_edits_top_level_output_budget():
     source = source_text()
     for text in (

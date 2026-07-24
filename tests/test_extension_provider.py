@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from logrisk.ai_harness.model_client import ModelClientError
@@ -101,3 +103,12 @@ def test_extension_client_redacts_configured_credential_from_error_and_raw_outpu
         client.generate_json([], {"type": "object"}, model="fake", timeout=5)
 
     assert "secret-token" not in captured.value.raw_output
+
+
+def test_local_provider_guide_defines_allowed_and_prohibited_change_boundaries():
+    text = Path("LOCAL_PROVIDER_DEVELOPMENT_GUIDE.md").read_text(encoding="utf-8")
+
+    assert "允许修改" in text
+    assert "禁止修改" in text
+    assert "token_auth_template.py" in text
+    assert "不得提交 Token" in text

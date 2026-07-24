@@ -4,7 +4,7 @@
   <img src="frontend/logo/logrisk-app-icon-orange-v2.png" width="112" alt="LOGRISK 应用图标" />
 </p>
 
-当前版本：`1.25.0`。完整变更记录见 [`releas.md`](releas.md)。
+当前版本：`1.25.1`。完整变更记录见 [`releas.md`](releas.md)。
 
 LOGRISK 在本地完成日志规范化、Drain3 模板化、确定性语义增强、风险评分、规则复用、模型特征识别和人工审批。系统只生成可审查、可导出的日志特征，不执行根因分析（RCA），也不会把原始日志直接发送给模型。
 
@@ -13,7 +13,7 @@ LOGRISK 在本地完成日志规范化、Drain3 模板化、确定性语义增�
 - 支持 JSON、JSONL、纯文本、无后缀 Linux 日志和 Gzip 大文件。
 - 使用 Drain3 压缩日志，并保留 HTTP 状态码、errno、exit code、signal、NVIDIA Xid 和 Kubernetes Reason 等关键语义。
 - 已批准且处于启用状态的规则优先匹配，命中后跳过模型调用；未知特征才进入 AI 分析和人工审批。
-- 支持本地 Ollama 与 OpenAI-compatible `/v1/chat/completions` 服务。
+- 支持本地 Ollama、OpenAI-compatible `/v1/chat/completions` 服务和可扩展的内部 Token 鉴权 Provider 模板。
 - 提供 Prompt 版本、模型 Profile、AI Trace、缓存、评测、Drain3 配置和语义词典治理。
 - 提供统一的评测与基准中心，可比较 Prompt、模型 Profile、失败 Case、趋势及发布门禁。
 - 提供服务器风险总览、风险事件台账、可解释评分，以及可编辑、可发布、可回滚的风险语义库。
@@ -53,7 +53,7 @@ ollama serve
 ollama pull qwen3:1.7b
 ```
 
-也可以在 Dashboard 的“模型画像”页面配置远端 OpenAI-compatible 服务，无需安装 Ollama。
+也可以在 Dashboard 的“模型画像”页面配置远端 OpenAI-compatible 服务或内部扩展适配器，无需安装 Ollama。
 
 ### 3. 启动 Dashboard
 
@@ -110,6 +110,8 @@ bash scripts/dashboard.sh restart
 ```
 
 随后在“模型画像 → API 连接”中新建 `openai_compatible` 连接，将 API Key 环境变量填写为 `REMOTE_LLM_API_KEY`，测试成功后绑定模型 Profile。不支持 `response_format` 的服务请选择 `prompt_only`。
+
+对于内部的 Token、签名或私有 SDK 协议，请选择 `extension` 连接并使用已提交的适配器模板。模板与核心任务链路隔离，连接仅保存适配器 ID、非敏感配置和环境变量名；实际 Token 不会保存或展示。请按 [本地扩展模型 Provider 开发指南](LOCAL_PROVIDER_DEVELOPMENT_GUIDE.md) 在内部环境完成适配。
 
 仓库内置 `qwen3.5:4b-mlx`、`qwen3.5:9b-mlx`、`qwen3:1.7b`、`qwen3.6:35b-a3b` 和 `deepseek-v4:flash` Profile。默认 Profile 仍为 `qwen3_1_7b_fast`，默认 Prompt 为 `feature_extract_v3_compact_strict_json_en`。`qwen3.5:9b-mlx` 使用 262144 tokens 上下文、12000 tokens 推荐输入预算和 2000 tokens 输出预算，默认关闭 Thinking 以提高结构化 JSON 稳定性。
 

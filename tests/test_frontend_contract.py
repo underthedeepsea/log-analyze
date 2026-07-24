@@ -473,11 +473,12 @@ def test_release_docs_describe_current_feature_version():
     assert "## 1.22.0 - 2026-07-18" in release
     assert "## 1.23.0 - 2026-07-19" in release
     assert "## 1.23.1 - 2026-07-21" in release
-    assert "当前版本：`1.25.0`" in readme
+    assert "当前版本：`1.25.1`" in readme
     assert "## 1.24.0 - 2026-07-22" in release
     assert "## 1.24.1 - 2026-07-22" in release
     assert "## 1.24.2 - 2026-07-22" in release
     assert "## 1.25.0 - 2026-07-23" in release
+    assert "## 1.25.1 - 2026-07-24" in release
     assert "qwen3.5:9b-mlx" in readme
     assert "state/logrisk.sqlite3" in readme
     assert "database/migrations/" in readme

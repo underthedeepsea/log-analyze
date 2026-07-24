@@ -107,6 +107,9 @@ def test_postgres_migrations_track_each_sqlite_schema_version_without_sqlite_onl
     assert " json_extract(" not in combined
     assert "jsonb" in combined
     assert "timestamptz" in combined
+    extension_migration = (postgres_root / "0007_extension_model_provider.sql").read_text(encoding="utf-8")
+    assert "extension" in extension_migration
+    assert "credential_envs_json JSONB" in extension_migration
 
 
 def test_postgres_dependency_is_optional_and_kept_out_of_default_requirements():

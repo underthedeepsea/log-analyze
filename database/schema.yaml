@@ -1,4 +1,4 @@
-schema_version: 6
+schema_version: 7
 database: logrisk
 description: LOGRISK 双模式运行时数据字典；SQLite 是默认本地实现，PostgreSQL 用于显式配置的外部生产部署。
 authoritative_ddl:
@@ -32,10 +32,10 @@ tables:
     primary_key: setting_key
     columns: {setting_key: 设置键, value_json: 设置值, updated_at: 更新时间}
   provider_connections:
-    description: Ollama 与 OpenAI-compatible API 连接；只保存密钥环境变量名
+    description: Ollama、OpenAI-compatible 与受控扩展模型连接；只保存凭据环境变量名与非敏感适配器配置
     primary_key: connection_id
-    constraints: provider 仅允许 ollama/openai_compatible；超时必须大于 0；启用与默认标志为布尔值
-    columns: {connection_id: 连接标识, display_name: 页面显示名, provider: Provider 类型, base_url: 服务根地址, api_key_env: API Key 环境变量名而非密钥, timeout_seconds: HTTP 超时秒数, enabled: 是否允许新任务使用, is_default: 是否为默认连接, created_at: 创建时间, updated_at: 更新时间}
+    constraints: provider 仅允许 ollama/openai_compatible/extension；扩展适配器必须在代码 allow-list 中注册；超时必须大于 0；启用与默认标志为布尔值
+    columns: {connection_id: 连接标识, display_name: 页面显示名, provider: Provider 类型, base_url: 服务根地址, api_key_env: OpenAI API Key 环境变量名而非密钥, adapter_id: 扩展适配器标识, credential_envs_json: 逻辑凭据名到环境变量名的映射而非凭据值, extension_config_json: 扩展适配器的非敏感 JSON 配置, timeout_seconds: HTTP 超时秒数, enabled: 是否允许新任务使用, is_default: 是否为默认连接, created_at: 创建时间, updated_at: 更新时间}
   model_profiles:
     description: 绑定连接的模型参数、Prompt 和上下文预算
     primary_key: profile_id

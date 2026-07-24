@@ -16,9 +16,15 @@ from urllib.parse import parse_qs, unquote, urlparse
 from urllib.request import Request, urlopen
 
 from logrisk.ai_harness.connections import ConnectionStore
+from logrisk.ai_harness.model_client import ModelClientError
 from logrisk.ai_harness.model_profile import ModelProfileRegistry
 from logrisk.ai_harness.prompt_registry import PromptRegistry, PromptTemplate, SQLitePromptRegistry
 from logrisk.ai_harness.providers import create_model_client
+from logrisk.ai_harness.providers.extension import redact_model_error
+from logrisk.ai_harness.providers.extensions.registry import (
+    get_extension_adapter,
+    list_extension_descriptors,
+)
 from logrisk.ai_harness.trace_logger import AITraceLogger
 from logrisk.ai_eval.runner import load_cases
 from logrisk.approved_rules import ApprovedRuleError, ApprovedRuleStore
@@ -78,6 +84,22 @@ def check_model_connection(connection: dict[str, Any]) -> dict[str, Any]:
         return {"online": False, "models": [], "error": "连接已停用"}
     if connection.get("provider") == "ollama":
         return check_ollama(str(connection["base_url"]), float(connection.get("timeout_seconds") or 2))
+    if connection.get("provider") == "extension":
+        values = [
+            os.environ.get(str(env_name), "")
+            for env_name in dict(connection.get("credential_envs") or {}).values()
+        ]
+        try:
+            result = get_extension_adapter(str(connection.get("adapter_id") or "")).check_connection(connection)
+            if not isinstance(result, dict):
+                raise ModelClientError("扩展适配器连接检查必须返回 JSON object")
+            result["models"] = list(result.get("models") or [])
+            result["online"] = bool(result.get("online"))
+            if result.get("error"):
+                result["error"] = redact_model_error(str(result["error"]), values)
+            return result
+        except Exception as exc:
+            return {"online": False, "models": [], "error": redact_model_error(str(exc), values)}
     api_key_env = str(connection.get("api_key_env") or "")
     api_key = os.environ.get(api_key_env)
     if not api_key:
@@ -600,6 +622,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if path == "/api/ai-harness/connections":
                 self._json(HTTPStatus.OK, {"items": self.server.connections.list()})  # type: ignore[attr-defined]
                 return
+            if path == "/api/ai-harness/extensions":
+                self._json(HTTPStatus.OK, {"items": list_extension_descriptors()})
+                return
             if path == "/api/ai-harness/observability/summary":
                 self._json(HTTPStatus.OK, self._observability_summary())
                 return
@@ -979,6 +1004,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     raise FeatureJobError(f"模型连接已停用: {profile.connection_id}")
                 if connection["provider"] == "openai_compatible" and not connection["api_key_configured"]:
                     raise FeatureJobError(f"未配置 API Key 环境变量: {connection.get('api_key_env')}")
+                if connection["provider"] == "extension":
+                    missing = [
+                        name for name, configured in dict(connection.get("credential_envs_configured") or {}).items()
+                        if not configured
+                    ]
+                    if missing:
+                        raise FeatureJobError(f"未配置扩展凭据环境变量: {', '.join(sorted(missing))}")
+                    try:
+                        get_extension_adapter(str(connection.get("adapter_id") or "")).validate_connection(connection)
+                    except ModelClientError as exc:
+                        raise FeatureJobError(str(exc)) from exc
                 job_id = self.server.manager.create_job(  # type: ignore[attr-defined]
                     payload.get("result"),
                     model=profile.model,
@@ -1183,11 +1219,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
             try:
                 connection = self.server.connections.get(profile.connection_id)  # type: ignore[attr-defined]
                 item["connection_enabled"] = bool(connection.get("enabled"))
+                extension_ready = all(dict(connection.get("credential_envs_configured") or {}).values())
                 item["connection_ready"] = bool(
                     connection.get("enabled")
                     and (
                         connection.get("provider") == "ollama"
                         or connection.get("api_key_configured")
+                        or (connection.get("provider") == "extension" and extension_ready)
                     )
                 )
             except KeyError:

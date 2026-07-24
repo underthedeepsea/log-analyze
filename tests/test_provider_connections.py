@@ -51,3 +51,43 @@ def test_default_ollama_connection_is_seeded(tmp_path):
 
     assert connection["provider"] == "ollama"
     assert connection["is_default"] is True
+
+
+def test_extension_connection_persists_only_credential_environment_names(tmp_path, monkeypatch):
+    database = SQLiteDatabase(tmp_path / "logrisk.sqlite3")
+    store = ConnectionStore(database)
+    monkeypatch.setenv("INTERNAL_ACCESS_TOKEN", "real-internal-token")
+
+    saved = store.save({
+        "connection_id": "internal-token",
+        "display_name": "内部 Token 模型",
+        "provider": "extension",
+        "base_url": "https://internal.example/model",
+        "adapter_id": "token_auth_template",
+        "credential_envs": {"access_token": "INTERNAL_ACCESS_TOKEN"},
+        "extension_config": {"tenant": "ops"},
+        "timeout_seconds": 30,
+        "enabled": True,
+    })
+
+    assert saved["adapter_id"] == "token_auth_template"
+    assert saved["credential_envs"] == {"access_token": "INTERNAL_ACCESS_TOKEN"}
+    assert saved["credential_envs_configured"] == {"access_token": True}
+    assert saved["extension_config"] == {"tenant": "ops"}
+    assert "real-internal-token" not in database.path.read_bytes().decode("utf-8", errors="ignore")
+
+
+def test_extension_connection_rejects_unregistered_adapter_and_sensitive_config(tmp_path):
+    store = ConnectionStore(SQLiteDatabase(tmp_path / "logrisk.sqlite3"))
+    base = {
+        "connection_id": "internal-token",
+        "display_name": "内部",
+        "provider": "extension",
+        "base_url": "https://internal.example/model",
+        "credential_envs": {"access_token": "INTERNAL_ACCESS_TOKEN"},
+    }
+
+    with pytest.raises(ValueError, match="未注册"):
+        store.save({**base, "adapter_id": "not-registered"})
+    with pytest.raises(ValueError, match="敏感"):
+        store.save({**base, "adapter_id": "token_auth_template", "extension_config": {"token": "not-allowed"}})

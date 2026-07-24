@@ -51,7 +51,43 @@ def test_database_migration_is_idempotent(tmp_path):
     with sqlite3.connect(path) as connection:
         count = connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0]
 
-    assert count == 6
+    assert count == 7
+
+
+def test_extension_provider_migration_upgrades_existing_connection_and_profile(tmp_path):
+    migration = Path("database/migrations/0007_extension_model_provider.sql")
+    assert migration.exists()
+    migrations = tmp_path / "migrations"
+    migrations.mkdir()
+    for source in sorted(Path("database/migrations").glob("000[1-6]_*.sql")):
+        shutil.copy(source, migrations / source.name)
+    path = tmp_path / "logrisk.sqlite3"
+    database = SQLiteDatabase(path, migrations_dir=migrations)
+    with database.transaction() as connection:
+        connection.execute(
+            "INSERT INTO provider_connections(connection_id, display_name, provider, base_url, created_at, updated_at) "
+            "VALUES ('ollama-local', 'Ollama', 'ollama', 'http://127.0.0.1:11434', 'now', 'now')"
+        )
+        connection.execute(
+            "INSERT INTO model_profiles(profile_id, connection_id, model, display_name, profile_json, created_at, updated_at) "
+            "VALUES ('profile-old', 'ollama-local', 'qwen', '旧画像', '{}', 'now', 'now')"
+        )
+    shutil.copy(migration, migrations / migration.name)
+
+    SQLiteDatabase(path, migrations_dir=migrations)
+
+    with sqlite3.connect(path) as connection:
+        old_profile = connection.execute(
+            "SELECT connection_id FROM model_profiles WHERE profile_id='profile-old'"
+        ).fetchone()[0]
+        connection.execute(
+            "INSERT INTO provider_connections(connection_id, display_name, provider, base_url, adapter_id, credential_envs_json, extension_config_json, created_at, updated_at) "
+            "VALUES ('internal-token', '内部', 'extension', 'https://internal.example', 'token_auth_template', '{}', '{}', 'now', 'now')"
+        )
+        fields = {row[1] for row in connection.execute("PRAGMA table_info(provider_connections)")}
+
+    assert old_profile == "ollama-local"
+    assert {"adapter_id", "credential_envs_json", "extension_config_json"} <= fields
 
 
 def test_output_budget_migration_updates_old_builtin_profile_and_removes_derived_options(tmp_path):
@@ -124,11 +160,12 @@ def test_qwen_9b_profile_migration_seeds_existing_database_without_changing_defa
 def test_schema_dictionary_describes_rule_lifecycle_tables():
     schema = Path("database/schema.yaml").read_text(encoding="utf-8")
 
-    assert "schema_version: 6" in schema
+    assert "schema_version: 7" in schema
     assert "rule_versions:" in schema
     assert "rule_feedback:" in schema
     assert "rule_audit_events:" in schema
     assert "current_version: 当前规则版本" in schema
+    assert "adapter_id: 扩展适配器标识" in schema
 
 
 def test_rule_governance_migration_versions_existing_rules_with_lifecycle_defaults(tmp_path):

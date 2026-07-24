@@ -104,6 +104,7 @@
     modelProfiles: function () { return jsonRequest("/api/ai-harness/model-profiles"); },
     saveModelProfile: function (profile) { return jsonRequest("/api/ai-harness/model-profiles", { method: "POST", body: JSON.stringify(profile) }); },
     modelConnections: function () { return jsonRequest("/api/ai-harness/connections"); },
+    modelExtensions: function () { return jsonRequest("/api/ai-harness/extensions"); },
     saveModelConnection: function (connection) { return jsonRequest("/api/ai-harness/connections", { method: "POST", body: JSON.stringify(connection) }); },
     updateModelConnection: function (id, changes) { return jsonRequest("/api/ai-harness/connections/" + encodeURIComponent(id), { method: "PATCH", body: JSON.stringify(changes) }); },
     testModelConnection: function (id) { return jsonRequest("/api/ai-harness/connections/" + encodeURIComponent(id) + "/test", { method: "POST", body: "{}" }); },
@@ -614,13 +615,16 @@
     const current = profiles.find(function (profile) { return profile.profile_id === currentId; }) || profiles[0] || {};
     const [draft, setDraft] = useState(current);
     const [connections, setConnections] = useState([]);
-    const [connectionDraft, setConnectionDraft] = useState({ connection_id: "", display_name: "", provider: "openai_compatible", base_url: "https://api.example.com/v1", api_key_env: "REMOTE_LLM_API_KEY", timeout_seconds: 120, enabled: true });
+    const [extensions, setExtensions] = useState([]);
+    const [connectionDraft, setConnectionDraft] = useState({ connection_id: "", display_name: "", provider: "openai_compatible", base_url: "https://api.example.com/v1", api_key_env: "REMOTE_LLM_API_KEY", adapter_id: "", credential_envs: {}, extension_config: {}, timeout_seconds: 120, enabled: true });
+    const [credentialEnvText, setCredentialEnvText] = useState("{}");
+    const [extensionConfigText, setExtensionConfigText] = useState("{}");
     const [connectionStatus, setConnectionStatus] = useState(null);
     const [connectionError, setConnectionError] = useState("");
     const [saveState, setSaveState] = useState("idle");
     const [saveMessage, setSaveMessage] = useState("");
     useEffect(function () { setDraft(current); setSaveState("idle"); setSaveMessage(""); }, [current.profile_id]);
-    useEffect(function () { api.modelConnections().then(function (value) { const items = value.items || []; setConnections(items); if (items[0]) setConnectionDraft(items[0]); }).catch(function (reason) { setConnectionError(reason.message); }); }, []);
+    useEffect(function () { Promise.all([api.modelConnections(), api.modelExtensions()]).then(function (values) { const items = values[0].items || []; setConnections(items); setExtensions(values[1].items || []); if (items[0]) selectConnection(items[0]); }).catch(function (reason) { setConnectionError(reason.message); }); }, []);
     const budget = draft.evidence_budget || {};
     function setField(key, value) { setDraft(Object.assign({}, draft, { [key]: value })); setSaveState("idle"); setSaveMessage(""); }
     function setBudget(key, value) { setDraft(Object.assign({}, draft, { evidence_budget: Object.assign({}, budget, { [key]: Number(value) || 0 }) })); setSaveState("idle"); setSaveMessage(""); }
@@ -632,9 +636,12 @@
       props.onSelect(next);
       setDraft(next);
     }
-    function selectConnection(connection) { setConnectionDraft(connection); setConnectionStatus(null); setConnectionError(""); }
-    function newConnection() { setConnectionDraft({ connection_id: "remote-" + Date.now(), display_name: "远端模型 API", provider: "openai_compatible", base_url: "https://api.example.com/v1", api_key_env: "REMOTE_LLM_API_KEY", timeout_seconds: 120, enabled: true, is_default: false }); setConnectionStatus(null); }
-    async function saveConnection() { try { const saved = await api.saveModelConnection(connectionDraft); const value = await api.modelConnections(); setConnections(value.items || []); setConnectionDraft(saved); setConnectionError(""); } catch (reason) { setConnectionError(reason.message); } }
+    function selectConnection(connection) { setConnectionDraft(connection); setCredentialEnvText(JSON.stringify(connection.credential_envs || {}, null, 2)); setExtensionConfigText(JSON.stringify(connection.extension_config || {}, null, 2)); setConnectionStatus(null); setConnectionError(""); }
+    function newConnection() { const next = { connection_id: "remote-" + Date.now(), display_name: "远端模型 API", provider: "openai_compatible", base_url: "https://api.example.com/v1", api_key_env: "REMOTE_LLM_API_KEY", adapter_id: "", credential_envs: {}, extension_config: {}, timeout_seconds: 120, enabled: true, is_default: false }; setConnectionDraft(next); setCredentialEnvText("{}"); setExtensionConfigText("{}"); setConnectionStatus(null); }
+    function parseJsonObject(value, fieldName) { try { const parsed = JSON.parse(value || "{}"); if (!parsed || Array.isArray(parsed) || typeof parsed !== "object") throw new Error(); return parsed; } catch (_) { throw new Error(fieldName + " 必须是 JSON 对象"); } }
+    function changeConnectionProvider(provider) { const next = Object.assign({}, connectionDraft, { provider: provider, adapter_id: "", credential_envs: {}, extension_config: {} }); if (provider === "extension") next.api_key_env = ""; if (provider === "ollama") next.api_key_env = ""; setConnectionDraft(next); setCredentialEnvText("{}"); setExtensionConfigText("{}"); }
+    function selectExtension(adapterId) { const extension = extensions.find(function (item) { return item.adapter_id === adapterId; }) || {}; const nextCredentials = {}; Object.keys(extension.credential_fields || {}).forEach(function (key) { nextCredentials[key] = (connectionDraft.credential_envs || {})[key] || ""; }); setConnectionField("adapter_id", adapterId); setCredentialEnvText(JSON.stringify(nextCredentials, null, 2)); }
+    async function saveConnection() { try { const payload = Object.assign({}, connectionDraft); if (payload.provider === "extension") { payload.credential_envs = parseJsonObject(credentialEnvText, "凭据环境变量映射"); payload.extension_config = parseJsonObject(extensionConfigText, "非敏感配置"); } const saved = await api.saveModelConnection(payload); const value = await api.modelConnections(); setConnections(value.items || []); selectConnection(saved); setConnectionError(""); } catch (reason) { setConnectionError(reason.message); } }
     async function testConnection() { try { setConnectionStatus(await api.testModelConnection(connectionDraft.connection_id)); setConnectionError(""); } catch (reason) { setConnectionError(reason.message); } }
     async function saveProfile() {
       setSaveState("saving");
@@ -650,6 +657,10 @@
       }
     }
     function setConnectionField(key, value) { setConnectionDraft(Object.assign({}, connectionDraft, { [key]: value })); }
+    const selectedExtension = extensions.find(function (item) { return item.adapter_id === connectionDraft.adapter_id; }) || null;
+    const profileConnection = connections.find(function (item) { return item.connection_id === draft.connection_id; }) || null;
+    const profileExtension = profileConnection && extensions.find(function (item) { return item.adapter_id === profileConnection.adapter_id; });
+    const outputModes = profileExtension ? profileExtension.supported_output_modes : ["json_schema", "json_object", "prompt_only"];
     const head = h("div", { className: "page-head obs-head" }, h("div", null, h("h1", null, "模型画像与上下文预算"), h("p", null, "按模型参数量、上下文窗口、Prompt 策略和 Thinking 开关，控制 Evidence 输入规模与调用行为")));
     const metrics = h("section", { className: "metrics-grid" },
         h(Metric, { label: "当前模型参数量", value: current.parameter_size || "—", tone: "orange" }),
@@ -665,9 +676,15 @@
         h("div", { className: "connection-form" },
           h("label", null, "连接 ID", h("input", { value: connectionDraft.connection_id || "", onChange: function (event) { setConnectionField("connection_id", event.target.value); } })),
           h("label", null, "显示名称", h("input", { value: connectionDraft.display_name || "", onChange: function (event) { setConnectionField("display_name", event.target.value); } })),
-          h("label", null, "Provider", h("select", { value: connectionDraft.provider || "ollama", onChange: function (event) { setConnectionField("provider", event.target.value); } }, h("option", { value: "ollama" }, "Ollama"), h("option", { value: "openai_compatible" }, "OpenAI-compatible"))),
-          h("label", { className: "wide" }, "API 基础地址", h("input", { value: connectionDraft.base_url || "", onChange: function (event) { setConnectionField("base_url", event.target.value); } }), h("small", null, connectionDraft.provider === "ollama" ? "示例：http://127.0.0.1:11434" : "地址需包含 /v1，例如：https://api.example.com/v1")),
-          h("label", null, "API Key 环境变量", h("input", { value: connectionDraft.api_key_env || "", disabled: connectionDraft.provider === "ollama", onChange: function (event) { setConnectionField("api_key_env", event.target.value); } }), h("small", null, "仅保存变量名，不保存密钥")),
+          h("label", null, "Provider", h("select", { value: connectionDraft.provider || "ollama", onChange: function (event) { changeConnectionProvider(event.target.value); } }, h("option", { value: "ollama" }, "Ollama"), h("option", { value: "openai_compatible" }, "OpenAI-compatible"), h("option", { value: "extension" }, "扩展适配器"))),
+          h("label", { className: "wide" }, "API 基础地址", h("input", { value: connectionDraft.base_url || "", onChange: function (event) { setConnectionField("base_url", event.target.value); } }), h("small", null, connectionDraft.provider === "ollama" ? "示例：http://127.0.0.1:11434" : (connectionDraft.provider === "extension" ? "内部模型服务根地址；私有路径由适配器模板负责。" : "地址需包含 /v1，例如：https://api.example.com/v1"))),
+          connectionDraft.provider !== "extension" && h("label", null, "API Key 环境变量", h("input", { value: connectionDraft.api_key_env || "", disabled: connectionDraft.provider === "ollama", onChange: function (event) { setConnectionField("api_key_env", event.target.value); } }), h("small", null, "仅保存变量名，不保存密钥")),
+          connectionDraft.provider === "extension" && h(React.Fragment, null,
+            h("label", null, "扩展适配器", h("select", { value: connectionDraft.adapter_id || "", onChange: function (event) { selectExtension(event.target.value); } }, h("option", { value: "" }, "选择已注册模板"), extensions.map(function (item) { return h("option", { value: item.adapter_id, key: item.adapter_id }, item.display_name); }))),
+            h("label", null, "结构化输出能力", h("input", { value: selectedExtension ? (selectedExtension.supported_output_modes || []).join(" · ") : "选择模板后显示", disabled: true })),
+            h("label", { className: "wide" }, "凭据环境变量映射", h("textarea", { value: credentialEnvText, onChange: function (event) { setCredentialEnvText(event.target.value); }, placeholder: '{\n  "access_token": "INTERNAL_ACCESS_TOKEN"\n}' }), h("small", null, selectedExtension ? selectedExtension.config_help : "选择模板后填写逻辑凭据名到环境变量名的映射。实际 Token 不会保存或展示。")),
+            h("label", { className: "wide" }, "非敏感扩展配置", h("textarea", { value: extensionConfigText, onChange: function (event) { setExtensionConfigText(event.target.value); }, placeholder: '{\n  "tenant": "ops"\n}' }), h("small", null, "只填写服务地址以外的非敏感参数；实际 Token 不会保存或展示。"))
+          ),
           h("label", null, "超时（秒）", h("input", { type: "number", value: connectionDraft.timeout_seconds || 120, onChange: function (event) { setConnectionField("timeout_seconds", Number(event.target.value) || 120); } })),
           h("label", null, "状态", h("select", { value: connectionDraft.enabled === false ? "off" : "on", onChange: function (event) { setConnectionField("enabled", event.target.value === "on"); } }, h("option", { value: "on" }, "启用"), h("option", { value: "off" }, "停用"))),
           h("div", { className: "button-row wide" }, h("button", { className: "primary-button", onClick: saveConnection }, "保存连接"), h("button", { className: "secondary-button", disabled: !connectionDraft.connection_id, onClick: testConnection }, "测试连接"), connectionStatus && h("span", { className: "connection-result " + (connectionStatus.online ? "success" : "failed") }, connectionStatus.online ? "连接成功 · " + (connectionStatus.models || []).length + " 个模型" : connectionStatus.error), connectionError && h("span", { className: "connection-result failed" }, connectionError)))));
@@ -685,7 +702,7 @@
         h("label", null, "模型名称", h("input", { value: draft.model || "", onChange: function (event) { setField("model", event.target.value); } })),
         h("label", null, "显示名称", h("input", { value: draft.display_name || "", onChange: function (event) { setField("display_name", event.target.value); } })),
         h("label", null, "API 连接", h("select", { value: draft.connection_id || "ollama-local", onChange: function (event) { const connection = connections.find(function (item) { return item.connection_id === event.target.value; }); setDraft(Object.assign({}, draft, { connection_id: event.target.value, provider: connection ? connection.provider : draft.provider })); } }, connections.map(function (connection) { return h("option", { value: connection.connection_id, key: connection.connection_id }, connection.display_name + " · " + connection.provider); }))),
-        h("label", null, "结构化输出", h("select", { value: draft.structured_output_mode || "json_schema", onChange: function (event) { setField("structured_output_mode", event.target.value); } }, h("option", { value: "json_schema" }, "JSON Schema"), h("option", { value: "json_object" }, "JSON Object"), h("option", { value: "prompt_only" }, "仅 Prompt 约束"))),
+        h("label", null, "结构化输出", h("select", { value: draft.structured_output_mode || "json_schema", onChange: function (event) { setField("structured_output_mode", event.target.value); } }, outputModes.map(function (mode) { return h("option", { value: mode, key: mode }, mode === "json_schema" ? "JSON Schema" : (mode === "json_object" ? "JSON Object" : "仅 Prompt 约束")); }))),
         h("label", null, "参数量", h("input", { value: draft.parameter_size || "", onChange: function (event) { setField("parameter_size", event.target.value); } })),
         h("label", null, "默认 Prompt", h("input", { value: draft.default_prompt_id || "", onChange: function (event) { setField("default_prompt_id", event.target.value); } })),
         h("label", null, "Thinking", h("select", { value: draft.thinking_enabled ? "on" : "off", onChange: function (event) { setField("thinking_enabled", event.target.value === "on"); } }, h("option", { value: "off" }, "Thinking OFF"), h("option", { value: "on" }, "Thinking ON"))),

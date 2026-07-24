@@ -468,6 +468,17 @@ def test_model_connections_api_creates_lists_and_updates_remote_connection(dashb
     assert updated["enabled"] is False
 
 
+def test_extension_adapter_api_lists_committed_template_without_secret_values(dashboard):
+    base_url, _ = dashboard
+
+    status, payload, _ = request_json(base_url + "/api/ai-harness/extensions")
+
+    assert status == 200
+    assert payload["items"][0]["adapter_id"] == "token_auth_template"
+    assert payload["items"][0]["credential_fields"] == {"access_token": "访问 Token 环境变量"}
+    assert "Token 实际值" in json.dumps(payload, ensure_ascii=False)
+
+
 def test_observability_progress_exposes_evaluator_status(dashboard):
     base_url, _ = dashboard
     _, created, _ = request_json(base_url + "/api/jobs", "POST", {

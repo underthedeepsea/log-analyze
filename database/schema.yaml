@@ -1,4 +1,4 @@
-schema_version: 7
+schema_version: 8
 database: logrisk
 description: LOGRISK 双模式运行时数据字典；SQLite 是默认本地实现，PostgreSQL 用于显式配置的外部生产部署。
 authoritative_ddl:
@@ -123,6 +123,28 @@ tables:
     primary_key: input_job_id
     foreign_keys: {upload_id: upload_sessions.upload_id}
     columns: {input_job_id: 输入任务标识, upload_id: 来源上传会话, status: 任务状态, stage: 当前处理阶段, job_json: 输入任务配置, progress_json: 实时处理进度, result_json: 聚合后的 result.json, created_at: 创建时间, updated_at: 更新时间}
+  streaming_tasks:
+    description: 可恢复文件或预留 Kafka 来源的增量处理任务；来源游标、配置摘要与任务状态为运行时权威记录
+    primary_key: task_id
+    constraints: source_kind 仅允许 file/kafka；status 为 queued/running/failed/interrupted/completed/conflict；不保存原始日志或凭据
+    indexes: [idx_streaming_tasks_status_updated(status, updated_at DESC)]
+    columns: {task_id: 流式任务标识, source_kind: 来源类型, source_identity_json: 文件身份或 Kafka 非敏感来源快照, config_hash: 锁定的 Drain3 配置摘要, status: 运行状态, stage: READING/SPOOLING/MINING/AGGREGATING/COMPLETED/FAILED/CONFLICT, cursor_json: 最后成功提交的来源游标, task_json: 完整任务脱敏快照, created_at: 创建时间, updated_at: 更新时间}
+  streaming_window_commits:
+    description: 已原子提交的增量窗口；相同 task/window 只能提交一次
+    primary_key: [task_id, window_id]
+    foreign_keys: {task_id: streaming_tasks.task_id ON DELETE CASCADE}
+    columns: {task_id: 流式任务标识, window_id: 稳定窗口标识, cursor_json: 本窗口提交后的来源游标, summary_json: 窗口聚合摘要, committed_at: 提交时间}
+  unknown_template_queue:
+    description: 未命中风险语义或风险规则的 Drain3 脱敏模板治理队列
+    primary_key: [task_id, template_hash, window_start]
+    foreign_keys: {task_id: streaming_tasks.task_id ON DELETE CASCADE}
+    indexes: [idx_unknown_template_queue_status_updated(status, updated_at DESC)]
+    columns: {task_id: 来源流式任务, template_hash: 脱敏模板摘要, component: 组件, window_start: 所属窗口, config_hash: 锁定 Drain3 配置摘要, occurrence_count: 聚合次数, template_json: 脱敏模板与语义字段, status: open/reviewed/ignored, created_at: 首次进入时间, updated_at: 最近更新时间}
+  streaming_task_events:
+    description: 流式任务创建、提交、失败、冲突和恢复的追加式审计事件
+    primary_key: [task_id, sequence]
+    foreign_keys: {task_id: streaming_tasks.task_id ON DELETE CASCADE}
+    columns: {task_id: 流式任务标识, sequence: 任务内递增序号, event_type: 事件类型, event_json: 脱敏事件详情, created_at: 发生时间}
   artifacts:
     description: 原始上传、分片、Drain3 快照和导出物路径与校验值
     primary_key: artifact_id

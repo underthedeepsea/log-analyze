@@ -101,7 +101,7 @@ def test_m11_quality_and_settings_use_workspace_design_contract():
         "secondary-button",
     ):
         assert text in source
-    assert '!["drainQuality", "benchmarkCenter", "settings", "rules", "nodeRisks", "semanticLibrary"].includes(view)' in source
+    assert '!["drainQuality", "benchmarkCenter", "streaming", "settings", "rules", "nodeRisks", "semanticLibrary"].includes(view)' in source
     assert "h(CodeBlock, { value: profile.parameters })" not in source
 
 
@@ -335,6 +335,14 @@ def test_upload_accepts_result_and_raw_log_formats():
     assert "/api/metrics" in source
 
 
+def test_frontend_exposes_streaming_workspace_contract():
+    source = source_text()
+
+    assert '"streaming"' in source
+    assert "/api/streaming/tasks" in source
+    assert "未知模板队列" in source
+
+
 def test_react_uses_text_rendering_without_raw_html_injection():
     source = source_text()
     assert "dangerouslySetInnerHTML" not in source
@@ -404,8 +412,8 @@ def test_feature_evidence_distinguishes_candidate_from_semantic_templates():
 def test_benchmark_center_has_route_api_and_six_decision_views():
     source = source_text()
     assert '["benchmarkCenter", "◎", "评测与基准"]' in source
-    assert 'path === "/benchmark-center" ? "benchmarkCenter"' in source
-    assert 'view === "benchmarkCenter" ? "/benchmark-center"' in source
+    assert 'if (path === "/benchmark-center") return "benchmarkCenter";' in source
+    assert 'benchmarkCenter: "/benchmark-center", streaming: "/streaming"' in source
     assert 'function BenchmarkCenterPage(props)' in source
     assert "/api/benchmark-center/overview" in source
     assert "/api/benchmark-center/leaderboard" in source
@@ -473,12 +481,13 @@ def test_release_docs_describe_current_feature_version():
     assert "## 1.22.0 - 2026-07-18" in release
     assert "## 1.23.0 - 2026-07-19" in release
     assert "## 1.23.1 - 2026-07-21" in release
-    assert "当前版本：`1.25.1`" in readme
+    assert "当前版本：`1.26.0`" in readme
     assert "## 1.24.0 - 2026-07-22" in release
     assert "## 1.24.1 - 2026-07-22" in release
     assert "## 1.24.2 - 2026-07-22" in release
     assert "## 1.25.0 - 2026-07-23" in release
     assert "## 1.25.1 - 2026-07-24" in release
+    assert "## 1.26.0 - 2026-07-27" in release
     assert "qwen3.5:9b-mlx" in readme
     assert "state/logrisk.sqlite3" in readme
     assert "database/migrations/" in readme
@@ -491,6 +500,8 @@ def test_release_docs_describe_current_feature_version():
         assert text in readme
     assert "普通启动不需要 Node.js" in readme
     assert "Vite" not in readme
+    assert "Kafka 目前不是可用数据源" in readme
+    assert "可恢复处理与 Kafka 预留接口" in readme
 
 
 def test_node_risk_and_editable_semantic_ui_contract():

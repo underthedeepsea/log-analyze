@@ -146,6 +146,7 @@ def test_database_status_and_restart_candidate_configuration_are_available(dashb
     assert saved["candidate"]["provider"] == "postgres"
     assert saved["candidate"]["password_configured"] is False
     assert saved["restart_required"] is True
+    assert health["version"] == "1.26.0"
     assert health["storage"] == "sqlite"
 
 
@@ -287,6 +288,7 @@ def test_large_upload_routes_create_input_job_and_result(dashboard):
             break
         time.sleep(0.02)
     result_status, result, _ = request_json(base_url + f"/api/input-jobs/{job['input_job_id']}/result")
+    streaming_status, streaming, _ = request_json(base_url + "/api/streaming/tasks")
 
     assert status == 200
     assert complete_status == 200
@@ -297,6 +299,26 @@ def test_large_upload_routes_create_input_job_and_result(dashboard):
     assert progress["drain_config_version"] == 1
     assert result_status == 200
     assert result["result"]["summary"]["total_raw_logs"] == 2
+    assert streaming_status == 200
+    assert streaming["tasks"][0]["input_job_id"] == job["input_job_id"]
+    assert streaming["tasks"][0]["status"] == "completed"
+
+
+def test_streaming_routes_expose_disabled_kafka_capability(dashboard):
+    base_url, _ = dashboard
+
+    tasks_status, tasks, _ = request_json(base_url + "/api/streaming/tasks")
+    sources_status, sources, _ = request_json(base_url + "/api/streaming/sources")
+    with pytest.raises(HTTPError) as unavailable:
+        request_json(base_url + "/api/streaming/kafka/start", "POST", {})
+
+    assert tasks_status == 200
+    assert tasks == {"tasks": []}
+    assert sources_status == 200
+    assert sources["sources"]["kafka"]["enabled"] is False
+    assert sources["sources"]["kafka"]["reason"] == "Kafka 消费适配器未注册"
+    assert unavailable.value.code == 422
+    assert json.load(unavailable.value)["code"] == "kafka_adapter_unavailable"
 
 
 def test_rule_list_route(dashboard):

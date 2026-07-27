@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import mimetypes
 import os
@@ -35,6 +36,7 @@ from logrisk.feature_extractor_ollama import DEFAULT_OLLAMA_URL, FEATURE_PROMPT_
 from logrisk.feature_jobs import FeatureJobError, FeatureJobFileStore, FeatureJobManager, _cache_enabled_default
 from logrisk.input_jobs import InputJobConfig, InputJobStore
 from logrisk.input_parser import parse_log_content
+from logrisk.incremental_sources import FileIncrementalSource, source_capabilities
 from logrisk.large_file_pipeline import run_large_file_pipeline
 from logrisk.processing_metrics import ProcessingMetricsError, ProcessingMetricsStore
 from logrisk.rule_governance import RuleGovernanceError, RuleGovernanceRepository, RuleGovernanceService
@@ -42,6 +44,7 @@ from logrisk.node_risk import NodeRiskError, NodeRiskService
 from logrisk.risk_semantics import RiskSemanticError, RiskSemanticService, validate_rule
 from logrisk.semantic.schema import SemanticValidationError
 from logrisk.semantic.store import SemanticDictionaryStore
+from logrisk.streaming_state import StreamingConflictError, StreamingStateRepository
 from logrisk.upload_sessions import UploadConfig, UploadSessionStore
 from logrisk.database import DatabaseError, PostgresDatabase, create_database
 from logrisk.database_config import DatabaseConnectionSettings, database_url_from_candidate, resolve_database_runtime
@@ -250,6 +253,8 @@ def build_server(
     server.trace_logger = traces  # type: ignore[attr-defined]
     server.upload_store = SQLiteUploadSessionStore(UploadConfig(upload_dir=state_root / "uploads"), database)  # type: ignore[attr-defined]
     server.input_jobs = SQLiteInputJobStore(InputJobConfig(output_dir=root / "output" / "uploads"), database)  # type: ignore[attr-defined]
+    server.streaming_state = StreamingStateRepository(database)  # type: ignore[attr-defined]
+    server.streaming_state.interrupt_running_tasks()  # type: ignore[attr-defined]
     server.drain_quality = drain_quality  # type: ignore[attr-defined]
     server.semantic_dictionaries = semantic_dictionaries  # type: ignore[attr-defined]
     server.risk_semantics = risk_semantics  # type: ignore[attr-defined]
@@ -308,6 +313,17 @@ def build_server(
     def run_input_job(input_job_id: str) -> None:
         store = server.input_jobs  # type: ignore[attr-defined]
         job = store.get_job(input_job_id)
+        config_path = job.get("drain_config_path") or root / "configs" / "drain3_recommended.ini"
+        if not job.get("streaming_task_id"):
+            source = FileIncrementalSource(job["source_path"], filename=job["filename"])
+            config_hash = hashlib.sha256(Path(config_path).read_bytes()).hexdigest()
+            streaming_task = server.streaming_state.create_or_load(  # type: ignore[attr-defined]
+                descriptor=source.descriptor(),
+                config_hash=config_hash,
+            )
+            server.streaming_state.attach_input_job(streaming_task["task_id"], input_job_id)  # type: ignore[attr-defined]
+            job["streaming_task_id"] = streaming_task["task_id"]
+            store.write_job(input_job_id, job)
         job.update({"status": "running", "stage": "reading", "started_at": _now()})
         store.write_job(input_job_id, job)
         try:
@@ -315,13 +331,15 @@ def build_server(
                 input_job_id=input_job_id,
                 input_path=job["source_path"],
                 filename=job["filename"],
-                config_path=job.get("drain_config_path") or root / "configs" / "drain3_recommended.ini",
+                config_path=config_path,
                 rules_path=root / "configs" / "risk_rules.yaml",
                 state_dir=state_root / "dashboard_drain3_large" / input_job_id,
                 progress_callback=lambda progress: store.write_progress(input_job_id, progress),
                 semantic_snapshot=job.get("semantic_dictionary_snapshot"),
                 risk_semantics=risk_semantics,
                 node_risks=node_risks,
+                streaming_repository=server.streaming_state,  # type: ignore[attr-defined]
+                resume_task_id=job["streaming_task_id"],
             )
             result = server.govern_drain_result(result)  # type: ignore[attr-defined]
             store.write_result(input_job_id, result)
@@ -329,6 +347,10 @@ def build_server(
             store.write_job(input_job_id, job)
             store.write_progress(input_job_id, {"input_job_id": input_job_id, "status": "completed", "stage": "completed", "progress": 1.0, "risk_entities": len(result.get("risk_entities") or [])})
         except Exception as exc:
+            if job.get("streaming_task_id"):
+                server.streaming_state.mark_failed(  # type: ignore[attr-defined]
+                    job["streaming_task_id"], str(exc), conflict=isinstance(exc, StreamingConflictError)
+                )
             job.update({"status": "failed", "stage": "failed", "completed_at": _now(), "error": str(exc)})
             store.write_job(input_job_id, job)
             store.write_progress(input_job_id, {"input_job_id": input_job_id, "status": "failed", "stage": "failed", "progress": 1.0, "error": str(exc)})
@@ -475,7 +497,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "schema_version": "logrisk_health_v1",
                     "service": "logrisk-dashboard",
                     "status": "ok",
-                    "version": "1.25.0",
+                    "version": "1.26.0",
                     "storage": self.server.database_runtime.provider,  # type: ignore[attr-defined]
                 })
                 return
@@ -658,6 +680,24 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 result = self.server.input_jobs.get_result(match.group(1))  # type: ignore[attr-defined]
                 self._json(HTTPStatus.OK, {"result_path": str(self.server.input_jobs.result_path(match.group(1))), "result": result})  # type: ignore[attr-defined]
                 return
+            if path == "/api/streaming/tasks":
+                self._json(HTTPStatus.OK, {"tasks": self.server.streaming_state.list_tasks(  # type: ignore[attr-defined]
+                    limit=int(query.get("limit", ["100"])[0]),
+                )})
+                return
+            match = re.fullmatch(r"/api/streaming/tasks/([A-Za-z0-9_-]+)", path)
+            if match:
+                self._json(HTTPStatus.OK, self.server.streaming_state.get_task(match.group(1)))  # type: ignore[attr-defined]
+                return
+            if path == "/api/streaming/unknown-templates":
+                self._json(HTTPStatus.OK, {"items": self.server.streaming_state.list_unknown_templates(  # type: ignore[attr-defined]
+                    task_id=query.get("task_id", [None])[0],
+                    limit=int(query.get("limit", ["200"])[0]),
+                )})
+                return
+            if path == "/api/streaming/sources":
+                self._json(HTTPStatus.OK, {"sources": source_capabilities()})
+                return
             match = re.fullmatch(r"/api/ai-harness/traces/([A-Za-z0-9_-]+)", path)
             if match:
                 trace = self.server.trace_logger.get_trace(match.group(1))  # type: ignore[attr-defined]
@@ -676,6 +716,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._serve_events(match.group(1), max(0, cursor))
                 return
             self._json(HTTPStatus.NOT_FOUND, {"error": "资源不存在"})
+        except StreamingConflictError as exc:
+            self._json(HTTPStatus.CONFLICT, {"error": str(exc), "code": "streaming_conflict"})
+        except KeyError as exc:
+            self._json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
         except BenchmarkError as exc:
             self._json(exc.status_code, {"error": str(exc), "code": exc.code, "request_id": f"request-{uuid.uuid4().hex}"})
         except (RiskSemanticError, NodeRiskError) as exc:
@@ -976,6 +1020,26 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 threading.Thread(target=self.server.run_input_job, args=(job["input_job_id"],), daemon=True).start()  # type: ignore[attr-defined]
                 self._json(HTTPStatus.ACCEPTED, job)
                 return
+            match = re.fullmatch(r"/api/streaming/tasks/([A-Za-z0-9_-]+)/resume", path)
+            if match:
+                task = self.server.streaming_state.get_task(match.group(1))  # type: ignore[attr-defined]
+                if task.get("status") not in {"failed", "interrupted"}:
+                    raise FeatureJobError("仅失败或中断的流式任务可以恢复")
+                input_job_id = str(task.get("input_job_id") or "")
+                if not input_job_id:
+                    raise FeatureJobError("流式任务缺少关联输入任务，无法恢复")
+                job = self.server.input_jobs.get_job(input_job_id)  # type: ignore[attr-defined]
+                job.update({"status": "queued", "stage": "queued", "error": None, "completed_at": None})
+                self.server.input_jobs.write_job(input_job_id, job)  # type: ignore[attr-defined]
+                threading.Thread(target=self.server.run_input_job, args=(input_job_id,), daemon=True).start()  # type: ignore[attr-defined]
+                self._json(HTTPStatus.ACCEPTED, {"task_id": task["task_id"], "input_job_id": input_job_id, "status": "queued"})
+                return
+            if path == "/api/streaming/kafka/start":
+                self._json(HTTPStatus.UNPROCESSABLE_ENTITY, {
+                    "error": "Kafka 消费接口仅预留给内部适配器，当前 Dashboard 不启动 Kafka 消费任务",
+                    "code": "kafka_adapter_unavailable",
+                })
+                return
             if path == "/api/ai-harness/model-profiles":
                 if not isinstance(payload, dict):
                     raise FeatureJobError("请求体必须是 JSON object")
@@ -1046,6 +1110,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 )
                 return
             self._json(HTTPStatus.NOT_FOUND, {"error": "资源不存在"})
+        except StreamingConflictError as exc:
+            self._json(HTTPStatus.CONFLICT, {"error": str(exc), "code": "streaming_conflict"})
+        except KeyError as exc:
+            self._json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
         except BenchmarkError as exc:
             self._json(exc.status_code, {"error": str(exc), "code": exc.code, "request_id": f"request-{uuid.uuid4().hex}"})
         except (RiskSemanticError, NodeRiskError) as exc:

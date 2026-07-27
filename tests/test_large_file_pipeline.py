@@ -2,8 +2,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from logrisk.database import SQLiteDatabase
 from logrisk.large_file_pipeline import run_large_file_pipeline
 from logrisk.semantic.store import SemanticDictionaryStore
+from logrisk.streaming_state import StreamingStateRepository
 
 
 def test_large_file_pipeline_reports_parallel_drain3_metadata_and_progress(tmp_path):
@@ -61,3 +63,67 @@ def test_large_file_pipeline_uses_pinned_semantic_snapshot(tmp_path):
 
     assert result["top_templates"][0]["semantic_fields"]["xid_code"] == [{"value": 79, "count": 1}]
     assert result["summary"]["semantic_dictionary_versions"]["nvidia"]["version"] == 1
+
+
+def test_large_file_pipeline_persists_streaming_checkpoint_and_unknown_templates(tmp_path):
+    source = tmp_path / "messages"
+    source.write_text("Jun 10 10:00:00 node-a app: unusual failure one\n", encoding="utf-8")
+    repository = StreamingStateRepository(SQLiteDatabase(tmp_path / "logrisk.sqlite3"))
+
+    result = run_large_file_pipeline(
+        input_job_id="input_job_streaming",
+        input_path=source,
+        filename="messages",
+        config_path="configs/drain3_recommended.ini",
+        rules_path="configs/risk_rules.yaml",
+        state_dir=tmp_path / "state",
+        worker_count=1,
+        streaming_repository=repository,
+    )
+
+    task_id = result["summary"]["streaming_task_id"]
+    task = repository.get_task(task_id)
+
+    assert task["status"] == "completed"
+    assert task["cursor"]["kind"] == "file"
+    assert task["cursor"]["value"]["offset"] == source.stat().st_size
+    assert repository.list_commits(task_id)
+    assert repository.list_unknown_templates(task_id=task_id)
+
+
+def test_large_file_pipeline_resumes_from_checkpoint_for_appended_file_data(tmp_path):
+    source = tmp_path / "messages"
+    source.write_text("Jun 10 10:00:00 node-a app: failure one\n", encoding="utf-8")
+    repository = StreamingStateRepository(SQLiteDatabase(tmp_path / "logrisk.sqlite3"))
+    first = run_large_file_pipeline(
+        input_job_id="input_job_resume",
+        input_path=source,
+        filename="messages",
+        config_path="configs/drain3_recommended.ini",
+        rules_path="configs/risk_rules.yaml",
+        state_dir=tmp_path / "state",
+        worker_count=1,
+        streaming_repository=repository,
+    )
+    task_id = first["summary"]["streaming_task_id"]
+    source.write_text(
+        "Jun 10 10:00:00 node-a app: failure one\n"
+        "Jun 10 10:01:00 node-a app: failure two\n",
+        encoding="utf-8",
+    )
+
+    resumed = run_large_file_pipeline(
+        input_job_id="input_job_resume",
+        input_path=source,
+        filename="messages",
+        config_path="configs/drain3_recommended.ini",
+        rules_path="configs/risk_rules.yaml",
+        state_dir=tmp_path / "state",
+        worker_count=1,
+        streaming_repository=repository,
+        resume_task_id=task_id,
+    )
+
+    assert resumed["summary"]["total_raw_logs"] == 1
+    assert repository.get_task(task_id)["cursor"]["value"]["offset"] == source.stat().st_size
+    assert len(repository.list_commits(task_id)) == 2

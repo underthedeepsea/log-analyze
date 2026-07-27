@@ -22,10 +22,18 @@ def iter_log_records_from_file(
     max_line_bytes: int | None = None,
     compressed_size_bytes: int | None = None,
     max_compression_ratio: float | None = None,
+    start_offset: int = 0,
+    start_line: int = 1,
 ) -> Iterator[dict[str, Any]]:
     path = Path(path)
+    if start_offset < 0:
+        raise ValueError("起始字节 Offset 不能小于 0")
+    if start_line < 1:
+        raise ValueError("起始行号必须大于 0")
     name = (filename or path.name).lower()
     is_gz = name.endswith(".gz")
+    if is_gz and start_offset:
+        raise ValueError("压缩日志暂不支持按字节 Offset 恢复")
     logical_name = name[:-3] if is_gz else name
     suffix = Path(logical_name).suffix.lower()
     if suffix == ".json":
@@ -33,9 +41,11 @@ def iter_log_records_from_file(
     opener = gzip.open if is_gz else open
     compressed_size = compressed_size_bytes if compressed_size_bytes is not None else (path.stat().st_size if is_gz else None)
     bytes_read = 0
-    with opener(path, "rt", encoding=encoding, errors="replace") as handle:
-        for line_no, line in enumerate(handle, start=1):
-            line_bytes = len(line.encode(encoding, errors="ignore"))
+    with opener(path, "rb") as handle:
+        if not is_gz:
+            handle.seek(start_offset)
+        for line_no, raw_line in enumerate(handle, start=start_line):
+            line_bytes = len(raw_line)
             if max_line_bytes is not None and line_bytes > max_line_bytes:
                 raise InputLimitError({
                     "error_code": "line_too_large",
@@ -58,20 +68,22 @@ def iter_log_records_from_file(
                     "actual": round(bytes_read / compressed_size, 2),
                     "line_no": line_no,
                 })
-            line = line.rstrip("\n")
+            line = raw_line.decode(encoding, errors="replace").rstrip("\n")
             if not line.strip():
                 continue
             if suffix in {".jsonl", ".ndjson"}:
                 try:
-                    yield _coerce_record(json.loads(line), line_no)
+                    record = _coerce_record(json.loads(line), line_no)
                 except json.JSONDecodeError:
                     if jsonl_bad_line_policy == "strict":
                         raise
                     if jsonl_bad_line_policy == "skip":
                         continue
-                    yield {"message": line, "_line_no": line_no, "_parse_error": "jsonl_decode_failed"}
+                    record = {"message": line, "_line_no": line_no, "_parse_error": "jsonl_decode_failed"}
             else:
-                yield {"message": line, "_line_no": line_no}
+                record = {"message": line, "_line_no": line_no}
+            record["_byte_offset_end"] = handle.tell()
+            yield record
 
 
 def _coerce_record(item: Any, line_no: int) -> dict[str, Any]:

@@ -2,13 +2,16 @@ from __future__ import annotations
 
 import os
 import time
+import hashlib
 from pathlib import Path
 from typing import Any, Callable
 
+from logrisk.incremental_sources import FileIncrementalSource, IncrementalSourceError, SourceCursor
 from logrisk.partition_spool import spool_normalized_records, update_manifest_status
-from logrisk.risk_engine import load_rules, score_risk_entities
+from logrisk.risk_engine import load_rules, match_template_rule, score_risk_entities
 from logrisk.stream_input_parser import iter_log_records_from_file
 from logrisk.streaming_drain_pipeline import mine_spooled_partitions
+from logrisk.streaming_state import StreamingConflictError, StreamingStateRepository
 from logrisk.semantic.extractor import SemanticExtractor
 from logrisk.node_risk import NodeRiskError, NodeRiskService
 from logrisk.risk_semantics import RiskSemanticError, RiskSemanticService
@@ -40,15 +43,80 @@ def run_large_file_pipeline(
     semantic_snapshot: dict[str, Any] | None = None,
     risk_semantics: RiskSemanticService | None = None,
     node_risks: NodeRiskService | None = None,
+    streaming_repository: StreamingStateRepository | None = None,
+    resume_task_id: str | None = None,
+    stream_batch_records: int = 10000,
 ) -> dict[str, Any]:
     input_path = Path(input_path)
     started = time.monotonic()
     parsed = 0
     job_root = Path(state_dir) / "input_jobs" / input_job_id
     spool_dir = job_root / "spool"
+    streaming_task: dict[str, Any] | None = None
+    source_cursor = SourceCursor.empty()
+    current_cursor = source_cursor
+    streaming_resumed = False
+    source = FileIncrementalSource(
+        input_path,
+        filename=filename,
+        max_decompressed_bytes=max_decompressed_bytes,
+        max_compression_ratio=max_compression_ratio,
+        max_line_bytes=max_line_bytes,
+    )
+    config_hash = hashlib.sha256(Path(config_path).read_bytes()).hexdigest()
+    if streaming_repository is not None:
+        if resume_task_id:
+            streaming_task = streaming_repository.get_task(resume_task_id)
+            if streaming_task.get("config_hash") != config_hash:
+                streaming_repository.mark_failed(resume_task_id, "Drain3 配置已变化，不能继续恢复", conflict=True)
+                raise StreamingConflictError("Drain3 配置已变化，不能继续恢复")
+            try:
+                source.validate_descriptor(streaming_task.get("source") or {})
+            except IncrementalSourceError as exc:
+                streaming_repository.mark_failed(resume_task_id, str(exc), conflict=True)
+                raise StreamingConflictError(str(exc)) from exc
+            source_cursor = SourceCursor.from_dict(streaming_task.get("cursor"))
+            streaming_resumed = bool(
+                source_cursor.value
+                or streaming_task.get("status") in {"failed", "interrupted", "conflict"}
+            )
+        else:
+            streaming_task = streaming_repository.create_or_load(
+                descriptor=source.descriptor(),
+                config_hash=config_hash,
+            )
+            source_cursor = SourceCursor.from_dict(streaming_task.get("cursor"))
+        streaming_repository.mark_running(str(streaming_task["task_id"]))
+
+    if streaming_repository is not None and streaming_task is not None:
+        return _run_checkpointed_file_batches(
+            input_job_id=input_job_id,
+            input_path=input_path,
+            filename=filename,
+            source=source,
+            source_cursor=source_cursor,
+            streaming_task=streaming_task,
+            streaming_resumed=streaming_resumed,
+            streaming_repository=streaming_repository,
+            config_path=config_path,
+            rules_path=rules_path,
+            state_dir=state_dir,
+            window_seconds=window_seconds,
+            requested_workers=worker_count or (os.cpu_count() or 1),
+            max_drain_workers=max_drain_workers,
+            reserve_cpu_cores=reserve_cpu_cores,
+            process_start_method=process_start_method,
+            semantic_snapshot=semantic_snapshot,
+            risk_semantics=risk_semantics,
+            node_risks=node_risks,
+            progress_callback=progress_callback,
+            started=started,
+            batch_records=stream_batch_records,
+        )
 
     def emit(stage: str, progress: float, **extra: Any) -> None:
         if progress_callback:
+            elapsed = max(time.monotonic() - started, 0.001)
             payload = {
                 "input_job_id": input_job_id,
                 "status": "running",
@@ -57,20 +125,28 @@ def run_large_file_pipeline(
                 "records_parsed": parsed,
                 "lines_read": parsed,
                 "progress": progress,
-                "elapsed_seconds": round(time.monotonic() - started, 2),
+                "elapsed_seconds": round(elapsed, 2),
+                "throughput_records_per_second": round(parsed / elapsed, 2),
             }
+            if streaming_task is not None:
+                payload.update({
+                    "streaming_task_id": streaming_task["task_id"],
+                    "checkpoint_cursor": current_cursor.to_dict(),
+                    "windows_committed": int(streaming_task.get("windows_committed") or 0),
+                })
             payload.update(extra)
             progress_callback(payload)
 
     def source_records():
         nonlocal parsed
-        for record in iter_log_records_from_file(
+        records = iter_log_records_from_file(
             input_path,
             filename=filename,
             max_decompressed_bytes=max_decompressed_bytes,
             max_compression_ratio=max_compression_ratio,
             max_line_bytes=max_line_bytes,
-        ):
+        )
+        for record in records:
             parsed += 1
             yield record
 
@@ -136,6 +212,8 @@ def run_large_file_pipeline(
                     continue
     update_manifest_status(spool_dir, manifest, "AGGREGATING")
     risk_entities = score_risk_entities(template_windows, load_rules(rules_path))
+    streaming_window_count = 0
+    unknown_template_count = 0
     reduced = max(0, parsed - len(template_windows))
     result = {
         "summary": {
@@ -162,10 +240,252 @@ def run_large_file_pipeline(
             "semantic_dictionary_versions": (semantic_snapshot or {}).get("versions", {}),
             "risk_semantic_matches": semantic_matches,
             "node_risk_ingestions": node_risk_ingestions,
+            "streaming_task_id": streaming_task.get("task_id") if streaming_task else None,
+            "streaming_resumed": streaming_resumed,
+            "checkpoint_cursor": current_cursor.to_dict() if streaming_task else None,
+            "streaming_windows_committed": int(streaming_task.get("windows_committed") or 0) if streaming_task else 0,
+            "streaming_windows_newly_committed": streaming_window_count,
+            "unknown_template_count": unknown_template_count,
         },
         "risk_entities": risk_entities,
         "top_templates": sorted(template_windows, key=lambda item: item.get("count", 0), reverse=True)[:20],
     }
     update_manifest_status(spool_dir, manifest, "COMPLETED")
+    emit("completed", 1.0)
+    return result
+
+
+def _streaming_template_snapshot(window: dict[str, Any]) -> dict[str, Any]:
+    """Select only aggregate, sanitized fields for the persistent unknown-template queue."""
+
+    return {
+        "template_hash": window.get("template_hash"),
+        "component": window.get("component"),
+        "template": window.get("template"),
+        "count": window.get("count") or 0,
+        "window_start": window.get("window_start"),
+        "window_end": window.get("window_end"),
+        "severity": window.get("severity"),
+        "category": window.get("category"),
+        "semantic_fields": window.get("semantic_fields") or {},
+    }
+
+
+def _run_checkpointed_file_batches(
+    *,
+    input_job_id: str,
+    input_path: Path,
+    filename: str,
+    source: FileIncrementalSource,
+    source_cursor: SourceCursor,
+    streaming_task: dict[str, Any],
+    streaming_resumed: bool,
+    streaming_repository: StreamingStateRepository,
+    config_path: str | Path,
+    rules_path: str | Path,
+    state_dir: str | Path,
+    window_seconds: int,
+    requested_workers: int,
+    max_drain_workers: int,
+    reserve_cpu_cores: int,
+    process_start_method: str,
+    semantic_snapshot: dict[str, Any] | None,
+    risk_semantics: RiskSemanticService | None,
+    node_risks: NodeRiskService | None,
+    progress_callback: ProgressCallback | None,
+    started: float,
+    batch_records: int,
+) -> dict[str, Any]:
+    """Process bounded file batches and advance the checkpoint only after commit.
+
+    The batch id is derived from the next committed byte offset.  This makes a
+    retry idempotent: an interrupted batch is read again, while already
+    committed input is skipped by the file cursor.  The spool directory is
+    intentionally reused because Drain3 state is stored separately and remains
+    the authority for the next batch.
+    """
+
+    if batch_records < 1:
+        raise ValueError("stream_batch_records 必须大于 0")
+    job_root = Path(state_dir) / "input_jobs" / input_job_id
+    spool_dir = job_root / "spool"
+    parsed = 0
+    all_windows: list[dict[str, Any]] = []
+    current_cursor = source_cursor
+    semantic_matches = 0
+    node_risk_ingestions = 0
+    newly_committed = 0
+    unknown_template_count = 0
+    mining_totals = {
+        "template_event_count": 0,
+        "partition_count": 0,
+        "worker_count": 0,
+        "parallel": False,
+        "process_start_method": process_start_method,
+    }
+    rules = load_rules(rules_path)
+    semantic_extractor = SemanticExtractor.from_snapshot(semantic_snapshot) if semantic_snapshot else None
+
+    def emit(stage: str, progress: float, **extra: Any) -> None:
+        if progress_callback is None:
+            return
+        elapsed = max(time.monotonic() - started, 0.001)
+        payload = {
+            "input_job_id": input_job_id,
+            "streaming_task_id": streaming_task["task_id"],
+            "status": "running",
+            "stage": stage,
+            "size_bytes": input_path.stat().st_size,
+            "records_parsed": parsed,
+            "lines_read": parsed,
+            "progress": progress,
+            "elapsed_seconds": round(elapsed, 2),
+            "throughput_records_per_second": round(parsed / elapsed, 2),
+            "checkpoint_cursor": current_cursor.to_dict(),
+            "windows_committed": int(streaming_task.get("windows_committed") or 0),
+        }
+        payload.update(extra)
+        progress_callback(payload)
+
+    def enrich_windows(windows: list[dict[str, Any]]) -> tuple[int, int]:
+        matched = 0
+        ingested = 0
+        if risk_semantics is None:
+            return matched, ingested
+        for window in windows:
+            try:
+                semantic_event = risk_semantics.match(window)
+            except RiskSemanticError as exc:
+                if exc.code != "semantic_unclassified":
+                    raise
+                risk_semantics.record_unclassified(window)
+                continue
+            window["risk_semantic"] = semantic_event
+            matched += int(window.get("count") or 1)
+            if node_risks is None or window.get("entity_type") != "node":
+                continue
+            source_record = dict(window, node=window.get("entity_id"))
+            try:
+                node_risks.ingest(
+                    semantic_event,
+                    source_record=source_record,
+                    source_job_id=input_job_id,
+                    occurrence_count=int(window.get("count") or 1),
+                )
+                ingested += int(window.get("count") or 1)
+            except NodeRiskError:
+                continue
+        return matched, ingested
+
+    def flush(batch: list[dict[str, Any]], checkpoint: SourceCursor) -> None:
+        nonlocal semantic_matches, node_risk_ingestions, newly_committed, unknown_template_count, streaming_task
+        if not batch:
+            return
+        streaming_task = streaming_repository.mark_stage(str(streaming_task["task_id"]), "SPOOLING")
+        emit("spooling", min(0.35, 0.05 + parsed / max(1, parsed + batch_records)))
+        manifest = spool_normalized_records(
+            batch,
+            spool_dir=spool_dir,
+            partition_by_node=True,
+            semantic_extractor=semantic_extractor,
+        )
+        update_manifest_status(spool_dir, manifest, "MINING")
+        streaming_task = streaming_repository.mark_stage(str(streaming_task["task_id"]), "MINING")
+        template_windows, mining = mine_spooled_partitions(
+            spool_dir=spool_dir,
+            manifest=manifest,
+            config_path=config_path,
+            state_dir=Path(state_dir) / "drain3",
+            window_seconds=window_seconds,
+            requested_workers=requested_workers,
+            max_workers=max_drain_workers,
+            reserve_cpu_cores=reserve_cpu_cores,
+            process_start_method=process_start_method,
+        )
+        mining_totals["template_event_count"] += int(mining["template_event_count"])
+        mining_totals["partition_count"] += int(mining["partition_count"])
+        mining_totals["worker_count"] = max(int(mining_totals["worker_count"]), int(mining["worker_count"]))
+        mining_totals["parallel"] = bool(mining_totals["parallel"] or mining["parallel"])
+        matched, ingested = enrich_windows(template_windows)
+        semantic_matches += matched
+        node_risk_ingestions += ingested
+        unknown = [
+            _streaming_template_snapshot(window)
+            for window in template_windows
+            if not window.get("risk_semantic") and match_template_rule(window, rules) is None
+        ]
+        streaming_task = streaming_repository.mark_stage(str(streaming_task["task_id"]), "AGGREGATING")
+        window_id = "file-offset:" + str(checkpoint.value.get("offset") or 0)
+        committed = streaming_repository.commit_window(
+            str(streaming_task["task_id"]),
+            window_id=window_id,
+            cursor=checkpoint,
+            templates=unknown,
+            summary={
+                "record_count": len(batch),
+                "template_count": len(template_windows),
+                "unknown_template_count": len(unknown),
+            },
+        )
+        if committed:
+            newly_committed += 1
+            unknown_template_count += len(unknown)
+            streaming_task["windows_committed"] = int(streaming_task.get("windows_committed") or 0) + 1
+        all_windows.extend(template_windows)
+        update_manifest_status(spool_dir, manifest, "COMPLETED")
+        emit("aggregating", 0.9, windows_pending=0)
+
+    batch: list[dict[str, Any]] = []
+    try:
+        for item in source.read(source_cursor):
+            batch.append(item.record)
+            current_cursor = item.next_cursor
+            parsed += 1
+            if len(batch) >= batch_records:
+                flush(batch, current_cursor)
+                batch = []
+        flush(batch, current_cursor)
+    except Exception as exc:
+        streaming_repository.mark_failed(str(streaming_task["task_id"]), str(exc))
+        raise
+
+    streaming_task = streaming_repository.mark_completed(str(streaming_task["task_id"]))
+    risk_entities = score_risk_entities(all_windows, rules)
+    reduced = max(0, parsed - len(all_windows))
+    result = {
+        "summary": {
+            "total_raw_logs": parsed,
+            "total_normalized_logs": parsed,
+            "total_template_events": mining_totals["template_event_count"],
+            "total_template_windows": len(all_windows),
+            "drain3_reduced_logs": reduced,
+            "drain3_compression_ratio_percent": round(reduced / parsed * 100, 2) if parsed else 0.0,
+            "drain3_parallel": mining_totals["parallel"],
+            "drain3_worker_count": mining_totals["worker_count"],
+            "drain3_partition_count": mining_totals["partition_count"],
+            "drain3_process_start_method": mining_totals["process_start_method"],
+            "total_risk_entities": len(risk_entities),
+            "critical_entities": sum(item.get("risk_level") == "critical" for item in risk_entities),
+            "high_entities": sum(item.get("risk_level") == "high" for item in risk_entities),
+            "input_job_id": input_job_id,
+            "filename": filename,
+            "large_file": True,
+            "lines_read": parsed,
+            "records_parsed": parsed,
+            "streaming_spool": True,
+            "semantic_enrichment": semantic_snapshot is not None,
+            "semantic_dictionary_versions": (semantic_snapshot or {}).get("versions", {}),
+            "risk_semantic_matches": semantic_matches,
+            "node_risk_ingestions": node_risk_ingestions,
+            "streaming_task_id": streaming_task["task_id"],
+            "streaming_resumed": streaming_resumed,
+            "checkpoint_cursor": current_cursor.to_dict(),
+            "streaming_windows_committed": int(streaming_task.get("windows_committed") or 0),
+            "streaming_windows_newly_committed": newly_committed,
+            "unknown_template_count": unknown_template_count,
+        },
+        "risk_entities": risk_entities,
+        "top_templates": sorted(all_windows, key=lambda item: item.get("count", 0), reverse=True)[:20],
+    }
     emit("completed", 1.0)
     return result

@@ -4,7 +4,7 @@
   <img src="frontend/logo/logrisk-app-icon-orange-v2.png" width="112" alt="LOGRISK 应用图标" />
 </p>
 
-当前版本：`1.25.1`。完整变更记录见 [`releas.md`](releas.md)。
+当前版本：`1.26.0`。完整变更记录见 [`releas.md`](releas.md)。
 
 LOGRISK 在本地完成日志规范化、Drain3 模板化、确定性语义增强、风险评分、规则复用、模型特征识别和人工审批。系统只生成可审查、可导出的日志特征，不执行根因分析（RCA），也不会把原始日志直接发送给模型。
 
@@ -12,6 +12,7 @@ LOGRISK 在本地完成日志规范化、Drain3 模板化、确定性语义增�
 
 - 支持 JSON、JSONL、纯文本、无后缀 Linux 日志和 Gzip 大文件。
 - 使用 Drain3 压缩日志，并保留 HTTP 状态码、errno、exit code、signal、NVIDIA Xid 和 Kubernetes Reason 等关键语义。
+- 大文件支持可恢复的文件 Checkpoint、批次提交和未知模板治理队列；Kafka 仅保留受控内部适配器契约，不连接 Broker。
 - 已批准且处于启用状态的规则优先匹配，命中后跳过模型调用；未知特征才进入 AI 分析和人工审批。
 - 支持本地 Ollama、OpenAI-compatible `/v1/chat/completions` 服务和可扩展的内部 Token 鉴权 Provider 模板。
 - 提供 Prompt 版本、模型 Profile、AI Trace、缓存、评测、Drain3 配置和语义词典治理。
@@ -92,6 +93,12 @@ python3 -m pipeline.manual_import_pipeline \
 ```
 
 10MB 以内文件使用 inline 分析；超过 10MB 后自动按 1MB 分片上传并创建异步任务。默认单文件上限为 500MB。大文件采用流式规范化和多进程 Drain3 分区处理，同一“集群 + 节点 + 来源 + 组件”分区保持原始顺序。并行度、Gzip 解压限制和单行大小限制配置在 `configs/runtime.yaml`。
+
+### 可恢复处理与 Kafka 预留接口
+
+“流式处理”工作区会显示大文件任务的来源、Drain3 配置摘要、最后成功 Checkpoint、提交批次和脱敏未知模板队列。文件任务按有界记录批次处理；每个批次在 Drain3 模板化、语义/规则判定后，以单个数据库事务同时提交脱敏摘要、未知模板和字节 Offset。服务重启会将运行中任务标记为中断，只有人工点击“从 Checkpoint 恢复”才会继续。文件身份、内容前缀或 Drain3 配置变化会标记为冲突，不能静默重读或跳过数据。
+
+Kafka 目前不是可用数据源：页面只展示 Topic、Consumer Group、Partition Offset、Bootstrap 环境变量名和 adapter ID 的契约。仓库不包含 Kafka 客户端、Broker 连接、凭据输入或自动消费；内部团队必须在受控代码中显式注册适配器后，才能由后续任务启动器使用。任务状态、审计事件和未知模板不保存原始日志、Kafka Token 或密码。
 
 ## 模型连接与 Profile
 

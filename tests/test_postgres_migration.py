@@ -7,7 +7,9 @@ from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 import pytest
 
-from logrisk.database import SQLiteDatabase
+from logrisk.database import PostgresDatabase, SQLiteDatabase
+from logrisk.incremental_sources import FileIncrementalSource, SourceCursor
+from logrisk.streaming_state import StreamingStateRepository
 from pipeline.database_migrate import SQLiteToPostgresMigration, _digest_rows, build_migration_preview, parse_args
 
 
@@ -80,6 +82,45 @@ def test_optional_postgres_integration_migrates_json_and_foreign_keys(tmp_path):
         result = SQLiteToPostgresMigration(source, target_url, state_root=tmp_path / "state").execute()
         assert result["verification"]["valid"] is True
         assert result["verification"]["tables"]["model_profiles"]["primary_key_match"] is True
+    finally:
+        with psycopg.connect(base_url, autocommit=True) as connection:
+            connection.execute('DROP SCHEMA IF EXISTS "' + schema + '" CASCADE')
+
+
+@pytest.mark.skipif(not os.getenv("LOGRISK_TEST_POSTGRES_URL"), reason="未设置 LOGRISK_TEST_POSTGRES_URL")
+def test_optional_postgres_streaming_checkpoint_uses_jsonb_and_foreign_keys(tmp_path):
+    psycopg = pytest.importorskip("psycopg")
+    base_url = os.environ["LOGRISK_TEST_POSTGRES_URL"]
+    schema = "logrisk_stream_" + uuid.uuid4().hex[:12]
+    parts = urlsplit(base_url)
+    query = parse_qsl(parts.query, keep_blank_values=True) + [("options", "-c search_path=" + schema)]
+    target_url = urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query, quote_via=quote), parts.fragment))
+    with psycopg.connect(base_url, autocommit=True) as connection:
+        connection.execute('CREATE SCHEMA "' + schema + '"')
+    try:
+        database = PostgresDatabase(target_url, state_root=tmp_path / "state")
+        path = tmp_path / "messages"
+        path.write_text("error one\n", encoding="utf-8")
+        repository = StreamingStateRepository(database)
+        task = repository.create_or_load(
+            descriptor=FileIncrementalSource(path, filename="messages").descriptor(),
+            config_hash="d" * 64,
+        )
+        repository.commit_window(
+            task["task_id"],
+            window_id="file-offset:10",
+            cursor=SourceCursor("file", {"offset": 10, "line": 2}),
+            templates=[{
+                "template_hash": "abc",
+                "component": "kernel",
+                "template": "error <*>",
+                "count": 1,
+                "window_start": "2026-07-27T00:00:00+00:00",
+            }],
+        )
+
+        assert repository.get_task(task["task_id"])["cursor"]["value"]["offset"] == 10
+        assert repository.list_unknown_templates(task_id=task["task_id"])[0]["template"]["template_hash"] == "abc"
     finally:
         with psycopg.connect(base_url, autocommit=True) as connection:
             connection.execute('DROP SCHEMA IF EXISTS "' + schema + '" CASCADE')

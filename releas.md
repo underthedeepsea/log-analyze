@@ -6,6 +6,23 @@
 - 仅修复 Bug 时提升最后一位，例如 `1.2.0 → 1.2.1`；
 - 每次代码更新必须同步更新本文件。
 
+## 1.26.0 - 2026-07-27
+
+### Added
+
+- 新增文件增量来源契约、文件身份校验、已提交字节 Offset Checkpoint 和有界批次处理；中断任务可从最后成功提交点继续，已提交批次不会重复写入未知模板队列。
+- 新增跨 SQLite/PostgreSQL 的流式任务、批次提交、未知模板队列和审计事件数据模型，以及“流式处理”工作区和任务恢复 API。
+- 新增 Kafka 消费适配器预留契约：支持显式注册内部 Adapter、Topic、Consumer Group、Partition Offset、Bootstrap 环境变量名和 adapter ID，但默认禁用且不含 Kafka 客户端或 Broker 连接。
+
+### Changed
+
+- 大文件上传任务会创建独立流式状态，持续上报 Checkpoint、批次提交数和处理吞吐；服务重启时遗留运行任务改为中断，需人工恢复。
+
+### Security
+
+- 流式状态、未知模板和审计记录仅保存 Drain3 脱敏模板与聚合统计；拒绝 `raw_sample`、`samples`、`message`、`content` 等原始日志字段。
+- 文件身份或 Drain3 配置摘要不一致时任务进入冲突状态；Kafka 凭据、Token、密码和原始消费记录不持久化，也不由 Dashboard 读取。
+
 ## 1.25.1 - 2026-07-24
 
 ### Added

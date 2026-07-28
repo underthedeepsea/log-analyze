@@ -1,4 +1,4 @@
-schema_version: 8
+schema_version: 9
 database: logrisk
 description: LOGRISK 双模式运行时数据字典；SQLite 是默认本地实现，PostgreSQL 用于显式配置的外部生产部署。
 authoritative_ddl:
@@ -37,7 +37,7 @@ tables:
     constraints: provider 仅允许 ollama/openai_compatible/extension；扩展适配器必须在代码 allow-list 中注册；超时必须大于 0；启用与默认标志为布尔值
     columns: {connection_id: 连接标识, display_name: 页面显示名, provider: Provider 类型, base_url: 服务根地址, api_key_env: OpenAI API Key 环境变量名而非密钥, adapter_id: 扩展适配器标识, credential_envs_json: 逻辑凭据名到环境变量名的映射而非凭据值, extension_config_json: 扩展适配器的非敏感 JSON 配置, timeout_seconds: HTTP 超时秒数, enabled: 是否允许新任务使用, is_default: 是否为默认连接, created_at: 创建时间, updated_at: 更新时间}
   model_profiles:
-    description: 绑定连接的模型参数、Prompt 和上下文预算
+    description: 绑定连接的模型参数、Prompt、上下文预算和可选 Token 单价；价格位于 profile_json
     primary_key: profile_id
     foreign_keys: {connection_id: provider_connections.connection_id}
     indexes: [idx_model_profiles_connection(connection_id)]
@@ -105,6 +105,28 @@ tables:
     primary_key: trace_id
     indexes: [idx_ai_traces_created(created_at DESC), idx_ai_traces_job(job_id)]
     columns: {trace_id: 调用追踪标识, job_id: 所属任务, provider: Provider 类型, model: 模型名, status: 调用或校验状态, prompt_id: Prompt 标识, prompt_hash: Prompt 内容摘要, latency_ms: 请求耗时毫秒, trace_json: 脱敏请求元数据与模型输出, created_at: 创建时间}
+  observability_runs:
+    description: 以任务为边界聚合输入、模板、模型、校验和审批阶段的 Observation
+    primary_key: observation_id
+    indexes: [idx_observability_runs_status_updated(status, updated_at DESC)]
+    columns: {observation_id: Observation 标识, job_id: 唯一关联任务, input_job_id: 可选输入处理任务, status: running/completed/failed, attributes_json: 脱敏任务属性, schema_version: 结构版本, created_at: 创建时间, updated_at: 更新时间}
+  observability_spans:
+    description: Observation 内可筛选的阶段 Span；仅记录脱敏属性和 Trace 引用
+    primary_key: span_id
+    foreign_keys: {observation_id: observability_runs.observation_id ON DELETE CASCADE, parent_span_id: observability_spans.span_id}
+    indexes: [idx_observability_spans_run_time(observation_id, started_at), idx_observability_spans_stage_status(stage, status, started_at DESC), idx_observability_spans_trace(trace_id)]
+    columns: {span_id: Span 标识, observation_id: 所属 Observation, trace_id: 可选模型 Trace, parent_span_id: 可选父 Span, name: 阶段事件名称, stage: 标准阶段, status: running/success/failed/skipped, started_at: 开始时间, ended_at: 结束时间, duration_ms: 耗时毫秒, attributes_json: 脱敏属性, idempotency_key: 事件幂等键, schema_version: 结构版本, created_at: 创建时间, updated_at: 更新时间}
+  replay_runs:
+    description: 历史校验或明确确认后的原模型重放；结果隔离且不写候选、规则或审批
+    primary_key: replay_id
+    foreign_keys: {observation_id: observability_runs.observation_id ON DELETE SET NULL, source_trace_id: ai_traces.trace_id}
+    indexes: [idx_replay_runs_source_created(source_trace_id, created_at DESC), idx_replay_runs_status_updated(status, updated_at DESC)]
+    columns: {replay_id: Replay 标识, observation_id: 可选来源 Observation, source_trace_id: 来源 Trace, mode: historical/model, status: pending/running/completed/failed, idempotency_key: 创建请求幂等键, snapshot_json: 锁定的 Prompt/Profile/Provider/Evidence 快照, result_json: 脱敏结果与差异, error_code: 稳定错误码, error_message: 脱敏错误信息, schema_version: 结构版本, created_at: 创建时间, updated_at: 更新时间, completed_at: 完成时间}
+  replay_events:
+    description: Replay 执行过程的追加式事件
+    primary_key: [replay_id, sequence]
+    foreign_keys: {replay_id: replay_runs.replay_id ON DELETE CASCADE}
+    columns: {replay_id: 所属 Replay, sequence: 递增序号, event_type: 事件类型, event_json: 脱敏事件详情, created_at: 创建时间}
   ai_cache_entries:
     description: Evidence、Prompt、Provider 和模型组合缓存
     primary_key: signature

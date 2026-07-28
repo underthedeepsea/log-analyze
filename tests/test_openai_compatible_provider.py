@@ -32,7 +32,10 @@ def test_openai_compatible_client_sends_auth_and_json_schema(monkeypatch):
         captured["headers"] = dict(request.header_items())
         captured["body"] = json.loads(request.data)
         captured["timeout"] = timeout
-        return Response({"choices": [{"message": {"content": "```json\n{\"features\": []}\n```"}}]})
+        return Response({
+            "choices": [{"message": {"content": "```json\n{\"features\": []}\n```"}}],
+            "usage": {"prompt_tokens": 50, "completion_tokens": 10, "total_tokens": 60},
+        })
 
     monkeypatch.setenv("REMOTE_KEY", "secret-token")
     client = OpenAICompatibleModelClient(
@@ -53,6 +56,7 @@ def test_openai_compatible_client_sends_auth_and_json_schema(monkeypatch):
     assert captured["headers"]["Authorization"] == "Bearer secret-token"
     assert captured["body"]["max_tokens"] == 900
     assert captured["body"]["response_format"]["type"] == "json_schema"
+    assert client.last_metadata["usage"]["total_tokens"] == 60
 
 
 def test_openai_compatible_client_requires_configured_api_key(monkeypatch):

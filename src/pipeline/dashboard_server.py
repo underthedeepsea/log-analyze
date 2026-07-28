@@ -7,6 +7,7 @@ import mimetypes
 import os
 import re
 import threading
+import time
 import uuid
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -27,12 +28,25 @@ from logrisk.ai_harness.providers.extensions.registry import (
     list_extension_descriptors,
 )
 from logrisk.ai_harness.trace_logger import AITraceLogger
+from logrisk.observability import (
+    ObservabilityRepository,
+    PromptSnapshotResolver,
+    ReplayError,
+    ReplayService,
+    SpanRecorder,
+)
 from logrisk.ai_eval.runner import load_cases
 from logrisk.approved_rules import ApprovedRuleError, ApprovedRuleStore
 from logrisk.benchmark_center import BenchmarkError, BenchmarkRepository, BenchmarkService
 from logrisk.drain_eval.schema import DrainQualityError
 from logrisk.drain_eval.service import DrainQualityService
-from logrisk.feature_extractor_ollama import DEFAULT_OLLAMA_URL, FEATURE_PROMPT_ID
+from logrisk.feature_extractor_ollama import (
+    DEFAULT_OLLAMA_URL,
+    FEATURE_PROMPT_ID,
+    FEATURE_RESPONSE_SCHEMA,
+    _validate_model_feature,
+)
+from logrisk.ai_harness.evaluator import evaluate_feature_output
 from logrisk.feature_jobs import FeatureJobError, FeatureJobFileStore, FeatureJobManager, _cache_enabled_default
 from logrisk.input_jobs import InputJobConfig, InputJobStore
 from logrisk.input_parser import parse_log_content
@@ -158,6 +172,8 @@ def build_server(
     profiles = ModelProfileRegistry(root / "configs" / "model_profiles.yaml", database=database)
     prompts = SQLitePromptRegistry(database, root / "prompts", root / "configs" / "ai_harness.yaml")
     traces = SQLiteAITraceLogger(database)
+    observability_repository = ObservabilityRepository(database)
+    span_recorder = SpanRecorder(observability_repository)
     ai_cache = SQLiteAICache(database)
     drain_quality = (
         DrainQualityService(drain_quality_root, root / "configs" / "drain3_profiles", root / "configs" / "drain3_recommended.ini")
@@ -198,7 +214,75 @@ def build_server(
             model_profile_id=profile.profile_id,
             provider=connection["provider"],
             model_profile=profile,
+            connection_snapshot=connection,
         )
+
+    def validate_replay_output(snapshot: dict[str, Any], output: dict[str, Any]) -> dict[str, Any]:
+        source = dict(snapshot.get("source_trace") or {})
+        evidence = dict(source.get("input_evidence") or {})
+        known_hashes = {
+            str(item.get("template_hash"))
+            for item in evidence.get("templates") or []
+            if item.get("template_hash")
+        }
+        try:
+            features = [_validate_model_feature(item, known_hashes) for item in output.get("features") or []]
+        except Exception as exc:
+            return {
+                "parsed_output": output,
+                "validation_result": {"valid": False, "errors": [str(exc)], "warnings": []},
+                "evaluator_result": {"passed": False, "errors": [], "warnings": [], "score": 0.0},
+            }
+        evaluator_results = [
+            evaluate_feature_output(
+                feature=feature,
+                entity={"entity_id": (evidence.get("entity") or {}).get("id")},
+                evidence=evidence,
+            )
+            for feature in features
+        ]
+        errors = [error for result in evaluator_results for error in result.get("errors", [])]
+        return {
+            "parsed_output": {"features": features},
+            "validation_result": {"valid": True, "errors": [], "warnings": []},
+            "evaluator_result": {
+                "passed": not errors,
+                "errors": errors,
+                "warnings": [warning for result in evaluator_results for warning in result.get("warnings", [])],
+                "score": min((float(result.get("score") or 0) for result in evaluator_results), default=1.0),
+            },
+        }
+
+    def replay_model(snapshot: dict[str, Any]) -> dict[str, Any]:
+        source = dict(snapshot.get("source_trace") or {})
+        evidence = dict(source.get("input_evidence") or {})
+        prompt = dict(snapshot.get("prompt") or {})
+        connection = dict(source.get("connection_snapshot") or {})
+        if not evidence or not prompt.get("prompt_content") or not connection:
+            raise ReplayError(
+                "来源 Trace 缺少锁定 Evidence、Prompt 或连接快照",
+                code="replay_snapshot_incomplete",
+                status_code=422,
+            )
+        if not connection.get("enabled"):
+            raise ReplayError("来源模型连接已停用", code="connection_disabled", status_code=409)
+        client = create_model_client(connection)
+        started = time.perf_counter()
+        output = client.generate_json(
+            [
+                {"role": "system", "content": prompt["prompt_content"]},
+                {"role": "user", "content": json.dumps(evidence, ensure_ascii=False, separators=(",", ":"))},
+            ],
+            FEATURE_RESPONSE_SCHEMA,
+            model=str(source.get("model") or ""),
+            timeout=float(connection.get("timeout_seconds") or 120),
+            options=dict(source.get("model_options") or {}),
+        )
+        return {
+            **validate_replay_output(snapshot, output),
+            "latency_ms": int((time.perf_counter() - started) * 1000),
+            "usage": dict(getattr(client, "last_metadata", {}).get("usage") or {}),
+        }
 
     benchmark_cases = load_cases()
 
@@ -242,7 +326,9 @@ def build_server(
         rule_store=rule_store,
         metrics_store=SQLiteProcessingMetricsStore(database),
         persistence=SQLiteFeatureJobStore(database),
+        observability=span_recorder,
     )
+    server.manager.observability = span_recorder  # type: ignore[attr-defined]
     server.rule_governance = RuleGovernanceService(RuleGovernanceRepository(database))  # type: ignore[attr-defined]
     server.frontend_path = Path(frontend_path or root / "frontend" / "dist" / "index.html")  # type: ignore[attr-defined]
     server.default_model = default_model  # type: ignore[attr-defined]
@@ -251,6 +337,14 @@ def build_server(
     server.prompt_registry = prompts  # type: ignore[attr-defined]
     server.model_profiles = profiles  # type: ignore[attr-defined]
     server.trace_logger = traces  # type: ignore[attr-defined]
+    server.observability_repository = observability_repository  # type: ignore[attr-defined]
+    server.replay_service = ReplayService(  # type: ignore[attr-defined]
+        observability_repository,
+        traces,
+        PromptSnapshotResolver(prompts),
+        model_runner=replay_model,
+        validation_runner=validate_replay_output,
+    )
     server.upload_store = SQLiteUploadSessionStore(UploadConfig(upload_dir=state_root / "uploads"), database)  # type: ignore[attr-defined]
     server.input_jobs = SQLiteInputJobStore(InputJobConfig(output_dir=root / "output" / "uploads"), database)  # type: ignore[attr-defined]
     server.streaming_state = StreamingStateRepository(database)  # type: ignore[attr-defined]
@@ -376,7 +470,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if origin and origin in self.server.cors_origins:  # type: ignore[attr-defined]
             self.send_header("Access-Control-Allow-Origin", origin)
             self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, OPTIONS")
-            self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Chunk-SHA256")
+            self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Chunk-SHA256, Idempotency-Key")
             self.send_header("Vary", "Origin")
 
     def _json(self, status: int, payload: Any, headers: dict[str, str] | None = None) -> None:
@@ -497,7 +591,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "schema_version": "logrisk_health_v1",
                     "service": "logrisk-dashboard",
                     "status": "ok",
-                    "version": "1.26.0",
+                    "version": "1.27.0",
                     "storage": self.server.database_runtime.provider,  # type: ignore[attr-defined]
                 })
                 return
@@ -671,6 +765,66 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if path == "/api/ai-harness/traces":
                 self._json(HTTPStatus.OK, self._trace_list(query))
                 return
+            if path == "/api/observability-v2/observations":
+                items = self.server.observability_repository.list_observations(  # type: ignore[attr-defined]
+                    job_id=query.get("job_id", [None])[0],
+                    status=query.get("status", [None])[0],
+                    limit=int(query.get("limit", ["50"])[0]),
+                )
+                prompt_id = query.get("prompt_id", [None])[0]
+                model = query.get("model", [None])[0]
+                entity_id = query.get("entity_id", [None])[0]
+                if prompt_id:
+                    items = [item for item in items if (item.get("attributes") or {}).get("prompt_id") == prompt_id]
+                if model:
+                    items = [item for item in items if (item.get("attributes") or {}).get("model") == model]
+                if entity_id:
+                    items = [
+                        item for item in items
+                        if any(
+                            (span.get("attributes") or {}).get("entity_id") == entity_id
+                            for span in self.server.observability_repository.list_spans(item["observation_id"])  # type: ignore[attr-defined]
+                        )
+                    ]
+                self._json(HTTPStatus.OK, {"schema_version": "observation_list_v2", "items": items})
+                return
+            if path == "/api/observability-v2/metrics":
+                self._json(HTTPStatus.OK, self._observability_v2_metrics())
+                return
+            match = re.fullmatch(r"/api/observability-v2/observations/([^/]+)(?:/(timeline))?", path)
+            if match:
+                observation = self.server.observability_repository.get_observation(match.group(1))  # type: ignore[attr-defined]
+                if not observation:
+                    raise ReplayError("Observation 不存在", code="observation_not_found", status_code=404)
+                if match.group(2) == "timeline":
+                    items = self.server.observability_repository.list_spans(  # type: ignore[attr-defined]
+                        match.group(1),
+                        stage=query.get("stage", [None])[0],
+                        status=query.get("status", [None])[0],
+                    )
+                    self._json(HTTPStatus.OK, {"schema_version": "observability_timeline_v2", "observation": observation, "items": items})
+                else:
+                    self._json(HTTPStatus.OK, observation)
+                return
+            match = re.fullmatch(r"/api/observability-v2/spans/([^/]+)", path)
+            if match:
+                span = self.server.observability_repository.get_span(match.group(1))  # type: ignore[attr-defined]
+                if not span:
+                    raise ReplayError("Span 不存在", code="span_not_found", status_code=404)
+                self._json(HTTPStatus.OK, span)
+                return
+            match = re.fullmatch(r"/api/observability-v2/replays/([^/]+)(?:/(events|diff))?", path)
+            if match:
+                replay = self.server.observability_repository.get_replay(match.group(1))  # type: ignore[attr-defined]
+                if not replay:
+                    raise ReplayError("Replay 不存在", code="replay_not_found", status_code=404)
+                if match.group(2) == "events":
+                    self._json(HTTPStatus.OK, {"items": self.server.observability_repository.list_replay_events(match.group(1))})  # type: ignore[attr-defined]
+                elif match.group(2) == "diff":
+                    self._json(HTTPStatus.OK, replay.get("result", {}).get("diff") or {})
+                else:
+                    self._json(HTTPStatus.OK, replay)
+                return
             match = re.fullmatch(r"/api/input-jobs/([A-Za-z0-9_-]+)", path)
             if match:
                 self._json(HTTPStatus.OK, self.server.input_jobs.get_progress(match.group(1)))  # type: ignore[attr-defined]
@@ -716,6 +870,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._serve_events(match.group(1), max(0, cursor))
                 return
             self._json(HTTPStatus.NOT_FOUND, {"error": "资源不存在"})
+        except ReplayError as exc:
+            self._json(exc.status_code, {"error": str(exc), "code": exc.code, "error_code": exc.code, "request_id": f"request-{uuid.uuid4().hex}"})
         except StreamingConflictError as exc:
             self._json(HTTPStatus.CONFLICT, {"error": str(exc), "code": "streaming_conflict"})
         except KeyError as exc:
@@ -759,6 +915,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 if not isinstance(payload, dict):
                     raise BenchmarkError("请求体必须是 JSON object")
                 self._json(HTTPStatus.CREATED, self.server.benchmark_center.create_suite(payload))  # type: ignore[attr-defined]
+                return
+            if path == "/api/observability-v2/replays":
+                if not isinstance(payload, dict):
+                    raise ReplayError("请求体必须是 JSON object", code="invalid_payload")
+                replay = self.server.replay_service.create(  # type: ignore[attr-defined]
+                    payload,
+                    idempotency_key=str(self.headers.get("Idempotency-Key") or ""),
+                )
+                threading.Thread(target=self._execute_replay_safely, args=(replay["replay_id"],), daemon=True).start()
+                self._json(HTTPStatus.ACCEPTED, {
+                    **replay,
+                    "request_id": f"request-{uuid.uuid4().hex}",
+                })
                 return
             if path == "/api/benchmark-center/runs":
                 if not isinstance(payload, dict):
@@ -1110,6 +1279,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 )
                 return
             self._json(HTTPStatus.NOT_FOUND, {"error": "资源不存在"})
+        except ReplayError as exc:
+            self._json(exc.status_code, {"error": str(exc), "code": exc.code, "error_code": exc.code, "request_id": f"request-{uuid.uuid4().hex}"})
         except StreamingConflictError as exc:
             self._json(HTTPStatus.CONFLICT, {"error": str(exc), "code": "streaming_conflict"})
         except KeyError as exc:
@@ -1309,6 +1480,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
         fields = ("trace_id", "job_id", "entity_type", "entity_id", "prompt_id", "prompt_hash", "provider", "model", "model_profile_id", "parameter_size", "thinking_enabled", "context_budget", "evidence_build_meta", "status", "latency_ms", "created_at", "evaluator_result")
         return [{key: item.get(key) for key in fields} for item in traces]
 
+    def _execute_replay_safely(self, replay_id: str) -> None:
+        try:
+            self.server.replay_service.execute(replay_id)  # type: ignore[attr-defined]
+        except ReplayError:
+            # ReplayService has already persisted the stable failure state.
+            return
+
     def _trace_list(self, query: dict[str, list[str]]) -> dict[str, Any]:
         limit = int(query.get("limit", ["50"])[0])
         traces = self.server.trace_logger.list_traces(  # type: ignore[attr-defined]
@@ -1320,15 +1498,93 @@ class DashboardHandler(BaseHTTPRequestHandler):
         )
         return {"items": self._compact_traces(traces)}
 
+    def _observability_v2_metrics(self) -> dict[str, Any]:
+        observations = self.server.observability_repository.list_observations(limit=200)  # type: ignore[attr-defined]
+        spans = [
+            span
+            for observation in observations
+            for span in self.server.observability_repository.list_spans(observation["observation_id"])  # type: ignore[attr-defined]
+        ]
+        stages: dict[str, dict[str, Any]] = {}
+        for stage in sorted({str(item.get("stage") or "unknown") for item in spans}):
+            selected = [item for item in spans if item.get("stage") == stage]
+            durations = sorted(
+                int(item.get("duration_ms") or (item.get("attributes") or {}).get("latency_ms") or 0)
+                for item in selected
+            )
+            count = len(durations)
+            percentile = lambda ratio: durations[min(count - 1, max(0, int((count - 1) * ratio)))] if count else 0
+            stages[stage] = {
+                "count": count,
+                "success_rate": round(sum(item.get("status") in {"success", "cache_hit", "skipped"} for item in selected) / count, 4) if count else 0,
+                "p50_latency_ms": percentile(0.50),
+                "p95_latency_ms": percentile(0.95),
+            }
+        traces = self.server.trace_logger.list_traces(limit=500)  # type: ignore[attr-defined]
+        model_metrics: dict[str, dict[str, Any]] = {}
+        for trace in traces:
+            provider = str(trace.get("provider") or "unknown")
+            model = str(trace.get("model") or "unknown")
+            key = f"{provider}:{model}"
+            metric = model_metrics.setdefault(key, {
+                "provider": provider,
+                "model": model,
+                "call_count": 0,
+                "success_count": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+            })
+            metric["call_count"] += 1
+            metric["success_count"] += int(trace.get("status") in {"success", "cache_hit"})
+            metric["input_tokens"] += int((trace.get("usage") or {}).get("input_tokens") or 0)
+            metric["output_tokens"] += int((trace.get("usage") or {}).get("output_tokens") or 0)
+        costs: dict[str, float] = {}
+        for trace in traces:
+            cost = trace.get("estimated_cost") or {}
+            if isinstance(cost, dict) and cost.get("amount") is not None:
+                currency = str(cost.get("currency") or "CNY")
+                costs[currency] = costs.get(currency, 0.0) + float(cost["amount"])
+        estimated_cost = None
+        if len(costs) == 1:
+            currency, amount = next(iter(costs.items()))
+            estimated_cost = {
+                "amount": round(amount, 8),
+                "currency": currency,
+                "estimated": True,
+            }
+        elif costs:
+            estimated_cost = {
+                "by_currency": {key: round(value, 8) for key, value in sorted(costs.items())},
+                "estimated": True,
+            }
+        return {
+            "schema_version": "observability_metrics_v2",
+            "observation_count": len(observations),
+            "span_count": len(spans),
+            "stages": stages,
+            "usage": {
+                "input_tokens": sum(int((item.get("usage") or {}).get("input_tokens") or 0) for item in traces),
+                "output_tokens": sum(int((item.get("usage") or {}).get("output_tokens") or 0) for item in traces),
+            },
+            "models": list(model_metrics.values()),
+            "estimated_cost": estimated_cost,
+        }
+
     def _with_prompt_content(self, trace: dict[str, Any]) -> dict[str, Any]:
         result = dict(trace)
         prompt_id = str(trace.get("prompt_id") or FEATURE_PROMPT_ID)
-        try:
-            prompt = self.server.prompt_registry.load(prompt_id)  # type: ignore[attr-defined]
-            result.setdefault("prompt_path", prompt.path)
-            result["prompt_content"] = prompt.content
-        except FileNotFoundError:
-            result["prompt_content"] = ""
+        from logrisk.observability import PromptSnapshotResolver
+
+        snapshot = PromptSnapshotResolver(self.server.prompt_registry).resolve(  # type: ignore[attr-defined]
+            prompt_id,
+            str(trace.get("prompt_hash") or ""),
+        )
+        result.update({
+            "prompt_content": snapshot["prompt_content"],
+            "prompt_path": snapshot["prompt_path"],
+            "prompt_version": snapshot["prompt_version"],
+            "prompt_snapshot_status": snapshot["status"],
+        })
         return result
 
     def _feature_status_for_entity(self, snapshot: dict[str, Any], entity: dict[str, Any], trace: dict[str, Any] | None = None) -> dict[str, Any]:

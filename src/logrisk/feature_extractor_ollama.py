@@ -94,6 +94,8 @@ def _write_trace(
     model_profile: ModelProfile | None = None,
     evidence_meta: Any | None = None,
     model_options: dict[str, Any] | None = None,
+    usage: dict[str, Any] | None = None,
+    connection_snapshot: dict[str, Any] | None = None,
 ) -> str | None:
     trace_id = str(uuid.uuid4())
     try:
@@ -123,6 +125,9 @@ def _write_trace(
             "parsed_output": parsed_output or {},
             "validation_result": validation_result,
             "evaluator_result": evaluator_result or {"passed": False, "errors": [], "warnings": [], "score": 0.0, "rule_results": []},
+            "usage": usage or {},
+            "estimated_cost": model_profile.estimate_cost(usage or {}) if model_profile else None,
+            "connection_snapshot": connection_snapshot or {},
             "latency_ms": latency_ms,
             "created_at": datetime.now(timezone.utc).isoformat(),
             "status": status,
@@ -245,6 +250,7 @@ def _request_features(
     model_profile: ModelProfile | None = None,
     provider: str = "ollama",
     prompt_template: PromptTemplate | None = None,
+    connection_snapshot: dict[str, Any] | None = None,
 ) -> tuple[list[Dict[str, Any]], str | None, Dict[str, Any], bool, Dict[str, Any]]:
     prompt = prompt_template or PROMPT_REGISTRY.load(prompt_id)
     if model_profile:
@@ -271,9 +277,9 @@ def _request_features(
     ]
     start = time.perf_counter()
     cache_hit = False
+    client = model_client or OllamaModelClient(base_url)
     model_output = AI_CACHE.get(signature) if cache_enabled else None
     if model_output is None:
-        client = model_client or OllamaModelClient(base_url)
         try:
             model_output = client.generate_json(
                 messages,
@@ -390,12 +396,15 @@ def _request_features(
         model_profile=model_profile,
         evidence_meta=evidence_meta,
         model_options=model_options,
+        usage=dict(getattr(client, "last_metadata", {}).get("usage") or {}),
+        connection_snapshot=connection_snapshot,
     )
     if cache_enabled and not cache_hit:
         AI_CACHE.set(signature, model_output)
     return features, trace_id, evaluator_summary, cache_hit, {
         "prompt_hash": prompt.sha256,
         "evidence_hash": evidence_hash(evidence),
+        "latency_ms": int((time.perf_counter() - start) * 1000),
     }
 
 
@@ -413,6 +422,7 @@ def extract_features_for_entity(
     provider: str = "ollama",
     model_profile: ModelProfile | None = None,
     prompt_template: PromptTemplate | None = None,
+    connection_snapshot: dict[str, Any] | None = None,
 ) -> list[Dict[str, Any]]:
     if model_profile is None:
         registry = ModelProfileRegistry(profile_config_path) if profile_config_path else MODEL_PROFILES
@@ -439,12 +449,14 @@ def extract_features_for_entity(
         profile,
         provider,
         prompt_template,
+        connection_snapshot,
     )
     attached = [_attach_source_facts(entity, feature, model_name, provider) for feature in features]
     for feature in attached:
         feature["prompt_id"] = selected_prompt
         feature["prompt_hash"] = request_meta["prompt_hash"]
         feature["evidence_hash"] = request_meta["evidence_hash"]
+        feature["latency_ms"] = request_meta["latency_ms"]
         feature["trace_id"] = trace_id
         feature["evaluator_result"] = evaluator_result
         feature["cache_hit"] = cache_hit

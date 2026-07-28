@@ -146,7 +146,7 @@ def test_database_status_and_restart_candidate_configuration_are_available(dashb
     assert saved["candidate"]["provider"] == "postgres"
     assert saved["candidate"]["password_configured"] is False
     assert saved["restart_required"] is True
-    assert health["version"] == "1.26.0"
+    assert health["version"] == "1.27.0"
     assert health["storage"] == "sqlite"
 
 
@@ -635,6 +635,52 @@ def test_ai_observability_routes_summarize_job_progress_and_events(dashboard):
     assert events_status == 200
     assert events["items"][0]["job_id"] == job_id
     assert "stage" in events["items"][0]
+
+    observations_status, observations, _ = request_json(
+        base_url + f"/api/observability-v2/observations?job_id={job_id}"
+    )
+    assert observations_status == 200
+    assert observations["items"][0]["job_id"] == job_id
+    observation_id = observations["items"][0]["observation_id"]
+
+    timeline_status, timeline, _ = request_json(
+        base_url + f"/api/observability-v2/observations/{observation_id}/timeline"
+    )
+    metrics_status, metrics, _ = request_json(base_url + "/api/observability-v2/metrics")
+    assert timeline_status == 200
+    assert timeline["items"]
+    assert {
+        "input",
+        "normalize",
+        "drain3",
+        "aggregate",
+        "evidence",
+        "prompt",
+        "model",
+        "parse",
+        "schema",
+        "evaluator",
+        "candidate",
+    } <= {item["stage"] for item in timeline["items"]}
+    assert metrics_status == 200
+    assert metrics["observation_count"] >= 1
+    assert metrics["span_count"] >= 1
+
+
+def test_replay_api_returns_stable_error_code(dashboard):
+    base_url, _ = dashboard
+
+    with pytest.raises(HTTPError) as invalid:
+        request_json(
+            base_url + "/api/observability-v2/replays",
+            "POST",
+            {"source_trace_id": "missing", "mode": "historical", "confirmed": True},
+        )
+
+    payload = json.load(invalid.value)
+    assert invalid.value.code == 400
+    assert payload["code"] == payload["error_code"]
+    assert payload["request_id"].startswith("request-")
 
 
 def test_serves_bundled_asset_with_correct_content_type(dashboard):

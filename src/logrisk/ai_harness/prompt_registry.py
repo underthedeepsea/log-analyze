@@ -243,6 +243,18 @@ class SQLitePromptRegistry(PromptRegistry):
             raise FileNotFoundError(f"prompt not found: {prompt_id}")
         return self._template(row)
 
+    def load_by_hash(self, prompt_id: str, sha256: str) -> PromptTemplate:
+        with self.database.connect() as connection:
+            row = connection.execute(
+                "SELECT t.*, v.version AS current_version, v.content, v.content_sha256 "
+                "FROM prompt_templates t JOIN prompt_versions v ON v.prompt_id=t.prompt_id "
+                "WHERE t.prompt_id=? AND v.content_sha256=?",
+                (prompt_id, sha256),
+            ).fetchone()
+        if row is None:
+            raise FileNotFoundError(f"prompt snapshot not found: {prompt_id}@{sha256}")
+        return self._template(row)
+
     def list_prompts(self) -> list[PromptTemplate]:
         with self.database.connect() as connection:
             rows = connection.execute(

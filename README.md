@@ -4,7 +4,7 @@
   <img src="frontend/logo/logrisk-app-icon-orange-v2.png" width="112" alt="LOGRISK 应用图标" />
 </p>
 
-当前版本：`1.26.0`。完整变更记录见 [`releas.md`](releas.md)。
+当前版本：`1.27.0`。完整变更记录见 [`releas.md`](releas.md)。
 
 LOGRISK 在本地完成日志规范化、Drain3 模板化、确定性语义增强、风险评分、规则复用、模型特征识别和人工审批。系统只生成可审查、可导出的日志特征，不执行根因分析（RCA），也不会把原始日志直接发送给模型。
 
@@ -15,7 +15,7 @@ LOGRISK 在本地完成日志规范化、Drain3 模板化、确定性语义增�
 - 大文件支持可恢复的文件 Checkpoint、批次提交和未知模板治理队列；Kafka 仅保留受控内部适配器契约，不连接 Broker。
 - 已批准且处于启用状态的规则优先匹配，命中后跳过模型调用；未知特征才进入 AI 分析和人工审批。
 - 支持本地 Ollama、OpenAI-compatible `/v1/chat/completions` 服务和可扩展的内部 Token 鉴权 Provider 模板。
-- 提供 Prompt 版本、模型 Profile、AI Trace、缓存、评测、Drain3 配置和语义词典治理。
+- 提供 Prompt 版本、模型 Profile、AI Trace、Observation/Span 链路、缓存、评测、Drain3 配置和语义词典治理。
 - 提供统一的评测与基准中心，可比较 Prompt、模型 Profile、失败 Case、趋势及发布门禁。
 - 提供服务器风险总览、风险事件台账、可解释评分，以及可编辑、可发布、可回滚的风险语义库。
 - 只导出人工批准的特征及关联风险节点，供外部 RCA 专家系统使用。
@@ -140,6 +140,8 @@ Dashboard 提供以下工作区：
 - **规则治理**：查看规则健康度、生命周期状态、版本历史、误报反馈、复审队列和完整 Lineage。
 
 人工审批表单默认保留模型返回的特征标题与标签；摘要同时展示模型摘要和当前选中的 Drain3 脱敏模板，便于审查语义判断与确定性日志证据。证据区明确区分“候选特征”和“关联证据模板”，并展示每个模板的 Xid、风险语义、严重级别和独立 Hash。
+
+AI 分析观测使用一个 Observation 汇总一次任务，并以 Span 展示输入、规范化、Drain3、聚合、规则/缓存、Evidence、Prompt、模型、JSON 解析、Schema、Evaluator、候选和审批阶段。页面支持阶段筛选、Span 详情、成功率、P50/P95 延迟及 Token 用量统计；模型 Profile 同时支持可选的每百万输入/输出 Token 单价，缺少 usage 或单价时成本明确显示“不可计算”。历史结果 Replay 不调用模型；“重新调用原模型”必须人工确认，并使用来源 Trace 锁定的 Prompt、Profile、Provider、模型参数和脱敏 Evidence。两种 Replay 都不会写入候选、批准规则或审批记录。
 
 所有启用的特征提取 Prompt 都必须明确声明 `feature_type`、`title`、`summary`、`importance`、`template_hashes`、`components`、`tags` 和 `selection_reason` 八个字段，并要求 `feature_type` 使用 `lowercase_snake_case`。启动时会把仍使用旧六字段契约的内置 Prompt 追加升级为新版本，同时保留原历史；页面保存缺少必填字段的 Prompt 时会返回明确错误。
 

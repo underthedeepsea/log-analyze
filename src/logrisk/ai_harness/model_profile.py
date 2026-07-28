@@ -38,6 +38,9 @@ class ModelProfile:
     thinking: ThinkingConfig
     evidence_budget: EvidenceBudget
     options: dict[str, Any] = field(default_factory=dict)
+    input_price_per_million: float | None = None
+    output_price_per_million: float | None = None
+    pricing_currency: str | None = None
 
     def build_model_options(self) -> dict[str, Any]:
         options = dict(self.options or {})
@@ -47,6 +50,21 @@ class ModelProfile:
             options.setdefault("num_predict", self.max_output_tokens)
         options["structured_output_mode"] = self.structured_output_mode
         return options
+
+    def estimate_cost(self, usage: dict[str, Any]) -> dict[str, Any] | None:
+        if self.input_price_per_million is None or self.output_price_per_million is None:
+            return None
+        input_tokens = int(usage.get("input_tokens") or 0)
+        output_tokens = int(usage.get("output_tokens") or 0)
+        amount = (
+            input_tokens * self.input_price_per_million
+            + output_tokens * self.output_price_per_million
+        ) / 1_000_000
+        return {
+            "amount": round(amount, 8),
+            "currency": self.pricing_currency or "CNY",
+            "estimated": True,
+        }
 
     def public_dict(self) -> dict[str, Any]:
         return {
@@ -68,6 +86,9 @@ class ModelProfile:
             "evidence_budget": self.evidence_budget.__dict__,
             "options": dict(self.options or {}),
             "runtime_options": self.build_model_options(),
+            "input_price_per_million": self.input_price_per_million,
+            "output_price_per_million": self.output_price_per_million,
+            "pricing_currency": self.pricing_currency,
         }
 
 
@@ -128,6 +149,9 @@ class ModelProfileRegistry:
                 max_output_tokens=raw.get("max_output_tokens"),
             ),
             options=dict(raw.get("options") or {}),
+            input_price_per_million=self._price(raw.get("input_price_per_million")),
+            output_price_per_million=self._price(raw.get("output_price_per_million")),
+            pricing_currency=str(raw.get("pricing_currency") or "").strip() or None,
         )
 
     def save(self, raw: dict[str, Any]) -> ModelProfile:
@@ -165,6 +189,9 @@ class ModelProfileRegistry:
                 "max_evidence_chars": int(budget.get("max_evidence_chars", 12000)),
             },
             "options": self._editable_options(raw.get("options")),
+            "input_price_per_million": self._price(raw.get("input_price_per_million")),
+            "output_price_per_million": self._price(raw.get("output_price_per_million")),
+            "pricing_currency": str(raw.get("pricing_currency") or "").strip() or None,
         }
         if not profiles[profile_id]["model"]:
             raise ValueError("model 不能为空")
@@ -182,6 +209,15 @@ class ModelProfileRegistry:
         for derived in ("think", "num_predict", "structured_output_mode"):
             options.pop(derived, None)
         return options
+
+    @staticmethod
+    def _price(value: Any) -> float | None:
+        if value is None or value == "":
+            return None
+        price = float(value)
+        if price < 0:
+            raise ValueError("模型 Token 单价不能小于 0")
+        return price
 
     def _seed_database(self) -> None:
         assert self.database is not None
@@ -243,6 +279,9 @@ class ModelProfileRegistry:
         payload.setdefault("display_name", profile_id)
         payload.setdefault("default_prompt_id", "feature_extract_v3_compact_strict_json_en")
         payload.setdefault("structured_output_mode", "json_schema")
+        payload["input_price_per_million"] = self._price(payload.get("input_price_per_million"))
+        payload["output_price_per_million"] = self._price(payload.get("output_price_per_million"))
+        payload["pricing_currency"] = str(payload.get("pricing_currency") or "").strip() or None
         payload["thinking"] = {
             "enabled": bool(payload.get("thinking_enabled", False)),
             "provider_option_name": "think",

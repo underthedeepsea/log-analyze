@@ -104,6 +104,13 @@
     observabilityProgress: function (jobId) { return jsonRequest("/api/ai-harness/jobs/" + encodeURIComponent(jobId) + "/progress"); },
     observabilityEvents: function (jobId) { return jsonRequest("/api/ai-harness/jobs/" + encodeURIComponent(jobId) + "/events"); },
     observabilityRecentEvents: function () { return jsonRequest("/api/ai-harness/events/recent?limit=100"); },
+    observations: function () { return jsonRequest("/api/observability-v2/observations?limit=50"); },
+    observationTimeline: function (id, query) { return jsonRequest("/api/observability-v2/observations/" + encodeURIComponent(id) + "/timeline" + (query || "")); },
+    observabilitySpan: function (id) { return jsonRequest("/api/observability-v2/spans/" + encodeURIComponent(id)); },
+    observabilityMetricsV2: function () { return jsonRequest("/api/observability-v2/metrics"); },
+    createReplay: function (payload) { return jsonRequest("/api/observability-v2/replays", { method: "POST", headers: { "Idempotency-Key": "ui-" + Date.now() }, body: JSON.stringify(payload) }); },
+    replay: function (id) { return jsonRequest("/api/observability-v2/replays/" + encodeURIComponent(id)); },
+    replayDiff: function (id) { return jsonRequest("/api/observability-v2/replays/" + encodeURIComponent(id) + "/diff"); },
     prompts: function () { return jsonRequest("/api/ai-harness/prompts"); },
     modelProfiles: function () { return jsonRequest("/api/ai-harness/model-profiles"); },
     saveModelProfile: function (profile) { return jsonRequest("/api/ai-harness/model-profiles", { method: "POST", body: JSON.stringify(profile) }); },
@@ -565,6 +572,58 @@
     const events = props.events || [];
     const funnel = progress && progress.summary || {};
     const total = funnel.risk_entities_total || 0;
+    const [v2, setV2] = useState({ observations: [], timeline: [], metrics: null, selected: null, error: "" });
+    const [stageFilter, setStageFilter] = useState("");
+    const [replayMode, setReplayMode] = useState("historical");
+    const [replayState, setReplayState] = useState(null);
+    const [replayDiff, setReplayDiff] = useState(null);
+    const [selectedSpan, setSelectedSpan] = useState(null);
+    const estimatedCost = v2.metrics && v2.metrics.estimated_cost;
+    const estimatedCostText = !estimatedCost ? "不可计算" : (
+      estimatedCost.amount !== undefined
+        ? estimatedCost.currency + " " + Number(estimatedCost.amount).toFixed(6)
+        : Object.keys(estimatedCost.by_currency || {}).map(function (currency) { return currency + " " + Number(estimatedCost.by_currency[currency]).toFixed(6); }).join(" · ")
+    );
+    const stageMetrics = v2.metrics && v2.metrics.stages || {};
+    const maxP95 = Math.max.apply(null, [0].concat(Object.keys(stageMetrics).map(function (stage) { return Number(stageMetrics[stage].p95_latency_ms || 0); })));
+    function loadTimeline(observation, stage) {
+      if (!observation) return Promise.resolve();
+      const query = stage ? "?stage=" + encodeURIComponent(stage) : "";
+      return api.observationTimeline(observation.observation_id, query).then(function (timeline) {
+        setV2(function (current) { return Object.assign({}, current, { selected: observation, timeline: timeline.items || [], error: "" }); });
+      });
+    }
+    function openSpan(spanId) {
+      api.observabilitySpan(spanId).then(setSelectedSpan).catch(function (reason) {
+        setV2(function (current) { return Object.assign({}, current, { error: reason.message }); });
+      });
+    }
+    useEffect(function () {
+      Promise.all([api.observations(), api.observabilityMetricsV2()]).then(function (values) {
+        const observations = values[0].items || [], selected = observations[0] || null;
+        setV2({ observations: observations, timeline: [], metrics: values[1], selected: selected, error: "" });
+        return loadTimeline(selected, "");
+      }).catch(function (reason) { setV2(function (current) { return Object.assign({}, current, { error: reason.message }); }); });
+    }, [progress && progress.job_id]);
+    function startReplay(traceId) {
+      if (!traceId) return;
+      if (!window.confirm(replayMode === "model" ? "重新调用原模型会产生真实调用，确认继续？" : "确认使用历史输出重新执行校验？")) return;
+      setReplayDiff(null);
+      api.createReplay({ source_trace_id: traceId, mode: replayMode, confirmed: true, operator: "local-operator" }).then(function (created) {
+        setReplayState(created);
+        function poll(remaining) {
+          api.replay(created.replay_id).then(function (current) {
+            setReplayState(current);
+            if ((current.status === "pending" || current.status === "running") && remaining > 0) {
+              window.setTimeout(function () { poll(remaining - 1); }, 500);
+              return;
+            }
+            if (current.status === "completed") api.replayDiff(created.replay_id).then(setReplayDiff);
+          }).catch(function (reason) { setReplayState({ status: "failed", error_message: reason.message }); });
+        }
+        poll(40);
+      }).catch(function (reason) { setReplayState({ status: "failed", error_message: reason.message }); });
+    }
     const funnelItems = [
       ["输入风险实体", funnel.risk_entities_total || 0],
       ["规则复用命中", funnel.rule_reused || 0],
@@ -598,6 +657,17 @@
         h(Metric, { label: "AI Cache 命中", value: summary.cache_hit_count || 0, tone: "green" }),
         h(Metric, { label: "候选特征生成", value: summary.candidate_feature_count || 0, tone: "orange" }),
         h(Metric, { label: "正常完成但无特征", value: summary.no_feature_count || 0 })),
+      h("section", { className: "surface observability-v2" },
+        h("div", { className: "surface-head" }, h("div", null, h("b", null, "分析链路时间线"), h("span", null, "Observation · Span · Replay")), h("div", { className: "obs-v2-metrics" }, h("span", null, "Span " + (v2.metrics && v2.metrics.span_count || 0)), h("span", null, "阶段最大 P95 " + maxP95 + " ms"), h("span", null, "Token 用量 " + (v2.metrics && v2.metrics.usage && (v2.metrics.usage.input_tokens + v2.metrics.usage.output_tokens) || 0)), h("span", null, "估算成本 " + estimatedCostText))),
+        v2.error && h("div", { className: "empty-state error" }, v2.error),
+        !v2.error && !v2.observations.length && h("div", { className: "empty-state" }, "暂无 Span 数据。旧版 Trace 仍可在 AI 调用追踪中查看。"),
+        v2.observations.length > 0 && h("div", { className: "obs-v2-layout" },
+          h("div", { className: "obs-v2-runs" }, v2.observations.map(function (item) { return h("button", { key: item.observation_id, className: v2.selected && v2.selected.observation_id === item.observation_id ? "active" : "", onClick: function () { loadTimeline(item, stageFilter); } }, h("b", null, item.job_id), h("small", null, item.status + " · " + timeText(item.updated_at))); })),
+          h("div", { className: "obs-v2-timeline" },
+            h("div", { className: "obs-v2-toolbar" }, h("select", { value: stageFilter, onChange: function (event) { const next = event.target.value; setStageFilter(next); loadTimeline(v2.selected, next); } }, h("option", { value: "" }, "全部阶段"), ["input", "normalize", "drain3", "aggregate", "rule_cache", "evidence", "prompt", "model", "parse", "schema", "evaluator", "candidate", "approval"].map(function (stage) { return h("option", { key: stage, value: stage }, stage); })), h("span", null, "失败阶段可通过状态颜色识别")),
+            v2.timeline.map(function (span) { return h("article", { className: "obs-span " + span.status, key: span.span_id }, h("i"), h("div", null, h("b", null, span.stage + " · " + span.name), h("small", null, span.status + " · " + (span.duration_ms || (span.attributes || {}).latency_ms || 0) + " ms")), h("button", { className: "text-button", onClick: function () { openSpan(span.span_id); } }, "详情"), span.trace_id && h("button", { className: "text-button", onClick: function () { props.onOpenTrace(span.trace_id); } }, "Trace")); }),
+            !v2.timeline.length && h("div", { className: "empty-state compact" }, "当前筛选没有 Span"))),
+        h("div", { className: "replay-panel" }, h("div", null, h("b", null, "安全 Replay"), h("span", null, "历史结果重放不调用模型；重新调用原模型需要人工确认，且结果不会写入规则。")), h("select", { value: replayMode, onChange: function (event) { setReplayMode(event.target.value); } }, h("option", { value: "historical" }, "历史结果重放"), h("option", { value: "model" }, "重新调用原模型")), h("button", { className: "secondary-button", disabled: !(progress && progress.entities || []).some(function (item) { return item.trace_id; }), onClick: function () { const entity = (progress && progress.entities || []).find(function (item) { return item.trace_id; }); startReplay(entity && entity.trace_id); } }, "创建 Replay"), replayState && h("span", { className: "status-chip " + replayState.status }, replayState.error_message || replayState.status), replayDiff && h("div", { className: "replay-diff" }, h("b", null, replayDiff.changed ? "版本差异：有变化" : "版本差异：无变化"), h("span", null, "新增 " + (replayDiff.added || 0) + " · 删除 " + (replayDiff.removed || 0) + " · 修改 " + (replayDiff.modified || 0))))),
       h("section", { className: "surface obs-progress" }, h("div", { className: "surface-head" }, h("b", null, "当前任务阶段"), h("span", null, progress.job_id + " · " + progress.status)),
         h("div", { className: "obs-tags" }, h("span", null, progress.source_file || "上传结果"), h("span", null, "Profile " + (progress.model_profile_id || "—")), h("span", null, "模型 " + (progress.model || "—")), h("span", null, "Thinking " + ((progress.model_profile && progress.model_profile.thinking_enabled) ? "ON" : "OFF")), h("span", null, "预算 " + ((progress.model_profile && progress.model_profile.max_templates) || "—") + " templates / " + ((progress.model_profile && progress.model_profile.max_evidence_chars) || "—") + " chars"), h("span", null, "Prompt " + (progress.prompt_id || "—")), h("span", null, "轮询刷新 2s")),
         h("div", { className: "stage-grid" }, stages.map(function (stage, index) {
@@ -623,7 +693,15 @@
           const canReview = entity.status === "candidate_generated" || entity.status === "waiting_review";
           const budget = entity.context_budget || {}, meta = entity.evidence_build_meta || {};
           return h("div", { className: "entity-ai-row", key: entity.entity_type + entity.entity_id }, h("span", null, entity.entity_type + "/" + entity.entity_id), h("b", null, entity.risk_score || "—"), h("span", null, entity.model_profile_id || "—"), h("span", null, entity.thinking_enabled === true ? "ON" : (entity.thinking_enabled === false ? "OFF" : "—")), h("span", null, (budget.max_templates || "—") + " / " + (budget.max_evidence_chars || "—")), h("span", null, meta.truncated ? "已裁剪 " + (meta.kept_template_count || "—") + "/" + (meta.original_template_count || "—") : "否"), h("span", null, entity.model_status || "—"), h("span", null, entity.schema_status || "—"), h("span", { className: "status-chip " + (entity.evaluator_status || "skipped") }, entity.evaluator_status === "passed" ? "通过" : (entity.evaluator_status === "failed" ? "拦截" : (entity.evaluator_status === "warning" ? "通过，有警告" : "未执行"))), entity.trace_id ? h("button", { className: "text-button", onClick: function () { props.onOpenTrace(entity.trace_id); } }, "查看 Trace") : h("span", null, entity.failure_reason || "—"), h("button", { className: "text-button", onClick: canReview ? props.onReview : (entity.reused_rule ? props.onRules : props.onRefresh) }, canReview ? "去审批" : (entity.reused_rule ? "查看规则" : "查看进度")));
-        })));
+        })),
+      h(Drawer, { title: "Span 详情", subtitle: selectedSpan && (selectedSpan.stage + " · " + selectedSpan.name), item: selectedSpan, onClose: function () { setSelectedSpan(null); } },
+        selectedSpan && h("div", { className: "span-detail" },
+          h("div", { className: "button-row" },
+            selectedSpan.trace_id && h("button", { className: "secondary-button", onClick: function () { props.onOpenTrace(selectedSpan.trace_id); } }, "查看 Trace"),
+            progress.prompt_id && h("button", { className: "secondary-button", onClick: function () { props.onOpenPrompt(progress.prompt_id); } }, "查看 Prompt"),
+            progress.model_profile_id && h("button", { className: "secondary-button", onClick: props.onModels }, "查看模型 Profile"),
+            h("button", { className: "secondary-button", onClick: props.onRules }, "查看规则")),
+          h(CodeBlock, { value: { span_id: selectedSpan.span_id, observation_id: selectedSpan.observation_id, status: selectedSpan.status, duration_ms: selectedSpan.duration_ms, attributes: selectedSpan.attributes } }))));
   }
 
   function thinkingBadge(enabled) {
@@ -730,6 +808,11 @@
         h("label", null, "默认 Prompt", h("input", { value: draft.default_prompt_id || "", onChange: function (event) { setField("default_prompt_id", event.target.value); } })),
         h("label", null, "Thinking", h("select", { value: draft.thinking_enabled ? "on" : "off", onChange: function (event) { setField("thinking_enabled", event.target.value === "on"); } }, h("option", { value: "off" }, "Thinking OFF"), h("option", { value: "on" }, "Thinking ON"))),
         h("p", null, "关闭 Thinking 模式用于 Ollama / 支持 thinking 参数的模型。关闭后降低推理耗时，减少中间思考内容影响 JSON 输出稳定性。"),
+        h("h3", null, "Token 成本（可选）"),
+        h("div", { className: "budget-grid" },
+          h("label", null, h("b", null, "每百万输入 Token"), h("input", { type: "number", min: "0", step: "0.000001", value: draft.input_price_per_million == null ? "" : draft.input_price_per_million, onChange: function (event) { setField("input_price_per_million", event.target.value === "" ? null : Number(event.target.value)); } })),
+          h("label", null, h("b", null, "每百万输出 Token"), h("input", { type: "number", min: "0", step: "0.000001", value: draft.output_price_per_million == null ? "" : draft.output_price_per_million, onChange: function (event) { setField("output_price_per_million", event.target.value === "" ? null : Number(event.target.value)); } })),
+          h("label", null, h("b", null, "币种"), h("input", { value: draft.pricing_currency || "", placeholder: "CNY", onChange: function (event) { setField("pricing_currency", event.target.value); } }))),
         h("h3", null, "Context Budget"),
         h("div", { className: "budget-grid" }, ["max_templates", "max_template_chars", "max_affected_entities", "max_evidence_chars", "recommended_input_tokens", "max_output_tokens"].map(function (key) {
           const topLevel = key === "recommended_input_tokens" || key === "max_output_tokens";
@@ -1518,7 +1601,7 @@
         view === "overview" && h(React.Fragment, null,
           h("section", { className: "upload-panel" }, h("div", null, h("b", null, fileName || "选择 result.json、JSONL、TXT、LOG、GZ 或无后缀日志"), h("span", null, result ? (result.risk_entities || []).length + " 个风险实体，已完成本地预处理" : "10MB 以内直接分析；超过 10MB 自动分片上传，Linux messages / syslog 无后缀文件也支持上传")), busy && h("div", { className: "upload-progress" }, uploadProgress && h("span", null, "上传进度：" + Math.round((uploadProgress.progress || 0) * 100) + "%（" + uploadProgress.received_chunks + " / " + uploadProgress.total_chunks + " chunks）"), preprocessProgress && h("span", null, "预处理阶段：" + (preprocessProgress.stage || "queued") + "，记录 " + (preprocessProgress.records_parsed || 0) + (preprocessProgress.drain3_partitions_total ? "，Drain3 分片 " + (preprocessProgress.drain3_partitions_completed || 0) + " / " + preprocessProgress.drain3_partitions_total : ""))), h("div", { className: "analysis-config" }, h("label", null, "分析流程", h("select", { value: "feature_extract", disabled: true }, h("option", { value: "feature_extract" }, "日志特征识别"))), h("label", null, "模型 Profile", h("select", { value: modelProfileId, onChange: function (event) { const profile = activeProfiles.find(function (item) { return item.profile_id === event.target.value; }) || {}; setModelProfileId(event.target.value); if (profile.model) setModel(profile.model); if (profile.default_prompt_id) setPromptId(profile.default_prompt_id); } }, activeProfiles.map(function (profile) { return h("option", { value: profile.profile_id, key: profile.profile_id }, (profile.display_name || profile.profile_id) + " · " + profile.provider); }))), h("label", null, "Provider / 连接", h("input", { value: (selectedModelProfile.provider || "—") + " / " + (selectedModelProfile.connection_id || "—"), disabled: true })), h("label", null, "模型", h("input", { value: model, onChange: function (event) { setModel(event.target.value); } })), h("label", null, "Prompt", h("select", { value: promptId, onChange: function (event) { setPromptId(event.target.value); } }, activePrompts.map(function (prompt) { return h("option", { value: prompt.prompt_id, key: prompt.prompt_id }, prompt.prompt_id); }))), h("label", null, "重试次数", h("select", { value: retryCount, onChange: function (event) { setRetryCount(Number(event.target.value)); } }, [0, 1, 2, 3].map(function (count) { return h("option", { value: count, key: count }, count + " 次"); }))), h("label", null, "阈值", h("input", { type: "number", value: threshold, onChange: function (event) { setThreshold(event.target.value); } })), h("button", { className: "primary-button", disabled: !result || busy, onClick: start }, busy ? "处理中…" : "开始识别"))), h(MetricsGrid, { snapshot: snapshot, result: result, daily: systemMetrics }), h(LiveProcessing, { snapshot: snapshot, result: result })),
         view === "queue" && h(React.Fragment, null, h(MetricsGrid, { snapshot: snapshot, result: result, daily: systemMetrics }), h(LiveProcessing, { snapshot: snapshot, result: result }), workspace),
-        view === "observability" && h(AIObservabilityPage, { summary: obsSummary, progress: obsProgress, events: obsEvents, onRefresh: function () { loadObservability(obsProgress && obsProgress.job_id).catch(function (reason) { setError(reason.message); }); }, onOpenTrace: openTrace, onReview: function () { changeView("review"); }, onRules: function () { changeView("rules"); }, onNewAnalysis: function () { changeView("overview"); } }),
+        view === "observability" && h(AIObservabilityPage, { summary: obsSummary, progress: obsProgress, events: obsEvents, onRefresh: function () { loadObservability(obsProgress && obsProgress.job_id).catch(function (reason) { setError(reason.message); }); }, onOpenTrace: openTrace, onOpenPrompt: openPrompt, onModels: function () { changeView("modelProfiles"); }, onReview: function () { changeView("review"); }, onRules: function () { changeView("rules"); }, onNewAnalysis: function () { changeView("overview"); } }),
         view === "traces" && h(AITracePage, { traces: traces, harness: harness, traceFilters: traceFilters, onFilter: applyTraceFilters, onOpenTrace: openTrace }),
         view === "prompts" && h(PromptManagement, { prompts: prompts, currentPrompt: harness.current_prompt_id || promptId, onOpenPrompt: openPrompt }),
         view === "modelProfiles" && h(ModelProfilesPage, { profiles: modelProfiles, selectedProfileId: modelProfileId, onSelect: function (profile) { setModelProfileId(profile.profile_id); setModel(profile.model || model); setPromptId(profile.default_prompt_id || promptId); }, onSave: saveModelProfile }),

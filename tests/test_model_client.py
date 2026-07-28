@@ -45,6 +45,8 @@ def test_ollama_model_client_posts_non_streaming_json_schema_request():
             def read(self):
                 return json.dumps({
                     "message": {"content": json.dumps({"features": []})},
+                    "prompt_eval_count": 120,
+                    "eval_count": 30,
                 }).encode()
 
         return Response()
@@ -63,6 +65,11 @@ def test_ollama_model_client_posts_non_streaming_json_schema_request():
     assert captured["body"]["stream"] is False
     assert captured["body"]["format"] == SCHEMA
     assert captured["body"]["options"] == {"temperature": 0}
+    assert client.last_metadata["usage"] == {
+        "input_tokens": 120,
+        "output_tokens": 30,
+        "total_tokens": 150,
+    }
 
 
 def test_ollama_model_client_merges_options_with_temperature_default():

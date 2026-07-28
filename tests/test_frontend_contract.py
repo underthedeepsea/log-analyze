@@ -481,13 +481,14 @@ def test_release_docs_describe_current_feature_version():
     assert "## 1.22.0 - 2026-07-18" in release
     assert "## 1.23.0 - 2026-07-19" in release
     assert "## 1.23.1 - 2026-07-21" in release
-    assert "当前版本：`1.26.0`" in readme
+    assert "当前版本：`1.27.0`" in readme
     assert "## 1.24.0 - 2026-07-22" in release
     assert "## 1.24.1 - 2026-07-22" in release
     assert "## 1.24.2 - 2026-07-22" in release
     assert "## 1.25.0 - 2026-07-23" in release
     assert "## 1.25.1 - 2026-07-24" in release
     assert "## 1.26.0 - 2026-07-27" in release
+    assert "## 1.27.0 - 2026-07-28" in release
     assert "qwen3.5:9b-mlx" in readme
     assert "state/logrisk.sqlite3" in readme
     assert "database/migrations/" in readme
@@ -563,3 +564,25 @@ def test_system_settings_exposes_postgres_candidate_configuration_without_passwo
     assert "PostgreSQL 运行数据库" in app
     assert "密码环境变量名" in app
     assert 'type: "password"' not in app
+
+
+def test_ai_observability_v2_exposes_timeline_metrics_and_safe_replay():
+    app = (FRONTEND / "src" / "app.js").read_text(encoding="utf-8")
+
+    for text in (
+        "/api/observability-v2/observations",
+        "/api/observability-v2/metrics",
+        "/api/observability-v2/replays",
+        "/api/observability-v2/spans/",
+        "分析链路时间线",
+        "Span 详情",
+        "阶段最大 P95",
+        "Token 用量",
+        "每百万输入 Token",
+        "每百万输出 Token",
+        "历史结果重放不调用模型",
+        "重新调用原模型需要人工确认",
+        "版本差异：有变化",
+        "旧版 Trace 仍可在 AI 调用追踪中查看",
+    ):
+        assert text in app

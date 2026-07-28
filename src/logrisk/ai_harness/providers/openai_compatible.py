@@ -16,6 +16,7 @@ class OpenAICompatibleModelClient:
         self.base_url = self._validate_base_url(base_url)
         self.api_key_env = api_key_env
         self.opener = opener or urlopen
+        self.last_metadata: dict[str, Any] = {}
 
     @staticmethod
     def _validate_base_url(base_url: str) -> str:
@@ -34,6 +35,7 @@ class OpenAICompatibleModelClient:
         timeout: float,
         options: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        self.last_metadata = {}
         api_key = os.environ.get(self.api_key_env)
         if not api_key:
             raise ModelClientError(f"未配置 API Key 环境变量: {self.api_key_env}")
@@ -73,6 +75,14 @@ class OpenAICompatibleModelClient:
             raise ModelClientError(f"无法连接远端模型: {exc}", raw_output=str(exc)) from exc
         try:
             payload = json.loads(raw_response)
+            usage = payload.get("usage") or {}
+            self.last_metadata = {
+                "usage": {
+                    "input_tokens": int(usage.get("prompt_tokens") or 0),
+                    "output_tokens": int(usage.get("completion_tokens") or 0),
+                    "total_tokens": int(usage.get("total_tokens") or 0),
+                }
+            }
             return parse_content_json(payload["choices"][0]["message"]["content"])
         except (json.JSONDecodeError, UnicodeDecodeError, KeyError, IndexError, TypeError) as exc:
             raw = raw_response.decode("utf-8", errors="replace")

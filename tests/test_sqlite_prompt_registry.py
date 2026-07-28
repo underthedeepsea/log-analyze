@@ -90,3 +90,21 @@ def test_sqlite_registry_rejects_feature_prompt_missing_required_fields(tmp_path
             "feature",
             "feature_type title summary importance template_hashes components",
         )
+
+
+def test_sqlite_registry_loads_exact_historical_hash(tmp_path):
+    prompt_dir = tmp_path / "prompts"
+    prompt_dir.mkdir()
+    content = valid_feature_prompt("first")
+    (prompt_dir / "feature.md").write_text(content, encoding="utf-8")
+    registry = SQLitePromptRegistry(
+        SQLiteDatabase(tmp_path / "logrisk.sqlite3"),
+        prompt_dir,
+    )
+    first = registry.load("feature")
+    registry.update("feature", valid_feature_prompt("second"), "second")
+
+    resolved = registry.load_by_hash("feature", first.sha256)
+
+    assert resolved.content == content
+    assert resolved.sha256 == first.sha256

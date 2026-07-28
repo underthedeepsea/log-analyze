@@ -19,6 +19,7 @@ class OllamaModelClient:
     ) -> None:
         self.base_url = self._validate_base_url(base_url)
         self.opener = opener or urlopen
+        self.last_metadata: dict[str, Any] = {}
 
     @staticmethod
     def _validate_base_url(base_url: str) -> str:
@@ -37,6 +38,7 @@ class OllamaModelClient:
         timeout: float,
         options: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        self.last_metadata = {}
         request_options = {"temperature": 0, **(options or {})}
         request_options.pop("structured_output_mode", None)
         if "max_output_tokens" in request_options:
@@ -72,6 +74,15 @@ class OllamaModelClient:
 
         try:
             payload = json.loads(raw_response)
+            input_tokens = int(payload.get("prompt_eval_count") or 0)
+            output_tokens = int(payload.get("eval_count") or 0)
+            self.last_metadata = {
+                "usage": {
+                    "input_tokens": input_tokens,
+                    "output_tokens": output_tokens,
+                    "total_tokens": input_tokens + output_tokens,
+                }
+            }
             message = payload["message"]
             content = message["content"]
             if not str(content).strip() and message.get("thinking") and payload.get("done_reason") == "length":

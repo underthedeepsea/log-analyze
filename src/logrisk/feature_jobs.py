@@ -195,6 +195,7 @@ class FeatureJobManager:
         monotonic: Callable[[], float] = time.monotonic,
         auto_start: bool = True,
         persistence: FeatureJobFileStore | None = None,
+        observability: Any | None = None,
     ) -> None:
         self.extractor = extractor
         self.rule_store = rule_store
@@ -202,6 +203,7 @@ class FeatureJobManager:
         self.monotonic = monotonic
         self.auto_start = auto_start
         self.persistence = persistence
+        self.observability = observability
         self._jobs: Dict[str, Dict[str, Any]] = {}
         self._lock = threading.RLock()
         self._restore_jobs()
@@ -360,9 +362,86 @@ class FeatureJobManager:
             **payload,
         }
         job["events"].append(event)
+        self._record_observability_event(job, event_type, payload)
         if self.persistence:
             self.persistence.save(job)
         job["condition"].notify_all()
+
+    def _record_observability_event(
+        self,
+        job: Dict[str, Any],
+        event_type: str,
+        payload: Dict[str, Any],
+    ) -> None:
+        if self.observability is None:
+            return
+        stages = {
+            "job_created": [
+                ("input", "input-ready", "success"),
+                ("normalize", "normalization-completed", "success"),
+                ("drain3", "template-mining-completed", "success"),
+                ("aggregate", "risk-aggregation-completed", "success"),
+            ],
+            "job_started": [("aggregate", "feature-job", "success")],
+            "entity_rule_matched": [("rule_cache", "approved-rule", "skipped")],
+            "entity_started": [
+                ("rule_cache", "rule-cache-checked", "success"),
+                ("evidence", "evidence-built", "success"),
+                ("prompt", "prompt-locked", "success"),
+                ("model", "model-call-started", "running"),
+            ],
+            "entity_retrying": [("model", "model-retry", "failed")],
+            "entity_cache_hit": [("rule_cache", "ai-cache", "cache_hit")],
+            "entity_completed": [
+                ("model", "model-call-completed", "success"),
+                ("parse", "json-parsed", "success"),
+                ("schema", "schema-validated", "success"),
+                ("evaluator", "quality-evaluated", "success"),
+                ("candidate", "candidate-generation", "success"),
+            ],
+            "entity_failed": [("model", "model-call", "failed")],
+            "feature_updated": [("approval", "manual-review", "success")],
+            "job_completed": [("candidate", "feature-job", "success")],
+        }
+        event_stages = stages.get(event_type)
+        if event_stages is None:
+            return
+        if event_type == "entity_failed":
+            error = str(payload.get("error") or "").lower()
+            if "evaluator" in error:
+                event_stages = [("evaluator", "quality-evaluated", "failed")]
+            elif "json" in error or "解析" in error:
+                event_stages = [("parse", "json-parsed", "failed")]
+            elif "schema" in error or "特征字段" in error or "features 数组" in error:
+                event_stages = [("schema", "schema-validated", "failed")]
+        try:
+            observation = self.observability.ensure_observation(
+                job_id=job["job_id"],
+                attributes={
+                    "provider": job.get("provider"),
+                    "model": job.get("model"),
+                    "prompt_id": job.get("prompt_id"),
+                },
+            )
+            sequence = len(job.get("events") or []) - 1
+            for stage, name, status in event_stages:
+                self.observability.record(
+                    observation_id=observation["observation_id"],
+                    name=name,
+                    stage=stage,
+                    status=status,
+                    trace_id=payload.get("trace_id"),
+                    attributes={"event_type": event_type, **payload},
+                    idempotency_key=f"{job['job_id']}:{sequence}:{stage}:{name}",
+                )
+            job["observation_id"] = observation["observation_id"]
+            if event_type == "job_completed":
+                self.observability.finish_observation(
+                    observation["observation_id"],
+                    failed=payload.get("status") == "completed_with_errors",
+                )
+        except Exception:
+            return
 
     def run_job(self, job_id: str, only_entity_id: str | None = None) -> None:
         with self._lock:
@@ -433,6 +512,8 @@ class FeatureJobManager:
                         "entity_completed",
                         entity_id=record["entity_id"],
                         feature_count=len(features),
+                        trace_id=next((item.get("trace_id") for item in features if item.get("trace_id")), None),
+                        latency_ms=max((int(item.get("latency_ms") or 0) for item in features), default=0),
                     )
             except Exception as exc:
                 with self._lock:

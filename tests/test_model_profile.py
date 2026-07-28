@@ -1,4 +1,5 @@
 import pytest
+from dataclasses import replace
 
 from logrisk.ai_harness.connections import ConnectionStore
 from logrisk.ai_harness.model_profile import ModelProfileRegistry
@@ -130,3 +131,19 @@ def test_profile_save_uses_edited_output_budget_instead_of_stale_runtime_options
     assert saved.options == {"temperature": 0}
     assert saved.public_dict()["runtime_options"]["num_predict"] == 1600
     assert "num_predict" not in saved.public_dict()["options"]
+
+
+def test_profile_estimates_cost_only_when_usage_and_prices_exist():
+    profile = ModelProfileRegistry("configs/model_profiles.yaml").get()
+    priced = replace(
+        profile,
+        input_price_per_million=2.0,
+        output_price_per_million=8.0,
+        pricing_currency="CNY",
+    )
+
+    assert priced.estimate_cost({
+        "input_tokens": 1_000_000,
+        "output_tokens": 500_000,
+    }) == {"amount": 6.0, "currency": "CNY", "estimated": True}
+    assert profile.estimate_cost({"input_tokens": 10}) is None

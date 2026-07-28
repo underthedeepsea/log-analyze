@@ -6,6 +6,20 @@
 - 仅修复 Bug 时提升最后一位，例如 `1.2.0 → 1.2.1`；
 - 每次代码更新必须同步更新本文件。
 
+## 1.27.0 - 2026-07-28
+
+### Added
+
+- 新增 AI Observability 2.0：以 Observation 汇总任务，以 Span 展示输入、Drain3、规则复用、Evidence、Prompt、模型、解析、Schema、Evaluator、候选和审批链路。
+- 新增按阶段与状态筛选的时间线、Span 详情、阶段成功率、P50/P95 延迟、模型 Token 用量和可选 Profile 单价成本指标；旧版 AI Trace 保持兼容。
+- 新增安全 Replay：历史结果重放不会调用模型；原模型重放必须人工确认并锁定来源 Prompt、Profile、Provider、Evidence 与模型参数。
+- 新增 SQLite/PostgreSQL 双模式 Observation、Span、Replay 和 Replay 事件表，并在数据字典中记录用途与 PostgreSQL 映射。
+
+### Security
+
+- Observation 和 Replay 仅保存聚合、脱敏快照，不保存原始日志、模型凭据或数据库密钥。
+- Replay 结果与正式候选、规则及审批链路隔离，不会自动写入业务资产，也不会切换或降级模型 Provider。
+
 ## 1.26.0 - 2026-07-27
 
 ### Added

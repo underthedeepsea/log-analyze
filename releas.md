@@ -6,6 +6,26 @@
 - 仅修复 Bug 时提升最后一位，例如 `1.2.0 → 1.2.1`；
 - 每次代码更新必须同步更新本文件。
 
+## 1.28.0 - 2026-07-29
+
+### Added
+
+- 新增 Production Runtime 领域：统一的任务目录、存储配额、Retention 预览/执行、运行状态、健康检查、就绪检查和脱敏审计。
+- 新增 PACAS/RBAC 外部身份边界：仅信任配置的代理 CIDR 与身份 Header；生产写请求可按角色失败关闭，本机开发继续支持显式 loopback bypass。
+- 新增 `runtime_policies`、`runtime_maintenance_runs`、`runtime_quota_snapshots` 和 `runtime_audit_events`，并提供 SQLite/PostgreSQL 对等 `0010` migration 与数据字典记录。
+- 新增 Dashboard“运行中心”，展示就绪状态、跨域任务、任务排序、存储用量、Retention 策略、人工确认清理、审计记录与可复制诊断信息。
+- 新增离线 HTML《LOGRISK 完整管理员使用手册》及 8 张脱敏界面截图，覆盖日志分析、审批导出、AI 工程、规则与语义、Drain3 评测、流式处理和生产运行操作。
+
+### Changed
+
+- 上传与分析在接受前重新计算存储用量；超过硬限制时返回稳定的 `507 runtime_quota_exceeded`，避免继续写满本机或生产磁盘。
+- Retention 只处理受控根目录中的已完成/失败任务产物，跳过运行任务、原始来源和导出物；执行后同步清理对应 Artifact 元数据。
+- 所有 Dashboard 写请求追加脱敏通用审计事件；运行策略使用乐观版本校验，冲突返回 `409 runtime_version_conflict`。
+
+### Security
+
+- 不新增本地用户、Bearer Token、密码、会话或第二套 RBAC；不会持久化认证 Header、Cookie、Token、API Key、DSN、模型内容或原始日志。
+
 ## 1.27.0 - 2026-07-28
 
 ### Added

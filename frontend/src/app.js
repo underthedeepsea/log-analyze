@@ -37,6 +37,16 @@
     health: function () { return jsonRequest("/api/health"); },
     config: function () { return jsonRequest("/api/config"); },
     databaseRuntime: function () { return jsonRequest("/api/system/database"); },
+    runtimeIdentity: function () { return jsonRequest("/api/runtime/identity"); },
+    runtimeHealth: function () { return jsonRequest("/api/runtime/health"); },
+    runtimeReadiness: function () { return jsonRequest("/api/runtime/readiness"); },
+    runtimeTasks: function () { return jsonRequest("/api/runtime/tasks?page_size=100"); },
+    runtimeStorage: function () { return jsonRequest("/api/runtime/storage"); },
+    runtimeRetention: function () { return jsonRequest("/api/runtime/retention"); },
+    runtimeAudit: function () { return jsonRequest("/api/runtime/audits?limit=100"); },
+    saveRuntimeRetention: function (payload) { return jsonRequest("/api/runtime/retention/policy", { method: "POST", body: JSON.stringify(payload) }); },
+    previewRuntimeRetention: function () { return jsonRequest("/api/runtime/retention/preview", { method: "POST", body: "{}" }); },
+    executeRuntimeRetention: function () { return jsonRequest("/api/runtime/retention/execute", { method: "POST", body: "{}" }); },
     saveDatabaseCandidate: function (payload) { return jsonRequest("/api/system/database/config", { method: "POST", body: JSON.stringify(payload) }); },
     testDatabaseCandidate: function (payload) { return jsonRequest("/api/system/database/test", { method: "POST", body: JSON.stringify(payload) }); },
     status: function () { return jsonRequest("/api/ollama/status"); },
@@ -191,7 +201,7 @@
 
   const navItems = [
     ["overview", "▦", "特征总览"], ["queue", "◫", "识别队列"], ["observability", "◉", "AI 分析观测"], ["traces", "⌁", "AI 调用追踪"], ["prompts", "{}", "Prompt 管理"], ["modelProfiles", "◌", "模型画像"], ["review", "✓", "人工审批"],
-    ["rules", "⌘", "规则治理"], ["nodeRisks", "△", "服务器风险"], ["semanticLibrary", "≋", "风险语义库"], ["streaming", "≈", "流式处理"], ["drainQuality", "◇", "评测中心 · 模板质量"], ["benchmarkCenter", "◎", "评测与基准"], ["export", "⇩", "导出记录"], ["settings", "⚙", "系统设置"],
+    ["rules", "⌘", "规则治理"], ["nodeRisks", "△", "服务器风险"], ["semanticLibrary", "≋", "风险语义库"], ["streaming", "≈", "流式处理"], ["drainQuality", "◇", "评测中心 · 模板质量"], ["benchmarkCenter", "◎", "评测与基准"], ["runtime", "◫", "运行中心"], ["export", "⇩", "导出记录"], ["settings", "⚙", "系统设置"],
   ];
   const statusNames = { queued: "等待分析", running: "识别中", completed: "Ollama 完成", failed: "识别失败", skipped: "低风险跳过", rule_matched: "规则复用" };
 
@@ -260,6 +270,7 @@
   function timeText(value) { return value ? new Date(value).toLocaleString() : "—"; }
   function pathToView(path) {
     if (path === "/benchmark-center") return "benchmarkCenter";
+    if (path === "/runtime") return "runtime";
     if (path === "/streaming") return "streaming";
     if (path === "/prompts") return "prompts";
     if (path === "/model-profiles") return "modelProfiles";
@@ -274,7 +285,7 @@
   }
   function routeForView(view) {
     return {
-      benchmarkCenter: "/benchmark-center", streaming: "/streaming", prompts: "/prompts", modelProfiles: "/model-profiles",
+      benchmarkCenter: "/benchmark-center", runtime: "/runtime", streaming: "/streaming", prompts: "/prompts", modelProfiles: "/model-profiles",
       traces: "/ai-traces", observability: "/ai-observability", drainQuality: "/drain-quality", rules: "/rules",
       nodeRisks: "/node-risks", semanticLibrary: "/semantic-library", settings: "/settings",
     }[view] || "/";
@@ -1419,6 +1430,91 @@
       tab === "gates" && h("section", { className: "surface benchmark-gate" }, h("div", { className: "surface-head" }, h("div", null, h("b", null, "发布门禁"), h("span", null, "比较基线和候选；结果不会自动发布任何生产资产"))), h("div", { className: "gate-form" }, h("label", null, "基线 Run", h("select", { value: baseline, onChange: function (event) { setBaseline(event.target.value); } }, completedRuns.map(function (run) { return h("option", { value: run.run_id, key: run.run_id }, run.run_id); }))), h("span", null, "→"), h("label", null, "候选 Run", h("select", { value: candidate, onChange: function (event) { setCandidate(event.target.value); } }, completedRuns.map(function (run) { return h("option", { value: run.run_id, key: run.run_id }, run.run_id); }))), h("button", { className: "primary-button", disabled: working || !baseline || !candidate, onClick: evaluateGate }, "执行门禁")), gateResult && h("div", { className: "gate-result " + gateResult.decision }, h("b", null, gateResult.decision), h("p", null, (gateResult.reasons || []).join("；")), h("code", null, JSON.stringify(gateResult.deltas)))));
   }
 
+  function runtimeBytes(value) {
+    const bytes = Number(value || 0);
+    if (bytes < 1024) return bytes + " B";
+    const units = ["KB", "MB", "GB", "TB"];
+    let amount = bytes;
+    let index = -1;
+    do { amount /= 1024; index += 1; } while (amount >= 1024 && index < units.length - 1);
+    return amount.toFixed(amount >= 10 ? 1 : 2) + " " + units[index];
+  }
+
+  function RuntimeCenterPage(props) {
+    const data = props.data || {};
+    const identity = data.identity || {};
+    const readiness = data.readiness || {};
+    const storage = data.storage || {};
+    const retention = data.retention || {};
+    const effective = retention.effective || retention.configured || {};
+    const tasks = data.tasks && data.tasks.items || [];
+    const audits = data.audits && data.audits.items || [];
+    const [working, setWorking] = useState("");
+    const [taskSort, setTaskSort] = useState("updated");
+    const [retentionDays, setRetentionDays] = useState(String(effective.completed_days || 30));
+    useEffect(function () { setRetentionDays(String(effective.completed_days || 30)); }, [effective.completed_days]);
+    async function preview() {
+      setWorking("preview");
+      try { await props.onPreview(); }
+      finally { setWorking(""); }
+    }
+    async function execute() {
+      if (!window.confirm("确认按当前 Retention 策略清理已过期的文件产物？此操作不会删除数据库记录或原始日志。")) return;
+      setWorking("execute");
+      try { await props.onExecute(); }
+      finally { setWorking(""); }
+    }
+    async function savePolicy() {
+      setWorking("policy");
+      try {
+        await props.onSavePolicy({
+          expected_version: Number(retention.policy && retention.policy.version || 0),
+          policy: {
+            enabled: !!effective.enabled,
+            completed_days: Number(retentionDays),
+            trace_days: Number(effective.trace_days || 30),
+            cache_days: Number(effective.cache_days || 14),
+          },
+        });
+      } finally { setWorking(""); }
+    }
+    function copyDiagnostic() {
+      const value = JSON.stringify({ page: "runtime", api_base: currentApiBase(), readiness: readiness.status || "unknown", quota: storage.level || "unknown", failure: data.failure || null, failure_code: data.failureCode || null }, null, 2);
+      if (navigator.clipboard) navigator.clipboard.writeText(value);
+    }
+    if (data.loading) return h("div", { className: "runtime-page" }, h("div", { className: "runtime-state" }, h("b", null, "正在读取运行状态"), h("span", null, "正在汇总任务、存储、保留策略和审计记录…")));
+    if (data.failure) return h("div", { className: "runtime-page" }, h("div", { className: "runtime-state error" }, h("b", null, data.failureCode === "runtime_identity_required" ? "缺少外部身份上下文" : "运行中心数据加载失败"), h("span", null, data.failure), h("div", null, h("button", { className: "secondary-button", onClick: props.onRefresh }, "重试"), h("button", { className: "text-button", onClick: copyDiagnostic }, "复制诊断信息"))));
+    const taskStatus = tasks.filter(function (item) { return ["running", "queued", "pending"].includes(item.status); }).length;
+    const sortedTasks = tasks.slice().sort(function (left, right) {
+      if (taskSort === "status") return String(left.status).localeCompare(String(right.status)) || String(right.updated_at).localeCompare(String(left.updated_at));
+      if (taskSort === "kind") return String(left.kind).localeCompare(String(right.kind)) || String(right.updated_at).localeCompare(String(left.updated_at));
+      return String(right.updated_at).localeCompare(String(left.updated_at));
+    });
+    return h("div", { className: "runtime-page" },
+      h("section", { className: "runtime-hero" },
+        h("div", null, h("span", { className: "eyebrow" }, "PRODUCTION RUNTIME"), h("h2", null, "运行中心"), h("p", null, "查看任务、存储配额、Retention 执行和审计记录；身份由外部 PACAS / RBAC 代理传入。")),
+        h("div", { className: "runtime-identity" }, h("span", { className: identity.authenticated ? "status-chip completed" : "status-chip" }, identity.authenticated ? "身份已识别" : "身份未启用"), h("b", null, identity.actor || "未提供主体"), h("small", null, identity.source === "loopback" ? "本机开发绕过" : (identity.roles || []).join(" · ") || "由外部身份边界管理"))),
+      h("section", { className: "runtime-metrics" },
+        [[readiness.ready ? "Ready" : "Not ready", "就绪状态", readiness.ready ? "ok" : "risk"], [String(tasks.length), "已登记任务", ""], [String(taskStatus), "运行 / 排队", taskStatus ? "warning" : ""], [runtimeBytes(storage.total_bytes), "存储用量", storage.level || ""], [String(audits.length), "审计记录", ""]].map(function (item) { return h("article", { key: item[1], className: item[2] || "" }, h("b", null, item[0]), h("span", null, item[1])); })),
+      h("section", { className: "surface runtime-task-table" }, h("div", { className: "surface-head" }, h("div", null, h("b", null, "任务中心"), h("span", null, "跨特征识别、流式处理、评测和回放的统一只读视图")), h("div", { className: "runtime-toolbar" }, h("label", null, h("span", null, "任务排序"), h("select", { value: taskSort, onChange: function (event) { setTaskSort(event.target.value); } }, h("option", { value: "updated" }, "最近更新"), h("option", { value: "status" }, "状态"), h("option", { value: "kind" }, "类型"))), h("button", { className: "text-button", onClick: props.onRefresh }, "刷新"))),
+        !tasks.length && h("div", { className: "empty-state compact" }, "当前没有已登记任务"),
+        sortedTasks.slice(0, 12).map(function (task) { return h("article", { key: task.kind + task.task_id }, h("div", null, h("b", null, task.kind), h("small", null, task.task_id), h("small", null, "阶段：" + task.stage)), h("span", { className: "status-chip " + task.status }, task.status), h("span", null, task.progress == null ? "—" : Math.round(Number(task.progress) * 100) + "%"), h("small", null, (task.actions || []).join(" · ") || "仅查看"), h("small", null, timeText(task.updated_at))); })),
+      h("section", { className: "runtime-grid" },
+        h("article", { className: "surface runtime-retention" }, h("div", { className: "surface-head" }, h("div", null, h("b", null, "Retention / Rotation"), h("span", null, "仅清理受控文件产物；预览不删除文件")), h("span", { className: effective.enabled ? "status-chip completed" : "status-chip" }, effective.enabled ? "已启用" : "未启用")),
+          h("div", { className: "runtime-retention-body" }, h("label", null, h("span", null, "已完成任务保留天数"), h("input", { type: "number", min: 1, max: 3650, value: retentionDays, onChange: function (event) { setRetentionDays(event.target.value); } })), h("p", null, "Trace " + (effective.trace_days || "—") + " 天 · Cache " + (effective.cache_days || "—") + " 天 · 策略版本 " + (retention.policy && retention.policy.version || 0)), h("div", { className: "runtime-actions" }, h("button", { className: "secondary-button", disabled: !!working, onClick: savePolicy }, working === "policy" ? "保存中…" : "保存策略"), h("button", { className: "secondary-button", disabled: !!working, onClick: preview }, working === "preview" ? "计算中…" : "预览清理"), h("button", { className: "danger-button", disabled: !!working || !effective.enabled, onClick: execute }, working === "execute" ? "清理中…" : "执行清理")))),
+        h("article", { className: "surface runtime-storage" },
+          h("div", { className: "surface-head" },
+            h("div", null, h("b", null, "存储用量"), h("span", null, "状态文件与输出文件；不包含原始日志内容")),
+            h("span", { className: "status-chip " + (storage.level || "") }, storage.level || "unknown")),
+          h("div", { className: "runtime-storage-body" },
+            h("b", null, runtimeBytes(storage.total_bytes)),
+            h("div", { className: "runtime-capacity" }, h("i", { style: { width: Math.min(100, Math.round(Number(storage.total_bytes || 0) / Math.max(1, Number(storage.hard_limit_bytes || 1)) * 100)) + "%" } })),
+            h("span", null, "预警 " + runtimeBytes(storage.soft_limit_bytes) + " · 硬限制 " + runtimeBytes(storage.hard_limit_bytes)),
+            h("small", null, "state " + runtimeBytes(storage.state_bytes) + " / " + (storage.state_files || 0) + " 个文件；output " + runtimeBytes(storage.output_bytes) + " / " + (storage.output_files || 0) + " 个文件"))),
+      ),
+      h("section", { className: "surface runtime-audit-table" }, h("div", { className: "surface-head" }, h("div", null, h("b", null, "审计日志"), h("span", null, "只记录脱敏操作元数据，不记录 API Key、Token 或原始日志")), h("span", null, audits.length + " 条")), !audits.length && h("div", { className: "empty-state compact" }, "尚无运行中心审计记录"), audits.slice(0, 12).map(function (item) { return h("article", { key: item.audit_id }, h("div", null, h("b", null, item.action), h("small", null, item.resource_type + (item.resource_id ? " · " + item.resource_id : ""))), h("span", null, item.actor || "系统"), h("span", { className: "status-chip " + (item.outcome === "success" ? "completed" : "failed") }, item.outcome), h("small", null, "request_id: " + (item.request_id || "—")), h("small", null, timeText(item.created_at))); })));
+  }
+
   function App() {
     const [view, setView] = useState(pathToView(window.location.pathname)), [model, setModel] = useState("qwen3:1.7b"), [threshold, setThreshold] = useState(40), [promptId, setPromptId] = useState("feature_extract_v3_compact_strict_json_en"), [retryCount, setRetryCount] = useState(1);
     const [ollama, setOllama] = useState({ online: false }), [result, setResult] = useState(null), [fileName, setFileName] = useState("");
@@ -1440,6 +1536,7 @@
     const [riskSemanticVersions, setRiskSemanticVersions] = useState([]), [unclassifiedRiskSemantics, setUnclassifiedRiskSemantics] = useState([]);
     const [benchmarkData, setBenchmarkData] = useState({ overview: {}, suites: [], runs: [], trends: [], leaderboard: [], selectedRun: null, loading: false, failure: "" });
     const [streamingData, setStreamingData] = useState({ tasks: [], sources: {}, templates: [] });
+    const [runtimeData, setRuntimeData] = useState({ identity: {}, health: {}, readiness: {}, tasks: { items: [] }, storage: {}, retention: {}, audits: { items: [] }, loading: false, failure: "", failureCode: "" });
     const [sidebarCollapsed, setSidebarCollapsed] = useState(false), [mobileMenuOpen, setMobileMenuOpen] = useState(false);
     const [narrowSidebar, setNarrowSidebar] = useState(function () { return window.matchMedia("(max-width: 900px)").matches; });
     const events = useRef(null);
@@ -1467,6 +1564,7 @@
       if (next === "semanticLibrary") loadRiskSemantics().catch(function (reason) { setError(reason.message); });
       if (next === "streaming") loadStreaming().catch(function (reason) { setError(reason.message); });
       if (next === "benchmarkCenter") loadBenchmark().catch(function () {});
+      if (next === "runtime") loadRuntime().catch(function () {});
     }
     function toggleSidebar() {
       if (narrowSidebar) setMobileMenuOpen(function (open) { return !open; });
@@ -1508,6 +1606,18 @@
       setStreamingData({ tasks: values[0].tasks || [], sources: values[1].sources || {}, templates: values[2].items || [] });
       return values[0];
     }
+    async function loadRuntime() {
+      setRuntimeData(function (current) { return Object.assign({}, current, { loading: true, failure: "", failureCode: "" }); });
+      try {
+        const values = await Promise.all([api.runtimeIdentity(), api.runtimeHealth(), api.runtimeReadiness(), api.runtimeTasks(), api.runtimeStorage(), api.runtimeRetention(), api.runtimeAudit()]);
+        const next = { identity: values[0].identity || {}, health: values[1] || {}, readiness: values[2] || {}, tasks: values[3] || { items: [] }, storage: values[4] || {}, retention: values[5] || {}, audits: values[6] || { items: [] }, loading: false, failure: "", failureCode: "" };
+        setRuntimeData(next);
+        return next;
+      } catch (reason) {
+        setRuntimeData(function (current) { return Object.assign({}, current, { loading: false, failure: reason.message || "未知错误", failureCode: reason.code || "" }); });
+        throw reason;
+      }
+    }
     async function resumeStreamingTask(taskId) { await api.resumeStreamingTask(taskId); await loadStreaming(); }
     async function createBenchmarkRun(payload) { const created = await api.createBenchmarkRun(payload); await loadBenchmark(created.run_id); return created; }
     async function evaluateBenchmarkGate(payload) { const gate = await api.evaluateBenchmarkGate(payload); await loadBenchmark(payload.candidate_run_id); return gate; }
@@ -1530,8 +1640,8 @@
     async function refresh(id) { const next = await api.job(id || jobId); setSnapshot(next); if (["completed", "completed_with_errors"].includes(next.status) && events.current) events.current.close(); loadHarness().catch(function () {}); }
     useEffect(function () {
       const query = window.location.pathname === "/ai-traces" ? traceFilterQuery(traceFiltersFromSearch(window.location.search)) : "?limit=50";
-      Promise.all([api.config(), api.status(), Promise.all([api.governedRules("?page_size=100"), api.ruleReviewQueue()]), api.metrics(), api.harnessStatus(), api.prompts(), api.traces(query), api.modelProfiles()]).then(function (values) { setModel(values[0].default_model); setOllama(values[1]); setRules(values[2][0].items || []); setRuleReviewQueue(values[2][1]); setSystemMetrics(values[3]); setHarness(values[4]); setPrompts(values[5].items || []); setPromptId(values[5].current_prompt_id || values[4].current_prompt_id || "feature_extract_v3_compact_strict_json_en"); setTraces(values[6].items || []); setModelProfiles(values[7]); setModelProfileId(values[7].default_profile_id || ""); if (window.location.pathname === "/ai-observability") loadObservability().catch(function (reason) { setError(reason.message); }); if (window.location.pathname === "/drain-quality") loadDrainQuality().catch(function (reason) { setError(reason.message); }); if (window.location.pathname.startsWith("/node-risks")) loadNodeRisks().catch(function (reason) { setError(reason.message); }); if (window.location.pathname === "/semantic-library") loadRiskSemantics().catch(function (reason) { setError(reason.message); }); if (window.location.pathname === "/streaming") loadStreaming().catch(function (reason) { setError(reason.message); }); if (window.location.pathname === "/benchmark-center") loadBenchmark().catch(function () {}); }).catch(function (reason) { setError(reason.message); });
-      function onPop() { const filters = traceFiltersFromSearch(window.location.search); setView(pathToView(window.location.pathname)); setTraceFilters(filters); if (window.location.pathname === "/ai-traces") loadHarness(traceFilterQuery(filters)).catch(function () {}); if (window.location.pathname === "/ai-observability") loadObservability().catch(function () {}); if (window.location.pathname === "/drain-quality") loadDrainQuality().catch(function () {}); if (window.location.pathname === "/rules") loadRules().catch(function () {}); if (window.location.pathname.startsWith("/node-risks")) loadNodeRisks().catch(function () {}); if (window.location.pathname === "/semantic-library") loadRiskSemantics().catch(function () {}); if (window.location.pathname === "/streaming") loadStreaming().catch(function () {}); if (window.location.pathname === "/benchmark-center") loadBenchmark().catch(function () {}); }
+      Promise.all([api.config(), api.status(), Promise.all([api.governedRules("?page_size=100"), api.ruleReviewQueue()]), api.metrics(), api.harnessStatus(), api.prompts(), api.traces(query), api.modelProfiles()]).then(function (values) { setModel(values[0].default_model); setOllama(values[1]); setRules(values[2][0].items || []); setRuleReviewQueue(values[2][1]); setSystemMetrics(values[3]); setHarness(values[4]); setPrompts(values[5].items || []); setPromptId(values[5].current_prompt_id || values[4].current_prompt_id || "feature_extract_v3_compact_strict_json_en"); setTraces(values[6].items || []); setModelProfiles(values[7]); setModelProfileId(values[7].default_profile_id || ""); if (window.location.pathname === "/ai-observability") loadObservability().catch(function (reason) { setError(reason.message); }); if (window.location.pathname === "/drain-quality") loadDrainQuality().catch(function (reason) { setError(reason.message); }); if (window.location.pathname.startsWith("/node-risks")) loadNodeRisks().catch(function (reason) { setError(reason.message); }); if (window.location.pathname === "/semantic-library") loadRiskSemantics().catch(function (reason) { setError(reason.message); }); if (window.location.pathname === "/streaming") loadStreaming().catch(function (reason) { setError(reason.message); }); if (window.location.pathname === "/benchmark-center") loadBenchmark().catch(function () {}); if (window.location.pathname === "/runtime") loadRuntime().catch(function () {}); }).catch(function (reason) { setError(reason.message); });
+      function onPop() { const filters = traceFiltersFromSearch(window.location.search); setView(pathToView(window.location.pathname)); setTraceFilters(filters); if (window.location.pathname === "/ai-traces") loadHarness(traceFilterQuery(filters)).catch(function () {}); if (window.location.pathname === "/ai-observability") loadObservability().catch(function () {}); if (window.location.pathname === "/drain-quality") loadDrainQuality().catch(function () {}); if (window.location.pathname === "/rules") loadRules().catch(function () {}); if (window.location.pathname.startsWith("/node-risks")) loadNodeRisks().catch(function () {}); if (window.location.pathname === "/semantic-library") loadRiskSemantics().catch(function () {}); if (window.location.pathname === "/streaming") loadStreaming().catch(function () {}); if (window.location.pathname === "/benchmark-center") loadBenchmark().catch(function () {}); if (window.location.pathname === "/runtime") loadRuntime().catch(function () {}); }
       window.addEventListener("popstate", onPop);
       return function () { window.removeEventListener("popstate", onPop); if (events.current) events.current.close(); };
     }, []);
@@ -1596,7 +1706,7 @@
       h(Sidebar, { active: view, onChange: changeView }),
       h("button", { className: "sidebar-overlay", type: "button", "aria-label": "关闭菜单", onClick: function () { setMobileMenuOpen(false); } }),
       h("main", null,
-        !["drainQuality", "benchmarkCenter", "streaming", "settings", "rules", "nodeRisks", "semanticLibrary"].includes(view) && h("div", { className: "page-head" }, h("div", null, h("h1", null, "日志特征工作台"), h("p", null, "上传日志、复用规则、识别未知特征并人工审批")), h("label", { className: "new-analysis" }, "＋ 新建分析", h("input", { type: "file", onChange: function (event) { loadFile(event.target.files && event.target.files[0]); } }))),
+        !["drainQuality", "benchmarkCenter", "streaming", "runtime", "settings", "rules", "nodeRisks", "semanticLibrary"].includes(view) && h("div", { className: "page-head" }, h("div", null, h("h1", null, "日志特征工作台"), h("p", null, "上传日志、复用规则、识别未知特征并人工审批")), h("label", { className: "new-analysis" }, "＋ 新建分析", h("input", { type: "file", onChange: function (event) { loadFile(event.target.files && event.target.files[0]); } }))),
         error && h("div", { className: "error-banner" }, error, h("button", { onClick: function () { setError(""); } }, "×")),
         view === "overview" && h(React.Fragment, null,
           h("section", { className: "upload-panel" }, h("div", null, h("b", null, fileName || "选择 result.json、JSONL、TXT、LOG、GZ 或无后缀日志"), h("span", null, result ? (result.risk_entities || []).length + " 个风险实体，已完成本地预处理" : "10MB 以内直接分析；超过 10MB 自动分片上传，Linux messages / syslog 无后缀文件也支持上传")), busy && h("div", { className: "upload-progress" }, uploadProgress && h("span", null, "上传进度：" + Math.round((uploadProgress.progress || 0) * 100) + "%（" + uploadProgress.received_chunks + " / " + uploadProgress.total_chunks + " chunks）"), preprocessProgress && h("span", null, "预处理阶段：" + (preprocessProgress.stage || "queued") + "，记录 " + (preprocessProgress.records_parsed || 0) + (preprocessProgress.drain3_partitions_total ? "，Drain3 分片 " + (preprocessProgress.drain3_partitions_completed || 0) + " / " + preprocessProgress.drain3_partitions_total : ""))), h("div", { className: "analysis-config" }, h("label", null, "分析流程", h("select", { value: "feature_extract", disabled: true }, h("option", { value: "feature_extract" }, "日志特征识别"))), h("label", null, "模型 Profile", h("select", { value: modelProfileId, onChange: function (event) { const profile = activeProfiles.find(function (item) { return item.profile_id === event.target.value; }) || {}; setModelProfileId(event.target.value); if (profile.model) setModel(profile.model); if (profile.default_prompt_id) setPromptId(profile.default_prompt_id); } }, activeProfiles.map(function (profile) { return h("option", { value: profile.profile_id, key: profile.profile_id }, (profile.display_name || profile.profile_id) + " · " + profile.provider); }))), h("label", null, "Provider / 连接", h("input", { value: (selectedModelProfile.provider || "—") + " / " + (selectedModelProfile.connection_id || "—"), disabled: true })), h("label", null, "模型", h("input", { value: model, onChange: function (event) { setModel(event.target.value); } })), h("label", null, "Prompt", h("select", { value: promptId, onChange: function (event) { setPromptId(event.target.value); } }, activePrompts.map(function (prompt) { return h("option", { value: prompt.prompt_id, key: prompt.prompt_id }, prompt.prompt_id); }))), h("label", null, "重试次数", h("select", { value: retryCount, onChange: function (event) { setRetryCount(Number(event.target.value)); } }, [0, 1, 2, 3].map(function (count) { return h("option", { value: count, key: count }, count + " 次"); }))), h("label", null, "阈值", h("input", { type: "number", value: threshold, onChange: function (event) { setThreshold(event.target.value); } })), h("button", { className: "primary-button", disabled: !result || busy, onClick: start }, busy ? "处理中…" : "开始识别"))), h(MetricsGrid, { snapshot: snapshot, result: result, daily: systemMetrics }), h(LiveProcessing, { snapshot: snapshot, result: result })),
@@ -1615,6 +1725,7 @@
         view === "drainQuality" && h(DrainQualityPage, { data: drainQuality, onRefresh: loadDrainQuality, onImport: importCurrentTemplates, onAnnotate: annotateTemplate, onTemplateChange: changeTemplate, onTemplateRollback: rollbackTemplate, onProfile: changeDrainProfile, onConfigCreate: createDrainConfig, onConfigLoadVersion: loadDrainConfigVersion, onConfigSave: saveDrainConfig, onConfigValidate: validateDrainConfig, onConfigPublish: publishDrainConfig, onConfigRollback: rollbackDrainConfig, onSemanticCreate: createSemanticCandidate, onSemanticLoadVersion: loadSemanticDictionaryVersion, onSemanticSave: saveSemanticDictionary, onSemanticValidate: validateSemanticDictionary, onSemanticPublish: publishSemanticDictionary, onSemanticRollback: rollbackSemanticDictionary, onSemanticTest: testSemanticDictionary }),
         view === "streaming" && h(StreamingPage, { data: streamingData, onRefresh: function () { loadStreaming().catch(function (reason) { setError(reason.message); }); }, onResume: function (taskId) { return resumeStreamingTask(taskId).catch(function (reason) { setError(reason.message); throw reason; }); } }),
         view === "benchmarkCenter" && h(BenchmarkCenterPage, { data: benchmarkData, prompts: activePrompts, profiles: activeProfiles, onRefresh: loadBenchmark, onCreateRun: createBenchmarkRun, onSelectRun: loadBenchmark, onEvaluateGate: evaluateBenchmarkGate }),
+        view === "runtime" && h(RuntimeCenterPage, { data: runtimeData, onRefresh: loadRuntime, onPreview: function () { return api.previewRuntimeRetention().then(loadRuntime); }, onExecute: function () { return api.executeRuntimeRetention().then(loadRuntime); }, onSavePolicy: function (payload) { return api.saveRuntimeRetention(payload).then(loadRuntime); } }),
         view === "settings" && h(BackendSettings, { onSaved: function () { setError(""); } }),
         view === "export" && h("section", { className: "surface export-surface" }, h("h2", null, "导出记录"), h("p", null, "导出包只包含人工批准或历史规则复用的脱敏特征，不包含原始日志和 RCA 结论。"), h("button", { className: "primary-button", disabled: !jobId || !(snapshot && snapshot.features || []).some(function (feature) { return feature.status === "approved"; }), onClick: function () { api.exportApproved(jobId).catch(function (reason) { setError(reason.message); }); } }, "导出已批准特征 JSON"))),
       h(Drawer, { title: drawer.type === "prompt" ? "Prompt 详情" : "Trace 详情", subtitle: drawer.item && (drawer.item.prompt_id || drawer.item.trace_id), item: drawer.item, onClose: function () { setDrawer({ type: null, item: null }); } }, drawerContent));

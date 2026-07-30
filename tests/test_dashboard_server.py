@@ -146,8 +146,62 @@ def test_database_status_and_restart_candidate_configuration_are_available(dashb
     assert saved["candidate"]["provider"] == "postgres"
     assert saved["candidate"]["password_configured"] is False
     assert saved["restart_required"] is True
-    assert health["version"] == "1.27.0"
+    assert health["version"] == "1.28.0"
     assert health["storage"] == "sqlite"
+
+
+def test_runtime_external_identity_configuration(tmp_path):
+    frontend = tmp_path / "dist" / "index.html"
+    frontend.parent.mkdir()
+    frontend.write_text("<!doctype html><title>Runtime Identity</title>", encoding="utf-8")
+    runtime_config = tmp_path / "runtime.yaml"
+    runtime_config.write_text(
+        """runtime:
+  identity:
+    enabled: true
+    allow_loopback_bypass: false
+    trusted_proxy_cidrs: [127.0.0.0/8]
+    write_roles: [logrisk:operator]
+""",
+        encoding="utf-8",
+    )
+    server = build_server(
+        "127.0.0.1",
+        0,
+        manager=FeatureJobManager(extractor=lambda *_args, **_kwargs: [], auto_start=True),
+        frontend_path=frontend,
+        database_path=tmp_path / "state" / "logrisk.sqlite3",
+        state_root=tmp_path / "state",
+        runtime_config_path=runtime_config,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        with pytest.raises(HTTPError) as rejected:
+            request_json(base_url + "/api/runtime/retention/preview", "POST", {})
+        allowed = Request(
+            base_url + "/api/runtime/retention/preview",
+            data=b"{}",
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "X-LOGRISK-Actor": "gateway-user",
+                "X-LOGRISK-Roles": "logrisk:operator",
+                "X-Request-ID": "runtime-config-test",
+            },
+        )
+        with urlopen(allowed, timeout=3) as response:
+            payload = json.load(response)
+
+        assert rejected.value.code == 403
+        assert json.load(rejected.value)["error_code"] == "runtime_identity_required"
+        assert payload["request_id"] == "runtime-config-test"
+        assert payload["maintenance"]["status"] == "completed"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
 
 
 def test_dashboard_cli_accepts_explicit_postgres_provider_and_url():

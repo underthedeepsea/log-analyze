@@ -4,7 +4,7 @@
   <img src="frontend/logo/logrisk-app-icon-orange-v2.png" width="112" alt="LOGRISK 应用图标" />
 </p>
 
-当前版本：`1.27.0`。完整变更记录见 [`releas.md`](releas.md)。
+当前版本：`1.28.0`。完整变更记录见 [`releas.md`](releas.md)。
 
 LOGRISK 在本地完成日志规范化、Drain3 模板化、确定性语义增强、风险评分、规则复用、模型特征识别和人工审批。系统只生成可审查、可导出的日志特征，不执行根因分析（RCA），也不会把原始日志直接发送给模型。
 
@@ -17,6 +17,7 @@ LOGRISK 在本地完成日志规范化、Drain3 模板化、确定性语义增�
 - 支持本地 Ollama、OpenAI-compatible `/v1/chat/completions` 服务和可扩展的内部 Token 鉴权 Provider 模板。
 - 提供 Prompt 版本、模型 Profile、AI Trace、Observation/Span 链路、缓存、评测、Drain3 配置和语义词典治理。
 - 提供统一的评测与基准中心，可比较 Prompt、模型 Profile、失败 Case、趋势及发布门禁。
+- 提供生产运行中心：统一查看任务、就绪状态、存储配额、Retention 维护和脱敏审计记录。
 - 提供服务器风险总览、风险事件台账、可解释评分，以及可编辑、可发布、可回滚的风险语义库。
 - 只导出人工批准的特征及关联风险节点，供外部 RCA 专家系统使用。
 
@@ -238,6 +239,34 @@ DASHBOARD_CORS_ORIGINS=https://logrisk.example.internal \
 ```
 
 常用环境变量包括 `LOGRISK_DB_PATH`、`OLLAMA_MODEL`、`OLLAMA_HOST`、`OLLAMA_TIMEOUT`、`DASHBOARD_HOST` 和 `DASHBOARD_PORT`。Dashboard 默认仅监听 `127.0.0.1`。
+
+## 生产运行与外部身份边界
+
+LOGRISK 不实现第二套登录、用户库、Bearer Token 或 RBAC。生产部署应由 PACAS / RBAC、Ingress 或反向代理完成认证和授权，并仅从受信任代理向 Dashboard 传递操作人、角色和请求 ID。默认配置保持本机开发模式；将 Dashboard 暴露到外部网络前，必须编辑 `configs/runtime.yaml` 并重启：
+
+```yaml
+runtime:
+  identity:
+    enabled: true
+    allow_loopback_bypass: false
+    trusted_proxy_cidrs: [10.0.0.0/8]
+    actor_header: X-LOGRISK-Actor
+    roles_header: X-LOGRISK-Roles
+    request_id_header: X-Request-ID
+    write_roles: [logrisk:operator]
+  retention:
+    enabled: true
+    completed_days: 30
+  quota:
+    soft_limit_bytes: 5368709120
+    hard_limit_bytes: 10737418240
+```
+
+开启后，只有来自 `trusted_proxy_cidrs` 且具备指定角色的写请求会被接受；直接外部写请求会以 `runtime_identity_required` 拒绝。Dashboard 不保存用户、角色、认证头、Token、Cookie 或密码。生产反向代理应只允许自身访问 Dashboard 监听地址，不能把这些身份 Header 直接暴露给不可信客户端。
+
+“运行中心”提供跨特征识别、流式处理、评测和 Replay 的任务目录，以及存储用量、Retention 预览/执行和审计记录。`GET /api/runtime/health` 用于存活检查，`GET /api/runtime/readiness` 同时检查数据库、迁移、运行目录和硬配额；未就绪时返回 `503`。超过硬配额时，新的上传和分析会以 `507 runtime_quota_exceeded` 拒绝，避免继续写满磁盘。
+
+Retention 必须先预览再人工确认执行，只会清理已完成或失败任务关联、且位于受控 `state/` 或 `output/` 根目录内的文件产物；运行中的任务、SQLite 数据库/WAL、配置、原始来源文件和导出物不会被自动删除。每次策略修改、维护操作和写接口结果都会形成脱敏审计记录，不包含原始日志、模型内容或凭据。
 
 ## 评测与测试
 

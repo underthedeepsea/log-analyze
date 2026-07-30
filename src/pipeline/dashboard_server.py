@@ -17,6 +17,8 @@ from urllib.error import URLError
 from urllib.parse import parse_qs, unquote, urlparse
 from urllib.request import Request, urlopen
 
+import yaml
+
 from logrisk.ai_harness.connections import ConnectionStore
 from logrisk.ai_harness.model_client import ModelClientError
 from logrisk.ai_harness.model_profile import ModelProfileRegistry
@@ -56,6 +58,10 @@ from logrisk.processing_metrics import ProcessingMetricsError, ProcessingMetrics
 from logrisk.rule_governance import RuleGovernanceError, RuleGovernanceRepository, RuleGovernanceService
 from logrisk.node_risk import NodeRiskError, NodeRiskService
 from logrisk.risk_semantics import RiskSemanticError, RiskSemanticService, validate_rule
+from logrisk.runtime.config import RuntimeConfig, RuntimeConfigError
+from logrisk.runtime.identity import RequestIdentity, RuntimeAccessError, require_write_access
+from logrisk.runtime.repository import RuntimeConflictError, RuntimeRepository
+from logrisk.runtime.service import RuntimeQuotaError, RuntimeService
 from logrisk.semantic.schema import SemanticValidationError
 from logrisk.semantic.store import SemanticDictionaryStore
 from logrisk.streaming_state import StreamingConflictError, StreamingStateRepository
@@ -151,6 +157,8 @@ def build_server(
     database_provider: str | None = None,
     database_url: str | None = None,
     state_root: str | Path | None = None,
+    runtime_config: RuntimeConfig | None = None,
+    runtime_config_path: str | Path | None = None,
 ) -> DashboardHTTPServer:
     root = Path(__file__).resolve().parents[2]
     state_root = Path(state_root) if state_root else (Path(database_path).parent if database_path else root / "state")
@@ -167,6 +175,13 @@ def build_server(
         database_url=database_runtime.database_url,
         state_root=state_root,
     )
+    if runtime_config is None:
+        selected_runtime_config = Path(runtime_config_path or root / "configs" / "runtime.yaml")
+        try:
+            runtime_payload = yaml.safe_load(selected_runtime_config.read_text(encoding="utf-8")) or {}
+        except (OSError, UnicodeError, yaml.YAMLError) as exc:
+            raise RuntimeConfigError("运行时配置文件无效") from exc
+        runtime_config = RuntimeConfig.from_mapping({"runtime": runtime_payload.get("runtime", {})})
     connections = ConnectionStore(database)
     connections.seed_defaults(default_ollama_url)
     profiles = ModelProfileRegistry(root / "configs" / "model_profiles.yaml", database=database)
@@ -317,6 +332,15 @@ def build_server(
     server.database = database  # type: ignore[attr-defined]
     server.database_runtime = database_runtime  # type: ignore[attr-defined]
     server.database_settings = database_settings  # type: ignore[attr-defined]
+    server.runtime_config = runtime_config  # type: ignore[attr-defined]
+    server.runtime_repository = RuntimeRepository(database)  # type: ignore[attr-defined]
+    server.runtime_service = RuntimeService(  # type: ignore[attr-defined]
+        database,
+        state_root=state_root,
+        output_root=root / "output",
+        config=runtime_config,
+        repository=server.runtime_repository,
+    )
     server.connections = connections  # type: ignore[attr-defined]
     rule_store = SQLiteApprovedRuleStore(database)
     if manager is not None and manager.rule_store is None:
@@ -356,6 +380,14 @@ def build_server(
     server.benchmark_center = benchmark_center  # type: ignore[attr-defined]
     configured_origins = cors_origins if cors_origins is not None else os.getenv("DASHBOARD_CORS_ORIGINS", "").split(",")
     server.cors_origins = {str(origin).strip().rstrip("/") for origin in configured_origins if str(origin).strip()}  # type: ignore[attr-defined]
+    server.cors_request_headers = (  # type: ignore[attr-defined]
+        "Content-Type, X-Chunk-SHA256, Idempotency-Key, "
+        + ", ".join((
+            runtime_config.identity.actor_header,
+            runtime_config.identity.roles_header,
+            runtime_config.identity.request_id_header,
+        ))
+    )
     server.ollama_checker = ollama_checker or (  # type: ignore[attr-defined]
         lambda: check_ollama(default_ollama_url)
     )
@@ -470,20 +502,74 @@ class DashboardHandler(BaseHTTPRequestHandler):
         if origin and origin in self.server.cors_origins:  # type: ignore[attr-defined]
             self.send_header("Access-Control-Allow-Origin", origin)
             self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, OPTIONS")
-            self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Chunk-SHA256, Idempotency-Key")
+            self.send_header("Access-Control-Allow-Headers", self.server.cors_request_headers)  # type: ignore[attr-defined]
             self.send_header("Vary", "Origin")
 
     def _json(self, status: int, payload: Any, headers: dict[str, str] | None = None) -> None:
+        self._record_runtime_write_outcome(status, payload)
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self._cors_headers()
+        identity = getattr(self, "_runtime_identity", None)
+        if isinstance(identity, RequestIdentity):
+            self.send_header("X-Request-ID", identity.request_id)
         for key, value in (headers or {}).items():
             self.send_header(key, value)
         self.end_headers()
         self.wfile.write(body)
+
+    def _runtime_request_identity(self) -> RequestIdentity:
+        identity = getattr(self, "_runtime_identity", None)
+        if isinstance(identity, RequestIdentity):
+            return identity
+        identity = RequestIdentity.from_request(
+            self.client_address[0],
+            {str(key): str(value) for key, value in self.headers.items()},
+            self.server.runtime_config,  # type: ignore[attr-defined]
+        )
+        self._runtime_identity = identity
+        return identity
+
+    def _require_runtime_write_access(self) -> RequestIdentity:
+        identity = self._runtime_request_identity()
+        path, _ = self._route_parts()
+        self._runtime_write_audit = {"identity": identity, "path": path, "recorded": False}
+        require_write_access(identity, self.server.runtime_config)  # type: ignore[attr-defined]
+        return identity
+
+    def _record_runtime_write_outcome(self, status: int, payload: Any) -> None:
+        context = getattr(self, "_runtime_write_audit", None)
+        if not isinstance(context, dict) or context.get("recorded"):
+            return
+        identity = context.get("identity")
+        if not isinstance(identity, RequestIdentity):
+            return
+        context["recorded"] = True
+        outcome = "success" if 200 <= int(status) < 300 else ("denied" if int(status) in {401, 403} else "failed")
+        resource_id = None
+        if isinstance(payload, dict):
+            for key in ("resource_id", "job_id", "input_job_id", "task_id", "run_id", "replay_id"):
+                value = payload.get(key)
+                if isinstance(value, (str, int)) and str(value):
+                    resource_id = str(value)
+                    break
+        try:
+            self.server.runtime_repository.append_audit(  # type: ignore[attr-defined]
+                "request." + self.command.lower(),
+                "http_request",
+                identity.actor,
+                identity.request_id,
+                {"method": self.command, "path": str(context["path"]), "status": int(status)},
+                resource_id=resource_id,
+                roles=identity.roles,
+                outcome=outcome,
+            )
+        except Exception:
+            # A best-effort audit must not turn an already-completed domain write into a false failure.
+            return
 
     def _read_json(self) -> Any:
         try:
@@ -519,7 +605,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         path, query = self._route_parts()
         try:
-            if path in {"/", "/prompts", "/ai-traces", "/ai-observability", "/model-profiles", "/drain-quality", "/benchmark-center", "/rules", "/settings", "/node-risks", "/semantic-library"} or path.startswith("/node-risks/"):
+            if path in {"/", "/prompts", "/ai-traces", "/ai-observability", "/model-profiles", "/drain-quality", "/benchmark-center", "/rules", "/settings", "/runtime", "/node-risks", "/semantic-library"} or path.startswith("/node-risks/"):
                 self._serve_frontend()
                 return
             if path == "/config.js":
@@ -544,6 +630,43 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "candidate": self.server.database_settings.public_dict(candidate) if candidate else None,  # type: ignore[attr-defined]
                     "restart_required": False,
                 })
+                return
+            if path == "/api/runtime/identity":
+                self._json(HTTPStatus.OK, {"identity": self._runtime_request_identity().public_dict()})
+                return
+            if path == "/api/runtime/health":
+                self._json(HTTPStatus.OK, self.server.runtime_service.health())  # type: ignore[attr-defined]
+                return
+            if path == "/api/runtime/readiness":
+                result = self.server.runtime_service.readiness()  # type: ignore[attr-defined]
+                self._json(HTTPStatus.OK if result["ready"] else HTTPStatus.SERVICE_UNAVAILABLE, result)
+                return
+            if path == "/api/runtime/tasks":
+                self._json(HTTPStatus.OK, self.server.runtime_service.list_tasks(  # type: ignore[attr-defined]
+                    page=int(query.get("page", ["1"])[0]),
+                    page_size=int(query.get("page_size", ["50"])[0]),
+                    kind=query.get("kind", [None])[0],
+                    status=query.get("status", [None])[0],
+                ))
+                return
+            if path == "/api/runtime/storage":
+                self._json(HTTPStatus.OK, self.server.runtime_service.storage_usage())  # type: ignore[attr-defined]
+                return
+            if path == "/api/runtime/retention":
+                self._json(HTTPStatus.OK, {
+                    "policy": self.server.runtime_repository.get_policy(),  # type: ignore[attr-defined]
+                    "effective": self.server.runtime_service.retention_policy(),  # type: ignore[attr-defined]
+                    "configured": {
+                        "enabled": self.server.runtime_config.retention.enabled,  # type: ignore[attr-defined]
+                        "completed_days": self.server.runtime_config.retention.completed_days,  # type: ignore[attr-defined]
+                    },
+                })
+                return
+            if path == "/api/runtime/audits":
+                self._json(HTTPStatus.OK, self.server.runtime_repository.list_audits(  # type: ignore[attr-defined]
+                    limit=int(query.get("limit", ["100"])[0]),
+                    before=query.get("before", [None])[0],
+                ))
                 return
             if path == "/api/node-risks":
                 self._json(HTTPStatus.OK, self.server.node_risks.list_nodes(  # type: ignore[attr-defined]
@@ -591,7 +714,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "schema_version": "logrisk_health_v1",
                     "service": "logrisk-dashboard",
                     "status": "ok",
-                    "version": "1.27.0",
+                    "version": "1.28.0",
                     "storage": self.server.database_runtime.provider,  # type: ignore[attr-defined]
                 })
                 return
@@ -870,6 +993,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._serve_events(match.group(1), max(0, cursor))
                 return
             self._json(HTTPStatus.NOT_FOUND, {"error": "资源不存在"})
+        except RuntimeAccessError as exc:
+            self._json(HTTPStatus.FORBIDDEN, {"error": str(exc), "code": exc.code, "error_code": exc.code, "request_id": self._runtime_request_identity().request_id})
         except ReplayError as exc:
             self._json(exc.status_code, {"error": str(exc), "code": exc.code, "error_code": exc.code, "request_id": f"request-{uuid.uuid4().hex}"})
         except StreamingConflictError as exc:
@@ -890,7 +1015,40 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         path, _ = self._route_parts()
         try:
+            identity = self._require_runtime_write_access()
             payload = self._read_json()
+            if path == "/api/runtime/retention/policy":
+                if not isinstance(payload, dict):
+                    raise ValueError("请求体必须是 JSON object")
+                result = self.server.runtime_service.save_retention_policy(  # type: ignore[attr-defined]
+                    payload.get("policy", {}),
+                    expected_version=payload.get("expected_version"),
+                    actor=identity.actor,
+                    roles=identity.roles,
+                    request_id=identity.request_id,
+                )
+                self._json(HTTPStatus.OK, {
+                    "policy": result,
+                    "request_id": identity.request_id,
+                    "resource_id": result["policy_id"],
+                    "version": result["version"],
+                })
+                return
+            if path in {"/api/runtime/retention/preview", "/api/runtime/retention/execute"}:
+                if not isinstance(payload, dict):
+                    raise ValueError("请求体必须是 JSON object")
+                maintenance = self.server.runtime_service.run_retention(  # type: ignore[attr-defined]
+                    actor=identity.actor,
+                    request_id=identity.request_id,
+                    execute=path.endswith("/execute"),
+                )
+                self._json(HTTPStatus.OK, {
+                    "maintenance": maintenance,
+                    "request_id": identity.request_id,
+                    "resource_id": maintenance["run_id"],
+                    "version": 1,
+                })
+                return
             if path == "/api/system/database/config":
                 if not isinstance(payload, dict):
                     raise ValueError("数据库配置必须是 JSON object")
@@ -1134,6 +1292,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if path == "/api/inputs/analyze":
                 if not isinstance(payload, dict):
                     raise FeatureJobError("请求体必须是 JSON object")
+                self.server.runtime_service.require_capacity("日志分析")  # type: ignore[attr-defined]
                 filename = payload.get("filename")
                 content = payload.get("content")
                 if not isinstance(filename, str) or not filename.strip():
@@ -1154,6 +1313,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if path == "/api/uploads":
                 if not isinstance(payload, dict):
                     raise FeatureJobError("请求体必须是 JSON object")
+                self.server.runtime_service.require_capacity(  # type: ignore[attr-defined]
+                    "上传", additional_bytes=max(0, int(payload.get("size_bytes") or 0))
+                )
                 manifest = self.server.upload_store.create(  # type: ignore[attr-defined]
                     filename=str(payload.get("filename") or "upload.log"),
                     size_bytes=int(payload.get("size_bytes") or 0),
@@ -1175,6 +1337,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if path == "/api/inputs/analyze-upload":
                 if not isinstance(payload, dict):
                     raise FeatureJobError("请求体必须是 JSON object")
+                self.server.runtime_service.require_capacity("大文件分析")  # type: ignore[attr-defined]
                 upload_id = str(payload.get("upload_id") or "")
                 manifest = self.server.upload_store.get(upload_id)  # type: ignore[attr-defined]
                 if manifest.get("status") != "completed":
@@ -1231,6 +1394,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if path == "/api/jobs":
                 if not isinstance(payload, dict):
                     raise FeatureJobError("请求体必须是 JSON object")
+                self.server.runtime_service.require_capacity("特征识别")  # type: ignore[attr-defined]
                 profile = self.server.model_profiles.get(payload.get("model_profile_id"))  # type: ignore[attr-defined]
                 connection = self.server.connections.get(profile.connection_id)  # type: ignore[attr-defined]
                 if not connection["enabled"]:
@@ -1291,14 +1455,21 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._json(exc.status_code, {"error": str(exc), "code": exc.code})
         except RuleGovernanceError as exc:
             self._json(exc.status_code, {"error": str(exc), "code": exc.code, "request_id": f"request-{uuid.uuid4().hex}"})
+        except RuntimeAccessError as exc:
+            self._json(HTTPStatus.FORBIDDEN, {"error": str(exc), "code": exc.code, "error_code": exc.code, "request_id": self._runtime_request_identity().request_id})
+        except RuntimeQuotaError as exc:
+            self._json(HTTPStatus.INSUFFICIENT_STORAGE, {"error": str(exc), "code": exc.code, "error_code": exc.code, "request_id": self._runtime_request_identity().request_id})
+        except RuntimeConflictError as exc:
+            self._json(HTTPStatus.CONFLICT, {"error": str(exc), "code": exc.code, "error_code": exc.code, "request_id": self._runtime_request_identity().request_id})
         except (FeatureJobError, ApprovedRuleError, ProcessingMetricsError, DrainQualityError, SemanticValidationError) as exc:
-            self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc), "code": "invalid_request", "error_code": "invalid_request", "request_id": self._runtime_request_identity().request_id})
         except (TypeError, ValueError) as exc:
-            self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc), "code": "invalid_request", "error_code": "invalid_request", "request_id": self._runtime_request_identity().request_id})
 
     def do_PUT(self) -> None:
         path, _ = self._route_parts()
         try:
+            self._require_runtime_write_access()
             match = re.fullmatch(r"/api/semantics/([^/]+)", path)
             if match:
                 payload = self._read_json()
@@ -1320,6 +1491,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._json(HTTPStatus.NOT_FOUND, {"error": "资源不存在"})
                 return
             data = self._read_bytes(MAX_UPLOAD_BYTES)
+            self.server.runtime_service.require_capacity(  # type: ignore[attr-defined]
+                "上传分片", additional_bytes=len(data)
+            )
             manifest = self.server.upload_store.append_chunk(  # type: ignore[attr-defined]
                 upload_id=match.group(1),
                 index=int(match.group(2)),
@@ -1336,12 +1510,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 "total_chunks": total,
                 "progress": received / total if total else 1.0,
             })
+        except RuntimeAccessError as exc:
+            self._json(HTTPStatus.FORBIDDEN, {"error": str(exc), "code": exc.code, "error_code": exc.code, "request_id": self._runtime_request_identity().request_id})
+        except RuntimeQuotaError as exc:
+            self._json(HTTPStatus.INSUFFICIENT_STORAGE, {"error": str(exc), "code": exc.code, "error_code": exc.code, "request_id": self._runtime_request_identity().request_id})
         except (FeatureJobError, DrainQualityError, SemanticValidationError, RiskSemanticError, NodeRiskError, KeyError, ValueError, OSError) as exc:
-            self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc), "code": "invalid_request", "error_code": "invalid_request", "request_id": self._runtime_request_identity().request_id})
 
     def do_DELETE(self) -> None:
         path, _ = self._route_parts()
         try:
+            self._require_runtime_write_access()
             match = re.fullmatch(r"/api/semantics/([^/]+)", path)
             if not match:
                 self._json(HTTPStatus.NOT_FOUND, {"error": "资源不存在"})
@@ -1349,12 +1528,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
             payload = self._read_json()
             self.server.risk_semantics.delete(unquote(match.group(1)), confirmed=payload.get("confirmed") is True, operator=str(payload.get("operator") or ""), reason=str(payload.get("reason") or ""))  # type: ignore[attr-defined]
             self._json(HTTPStatus.OK, {"deleted": True})
+        except RuntimeAccessError as exc:
+            self._json(HTTPStatus.FORBIDDEN, {"error": str(exc), "code": exc.code, "error_code": exc.code, "request_id": self._runtime_request_identity().request_id})
         except RiskSemanticError as exc:
-            self._json(exc.status_code, {"error": str(exc), "code": exc.code})
+            self._json(exc.status_code, {"error": str(exc), "code": exc.code, "error_code": exc.code, "request_id": self._runtime_request_identity().request_id})
 
     def do_PATCH(self) -> None:
         path, _ = self._route_parts()
         try:
+            self._require_runtime_write_access()
             payload = self._read_json()
             match = re.fullmatch(r"/api/ai-harness/prompts/([A-Za-z0-9_-]+)", path)
             if match:
@@ -1380,8 +1562,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 return
             feature = self.server.manager.update_feature(match.group(1), match.group(2), payload)  # type: ignore[attr-defined]
             self._json(HTTPStatus.OK, feature)
+        except RuntimeAccessError as exc:
+            self._json(HTTPStatus.FORBIDDEN, {"error": str(exc), "code": exc.code, "error_code": exc.code, "request_id": self._runtime_request_identity().request_id})
         except (FeatureJobError, ApprovedRuleError, ProcessingMetricsError, DrainQualityError, KeyError, ValueError) as exc:
-            self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
+            self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc), "code": "invalid_request", "error_code": "invalid_request", "request_id": self._runtime_request_identity().request_id})
 
     def _serve_frontend(self) -> None:
         path = self.server.frontend_path  # type: ignore[attr-defined]

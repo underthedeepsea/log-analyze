@@ -59,6 +59,23 @@ def test_runtime_backend_address_contract():
     assert (FRONTEND / "dist" / "config.js").is_file()
 
 
+def test_runtime_center_contract():
+    source = source_text()
+    for value in (
+        "运行中心",
+        "/runtime",
+        "/api/runtime/tasks",
+        "/api/runtime/readiness",
+        "Retention",
+        "存储用量",
+        "审计日志",
+        "任务排序",
+        "复制诊断信息",
+        "request_id",
+    ):
+        assert value in source
+
+
 def test_brand_icon_is_published_for_readme_and_browser():
     icon_name = "logrisk-app-icon-orange-v2.png"
     source_icon = FRONTEND / "logo" / icon_name
@@ -101,7 +118,7 @@ def test_m11_quality_and_settings_use_workspace_design_contract():
         "secondary-button",
     ):
         assert text in source
-    assert '!["drainQuality", "benchmarkCenter", "streaming", "settings", "rules", "nodeRisks", "semanticLibrary"].includes(view)' in source
+    assert '!["drainQuality", "benchmarkCenter", "streaming", "runtime", "settings", "rules", "nodeRisks", "semanticLibrary"].includes(view)' in source
     assert "h(CodeBlock, { value: profile.parameters })" not in source
 
 
@@ -413,7 +430,7 @@ def test_benchmark_center_has_route_api_and_six_decision_views():
     source = source_text()
     assert '["benchmarkCenter", "◎", "评测与基准"]' in source
     assert 'if (path === "/benchmark-center") return "benchmarkCenter";' in source
-    assert 'benchmarkCenter: "/benchmark-center", streaming: "/streaming"' in source
+    assert 'benchmarkCenter: "/benchmark-center", runtime: "/runtime", streaming: "/streaming"' in source
     assert 'function BenchmarkCenterPage(props)' in source
     assert "/api/benchmark-center/overview" in source
     assert "/api/benchmark-center/leaderboard" in source
@@ -481,7 +498,8 @@ def test_release_docs_describe_current_feature_version():
     assert "## 1.22.0 - 2026-07-18" in release
     assert "## 1.23.0 - 2026-07-19" in release
     assert "## 1.23.1 - 2026-07-21" in release
-    assert "当前版本：`1.27.0`" in readme
+    assert "## 1.28.0 - 2026-07-29" in release
+    assert "当前版本：`1.28.0`" in readme
     assert "## 1.24.0 - 2026-07-22" in release
     assert "## 1.24.1 - 2026-07-22" in release
     assert "## 1.24.2 - 2026-07-22" in release

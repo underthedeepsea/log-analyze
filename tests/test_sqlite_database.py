@@ -51,7 +51,7 @@ def test_database_migration_is_idempotent(tmp_path):
     with sqlite3.connect(path) as connection:
         count = connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0]
 
-    assert count == 9
+    assert count == 10
 
 
 def test_extension_provider_migration_upgrades_existing_connection_and_profile(tmp_path):
@@ -160,7 +160,7 @@ def test_qwen_9b_profile_migration_seeds_existing_database_without_changing_defa
 def test_schema_dictionary_describes_rule_lifecycle_tables():
     schema = Path("database/schema.yaml").read_text(encoding="utf-8")
 
-    assert "schema_version: 9" in schema
+    assert "schema_version: 10" in schema
     assert "rule_versions:" in schema
     assert "rule_feedback:" in schema
     assert "rule_audit_events:" in schema
@@ -168,6 +168,8 @@ def test_schema_dictionary_describes_rule_lifecycle_tables():
     assert "adapter_id: 扩展适配器标识" in schema
     assert "streaming_tasks:" in schema
     assert "unknown_template_queue:" in schema
+    assert "runtime_policies:" in schema
+    assert "runtime_audit_events:" in schema
 
 
 def test_rule_governance_migration_versions_existing_rules_with_lifecycle_defaults(tmp_path):

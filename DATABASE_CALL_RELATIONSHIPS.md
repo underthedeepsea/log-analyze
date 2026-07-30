@@ -76,9 +76,9 @@ PostgreSQL 模式下，所有结构化运行时业务状态统一写入 PostgreS
 
 原始日志、API Key、Token、密码和含密 DSN 不得进入业务表、AI Trace、Observation 或 Replay。
 
-## 60 张表与代码映射
+## 64 张表与代码映射
 
-当前逻辑结构共 60 张表：59 张由版本化 migration 创建，`schema_migrations` 由数据库适配层创建。
+当前逻辑结构共 64 张表：63 张由版本化 migration 创建，`schema_migrations` 由数据库适配层创建。
 
 ### 管理与迁移（3）
 
@@ -139,6 +139,15 @@ PostgreSQL 模式下，所有结构化运行时业务状态统一写入 PostgreS
 | `unknown_template_queue` | 未知脱敏模板治理队列 | `src/logrisk/streaming_state.py` |
 | `streaming_task_events` | 流式任务审计事件 | `src/logrisk/streaming_state.py` |
 | `artifacts` | 文件产物路径、大小和校验值 | `src/logrisk/sqlite_stores.py` |
+
+### 生产运行（4）
+
+| 表 | 用途 | 主要代码 |
+|---|---|---|
+| `runtime_policies` | Retention 策略和乐观版本 | `src/logrisk/runtime/repository.py`、`src/logrisk/runtime/service.py` |
+| `runtime_maintenance_runs` | Retention 预览与执行记录 | `src/logrisk/runtime/repository.py`、`src/logrisk/runtime/service.py` |
+| `runtime_quota_snapshots` | 接受上传或分析前的最新存储用量快照 | `src/logrisk/runtime/repository.py`、`src/logrisk/runtime/service.py` |
+| `runtime_audit_events` | PACAS/RBAC 身份上下文下的脱敏运行审计 | `src/logrisk/runtime/repository.py`、`src/pipeline/dashboard_server.py` |
 
 ### Drain3 治理（10）
 
@@ -237,6 +246,19 @@ POST /api/observability-v2/replays
 ```
 
 Span 写入失败不会中断主分析流程。Replay 使用锁定的脱敏 Evidence、Prompt、Profile 和 Provider 快照，结果不会写入候选特征或批准规则。
+
+### Production Runtime
+
+```text
+Dashboard POST/PUT/PATCH/DELETE
+  → RequestIdentity（仅可信 PACAS/RBAC 代理 Header）
+  → RuntimeService.require_capacity() / Retention 操作
+  → RuntimeRepository
+  → runtime_policies / runtime_maintenance_runs
+  → runtime_quota_snapshots / runtime_audit_events
+```
+
+运行中心读取现有 `feature_jobs`、`input_jobs`、`streaming_tasks`、`benchmark_runs` 和 `replay_runs`，不会复制任务记录。Retention 只读取 `artifacts` 的元数据；文件本体仍位于文件系统，删除前会校验受控根目录、年龄、任务状态和受保护 Artifact 类型。`runtime_audit_events` 仅记录方法、路径、状态、外部主体、角色和请求 ID 等脱敏元数据。
 
 ### PostgreSQL 复用 Store
 

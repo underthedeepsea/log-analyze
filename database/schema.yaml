@@ -1,4 +1,4 @@
-schema_version: 9
+schema_version: 10
 database: logrisk
 description: LOGRISK 双模式运行时数据字典；SQLite 是默认本地实现，PostgreSQL 用于显式配置的外部生产部署。
 authoritative_ddl:
@@ -127,6 +127,24 @@ tables:
     primary_key: [replay_id, sequence]
     foreign_keys: {replay_id: replay_runs.replay_id ON DELETE CASCADE}
     columns: {replay_id: 所属 Replay, sequence: 递增序号, event_type: 事件类型, event_json: 脱敏事件详情, created_at: 创建时间}
+  runtime_policies:
+    description: 生产运行中心的 Retention 和存储配额策略；通过乐观版本校验更新
+    primary_key: policy_id
+    columns: {policy_id: 默认策略标识, policy_json: 脱敏运行策略, version: 递增版本, schema_version: 结构版本, created_at: 创建时间, updated_at: 更新时间}
+  runtime_maintenance_runs:
+    description: Retention 等维护操作的 dry-run 或实际执行记录
+    primary_key: run_id
+    indexes: [idx_runtime_maintenance_status_updated(status, updated_at DESC)]
+    columns: {run_id: 维护运行标识, action: 维护动作, mode: dry_run/execute, status: running/completed/failed, summary_json: 脱敏统计摘要, error_code: 稳定错误码, error_message: 脱敏错误, actor: 外部身份操作人, request_id: 请求标识, schema_version: 结构版本, created_at: 创建时间, updated_at: 更新时间, completed_at: 完成时间}
+  runtime_quota_snapshots:
+    description: 状态目录和输出目录的聚合存储用量快照
+    primary_key: snapshot_id
+    columns: {snapshot_id: 用量快照标识, usage_json: 文件数量和字节聚合值, schema_version: 结构版本, created_at: 采样时间}
+  runtime_audit_events:
+    description: 外部身份驱动的运行时操作追加式审计；仅保存脱敏元数据
+    primary_key: audit_id
+    indexes: [idx_runtime_audit_created(created_at DESC, audit_id DESC), idx_runtime_audit_resource(resource_type, resource_id, created_at DESC)]
+    columns: {audit_id: 审计标识, action: 操作名称, resource_type: 资源类别, resource_id: 资源标识, actor: PACAS/RBAC 传入的操作人, roles_json: 角色名称列表, request_id: 请求标识, outcome: success/failed/denied, attributes_json: 脱敏操作元数据, schema_version: 结构版本, created_at: 发生时间}
   ai_cache_entries:
     description: Evidence、Prompt、Provider 和模型组合缓存
     primary_key: signature

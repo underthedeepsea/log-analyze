@@ -146,8 +146,62 @@ def test_database_status_and_restart_candidate_configuration_are_available(dashb
     assert saved["candidate"]["provider"] == "postgres"
     assert saved["candidate"]["password_configured"] is False
     assert saved["restart_required"] is True
-    assert health["version"] == "1.27.0"
+    assert health["version"] == "1.29.0"
     assert health["storage"] == "sqlite"
+
+
+def test_runtime_external_identity_configuration(tmp_path):
+    frontend = tmp_path / "dist" / "index.html"
+    frontend.parent.mkdir()
+    frontend.write_text("<!doctype html><title>Runtime Identity</title>", encoding="utf-8")
+    runtime_config = tmp_path / "runtime.yaml"
+    runtime_config.write_text(
+        """runtime:
+  identity:
+    enabled: true
+    allow_loopback_bypass: false
+    trusted_proxy_cidrs: [127.0.0.0/8]
+    write_roles: [logrisk:operator]
+""",
+        encoding="utf-8",
+    )
+    server = build_server(
+        "127.0.0.1",
+        0,
+        manager=FeatureJobManager(extractor=lambda *_args, **_kwargs: [], auto_start=True),
+        frontend_path=frontend,
+        database_path=tmp_path / "state" / "logrisk.sqlite3",
+        state_root=tmp_path / "state",
+        runtime_config_path=runtime_config,
+    )
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+    try:
+        with pytest.raises(HTTPError) as rejected:
+            request_json(base_url + "/api/runtime/retention/preview", "POST", {})
+        allowed = Request(
+            base_url + "/api/runtime/retention/preview",
+            data=b"{}",
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "X-LOGRISK-Actor": "gateway-user",
+                "X-LOGRISK-Roles": "logrisk:operator",
+                "X-Request-ID": "runtime-config-test",
+            },
+        )
+        with urlopen(allowed, timeout=3) as response:
+            payload = json.load(response)
+
+        assert rejected.value.code == 403
+        assert json.load(rejected.value)["error_code"] == "runtime_identity_required"
+        assert payload["request_id"] == "runtime-config-test"
+        assert payload["maintenance"]["status"] == "completed"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
 
 
 def test_dashboard_cli_accepts_explicit_postgres_provider_and_url():
@@ -601,10 +655,78 @@ def test_create_job_route_forwards_retry_count(dashboard):
 def test_serves_frontend_for_ai_harness_routes(dashboard):
     base_url, _ = dashboard
 
-    for path in ("/prompts", "/ai-traces", "/ai-observability", "/model-profiles", "/rules"):
+    for path in ("/prompts", "/ai-traces", "/ai-observability", "/model-profiles", "/rules", "/multi-source"):
         with urlopen(base_url + path, timeout=3) as response:
             html = response.read().decode()
         assert "Feature Dashboard" in html
+
+
+def test_multi_source_routes_expose_sanitized_entity_timeline(dashboard):
+    base_url, _ = dashboard
+    status, summary, _ = request_json(base_url + "/api/multi-source/summary")
+    entities_status, entities, _ = request_json(base_url + "/api/multi-source/entities")
+    rules_status, rules, _ = request_json(base_url + "/api/multi-source/rules")
+
+    assert status == entities_status == rules_status == 200
+    assert summary["schema_version"] == "multi_source_summary_v1"
+    assert entities["schema_version"] == "multi_source_entities_v1"
+    assert rules["schema_version"] == "multi_source_rules_v1"
+    assert rules["items"][0]["rule_id"] == "exact-entity-cross-source"
+
+
+def test_multi_source_rule_route_persists_complete_editor_update(dashboard):
+    base_url, _ = dashboard
+    _, rules, _ = request_json(base_url + "/api/multi-source/rules")
+    rule = rules["items"][0]
+
+    status, updated, _ = request_json(
+        base_url + "/api/multi-source/rules/exact-entity-cross-source",
+        "PATCH",
+        {
+            "display_name": "节点运行时信号",
+            "enabled": True,
+            "source_pairs": [["kernel", "containerd"]],
+            "max_gap_seconds": 180,
+            "min_risk_score": 45,
+            "min_count": 2,
+            "confidence": 0.87,
+            "expected_version": rule["version"],
+        },
+    )
+
+    assert status == 200
+    assert updated["display_name"] == "节点运行时信号"
+    assert updated["source_pairs"] == [["kernel", "containerd"]]
+    assert updated["max_gap_seconds"] == 180
+    assert updated["min_risk_score"] == 45.0
+    assert updated["min_count"] == 2
+    assert updated["confidence"] == 0.87
+    _, reloaded, _ = request_json(base_url + "/api/multi-source/rules")
+    assert reloaded["items"][0]["version"] == rule["version"] + 1
+
+
+def test_serves_branded_help_manual(dashboard):
+    base_url, _ = dashboard
+
+    with urlopen(base_url + "/help", timeout=3) as response:
+        content_type = response.headers["Content-Type"]
+        html = response.read().decode()
+
+    assert content_type == "text/html; charset=utf-8"
+    assert "/assets/logrisk-app-icon-orange-v2.png" in html
+    assert "多来源关联" in html
+    assert "source_pairs" in html
+    assert 'id="manual-search"' in html
+    assert 'id="manual-search-status"' in html
+    assert "function filterManualSections" in html
+    assert "#toc a[hidden]{display:none!important;}" in html
+    assert "折叠分组导航" in html
+    assert "AI 分析观测" in html
+    assert "安全 Replay" in html
+
+    with urlopen(base_url + "/manual-assets/01-overview.png", timeout=3) as response:
+        assert response.headers["Content-Type"] == "image/png"
+        assert response.read(8).startswith(b"\x89PNG")
 
 
 def test_ai_observability_routes_summarize_job_progress_and_events(dashboard):

@@ -59,6 +59,54 @@ def test_runtime_backend_address_contract():
     assert (FRONTEND / "dist" / "config.js").is_file()
 
 
+def test_runtime_center_contract():
+    source = source_text()
+    for value in (
+        "运行中心",
+        "/runtime",
+        "/api/runtime/tasks",
+        "/api/runtime/readiness",
+        "Retention",
+        "存储用量",
+        "审计日志",
+        "任务排序",
+        "复制诊断信息",
+        "request_id",
+    ):
+        assert value in source
+
+
+def test_multi_source_workspace_contract():
+    source = source_text()
+    for value in (
+        "多来源关联",
+        "/multi-source",
+        "/api/multi-source/summary",
+        "/api/multi-source/entities",
+        "/api/multi-source/rules",
+        "跨来源时间线",
+        "关联规则",
+        "关联规则编辑",
+        "source_pairs",
+        "apiUrl(\"/help\")",
+        "help-button",
+    ):
+        assert value in source
+
+
+def test_grouped_navigation_preserves_all_workspace_routes():
+    source = source_text()
+
+    for label in ("分析工作台", "AI 工程", "规则与风险", "数据治理", "系统"):
+        assert label in source
+    for view in ("overview", "queue", "multiSource", "benchmarkCenter", "runtime", "settings"):
+        assert view in source
+    for selector in ("nav-group-toggle", "nav-group-items", "nav-group.is-open"):
+        assert selector in source
+    assert 'group.items.length + " 项"' not in source
+    assert ".nav-group-toggle>span{font-size:11px" in source
+
+
 def test_brand_icon_is_published_for_readme_and_browser():
     icon_name = "logrisk-app-icon-orange-v2.png"
     source_icon = FRONTEND / "logo" / icon_name
@@ -101,7 +149,7 @@ def test_m11_quality_and_settings_use_workspace_design_contract():
         "secondary-button",
     ):
         assert text in source
-    assert '!["drainQuality", "benchmarkCenter", "streaming", "settings", "rules", "nodeRisks", "semanticLibrary"].includes(view)' in source
+    assert '!["drainQuality", "benchmarkCenter", "streaming", "runtime", "settings", "rules", "nodeRisks", "multiSource", "semanticLibrary"].includes(view)' in source
     assert "h(CodeBlock, { value: profile.parameters })" not in source
 
 
@@ -411,9 +459,9 @@ def test_feature_evidence_distinguishes_candidate_from_semantic_templates():
 
 def test_benchmark_center_has_route_api_and_six_decision_views():
     source = source_text()
-    assert '["benchmarkCenter", "◎", "评测与基准"]' in source
+    assert '["benchmarkCenter", "评测与基准"]' in source
     assert 'if (path === "/benchmark-center") return "benchmarkCenter";' in source
-    assert 'benchmarkCenter: "/benchmark-center", streaming: "/streaming"' in source
+    assert 'benchmarkCenter: "/benchmark-center", runtime: "/runtime", streaming: "/streaming"' in source
     assert 'function BenchmarkCenterPage(props)' in source
     assert "/api/benchmark-center/overview" in source
     assert "/api/benchmark-center/leaderboard" in source
@@ -481,7 +529,9 @@ def test_release_docs_describe_current_feature_version():
     assert "## 1.22.0 - 2026-07-18" in release
     assert "## 1.23.0 - 2026-07-19" in release
     assert "## 1.23.1 - 2026-07-21" in release
-    assert "当前版本：`1.27.0`" in readme
+    assert "## 1.28.0 - 2026-07-29" in release
+    assert "## 1.29.0 - 2026-07-30" in release
+    assert "当前版本：`1.29.0`" in readme
     assert "## 1.24.0 - 2026-07-22" in release
     assert "## 1.24.1 - 2026-07-22" in release
     assert "## 1.24.2 - 2026-07-22" in release
@@ -508,8 +558,8 @@ def test_release_docs_describe_current_feature_version():
 def test_node_risk_and_editable_semantic_ui_contract():
     source = source_text()
     for text in (
-        '"nodeRisks", "△", "服务器风险"',
-        '"semanticLibrary", "≋", "风险语义库"',
+            '"nodeRisks", "服务器风险"',
+            '"semanticLibrary", "风险语义库"',
         'function NodeRiskPage',
         'function SemanticLibraryPage',
         '"/api/node-risks"',

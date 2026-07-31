@@ -62,6 +62,11 @@ class TemplateEventAggregator:
                 "cluster": event.get("cluster"),
                 "entity_type": entity_type,
                 "entity_id": entity_id,
+                "node": event.get("node"),
+                "namespace": event.get("namespace"),
+                "pod": event.get("pod"),
+                "container": event.get("container"),
+                "device": event.get("device"),
                 "source_type": event.get("source_type"),
                 "component": event.get("component"),
                 "severity": event.get("severity"),
@@ -76,6 +81,8 @@ class TemplateEventAggregator:
                 "samples": [],
                 "affected_namespaces": set(),
                 "affected_pods": set(),
+                "entity_keys": set(),
+                "entity_relations": {},
                 "semantic_field_counts": defaultdict(dict),
                 "semantic_tags": set(),
                 "typed_parameter_counts": {},
@@ -95,6 +102,18 @@ class TemplateEventAggregator:
             w["affected_namespaces"].add(event["namespace"])
         if event.get("pod"):
             w["affected_pods"].add(event["pod"])
+        route = event.get("entity_route") or {}
+        for entity in route.get("entities") or []:
+            if entity.get("entity_key"):
+                w["entity_keys"].add(str(entity["entity_key"]))
+        for relation in route.get("relations") or []:
+            relation_key = (
+                str(relation.get("from_key") or ""),
+                str(relation.get("relation") or ""),
+                str(relation.get("to_key") or ""),
+            )
+            if all(relation_key):
+                w["entity_relations"][relation_key] = dict(relation)
         for field, value in (event.get("semantic_fields") or {}).items():
             value_key = repr(value)
             entry = w["semantic_field_counts"][field].setdefault(value_key, {"value": value, "count": 0})
@@ -117,6 +136,10 @@ class TemplateEventAggregator:
             item = dict(w)
             item["affected_namespaces"] = sorted(w["affected_namespaces"])
             item["affected_pods"] = sorted(w["affected_pods"])
+            item["entity_keys"] = sorted(w["entity_keys"])
+            item["entity_relations"] = [
+                w["entity_relations"][key] for key in sorted(w["entity_relations"])
+            ]
             item["semantic_fields"] = {
                 field: sorted(values.values(), key=lambda entry: (-entry["count"], str(entry["value"])))[:20]
                 for field, values in sorted(w["semantic_field_counts"].items())

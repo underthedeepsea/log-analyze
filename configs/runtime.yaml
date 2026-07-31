@@ -1,3 +1,21 @@
+runtime:
+  identity:
+    enabled: false
+    allow_loopback_bypass: true
+    trusted_proxy_cidrs: []
+    actor_header: X-LOGRISK-Actor
+    roles_header: X-LOGRISK-Roles
+    request_id_header: X-Request-ID
+    write_roles: []
+  retention:
+    enabled: false
+    completed_days: 30
+    trace_days: 30
+    cache_days: 14
+  quota:
+    soft_limit_bytes: 5368709120
+    hard_limit_bytes: 10737418240
+
 drain3_runtime:
   parameter_extraction_mode: off
 

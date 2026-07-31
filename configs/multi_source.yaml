@@ -1,0 +1,23 @@
+schema_version: 1
+enabled: true
+
+aliases:
+  node: {}
+  namespace: {}
+  pod: {}
+  container: {}
+  device: {}
+
+rules:
+  - rule_id: exact-entity-cross-source
+    display_name: 同实体跨来源异常
+    enabled: true
+    source_pairs:
+      - [kernel, kubelet]
+      - [kubelet, containerd]
+      - [containerd, podlog]
+      - [audit, journal]
+    max_gap_seconds: 300
+    min_risk_score: 40
+    min_count: 1
+    confidence: 0.9

@@ -38,6 +38,7 @@ class NormalizedLog:
     namespace: Optional[str]
     pod: Optional[str]
     container: Optional[str]
+    device: Optional[str]
     source_type: str
     component: str
     severity: Optional[str]
@@ -92,6 +93,7 @@ def normalize_record(record: Dict[str, Any], default_cluster: str = "default") -
         namespace=record.get("namespace"),
         pod=record.get("pod"),
         container=record.get("container"),
+        device=record.get("device") or (record.get("labels") or {}).get("device"),
         source_type=source_type,
         component=component,
         severity=str(severity).upper() if severity else None,

@@ -69,6 +69,9 @@ from logrisk.upload_sessions import UploadConfig, UploadSessionStore
 from logrisk.database import DatabaseError, PostgresDatabase, create_database
 from logrisk.database_config import DatabaseConnectionSettings, database_url_from_candidate, resolve_database_runtime
 from logrisk.legacy_import import LegacyStateImporter
+from logrisk.multi_source.config import load_multi_source_config
+from logrisk.multi_source.repository import MultiSourceConflictError, MultiSourceRepository
+from logrisk.multi_source.service import MultiSourceService
 from logrisk.sqlite_stores import (
     SQLiteAICache,
     SQLiteAITraceLogger,
@@ -200,6 +203,13 @@ def build_server(
     )
     risk_semantics = RiskSemanticService(database, root / "configs" / "risk_semantics" / "builtin.yaml")
     node_risks = NodeRiskService(database, root / "configs" / "node_risk.yaml")
+    multi_source_config = load_multi_source_config(root / "configs" / "multi_source.yaml")
+    multi_source = MultiSourceService(
+        MultiSourceRepository(database),
+        aliases=multi_source_config["aliases"],
+        rules=multi_source_config["rules"],
+        enabled=multi_source_config["enabled"],
+    )
     LegacyStateImporter(database, state_root, root / "output" / "uploads").run()
 
     def configured_extractor(entity: dict[str, Any], **kwargs: Any) -> list[dict[str, Any]]:
@@ -355,6 +365,8 @@ def build_server(
     server.manager.observability = span_recorder  # type: ignore[attr-defined]
     server.rule_governance = RuleGovernanceService(RuleGovernanceRepository(database))  # type: ignore[attr-defined]
     server.frontend_path = Path(frontend_path or root / "frontend" / "dist" / "index.html")  # type: ignore[attr-defined]
+    server.help_path = root / "LOGRISK_USER_MANUAL.html"  # type: ignore[attr-defined]
+    server.manual_assets_path = root / "manual-assets"  # type: ignore[attr-defined]
     server.default_model = default_model  # type: ignore[attr-defined]
     server.default_ollama_url = default_ollama_url  # type: ignore[attr-defined]
     server.default_timeout = default_timeout  # type: ignore[attr-defined]
@@ -377,6 +389,7 @@ def build_server(
     server.semantic_dictionaries = semantic_dictionaries  # type: ignore[attr-defined]
     server.risk_semantics = risk_semantics  # type: ignore[attr-defined]
     server.node_risks = node_risks  # type: ignore[attr-defined]
+    server.multi_source = multi_source  # type: ignore[attr-defined]
     server.benchmark_center = benchmark_center  # type: ignore[attr-defined]
     configured_origins = cors_origins if cors_origins is not None else os.getenv("DASHBOARD_CORS_ORIGINS", "").split(",")
     server.cors_origins = {str(origin).strip().rstrip("/") for origin in configured_origins if str(origin).strip()}  # type: ignore[attr-defined]
@@ -423,7 +436,7 @@ def build_server(
         semantic_snapshot: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         with analysis_lock:
-            return analyze_records(
+            result = analyze_records(
                 records,
                 config_path=str(config_path or root / "configs" / "drain3_recommended.ini"),
                 rules_path=str(root / "configs" / "risk_rules.yaml"),
@@ -432,6 +445,11 @@ def build_server(
                 risk_semantics=risk_semantics,
                 node_risks=node_risks,
             )
+            result.setdefault("summary", {})["multi_source"] = multi_source.ingest_risk_entities(
+                result.get("risk_entities") or [],
+                source_job_id=None,
+            )
+            return result
 
     server.input_analyzer = input_analyzer or default_input_analyzer  # type: ignore[attr-defined]
     server.input_analyzer_accepts_config = input_analyzer is None  # type: ignore[attr-defined]
@@ -464,6 +482,7 @@ def build_server(
                 semantic_snapshot=job.get("semantic_dictionary_snapshot"),
                 risk_semantics=risk_semantics,
                 node_risks=node_risks,
+                multi_source=multi_source,
                 streaming_repository=server.streaming_state,  # type: ignore[attr-defined]
                 resume_task_id=job["streaming_task_id"],
             )
@@ -605,11 +624,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def do_GET(self) -> None:
         path, query = self._route_parts()
         try:
-            if path in {"/", "/prompts", "/ai-traces", "/ai-observability", "/model-profiles", "/drain-quality", "/benchmark-center", "/rules", "/settings", "/runtime", "/node-risks", "/semantic-library"} or path.startswith("/node-risks/"):
+            if path == "/help":
+                self._serve_help()
+                return
+            if path in {"/", "/prompts", "/ai-traces", "/ai-observability", "/model-profiles", "/drain-quality", "/benchmark-center", "/rules", "/settings", "/runtime", "/node-risks", "/semantic-library", "/multi-source"} or path.startswith("/node-risks/"):
                 self._serve_frontend()
                 return
             if path == "/config.js":
                 self._serve_frontend_file("config.js", "application/javascript; charset=utf-8")
+                return
+            if path.startswith("/manual-assets/"):
+                self._serve_manual_asset(path)
                 return
             if path.startswith("/assets/"):
                 self._serve_asset(path)
@@ -668,6 +693,39 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     before=query.get("before", [None])[0],
                 ))
                 return
+            if path == "/api/multi-source/summary":
+                self._json(HTTPStatus.OK, self.server.multi_source.summary())  # type: ignore[attr-defined]
+                return
+            if path == "/api/multi-source/entities":
+                self._json(HTTPStatus.OK, self.server.multi_source.entities(  # type: ignore[attr-defined]
+                    limit=int(query.get("limit", ["200"])[0]),
+                ))
+                return
+            if path == "/api/multi-source/rules":
+                self._json(HTTPStatus.OK, self.server.multi_source.rules_view())  # type: ignore[attr-defined]
+                return
+            match = re.fullmatch(r"/api/multi-source/correlations/([^/]+)", path)
+            if match:
+                self._json(HTTPStatus.OK, self.server.multi_source.correlation(unquote(match.group(1))))  # type: ignore[attr-defined]
+                return
+            match = re.fullmatch(r"/api/multi-source/entities/([^/]+)/([^/]+)(?:/(timeline))?", path)
+            if match:
+                entity_type, entity_id, subresource = match.groups()
+                if subresource == "timeline":
+                    result = self.server.multi_source.entity_timeline(  # type: ignore[attr-defined]
+                        unquote(entity_type),
+                        unquote(entity_id),
+                        cluster=str(query.get("cluster", ["default"])[0]),
+                        limit=int(query.get("limit", ["200"])[0]),
+                    )
+                else:
+                    result = self.server.multi_source.entity_detail(  # type: ignore[attr-defined]
+                        unquote(entity_type),
+                        unquote(entity_id),
+                        cluster=str(query.get("cluster", ["default"])[0]),
+                    )
+                self._json(HTTPStatus.OK, result)
+                return
             if path == "/api/node-risks":
                 self._json(HTTPStatus.OK, self.server.node_risks.list_nodes(  # type: ignore[attr-defined]
                     cluster=query.get("cluster", [None])[0], level=query.get("level", [None])[0], domain=query.get("domain", [None])[0],
@@ -714,7 +772,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "schema_version": "logrisk_health_v1",
                     "service": "logrisk-dashboard",
                     "status": "ok",
-                    "version": "1.28.0",
+                    "version": "1.29.0",
                     "storage": self.server.database_runtime.provider,  # type: ignore[attr-defined]
                 })
                 return
@@ -1538,6 +1596,17 @@ class DashboardHandler(BaseHTTPRequestHandler):
         try:
             self._require_runtime_write_access()
             payload = self._read_json()
+            match = re.fullmatch(r"/api/multi-source/rules/([A-Za-z0-9_-]+)", path)
+            if match:
+                identity = self._runtime_request_identity()
+                updated = self.server.multi_source.update_rule(  # type: ignore[attr-defined]
+                    match.group(1),
+                    payload,
+                    actor=identity.actor,
+                    request_id=identity.request_id,
+                )
+                self._json(HTTPStatus.OK, updated)
+                return
             match = re.fullmatch(r"/api/ai-harness/prompts/([A-Za-z0-9_-]+)", path)
             if match:
                 if not isinstance(payload, dict):
@@ -1564,6 +1633,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._json(HTTPStatus.OK, feature)
         except RuntimeAccessError as exc:
             self._json(HTTPStatus.FORBIDDEN, {"error": str(exc), "code": exc.code, "error_code": exc.code, "request_id": self._runtime_request_identity().request_id})
+        except MultiSourceConflictError as exc:
+            self._json(HTTPStatus.CONFLICT, {"error": str(exc), "code": exc.code, "error_code": exc.code, "request_id": self._runtime_request_identity().request_id})
         except (FeatureJobError, ApprovedRuleError, ProcessingMetricsError, DrainQualityError, KeyError, ValueError) as exc:
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc), "code": "invalid_request", "error_code": "invalid_request", "request_id": self._runtime_request_identity().request_id})
 
@@ -1571,6 +1642,20 @@ class DashboardHandler(BaseHTTPRequestHandler):
         path = self.server.frontend_path  # type: ignore[attr-defined]
         if not path.is_file():
             self._json(HTTPStatus.NOT_FOUND, {"error": "前端文件不存在"})
+            return
+        body = path.read_bytes()
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self._cors_headers()
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _serve_help(self) -> None:
+        path = self.server.help_path  # type: ignore[attr-defined]
+        if not path.is_file():
+            self._json(HTTPStatus.NOT_FOUND, {"error": "帮助文件不存在"})
             return
         body = path.read_bytes()
         self.send_response(HTTPStatus.OK)
@@ -2032,8 +2117,18 @@ class DashboardHandler(BaseHTTPRequestHandler):
         return {"items": [self._observability_event(event) for event in items[: max(1, min(limit, 200))]]}
 
     def _serve_asset(self, request_path: str) -> None:
-        asset_root = (self.server.frontend_path.parent / "assets").resolve()  # type: ignore[attr-defined]
-        relative = request_path.removeprefix("/assets/")
+        self._serve_static_asset(
+            (self.server.frontend_path.parent / "assets").resolve(),  # type: ignore[attr-defined]
+            request_path.removeprefix("/assets/"),
+        )
+
+    def _serve_manual_asset(self, request_path: str) -> None:
+        self._serve_static_asset(
+            self.server.manual_assets_path.resolve(),  # type: ignore[attr-defined]
+            request_path.removeprefix("/manual-assets/"),
+        )
+
+    def _serve_static_asset(self, asset_root: Path, relative: str) -> None:
         target = (asset_root / relative).resolve()
         try:
             target.relative_to(asset_root)

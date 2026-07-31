@@ -4,7 +4,7 @@
   <img src="frontend/logo/logrisk-app-icon-orange-v2.png" width="112" alt="LOGRISK 应用图标" />
 </p>
 
-当前版本：`1.28.0`。完整变更记录见 [`releas.md`](releas.md)。
+当前版本：`1.29.0`。完整变更记录见 [`releas.md`](releas.md)。
 
 LOGRISK 在本地完成日志规范化、Drain3 模板化、确定性语义增强、风险评分、规则复用、模型特征识别和人工审批。系统只生成可审查、可导出的日志特征，不执行根因分析（RCA），也不会把原始日志直接发送给模型。
 
@@ -18,7 +18,9 @@ LOGRISK 在本地完成日志规范化、Drain3 模板化、确定性语义增�
 - 提供 Prompt 版本、模型 Profile、AI Trace、Observation/Span 链路、缓存、评测、Drain3 配置和语义词典治理。
 - 提供统一的评测与基准中心，可比较 Prompt、模型 Profile、失败 Case、趋势及发布门禁。
 - 提供生产运行中心：统一查看任务、就绪状态、存储配额、Retention 维护和脱敏审计记录。
+- 提供多来源智能关联：按确定实体、显式层级和时间窗口汇总跨来源脱敏证据链。
 - 提供服务器风险总览、风险事件台账、可解释评分，以及可编辑、可发布、可回滚的风险语义库。
+- Dashboard 导航按分析工作台、AI 工程、规则与风险、数据治理和系统归类；一级分组可折叠，所有原有页面路由保持不变。
 - 只导出人工批准的特征及关联风险节点，供外部 RCA 专家系统使用。
 
 ```text
@@ -73,6 +75,8 @@ bash scripts/dashboard.sh stop
 
 启动脚本使用轻量 `nohup` 后台进程，不注册 `launchd` 或其他常驻系统服务。日志位于 `state/dashboard.log`，PID 位于 `state/dashboard.pid`；前台运行可使用 `bash scripts/run_dashboard.sh`。
 
+页面右上角的“帮助”会打开同一后端提供的离线管理员手册（`/help`），无需访问外网。
+
 ## 日志输入与处理
 
 Dashboard 和命令行支持：
@@ -98,6 +102,8 @@ python3 -m pipeline.manual_import_pipeline \
 ### 可恢复处理与 Kafka 预留接口
 
 “流式处理”工作区会显示大文件任务的来源、Drain3 配置摘要、最后成功 Checkpoint、提交批次和脱敏未知模板队列。文件任务按有界记录批次处理；每个批次在 Drain3 模板化、语义/规则判定后，以单个数据库事务同时提交脱敏摘要、未知模板和字节 Offset。服务重启会将运行中任务标记为中断，只有人工点击“从 Checkpoint 恢复”才会继续。文件身份、内容前缀或 Drain3 配置变化会标记为冲突，不能静默重读或跳过数据。
+
+“多来源关联”工作区按 `cluster/entity_type/entity_id` 展示节点、命名空间、Pod、容器和设备。关联引擎只接受明确实体标识、`configs/multi_source.yaml` 中的人工别名和显式层级关系，并同时校验来源组合、时间窗口、计数和风险阈值。规则编辑器可维护规则名称、启停状态、来源组合、时间窗口、最低风险分、最低出现次数和置信度；保存使用乐观版本校验，规则变更只影响后续关联。不同集群永不关联，缺少可靠实体的数据保持不可路由。Drain3 仍只学习日志消息正文，实体元数据不会进入模板学习；持久化观察不包含原始日志、样例或 `message_core`。
 
 Kafka 目前不是可用数据源：页面只展示 Topic、Consumer Group、Partition Offset、Bootstrap 环境变量名和 adapter ID 的契约。仓库不包含 Kafka 客户端、Broker 连接、凭据输入或自动消费；内部团队必须在受控代码中显式注册适配器后，才能由后续任务启动器使用。任务状态、审计事件和未知模板不保存原始日志、Kafka Token 或密码。
 

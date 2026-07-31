@@ -15,6 +15,7 @@ from logrisk.streaming_state import StreamingConflictError, StreamingStateReposi
 from logrisk.semantic.extractor import SemanticExtractor
 from logrisk.node_risk import NodeRiskError, NodeRiskService
 from logrisk.risk_semantics import RiskSemanticError, RiskSemanticService
+from logrisk.multi_source.service import MultiSourceService
 
 
 ProgressCallback = Callable[[dict[str, Any]], None]
@@ -43,6 +44,7 @@ def run_large_file_pipeline(
     semantic_snapshot: dict[str, Any] | None = None,
     risk_semantics: RiskSemanticService | None = None,
     node_risks: NodeRiskService | None = None,
+    multi_source: MultiSourceService | None = None,
     streaming_repository: StreamingStateRepository | None = None,
     resume_task_id: str | None = None,
     stream_batch_records: int = 10000,
@@ -109,6 +111,7 @@ def run_large_file_pipeline(
             semantic_snapshot=semantic_snapshot,
             risk_semantics=risk_semantics,
             node_risks=node_risks,
+            multi_source=multi_source,
             progress_callback=progress_callback,
             started=started,
             batch_records=stream_batch_records,
@@ -212,6 +215,10 @@ def run_large_file_pipeline(
                     continue
     update_manifest_status(spool_dir, manifest, "AGGREGATING")
     risk_entities = score_risk_entities(template_windows, load_rules(rules_path))
+    multi_source_result = (
+        multi_source.ingest_risk_entities(risk_entities, source_job_id=input_job_id)
+        if multi_source else {"observations": 0, "correlations": 0, "unroutable": 0}
+    )
     streaming_window_count = 0
     unknown_template_count = 0
     reduced = max(0, parsed - len(template_windows))
@@ -240,6 +247,7 @@ def run_large_file_pipeline(
             "semantic_dictionary_versions": (semantic_snapshot or {}).get("versions", {}),
             "risk_semantic_matches": semantic_matches,
             "node_risk_ingestions": node_risk_ingestions,
+            "multi_source": multi_source_result,
             "streaming_task_id": streaming_task.get("task_id") if streaming_task else None,
             "streaming_resumed": streaming_resumed,
             "checkpoint_cursor": current_cursor.to_dict() if streaming_task else None,
@@ -292,6 +300,7 @@ def _run_checkpointed_file_batches(
     semantic_snapshot: dict[str, Any] | None,
     risk_semantics: RiskSemanticService | None,
     node_risks: NodeRiskService | None,
+    multi_source: MultiSourceService | None,
     progress_callback: ProgressCallback | None,
     started: float,
     batch_records: int,
@@ -451,6 +460,10 @@ def _run_checkpointed_file_batches(
 
     streaming_task = streaming_repository.mark_completed(str(streaming_task["task_id"]))
     risk_entities = score_risk_entities(all_windows, rules)
+    multi_source_result = (
+        multi_source.ingest_risk_entities(risk_entities, source_job_id=input_job_id)
+        if multi_source else {"observations": 0, "correlations": 0, "unroutable": 0}
+    )
     reduced = max(0, parsed - len(all_windows))
     result = {
         "summary": {
@@ -477,6 +490,7 @@ def _run_checkpointed_file_batches(
             "semantic_dictionary_versions": (semantic_snapshot or {}).get("versions", {}),
             "risk_semantic_matches": semantic_matches,
             "node_risk_ingestions": node_risk_ingestions,
+            "multi_source": multi_source_result,
             "streaming_task_id": streaming_task["task_id"],
             "streaming_resumed": streaming_resumed,
             "checkpoint_cursor": current_cursor.to_dict(),

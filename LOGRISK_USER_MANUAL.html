@@ -4,6 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="description" content="LOGRISK 日志特征分析与审批系统完整管理员使用手册">
+  <link rel="icon" type="image/png" href="/assets/logrisk-app-icon-orange-v2.png">
   <title>LOGRISK 完整管理员使用手册</title>
   <style>
     :root { --ink:#1f2937; --muted:#667085; --line:#e8e1dc; --paper:#ffffff; --canvas:#fffaf7; --orange:#ff6a21; --orange-dark:#c94b13; --orange-soft:#fff0e8; --green:#1f8b61; --shadow:0 16px 45px rgba(91, 51, 22, .10); }
@@ -14,11 +15,18 @@
     .layout { display:grid; grid-template-columns:286px minmax(0,1fr); max-width:1540px; min-height:100vh; margin:0 auto; background:rgba(255,255,255,.66); }
     aside { position:sticky; top:0; height:100vh; overflow:auto; border-right:1px solid var(--line); padding:28px 22px; background:rgba(255,255,255,.87); backdrop-filter:blur(14px); }
     .brand { display:flex; align-items:center; gap:12px; margin:0 0 28px; }
-    .logo { display:grid; width:40px; height:40px; place-items:center; color:#fff; font-weight:800; font-size:24px; border-radius:13px; background:linear-gradient(145deg,#ff873f,#f75e16); box-shadow:0 8px 20px rgba(255,106,33,.28); }
+    .logo { display:block; width:40px; height:40px; object-fit:cover; border-radius:13px; box-shadow:0 8px 20px rgba(255,106,33,.28); }
     .brand b { display:block; letter-spacing:.09em; font-size:19px; }
     .brand small, .side-note { color:var(--muted); font-size:12px; }
     .toc-title { margin:0 0 9px; color:#9a7d6d; font-size:11px; font-weight:800; letter-spacing:.13em; text-transform:uppercase; }
+    .manual-search { display:grid; gap:6px; margin:0 0 16px; }
+    .manual-search label { color:#7d6a60; font-size:11px; font-weight:800; letter-spacing:.06em; }
+    .manual-search input { width:100%; min-height:38px; padding:0 11px; color:var(--ink); border:1px solid #eadbd1; border-radius:10px; outline:none; background:#fff; font:13px/1.4 inherit; transition:border-color .18s ease,box-shadow .18s ease; }
+    .manual-search input:focus { border-color:#f29a69; box-shadow:0 0 0 3px rgba(255,106,33,.12); }
+    .manual-search-status { min-height:17px; margin:0; color:var(--muted); font-size:11px; }
+    .manual-search-status.is-empty { color:#b14a1c; }
     nav a { display:block; margin:2px 0; padding:8px 11px; color:#5c6675; border-radius:9px; transition:.18s ease; }
+    #toc a[hidden]{display:none!important;}
     nav a:hover, nav a.active { color:var(--orange-dark); background:var(--orange-soft); }
     .side-note { margin:25px 4px 0; padding:12px; border:1px solid #ffd9c5; border-radius:12px; background:#fffaf7; }
     main { min-width:0; padding:42px clamp(24px,5vw,82px) 70px; }
@@ -66,7 +74,7 @@
     .checklist li { break-inside:avoid; margin:7px 0; padding-left:25px; position:relative; }
     .checklist li:before { content:"✓"; position:absolute; left:0; color:var(--green); font-weight:900; }
     .footer { margin-top:52px; padding-top:20px; color:#77808d; border-top:1px solid var(--line); font-size:13px; }
-    @media (max-width:980px) { .layout { display:block; } aside { position:relative; height:auto; padding:18px; border-right:0; border-bottom:1px solid var(--line); } nav { display:flex; flex-wrap:wrap; gap:2px; } nav a { font-size:13px; } .side-note { display:none; } main { padding:28px 20px 55px; } .intro-grid,.card-grid { grid-template-columns:1fr; } .hero { padding:30px 25px; } }
+    @media (max-width:980px) { .layout { display:block; } aside { position:relative; height:auto; padding:18px; border-right:0; border-bottom:1px solid var(--line); } .manual-search { max-width:360px; } nav { display:flex; flex-wrap:wrap; gap:2px; } nav a { font-size:13px; } .side-note { display:none; } main { padding:28px 20px 55px; } .intro-grid,.card-grid { grid-template-columns:1fr; } .hero { padding:30px 25px; } }
     @media (max-width:620px) { h1 { font-size:34px; } .feature-list,.checklist { columns:1; grid-template-columns:1fr; } .facts { grid-template-columns:1fr; } .facts div:nth-child(odd) { border-bottom:0; } .section-head { display:block; } }
     @media print { body { background:#fff; font-size:11pt; } .layout { display:block; } aside,.progress { display:none; } main { padding:0; } .hero,figure,.card { box-shadow:none; } section { break-inside:avoid; } a { text-decoration:none; } }
   </style>
@@ -75,18 +83,24 @@
   <div class="progress" id="progress"></div>
   <div class="layout">
     <aside>
-      <a class="brand" href="#top"><span class="logo">L</span><span><b>LOGRISK</b><small>管理员使用手册</small></span></a>
+      <a class="brand" href="#top"><img class="logo" src="/assets/logrisk-app-icon-orange-v2.png" alt="LOGRISK"><span><b>LOGRISK</b><small>管理员使用手册</small></span></a>
       <p class="toc-title">目录</p>
+      <div class="manual-search">
+        <label for="manual-search">搜索手册</label>
+        <input id="manual-search" type="search" placeholder="例如：Replay、Drain3、导出" autocomplete="off">
+        <p class="manual-search-status" id="manual-search-status" role="status" aria-live="polite">显示全部章节</p>
+      </div>
       <nav id="toc">
         <a href="#quick-start">01 · 快速开始</a>
         <a href="#analysis">02 · 日志分析与队列</a>
         <a href="#review-export">03 · 人工审批与导出</a>
         <a href="#ai-engineering">04 · Prompt、模型与 AI Trace</a>
         <a href="#governance">05 · 规则、节点与风险语义</a>
-        <a href="#drain-evaluation">06 · Drain3 与评测</a>
-        <a href="#streaming">07 · 流式处理与大文件</a>
-        <a href="#runtime">08 · 运行中心与数据库</a>
-        <a href="#faq">09 · 常见问题与检查单</a>
+        <a href="#multi-source">06 · 多来源关联规则</a>
+        <a href="#drain-evaluation">07 · Drain3 与评测</a>
+        <a href="#streaming">08 · 流式处理与大文件</a>
+        <a href="#runtime">09 · 运行中心与数据库</a>
+        <a href="#faq">10 · 常见问题与检查单</a>
       </nav>
       <div class="side-note"><b>安全边界</b><br>仅识别、审批与导出日志特征；不执行 RCA 或自动修复。</div>
     </aside>
@@ -95,7 +109,7 @@
         <p class="eyebrow">LOGRISK ADMINISTRATOR GUIDE</p>
         <h1>日志特征分析与审批系统<br>完整管理员使用手册</h1>
         <p>面向平台管理员、日志分析人员与规则维护人员。从导入日志到人工批准、规则复用、Drain3 治理、模型观测及生产运行，按安全边界完成每一步。</p>
-        <div class="badges"><span class="badge">适用于 v1.28.0</span><span class="badge green">可离线阅读</span><span class="badge">更新日期：2026-07-30</span></div>
+        <div class="badges"><span class="badge">适用于 v1.29.0</span><span class="badge green">可离线阅读</span><span class="badge">更新日期：2026-07-30</span></div>
       </header>
 
       <div class="intro-grid">
@@ -107,6 +121,8 @@
       <section id="quick-start">
         <div class="section-head"><div><p class="section-number">01 / QUICK START</p><h2>从工作台开始一次安全分析</h2><p>工作台集中展示上传入口、模型 Profile、Prompt、阈值、重试次数、Drain3 压缩指标和识别进度。</p></div></div>
         <ol class="steps"><li>打开 Dashboard，确认页头显示的模型连接状态与所选 Prompt；离线或停用连接不能启动需要模型的识别。</li><li>点击“新建分析”，选择 <code>result.json</code>、JSONL、TXT、LOG、GZ 或无后缀 Linux 日志文件。超过 10 MB 的文件会自动分片上传。</li><li>选择启用的模型 Profile。Profile 会锁定 Provider、连接、模型、Prompt、上下文预算和结构化输出策略。</li><li>设置风险阈值与重试次数，点击“开始识别”。任务创建后，在识别队列跟踪实体级状态。</li></ol>
+        <h3>使用折叠分组导航与帮助</h3>
+        <p>Dashboard 左侧的折叠分组导航将入口归纳为分析工作台、AI 工程、规则与风险、数据治理和系统；点击分组可展开或收起，切换页面时当前分组会自动展开。右上角“帮助”按钮会在新标签打开本手册，方便在操作过程中查询。</p>
         <div class="notice safe"><b>开始前检查：</b>确认连接可用、模型已安装或远端 API 可访问；Prompt 为启用状态；文件中不包含不应进入本地状态目录的敏感内容。</div>
         <figure><img src="manual-assets/01-overview.png" alt="LOGRISK 工作台中的新建分析、模型 Profile、Prompt 和实时处理指标"><figcaption>工作台：选择输入、模型 Profile、Prompt、重试次数和阈值；指标仅展示处理汇总，不展示原始日志。</figcaption></figure>
       </section>
@@ -136,6 +152,9 @@
         <h3>如何使用 AI 调用追踪</h3>
         <p>“AI 调用追踪”按任务、Trace ID、状态和 Prompt 过滤。打开一条 Trace 可核对脱敏 Evidence、发送 Prompt、模型原始输出、解析结果和字段校验错误；它用于判断模型输出是否满足结构化约束，不用于保留原始日志。</p>
         <figure><img src="manual-assets/05-trace.png" alt="LOGRISK AI 调用追踪页面的过滤与空状态"><figcaption>AI 调用追踪：完成一次识别后可按任务、Trace、状态或 Prompt 查询。Trace 页面应只含脱敏调用元数据。</figcaption></figure>
+        <h3>AI 分析观测与安全 Replay</h3>
+        <p>“AI 分析观测”按 Observation、Span 和阶段展示输入准备、Drain3、规则复用、Evidence、模型、解析、校验、Evaluator、候选和审批链路，并提供延迟、成功率、Token 和可选成本汇总。</p>
+        <ul class="feature-list"><li><b>结果 Replay：</b>复用历史脱敏快照重新展示既有结果，不调用模型，也不会修改候选、规则或审批资产。</li><li><b>模型 Replay：</b>必须人工确认，且锁定历史 Prompt、Profile、Provider、Evidence 与模型参数；它独立于正式审批链路。</li></ul>
       </section>
 
       <section id="governance">
@@ -145,28 +164,36 @@
         <figure><img src="manual-assets/06-rules-risk.png" alt="LOGRISK 规则生命周期治理页面的规则健康度与状态筛选"><figcaption>规则治理：人工批准规则形成可复用资产。首次批准前页面会显示空状态。</figcaption></figure>
       </section>
 
+      <section id="multi-source">
+        <div class="section-head"><div><p class="section-number">06 / MULTI-SOURCE CORRELATION</p><h2>多来源关联与规则管理</h2><p>“多来源关联”工作区只把同一集群内、具有明确实体标识的脱敏模板放入时间线；它帮助人工查看证据链，不会生成 RCA 结论。</p></div></div>
+        <div class="facts"><div>实体范围</div><div>节点、命名空间、Pod、容器和设备。实体路由使用输入中明确的字段、人工维护的别名与显式层级关系；无法可靠路由的记录不会被猜测关联。</div><div>来源组合</div><div><code>source_pairs</code> 定义允许的来源两两组合，例如 <code>kernel ↔ kubelet</code>。来源名称按小写规范化，不支持同一来源与自身或重复组合。</div><div>阈值</div><div>时间窗口限制事件最大间隔；最小风险分与最小出现次数用于过滤弱信号；置信度是写入证据链的确定性规则值，不是模型评分。</div><div>版本与审计</div><div>保存必须携带当前规则版本。其他操作者已保存时，页面会提示重新加载，避免覆盖。审计只记录规则元数据，不保存原始日志。</div></div>
+        <h3>如何调整一条关联规则</h3>
+        <ol class="steps"><li>打开“多来源关联”，在“关联规则编辑”中选择要维护的规则；先阅读规则 ID、当前版本与状态。</li><li>可启用或停用规则，并逐行新增、删除或修改来源组合。停用后，后续观察不会用此规则生成新的跨来源证据链；历史链路保留原规则版本。</li><li>设置时间窗口、最低风险分、最低出现次数和置信度。只使用业务已确认的数值，避免把不相干的来源或低风险噪声放进关联范围。</li><li>点击“保存规则”。保存成功后页面会刷新为新版本；若提示版本冲突，先刷新并基于最新规则重新调整。</li></ol>
+        <div class="notice safe"><b>关联边界：</b>规则不改变 Drain3 的模板树、参数、脱敏规则或原始日志处理方式；只在风险评分后读取聚合的脱敏观察。规则编辑不调用大模型，也不会跨集群关联。</div>
+      </section>
+
       <section id="drain-evaluation">
-        <div class="section-head"><div><p class="section-number">06 / DRAIN3 &amp; EVALUATION</p><h2>Drain3 模板、脱敏规则与评测基准</h2><p>Drain3 的职责是将大量日志压缩为稳定、脱敏的模板；评测中心负责比较模板质量和配置效果，不会自动修改生产配置。</p></div></div>
+        <div class="section-head"><div><p class="section-number">07 / DRAIN3 &amp; EVALUATION</p><h2>Drain3 模板、脱敏规则与评测基准</h2><p>Drain3 的职责是将大量日志压缩为稳定、脱敏的模板；评测中心负责比较模板质量和配置效果，不会自动修改生产配置。</p></div></div>
         <ul class="feature-list"><li><b>模板管理：</b>搜索、筛选、编辑、合并、忽略、软删除和回滚受管模板；所有操作保留审计信息。</li><li><b>Drain3 配置：</b>以 <code>drain3_recommended.ini</code> 基线创建候选版本，调整算法参数与脱敏规则，并关联评测运行。</li><li><b>语义词典：</b>从日志中提取 errno、HTTP 状态码、signal 等 Typed Mask；自定义规则扩展内置规则，而非覆盖它们。</li><li><b>评测与基准：</b>用 Gold Dataset、Case、Suite、Run 与 Gate 比较 Prompt、模型、模板配置和稳定性。</li></ul>
         <ol class="steps"><li>导入当前结果中的脱敏模板，再在“标注工作台”确认模板的分组语义和有效内容。</li><li>复制基线为候选 Drain3 配置，保存新版本并执行配置校验或评测。</li><li>在“配置对比”核对相似度阈值、树深度、最大子节点、数值参数化和额外分隔符差异。</li><li>仅在评测证据充分且人工确认后发布候选配置；必要时从版本历史回滚。</li></ol>
         <figure><img src="manual-assets/07-drain-eval.png" alt="LOGRISK 评测中心的模板质量概览、标注、配置与发布导航"><figcaption>评测中心：质量概览、标注、可疑模板、配置对比、模板管理、Drain3 配置、语义词典和发布管理位于同一治理入口。</figcaption></figure>
       </section>
 
       <section id="streaming">
-        <div class="section-head"><div><p class="section-number">07 / STREAMING &amp; LARGE FILES</p><h2>大文件与流式处理</h2><p>大文件先分片上传，本地并行预处理后再合并确定性 Drain3 结果。流式入口采用受注册的内部适配器契约，不会自动连接 Kafka 或持久化原始记录。</p></div></div>
+        <div class="section-head"><div><p class="section-number">08 / STREAMING &amp; LARGE FILES</p><h2>大文件与流式处理</h2><p>大文件先分片上传，本地并行预处理后再合并确定性 Drain3 结果。流式入口采用受注册的内部适配器契约，不会自动连接 Kafka 或持久化原始记录。</p></div></div>
         <ol class="steps"><li>对于超过 10 MB 的文件，使用工作台上传入口；页面会显示分片数、上传进度、已解析记录数和 Drain3 分区进度。</li><li>等待所有分片提交完成后再启动特征识别。文件替换、Drain3 配置变化或 Checkpoint 不一致时，恢复会被安全停止。</li><li>在“流式处理”查看文件来源、已提交 Checkpoint、未知模板队列和人工治理入口。</li><li>若要接入 Kafka 或私有消息系统，只实现并注册内部适配器；不得把 Broker 地址、Token、消费者或原始消息写入当前通用前端流程。</li></ol>
         <div class="notice"><b>并行处理说明：</b>并行用于分片解析和局部模板学习，最终模板按稳定规则合并，避免多个线程直接竞争同一 Drain3 树。</div>
       </section>
 
       <section id="runtime">
-        <div class="section-head"><div><p class="section-number">08 / PRODUCTION RUNTIME</p><h2>运行中心、外部身份与数据库运行模式</h2><p>运行中心是生产管理员的只读总览与受控维护入口。它聚合分析、流式、评测和回放任务，并展示存储配额、Retention 预览/执行和脱敏审计记录。</p></div></div>
+        <div class="section-head"><div><p class="section-number">09 / PRODUCTION RUNTIME</p><h2>运行中心、外部身份与数据库运行模式</h2><p>运行中心是生产管理员的只读总览与受控维护入口。它聚合分析、流式、评测和回放任务，并展示存储配额、Retention 预览/执行和脱敏审计记录。</p></div></div>
         <div class="card-grid"><article class="card"><b>身份边界</b><small>生产环境由外部 PACAS/RBAC 代理传入可信身份头。写操作在未识别身份或角色不符时应被拒绝。</small></article><article class="card"><b>Retention</b><small>先预览、再执行。仅清理允许范围内的受控文件产物；原始日志、导出、配置、数据库与 WAL/SHM 受保护。</small></article><article class="card"><b>数据库</b><small>默认 SQLite；生产可显式切换 PostgreSQL。切换采用停机的一次性元数据迁移，不自动回退或双写。</small></article></div>
         <ol class="steps"><li>打开“运行中心”，确认就绪状态为 <code>Ready</code>，并检查数据库、迁移、状态/输出目录和配额状态。</li><li>使用任务中心按最近更新、状态或类型浏览任务；它不展示原始日志。</li><li>调整 Retention 前先点击“预览清理”，审核候选数量和大小；确认无误后才可执行清理。</li><li>查看审计日志中的操作者、Request ID、资源、结果和时间。审计不保存 Token、Cookie、API Key 或原始日志。</li><li>切换到 PostgreSQL 前按部署文档配置 <code>LOGRISK_DATABASE_PROVIDER=postgres</code> 与 <code>LOGRISK_DATABASE_URL</code>，运行离线迁移及核验，再重启服务。</li></ol>
         <figure><img src="manual-assets/08-runtime.png" alt="LOGRISK 运行中心的就绪状态、任务统计与存储用量概览"><figcaption>运行中心：顶部显示外部身份状态、系统就绪、任务数、运行/排队数、存储用量和审计数。截图已裁剪，不含任务详情。</figcaption></figure>
       </section>
 
       <section id="faq">
-        <div class="section-head"><div><p class="section-number">09 / FAQ &amp; CHECKLIST</p><h2>常见问题与管理员检查单</h2><p>先定位、再处理。不要通过关闭结构化校验、改写历史 Trace 或强制导出候选特征来绕过系统边界。</p></div></div>
+        <div class="section-head"><div><p class="section-number">10 / FAQ &amp; CHECKLIST</p><h2>常见问题与管理员检查单</h2><p>先定位、再处理。不要通过关闭结构化校验、改写历史 Trace 或强制导出候选特征来绕过系统边界。</p></div></div>
         <details><summary>模型返回 Markdown 或字段不完整，为什么候选被拦截？</summary><p>系统兼容纯 JSON 与 Markdown fenced JSON 的解析，但随后仍会校验每个特征的必填字段、模板 Hash、组件、标签和选择理由。缺字段说明模型没有满足契约；检查 Prompt、输出 Token 上限、Profile 的结构化模式和该 Trace 的脱敏 Evidence。</p></details>
         <details><summary>为什么已批准规则不再调用模型？</summary><p>这是规则复用收益。已批准规则代表人工确认过的可复用模式；命中时系统保留实体和指标记录，但跳过 LLM，避免把同类证据反复交给模型。</p></details>
         <details><summary>导出为空或缺少节点信息怎么办？</summary><p>只有已批准特征可导出。节点信息来自与批准特征关联的 <code>entity_type=node</code> 实体；未批准、低风险跳过或未解析到节点的记录不会进入 <code>approved_risk_nodes</code>。</p></details>
@@ -176,7 +203,7 @@
         <ul class="checklist"><li>连接测试通过，API Key 只存在于环境变量。</li><li>模型 Profile、Prompt 和 Drain3 配置均为明确版本。</li><li>上传数据的处理范围符合本地存储和保留政策。</li><li>候选特征已经人工审批；未批准项不会导出。</li><li>评测结果支持本次 Drain3 / 语义 / Prompt 变更。</li><li>运行中心 Ready，存储配额未超过硬限制。</li><li>生产写操作由外部 PACAS/RBAC 边界授权。</li><li>SQLite → PostgreSQL 迁移已在停机窗口完成核验。</li></ul>
       </section>
 
-      <footer class="footer">LOGRISK 完整管理员使用手册 · v1.28.0 · 本手册为离线静态文档，截图为脱敏界面示例。请以实际部署策略、权限边界和已发布版本为准。</footer>
+      <footer class="footer">LOGRISK 完整管理员使用手册 · v1.29.0 · 本手册为离线静态文档，截图为脱敏界面示例。请以实际部署策略、权限边界和已发布版本为准。</footer>
     </main>
   </div>
   <script>
@@ -184,6 +211,29 @@
       var progress = document.getElementById('progress');
       var links = Array.prototype.slice.call(document.querySelectorAll('#toc a'));
       var sections = links.map(function (link) { return document.querySelector(link.getAttribute('href')); }).filter(Boolean);
+      var search = document.getElementById('manual-search');
+      var searchStatus = document.getElementById('manual-search-status');
+      function filterManualSections() {
+        var query = (search.value || '').trim().toLocaleLowerCase();
+        var matches = 0;
+        links.forEach(function (link) {
+          var section = document.querySelector(link.getAttribute('href'));
+          var match = !query || (section && (section.textContent + ' ' + link.textContent).toLocaleLowerCase().indexOf(query) !== -1);
+          link.hidden = !match;
+          if (section) section.hidden = !match;
+          if (match) matches += 1;
+        });
+        if (!query) {
+          searchStatus.textContent = '显示全部 ' + sections.length + ' 个章节';
+          searchStatus.classList.remove('is-empty');
+        } else if (matches) {
+          searchStatus.textContent = '找到 ' + matches + ' 个匹配章节';
+          searchStatus.classList.remove('is-empty');
+        } else {
+          searchStatus.textContent = '没有匹配章节，请更换关键词';
+          searchStatus.classList.add('is-empty');
+        }
+      }
       function update() {
         var top = window.scrollY || document.documentElement.scrollTop;
         var height = document.documentElement.scrollHeight - window.innerHeight;
@@ -193,6 +243,9 @@
         links.forEach(function (link) { link.classList.toggle('active', link.getAttribute('href') === '#' + active.id); });
       }
       window.addEventListener('scroll', update, {passive:true});
+      search.addEventListener('input', filterManualSections);
+      search.addEventListener('search', filterManualSections);
+      filterManualSections();
       update();
     }());
   </script>

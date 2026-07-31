@@ -12,6 +12,7 @@ from drain3.file_persistence import FilePersistence
 from drain3.template_miner_config import TemplateMinerConfig
 
 from .template_identity import HASH_VERSION, template_fingerprint, template_instance_hash
+from .multi_source.router import route_entities
 
 
 class Drain3ShardManager:
@@ -72,6 +73,7 @@ def mine_template_event(
     source_type = str(record.get("source_type") or "unknown")
     component = str(record.get("component") or "unknown")
     message_core = str(record["message_core"])
+    entity_route = route_entities(record)
 
     miner = shard_manager.get_miner(cluster, source_type, component, state_scope=state_scope)
     result = miner.add_log_message(message_core)
@@ -98,7 +100,6 @@ def mine_template_event(
         {"type": p.mask_name, "value": p.value}
         for p in (extracted or [])
     ]
-
     return {
         "schema_version": "template_event_v2" if "semantic_fields" in record else "template_event_v1",
         "event_id": record.get("raw_log_id"),
@@ -108,6 +109,8 @@ def mine_template_event(
         "namespace": record.get("namespace"),
         "pod": record.get("pod"),
         "container": record.get("container"),
+        "device": record.get("device"),
+        "entity_route": entity_route,
         "source_type": source_type,
         "component": component,
         "severity": record.get("severity"),

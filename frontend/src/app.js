@@ -47,6 +47,11 @@
     saveRuntimeRetention: function (payload) { return jsonRequest("/api/runtime/retention/policy", { method: "POST", body: JSON.stringify(payload) }); },
     previewRuntimeRetention: function () { return jsonRequest("/api/runtime/retention/preview", { method: "POST", body: "{}" }); },
     executeRuntimeRetention: function () { return jsonRequest("/api/runtime/retention/execute", { method: "POST", body: "{}" }); },
+    multiSourceSummary: function () { return jsonRequest("/api/multi-source/summary"); },
+    multiSourceEntities: function () { return jsonRequest("/api/multi-source/entities?limit=200"); },
+    multiSourceRules: function () { return jsonRequest("/api/multi-source/rules"); },
+    multiSourceTimeline: function (entityType, entityId, cluster) { return jsonRequest("/api/multi-source/entities/" + encodeURIComponent(entityType) + "/" + encodeURIComponent(entityId) + "/timeline?cluster=" + encodeURIComponent(cluster)); },
+    updateMultiSourceRule: function (ruleId, payload) { return jsonRequest("/api/multi-source/rules/" + encodeURIComponent(ruleId), { method: "PATCH", body: JSON.stringify(payload) }); },
     saveDatabaseCandidate: function (payload) { return jsonRequest("/api/system/database/config", { method: "POST", body: JSON.stringify(payload) }); },
     testDatabaseCandidate: function (payload) { return jsonRequest("/api/system/database/test", { method: "POST", body: JSON.stringify(payload) }); },
     status: function () { return jsonRequest("/api/ollama/status"); },
@@ -199,15 +204,24 @@
     },
   };
 
-  const navItems = [
-    ["overview", "▦", "特征总览"], ["queue", "◫", "识别队列"], ["observability", "◉", "AI 分析观测"], ["traces", "⌁", "AI 调用追踪"], ["prompts", "{}", "Prompt 管理"], ["modelProfiles", "◌", "模型画像"], ["review", "✓", "人工审批"],
-    ["rules", "⌘", "规则治理"], ["nodeRisks", "△", "服务器风险"], ["semanticLibrary", "≋", "风险语义库"], ["streaming", "≈", "流式处理"], ["drainQuality", "◇", "评测中心 · 模板质量"], ["benchmarkCenter", "◎", "评测与基准"], ["runtime", "◫", "运行中心"], ["export", "⇩", "导出记录"], ["settings", "⚙", "系统设置"],
+  const NAV_GROUPS = [
+    { id: "analysis", label: "分析工作台", items: [["overview", "特征总览"], ["queue", "识别队列"], ["review", "人工审批"], ["export", "导出记录"]] },
+    { id: "ai", label: "AI 工程", items: [["observability", "AI 分析观测"], ["traces", "AI 调用追踪"], ["prompts", "Prompt 管理"], ["modelProfiles", "模型画像"]] },
+    { id: "risk", label: "规则与风险", items: [["rules", "规则治理"], ["nodeRisks", "服务器风险"], ["multiSource", "多来源关联"], ["semanticLibrary", "风险语义库"]] },
+    { id: "governance", label: "数据治理", items: [["streaming", "流式处理"], ["drainQuality", "评测中心 · 模板质量"], ["benchmarkCenter", "评测与基准"]] },
+    { id: "system", label: "系统", items: [["runtime", "运行中心"], ["settings", "系统设置"]] },
   ];
+  function navigationGroupForView(view) {
+    return NAV_GROUPS.find(function (group) {
+      return group.items.some(function (item) { return item[0] === view; });
+    }) || NAV_GROUPS[0];
+  }
   const statusNames = { queued: "等待分析", running: "识别中", completed: "Ollama 完成", failed: "识别失败", skipped: "低风险跳过", rule_matched: "规则复用" };
 
   function Sidebar(props) {
     const scrollRef = useRef(null), railRef = useRef(null), dragRef = useRef(null);
     const [scrollbar, setScrollbar] = useState({ visible: false, height: 46, top: 0 });
+    const [expandedGroups, setExpandedGroups] = useState(function () { return [navigationGroupForView(props.active).id]; });
     function updateSidebarScroll() {
       const scroll = scrollRef.current, rail = railRef.current;
       if (!scroll || !rail) return;
@@ -231,6 +245,11 @@
         if (observer) observer.disconnect();
       };
     }, []);
+    useEffect(function () {
+      const activeGroup = navigationGroupForView(props.active);
+      setExpandedGroups([activeGroup.id]);
+    }, [props.active]);
+    useEffect(function () { requestAnimationFrame(updateSidebarScroll); }, [expandedGroups]);
     function startSidebarThumbDrag(event) {
       event.stopPropagation();
       event.currentTarget.setPointerCapture(event.pointerId);
@@ -252,11 +271,21 @@
       const scroll = scrollRef.current, rect = railRef.current.getBoundingClientRect();
       scroll.scrollTop = (event.clientY - rect.top) / Math.max(1, rect.height) * (scroll.scrollHeight - scroll.clientHeight);
     }
+    function toggleGroup(groupId) {
+      setExpandedGroups(function (current) {
+        return current.includes(groupId) ? current.filter(function (id) { return id !== groupId; }) : current.concat([groupId]);
+      });
+    }
     return h("aside", { className: "sidebar", id: "primary-navigation" },
       h("div", { className: "nav-label" }, "功能导航"),
       h("div", { className: "sidebar-frame" },
-        h("nav", { className: "sidebar-scroll", ref: scrollRef }, navItems.map(function (item) {
-          return h("button", { key: item[0], type: "button", className: "nav-item " + (props.active === item[0] ? "active" : ""), onClick: function () { props.onChange(item[0]); } }, h("span", null, item[2]));
+        h("nav", { className: "sidebar-scroll", ref: scrollRef }, NAV_GROUPS.map(function (group) {
+          const isOpen = expandedGroups.includes(group.id);
+          return h("section", { className: "nav-group " + (isOpen ? "is-open" : ""), key: group.id },
+            h("button", { type: "button", className: "nav-group-toggle", "aria-expanded": isOpen, onClick: function () { toggleGroup(group.id); } }, h("span", null, group.label), h("i", { "aria-hidden": "true" }, "⌄")),
+            h("div", { className: "nav-group-items" }, group.items.map(function (item) {
+              return h("button", { key: item[0], type: "button", className: "nav-item " + (props.active === item[0] ? "active" : ""), onClick: function () { setExpandedGroups([group.id]); props.onChange(item[0]); } }, h("span", null, item[1]));
+            })));
         })),
         h("div", { className: "sidebar-rail " + (scrollbar.visible ? "visible" : ""), ref: railRef, onPointerDown: jumpSidebarScroll, "aria-hidden": "true" },
           h("span", { className: "sidebar-thumb", style: { height: scrollbar.height + "px", transform: "translateY(" + scrollbar.top + "px)" }, onPointerDown: startSidebarThumbDrag, onPointerMove: moveSidebarThumb, onPointerUp: stopSidebarThumbDrag, onPointerCancel: stopSidebarThumbDrag }))));
@@ -279,6 +308,7 @@
     if (path === "/drain-quality") return "drainQuality";
     if (path === "/rules") return "rules";
     if (path.startsWith("/node-risks")) return "nodeRisks";
+    if (path === "/multi-source") return "multiSource";
     if (path === "/semantic-library") return "semanticLibrary";
     if (path === "/settings") return "settings";
     return "overview";
@@ -287,7 +317,7 @@
     return {
       benchmarkCenter: "/benchmark-center", runtime: "/runtime", streaming: "/streaming", prompts: "/prompts", modelProfiles: "/model-profiles",
       traces: "/ai-traces", observability: "/ai-observability", drainQuality: "/drain-quality", rules: "/rules",
-      nodeRisks: "/node-risks", semanticLibrary: "/semantic-library", settings: "/settings",
+      nodeRisks: "/node-risks", multiSource: "/multi-source", semanticLibrary: "/semantic-library", settings: "/settings",
     }[view] || "/";
   }
   function traceFiltersFromSearch(search) {
@@ -1515,6 +1545,147 @@
       h("section", { className: "surface runtime-audit-table" }, h("div", { className: "surface-head" }, h("div", null, h("b", null, "审计日志"), h("span", null, "只记录脱敏操作元数据，不记录 API Key、Token 或原始日志")), h("span", null, audits.length + " 条")), !audits.length && h("div", { className: "empty-state compact" }, "尚无运行中心审计记录"), audits.slice(0, 12).map(function (item) { return h("article", { key: item.audit_id }, h("div", null, h("b", null, item.action), h("small", null, item.resource_type + (item.resource_id ? " · " + item.resource_id : ""))), h("span", null, item.actor || "系统"), h("span", { className: "status-chip " + (item.outcome === "success" ? "completed" : "failed") }, item.outcome), h("small", null, "request_id: " + (item.request_id || "—")), h("small", null, timeText(item.created_at))); })));
   }
 
+  function multiSourceRuleDraft(rule) {
+    return {
+      display_name: String(rule.display_name || ""),
+      enabled: !!rule.enabled,
+      source_pairs: (rule.source_pairs || []).map(function (pair) { return [String(pair[0] || ""), String(pair[1] || "")]; }),
+      max_gap_seconds: String(rule.max_gap_seconds == null ? 300 : rule.max_gap_seconds),
+      min_risk_score: String(rule.min_risk_score == null ? 40 : rule.min_risk_score),
+      min_count: String(rule.min_count == null ? 1 : rule.min_count),
+      confidence: String(rule.confidence == null ? 0.9 : rule.confidence),
+    };
+  }
+
+  function MultiSourceRuleEditor(props) {
+    const rules = props.rules || [];
+    const [selectedRuleId, setSelectedRuleId] = useState(function () { return rules[0] && rules[0].rule_id || ""; });
+    const [draft, setDraft] = useState(function () { return rules[0] ? multiSourceRuleDraft(rules[0]) : null; });
+    const [busy, setBusy] = useState(false), [notice, setNotice] = useState("");
+    const selectedRule = rules.find(function (rule) { return rule.rule_id === selectedRuleId; }) || rules[0] || null;
+
+    useEffect(function () {
+      const next = rules.find(function (rule) { return rule.rule_id === selectedRuleId; }) || rules[0] || null;
+      setSelectedRuleId(next ? next.rule_id : "");
+      setDraft(next ? multiSourceRuleDraft(next) : null);
+      setNotice("");
+    }, [rules]);
+
+    function selectRule(rule) {
+      setSelectedRuleId(rule.rule_id);
+      setDraft(multiSourceRuleDraft(rule));
+      setNotice("");
+    }
+    function update(field, value) { setDraft(function (current) { return Object.assign({}, current, { [field]: value }); }); }
+    function updatePair(index, position, value) {
+      setDraft(function (current) {
+        return Object.assign({}, current, { source_pairs: current.source_pairs.map(function (pair, pairIndex) {
+          if (pairIndex !== index) return pair;
+          return position === 0 ? [value, pair[1]] : [pair[0], value];
+        }) });
+      });
+    }
+    function addPair() { setDraft(function (current) { return Object.assign({}, current, { source_pairs: current.source_pairs.concat([["", ""]]) }); }); }
+    function removePair(index) { setDraft(function (current) { return Object.assign({}, current, { source_pairs: current.source_pairs.filter(function (_, pairIndex) { return pairIndex !== index; }) }); }); }
+    async function save(event) {
+      event.preventDefault();
+      if (!selectedRule || !draft) return;
+      setBusy(true);
+      setNotice("");
+      try {
+        await props.onSave(selectedRule, {
+          display_name: draft.display_name,
+          enabled: draft.enabled,
+          source_pairs: draft.source_pairs,
+          max_gap_seconds: Number(draft.max_gap_seconds),
+          min_risk_score: Number(draft.min_risk_score),
+          min_count: Number(draft.min_count),
+          confidence: Number(draft.confidence),
+          expected_version: selectedRule.version,
+        });
+        setNotice("规则已保存，新版本已生效。");
+      } catch (reason) {
+        setNotice(reason.message || "保存失败，请检查字段后重试。");
+      } finally {
+        setBusy(false);
+      }
+    }
+
+    if (!selectedRule || !draft) return h("section", { className: "surface multi-source-rule-editor empty" }, h("div", { className: "empty-state compact" }, "当前没有可编辑的关联规则。"));
+    return h("section", { className: "surface multi-source-rule-editor" },
+      h("div", { className: "surface-head" }, h("div", null, h("b", null, "关联规则编辑"), h("span", null, "修改后仅影响后续的确定性关联")), h("span", null, rules.length + " 条")),
+      h("div", { className: "multi-source-rule-editor-body" },
+        h("aside", { className: "multi-source-rule-list", "aria-label": "关联规则列表" }, rules.map(function (rule) {
+          return h("button", { type: "button", key: rule.rule_id, className: rule.rule_id === selectedRule.rule_id ? "active" : "", onClick: function () { selectRule(rule); } },
+            h("b", null, rule.display_name), h("small", null, rule.rule_id + " · v" + rule.version), h("span", { className: rule.enabled ? "status-chip completed" : "status-chip disabled" }, rule.enabled ? "启用" : "停用"));
+        })),
+        h("form", { className: "multi-source-rule-form", onSubmit: save },
+          h("div", { className: "multi-source-rule-meta" }, h("span", null, "规则 ID：", h("code", null, selectedRule.rule_id)), h("span", null, "当前版本：v" + selectedRule.version)),
+          h("div", { className: "multi-source-form-grid" },
+            h("label", null, h("span", null, "规则名称"), h("input", { value: draft.display_name, maxLength: 80, onChange: function (event) { update("display_name", event.target.value); } })),
+            h("label", { className: "multi-source-enabled" }, h("span", null, "启用状态"), h("input", { type: "checkbox", checked: draft.enabled, onChange: function (event) { update("enabled", event.target.checked); } }), h("b", null, draft.enabled ? "已启用" : "已停用"))),
+            h("label", null, h("span", null, "最大时间窗口（秒）"), h("input", { type: "number", min: 1, max: 86400, value: draft.max_gap_seconds, onChange: function (event) { update("max_gap_seconds", event.target.value); } })),
+            h("label", null, h("span", null, "最低风险分（0–100）"), h("input", { type: "number", min: 0, max: 100, step: 0.1, value: draft.min_risk_score, onChange: function (event) { update("min_risk_score", event.target.value); } })),
+            h("label", null, h("span", null, "最低出现次数"), h("input", { type: "number", min: 1, max: 1000000, value: draft.min_count, onChange: function (event) { update("min_count", event.target.value); } })),
+            h("label", null, h("span", null, "关联置信度（0–1）"), h("input", { type: "number", min: 0, max: 1, step: 0.01, value: draft.confidence, onChange: function (event) { update("confidence", event.target.value); } }))),
+          h("div", { className: "multi-source-pairs-head" }, h("div", null, h("b", null, "来源组合"), h("small", null, "仅允许配置的两类来源在同一实体、同一集群内关联")), h("button", { type: "button", className: "secondary-button", onClick: addPair }, "＋ 添加组合")),
+          h("div", { className: "multi-source-pair-list" }, draft.source_pairs.map(function (pair, index) {
+            return h("div", { className: "multi-source-pair", key: index },
+              h("input", { value: pair[0], placeholder: "例如 kernel", "aria-label": "第 " + (index + 1) + " 组来源一", onChange: function (event) { updatePair(index, 0, event.target.value); } }),
+              h("span", null, "↔"),
+              h("input", { value: pair[1], placeholder: "例如 kubelet", "aria-label": "第 " + (index + 1) + " 组来源二", onChange: function (event) { updatePair(index, 1, event.target.value); } }),
+              h("button", { type: "button", className: "text-button", disabled: draft.source_pairs.length === 1, onClick: function () { removePair(index); } }, "删除"));
+          })),
+          notice && h("p", { className: notice.indexOf("已保存") === 0 ? "multi-source-form-notice success" : "multi-source-form-notice error" }, notice),
+          h("div", { className: "multi-source-form-actions" }, h("button", { type: "button", className: "secondary-button", disabled: busy, onClick: function () { setDraft(multiSourceRuleDraft(selectedRule)); setNotice(""); } }, "撤销编辑"), h("button", { type: "submit", className: "primary-button", disabled: busy }, busy ? "保存中…" : "保存规则"))));
+  }
+
+  function MultiSourcePage(props) {
+    const data = props.data || {}, summary = data.summary || {}, entities = data.entities || [], rules = data.rules || [], timeline = data.timeline || [], correlations = data.correlations || [];
+    const selected = data.selected || null;
+    if (data.loading) return h("div", { className: "multi-source-state" }, h("b", null, "正在汇总跨来源证据"), h("span", null, "正在读取实体、时间线和关联规则…"));
+    if (data.failure) return h("div", { className: "multi-source-state error" }, h("b", null, "多来源关联数据加载失败"), h("span", null, data.failure), h("button", { className: "secondary-button", onClick: props.onRefresh }, "重试"));
+    return h("div", { className: "multi-source-page" },
+      h("section", { className: "multi-source-hero" },
+        h("div", null, h("span", { className: "eyebrow" }, "DETERMINISTIC CORRELATION"), h("h2", null, "多来源关联"), h("p", null, "按确定实体、显式层级和时间窗口关联日志特征；不进行模糊匹配，也不输出 RCA 结论。")),
+        h("button", { className: "secondary-button", onClick: props.onRefresh }, "刷新")),
+      h("section", { className: "multi-source-metrics" },
+        h("article", null, h("b", null, summary.observation_count || 0), h("span", null, "脱敏观察")),
+        h("article", null, h("b", null, summary.correlation_count || 0), h("span", null, "跨来源证据链")),
+        h("article", null, h("b", null, entities.length), h("span", null, "可路由实体")),
+        h("article", null, h("b", null, (summary.source_coverage || []).length), h("span", null, "来源覆盖"))),
+      h("section", { className: "multi-source-layout" },
+        h("article", { className: "surface multi-source-entities" },
+          h("div", { className: "surface-head" }, h("div", null, h("b", null, "实体目录"), h("span", null, "同集群内的规范实体标识")), h("span", null, entities.length + " 个")),
+          !entities.length && h("div", { className: "empty-state compact" }, "完成一次包含明确节点、Pod 或容器标识的分析后，这里会显示实体。"),
+          entities.map(function (item) {
+            const parts = String(item.entity_key).split("/"), cluster = parts.shift(), type = parts.shift(), entityId = parts.join("/");
+            return h("button", { key: item.entity_key, className: "multi-source-entity " + (selected && selected.entity_key === item.entity_key ? "active" : ""), onClick: function () { props.onSelect({ entity_key: item.entity_key, cluster: cluster, entity_type: type, entity_id: entityId }); } },
+              h("div", null, h("b", null, entityId), h("small", null, cluster + " · " + type)),
+              h("span", null, item.observation_count + " 条"),
+              h("small", null, (item.source_families || []).join(" · ") || "unknown"),
+              h("em", null, Number(item.max_risk_score || 0).toFixed(1)));
+          })),
+        h("article", { className: "surface multi-source-timeline" },
+          h("div", { className: "surface-head" }, h("div", null, h("b", null, "跨来源时间线"), h("span", null, selected ? selected.entity_key : "选择左侧实体查看证据")), h("span", null, timeline.length + " 条")),
+          !selected && h("div", { className: "empty-state compact" }, "请选择一个实体。"),
+          selected && !timeline.length && h("div", { className: "empty-state compact" }, "当前实体暂无可展示的脱敏模板观察。"),
+          correlations.map(function (item) {
+            return h("div", { className: "multi-source-correlation", key: item.correlation_id },
+              h("div", null, h("b", null, "跨来源证据链"), h("small", null, item.rule_id + " · v" + item.rule_version)),
+              h("span", null, (item.source_families || []).join(" ↔ ")),
+              h("em", null, "置信度 " + Number(item.confidence || 0).toFixed(2)));
+          }),
+          timeline.map(function (item) {
+            return h("div", { className: "multi-source-event", key: item.observation_id },
+              h("i", { className: String(item.risk_level || "low") }),
+              h("div", null, h("b", null, item.template), h("small", null, item.source_family + " · " + item.component + " · " + (item.severity || "UNKNOWN"))),
+              h("span", null, item.count + " 次"),
+              h("time", null, timeText(item.window_start)));
+          }))),
+      h(MultiSourceRuleEditor, { rules: rules, onSave: props.onRule }));
+  }
+
   function App() {
     const [view, setView] = useState(pathToView(window.location.pathname)), [model, setModel] = useState("qwen3:1.7b"), [threshold, setThreshold] = useState(40), [promptId, setPromptId] = useState("feature_extract_v3_compact_strict_json_en"), [retryCount, setRetryCount] = useState(1);
     const [ollama, setOllama] = useState({ online: false }), [result, setResult] = useState(null), [fileName, setFileName] = useState("");
@@ -1537,6 +1708,7 @@
     const [benchmarkData, setBenchmarkData] = useState({ overview: {}, suites: [], runs: [], trends: [], leaderboard: [], selectedRun: null, loading: false, failure: "" });
     const [streamingData, setStreamingData] = useState({ tasks: [], sources: {}, templates: [] });
     const [runtimeData, setRuntimeData] = useState({ identity: {}, health: {}, readiness: {}, tasks: { items: [] }, storage: {}, retention: {}, audits: { items: [] }, loading: false, failure: "", failureCode: "" });
+    const [multiSourceData, setMultiSourceData] = useState({ summary: {}, entities: [], rules: [], timeline: [], correlations: [], selected: null, loading: false, failure: "" });
     const [sidebarCollapsed, setSidebarCollapsed] = useState(false), [mobileMenuOpen, setMobileMenuOpen] = useState(false);
     const [narrowSidebar, setNarrowSidebar] = useState(function () { return window.matchMedia("(max-width: 900px)").matches; });
     const events = useRef(null);
@@ -1565,6 +1737,7 @@
       if (next === "streaming") loadStreaming().catch(function (reason) { setError(reason.message); });
       if (next === "benchmarkCenter") loadBenchmark().catch(function () {});
       if (next === "runtime") loadRuntime().catch(function () {});
+      if (next === "multiSource") loadMultiSource().catch(function () {});
     }
     function toggleSidebar() {
       if (narrowSidebar) setMobileMenuOpen(function (open) { return !open; });
@@ -1578,6 +1751,24 @@
       loadHarness(query).catch(function (reason) { setError(reason.message); });
     }
     async function loadHarness(query) { const values = await Promise.all([api.harnessStatus(), api.prompts(), api.traces(query || "?limit=50"), api.modelProfiles()]); setHarness(values[0]); setPrompts(values[1].items || []); setPromptId(values[1].current_prompt_id || "feature_extract_v3_compact_strict_json_en"); setTraces(values[2].items || []); setModelProfiles(values[3]); setModelProfileId(function (current) { return current || values[3].default_profile_id || ""; }); }
+    async function loadMultiSource() {
+      setMultiSourceData(function (current) { return Object.assign({}, current, { loading: true, failure: "" }); });
+      try {
+        const values = await Promise.all([api.multiSourceSummary(), api.multiSourceEntities(), api.multiSourceRules()]);
+        setMultiSourceData(function (current) { return Object.assign({}, current, { summary: values[0], entities: values[1].items || [], rules: values[2].items || [], loading: false, failure: "" }); });
+      } catch (reason) {
+        setMultiSourceData(function (current) { return Object.assign({}, current, { loading: false, failure: reason.message }); });
+        throw reason;
+      }
+    }
+    async function selectMultiSourceEntity(entity) {
+      const value = await api.multiSourceTimeline(entity.entity_type, entity.entity_id, entity.cluster);
+      setMultiSourceData(function (current) { return Object.assign({}, current, { selected: entity, timeline: value.items || [], correlations: value.correlations || [] }); });
+    }
+    async function changeMultiSourceRule(rule, payload) {
+      await api.updateMultiSourceRule(rule.rule_id, payload);
+      await loadMultiSource();
+    }
     async function loadDrainQuality() {
       const values = await Promise.all([api.drainDatasets(), api.drainAnnotations(), api.drainEvalRuns(), api.drainProfiles(), api.drainTemplates(), api.drainConfigs(), api.semanticDictionaries()]);
       setDrainQuality({ datasets: values[0].items || [], annotations: values[1].items || [], annotationState: values[1].state || {}, evalRuns: values[2].items || [], profiles: values[3].items || [], templates: values[4].items || [], configs: values[5], semantics: values[6] });
@@ -1640,8 +1831,8 @@
     async function refresh(id) { const next = await api.job(id || jobId); setSnapshot(next); if (["completed", "completed_with_errors"].includes(next.status) && events.current) events.current.close(); loadHarness().catch(function () {}); }
     useEffect(function () {
       const query = window.location.pathname === "/ai-traces" ? traceFilterQuery(traceFiltersFromSearch(window.location.search)) : "?limit=50";
-      Promise.all([api.config(), api.status(), Promise.all([api.governedRules("?page_size=100"), api.ruleReviewQueue()]), api.metrics(), api.harnessStatus(), api.prompts(), api.traces(query), api.modelProfiles()]).then(function (values) { setModel(values[0].default_model); setOllama(values[1]); setRules(values[2][0].items || []); setRuleReviewQueue(values[2][1]); setSystemMetrics(values[3]); setHarness(values[4]); setPrompts(values[5].items || []); setPromptId(values[5].current_prompt_id || values[4].current_prompt_id || "feature_extract_v3_compact_strict_json_en"); setTraces(values[6].items || []); setModelProfiles(values[7]); setModelProfileId(values[7].default_profile_id || ""); if (window.location.pathname === "/ai-observability") loadObservability().catch(function (reason) { setError(reason.message); }); if (window.location.pathname === "/drain-quality") loadDrainQuality().catch(function (reason) { setError(reason.message); }); if (window.location.pathname.startsWith("/node-risks")) loadNodeRisks().catch(function (reason) { setError(reason.message); }); if (window.location.pathname === "/semantic-library") loadRiskSemantics().catch(function (reason) { setError(reason.message); }); if (window.location.pathname === "/streaming") loadStreaming().catch(function (reason) { setError(reason.message); }); if (window.location.pathname === "/benchmark-center") loadBenchmark().catch(function () {}); if (window.location.pathname === "/runtime") loadRuntime().catch(function () {}); }).catch(function (reason) { setError(reason.message); });
-      function onPop() { const filters = traceFiltersFromSearch(window.location.search); setView(pathToView(window.location.pathname)); setTraceFilters(filters); if (window.location.pathname === "/ai-traces") loadHarness(traceFilterQuery(filters)).catch(function () {}); if (window.location.pathname === "/ai-observability") loadObservability().catch(function () {}); if (window.location.pathname === "/drain-quality") loadDrainQuality().catch(function () {}); if (window.location.pathname === "/rules") loadRules().catch(function () {}); if (window.location.pathname.startsWith("/node-risks")) loadNodeRisks().catch(function () {}); if (window.location.pathname === "/semantic-library") loadRiskSemantics().catch(function () {}); if (window.location.pathname === "/streaming") loadStreaming().catch(function () {}); if (window.location.pathname === "/benchmark-center") loadBenchmark().catch(function () {}); if (window.location.pathname === "/runtime") loadRuntime().catch(function () {}); }
+      Promise.all([api.config(), api.status(), Promise.all([api.governedRules("?page_size=100"), api.ruleReviewQueue()]), api.metrics(), api.harnessStatus(), api.prompts(), api.traces(query), api.modelProfiles()]).then(function (values) { setModel(values[0].default_model); setOllama(values[1]); setRules(values[2][0].items || []); setRuleReviewQueue(values[2][1]); setSystemMetrics(values[3]); setHarness(values[4]); setPrompts(values[5].items || []); setPromptId(values[5].current_prompt_id || values[4].current_prompt_id || "feature_extract_v3_compact_strict_json_en"); setTraces(values[6].items || []); setModelProfiles(values[7]); setModelProfileId(values[7].default_profile_id || ""); if (window.location.pathname === "/ai-observability") loadObservability().catch(function (reason) { setError(reason.message); }); if (window.location.pathname === "/drain-quality") loadDrainQuality().catch(function (reason) { setError(reason.message); }); if (window.location.pathname.startsWith("/node-risks")) loadNodeRisks().catch(function (reason) { setError(reason.message); }); if (window.location.pathname === "/multi-source") loadMultiSource().catch(function () {}); if (window.location.pathname === "/semantic-library") loadRiskSemantics().catch(function (reason) { setError(reason.message); }); if (window.location.pathname === "/streaming") loadStreaming().catch(function (reason) { setError(reason.message); }); if (window.location.pathname === "/benchmark-center") loadBenchmark().catch(function () {}); if (window.location.pathname === "/runtime") loadRuntime().catch(function () {}); }).catch(function (reason) { setError(reason.message); });
+      function onPop() { const filters = traceFiltersFromSearch(window.location.search); setView(pathToView(window.location.pathname)); setTraceFilters(filters); if (window.location.pathname === "/ai-traces") loadHarness(traceFilterQuery(filters)).catch(function () {}); if (window.location.pathname === "/ai-observability") loadObservability().catch(function () {}); if (window.location.pathname === "/drain-quality") loadDrainQuality().catch(function () {}); if (window.location.pathname === "/rules") loadRules().catch(function () {}); if (window.location.pathname.startsWith("/node-risks")) loadNodeRisks().catch(function () {}); if (window.location.pathname === "/multi-source") loadMultiSource().catch(function () {}); if (window.location.pathname === "/semantic-library") loadRiskSemantics().catch(function () {}); if (window.location.pathname === "/streaming") loadStreaming().catch(function () {}); if (window.location.pathname === "/benchmark-center") loadBenchmark().catch(function () {}); if (window.location.pathname === "/runtime") loadRuntime().catch(function () {}); }
       window.addEventListener("popstate", onPop);
       return function () { window.removeEventListener("popstate", onPop); if (events.current) events.current.close(); };
     }, []);
@@ -1702,11 +1893,11 @@
     const traceRule = drawer.item && rules.find(function (rule) { return rule.lineage && rule.lineage.trace_id === drawer.item.trace_id; });
     const drawerContent = !drawer.item ? null : (drawer.type === "prompt" ? h(PromptDrawer, { item: drawer.item, onSave: savePrompt, onOpenTrace: openTrace }) : h(TraceDrawer, { item: drawer.item, rule: traceRule, onOpenRule: openRule }));
     return h("div", { className: "app-shell" + (sidebarCollapsed ? " sidebar-collapsed" : "") + (mobileMenuOpen ? " mobile-menu-open" : "") },
-      h("header", { className: "topbar" }, h("div", { className: "topbar-left" }, h("button", { className: "sidebar-toggle", type: "button", "aria-label": narrowSidebar ? (mobileMenuOpen ? "关闭菜单" : "打开菜单") : (sidebarCollapsed ? "展开菜单" : "折叠菜单"), "aria-controls": "primary-navigation", "aria-expanded": narrowSidebar ? mobileMenuOpen : !sidebarCollapsed, onClick: toggleSidebar }, h("i"), h("i"), h("i")), h("div", { className: "brand" }, h("img", { className: "brand-logo", src: "/assets/logrisk-app-icon-orange-v2.png", alt: "LOGRISK" }), h("div", null, h("b", null, "LOGRISK")))), h("div", { className: "system-status" }, h("span", { className: ollama.online ? "online" : "offline" }, "● Ollama " + (ollama.online ? "在线" : "离线")), h("span", null, model), h("button", { className: "prompt-pill", onClick: function () { changeView("prompts"); } }, "Prompt " + (harness.current_prompt_id || promptId)), h("span", { className: harness.trace_enabled ? "trace-on" : "trace-off" }, "● Trace " + (harness.trace_enabled ? "ON" : "OFF")))),
+      h("header", { className: "topbar" }, h("div", { className: "topbar-left" }, h("button", { className: "sidebar-toggle", type: "button", "aria-label": narrowSidebar ? (mobileMenuOpen ? "关闭菜单" : "打开菜单") : (sidebarCollapsed ? "展开菜单" : "折叠菜单"), "aria-controls": "primary-navigation", "aria-expanded": narrowSidebar ? mobileMenuOpen : !sidebarCollapsed, onClick: toggleSidebar }, h("i"), h("i"), h("i")), h("div", { className: "brand" }, h("img", { className: "brand-logo", src: "/assets/logrisk-app-icon-orange-v2.png", alt: "LOGRISK" }), h("div", null, h("b", null, "LOGRISK")))), h("div", { className: "topbar-actions" }, h("a", { className: "help-button", href: apiUrl("/help"), target: "_blank", rel: "noreferrer" }, "? 帮助"), h("div", { className: "system-status" }, h("span", { className: ollama.online ? "online" : "offline" }, "● Ollama " + (ollama.online ? "在线" : "离线")), h("span", null, model), h("button", { className: "prompt-pill", onClick: function () { changeView("prompts"); } }, "Prompt " + (harness.current_prompt_id || promptId)), h("span", { className: harness.trace_enabled ? "trace-on" : "trace-off" }, "● Trace " + (harness.trace_enabled ? "ON" : "OFF"))))),
       h(Sidebar, { active: view, onChange: changeView }),
       h("button", { className: "sidebar-overlay", type: "button", "aria-label": "关闭菜单", onClick: function () { setMobileMenuOpen(false); } }),
       h("main", null,
-        !["drainQuality", "benchmarkCenter", "streaming", "runtime", "settings", "rules", "nodeRisks", "semanticLibrary"].includes(view) && h("div", { className: "page-head" }, h("div", null, h("h1", null, "日志特征工作台"), h("p", null, "上传日志、复用规则、识别未知特征并人工审批")), h("label", { className: "new-analysis" }, "＋ 新建分析", h("input", { type: "file", onChange: function (event) { loadFile(event.target.files && event.target.files[0]); } }))),
+        !["drainQuality", "benchmarkCenter", "streaming", "runtime", "settings", "rules", "nodeRisks", "multiSource", "semanticLibrary"].includes(view) && h("div", { className: "page-head" }, h("div", null, h("h1", null, "日志特征工作台"), h("p", null, "上传日志、复用规则、识别未知特征并人工审批")), h("label", { className: "new-analysis" }, "＋ 新建分析", h("input", { type: "file", onChange: function (event) { loadFile(event.target.files && event.target.files[0]); } }))),
         error && h("div", { className: "error-banner" }, error, h("button", { onClick: function () { setError(""); } }, "×")),
         view === "overview" && h(React.Fragment, null,
           h("section", { className: "upload-panel" }, h("div", null, h("b", null, fileName || "选择 result.json、JSONL、TXT、LOG、GZ 或无后缀日志"), h("span", null, result ? (result.risk_entities || []).length + " 个风险实体，已完成本地预处理" : "10MB 以内直接分析；超过 10MB 自动分片上传，Linux messages / syslog 无后缀文件也支持上传")), busy && h("div", { className: "upload-progress" }, uploadProgress && h("span", null, "上传进度：" + Math.round((uploadProgress.progress || 0) * 100) + "%（" + uploadProgress.received_chunks + " / " + uploadProgress.total_chunks + " chunks）"), preprocessProgress && h("span", null, "预处理阶段：" + (preprocessProgress.stage || "queued") + "，记录 " + (preprocessProgress.records_parsed || 0) + (preprocessProgress.drain3_partitions_total ? "，Drain3 分片 " + (preprocessProgress.drain3_partitions_completed || 0) + " / " + preprocessProgress.drain3_partitions_total : ""))), h("div", { className: "analysis-config" }, h("label", null, "分析流程", h("select", { value: "feature_extract", disabled: true }, h("option", { value: "feature_extract" }, "日志特征识别"))), h("label", null, "模型 Profile", h("select", { value: modelProfileId, onChange: function (event) { const profile = activeProfiles.find(function (item) { return item.profile_id === event.target.value; }) || {}; setModelProfileId(event.target.value); if (profile.model) setModel(profile.model); if (profile.default_prompt_id) setPromptId(profile.default_prompt_id); } }, activeProfiles.map(function (profile) { return h("option", { value: profile.profile_id, key: profile.profile_id }, (profile.display_name || profile.profile_id) + " · " + profile.provider); }))), h("label", null, "Provider / 连接", h("input", { value: (selectedModelProfile.provider || "—") + " / " + (selectedModelProfile.connection_id || "—"), disabled: true })), h("label", null, "模型", h("input", { value: model, onChange: function (event) { setModel(event.target.value); } })), h("label", null, "Prompt", h("select", { value: promptId, onChange: function (event) { setPromptId(event.target.value); } }, activePrompts.map(function (prompt) { return h("option", { value: prompt.prompt_id, key: prompt.prompt_id }, prompt.prompt_id); }))), h("label", null, "重试次数", h("select", { value: retryCount, onChange: function (event) { setRetryCount(Number(event.target.value)); } }, [0, 1, 2, 3].map(function (count) { return h("option", { value: count, key: count }, count + " 次"); }))), h("label", null, "阈值", h("input", { type: "number", value: threshold, onChange: function (event) { setThreshold(event.target.value); } })), h("button", { className: "primary-button", disabled: !result || busy, onClick: start }, busy ? "处理中…" : "开始识别"))), h(MetricsGrid, { snapshot: snapshot, result: result, daily: systemMetrics }), h(LiveProcessing, { snapshot: snapshot, result: result })),
@@ -1721,6 +1912,7 @@
           h(ReviewEditor, { feature: selected, selectedTemplate: selectedTemplate, onSave: save, onOpenTrace: openTrace })),
         view === "rules" && h(RuleLibrary, { rules: rules, reviewQueue: ruleReviewQueue, loading: ruleLoading, focusRuleId: ruleFocus, onOpenTrace: openTrace, onChanged: loadRules }),
         view === "nodeRisks" && h(NodeRiskPage, { catalog: nodeRiskCatalog, selected: selectedNodeRisk, onRefresh: loadNodeRisks, onSelect: function (item) { selectNodeRisk(item).catch(function (reason) { setError(reason.message); }); }, onEvent: function (eventId, action) { changeNodeEvent(eventId, action).catch(function (reason) { setError(reason.message); }); } }),
+        view === "multiSource" && h(MultiSourcePage, { data: multiSourceData, onRefresh: function () { loadMultiSource().catch(function () {}); }, onSelect: function (entity) { selectMultiSourceEntity(entity).catch(function (reason) { setError(reason.message); }); }, onRule: function (rule, enabled) { changeMultiSourceRule(rule, enabled).catch(function (reason) { setError(reason.message); }); } }),
         view === "semanticLibrary" && h(SemanticLibraryPage, { catalog: riskSemanticCatalog, selectedId: selectedRiskSemanticId, versions: riskSemanticVersions, unclassified: unclassifiedRiskSemantics, onSelect: function (id) { selectRiskSemantic(id).catch(function (reason) { setError(reason.message); }); }, onRefresh: loadRiskSemantics, onSave: function (rule, content) { saveRiskSemantic(rule, content).catch(function (reason) { setError(reason.message); }); }, onPublish: function (rule) { publishRiskSemantic(rule).catch(function (reason) { setError(reason.message); }); }, onTest: api.testRiskSemantic }),
         view === "drainQuality" && h(DrainQualityPage, { data: drainQuality, onRefresh: loadDrainQuality, onImport: importCurrentTemplates, onAnnotate: annotateTemplate, onTemplateChange: changeTemplate, onTemplateRollback: rollbackTemplate, onProfile: changeDrainProfile, onConfigCreate: createDrainConfig, onConfigLoadVersion: loadDrainConfigVersion, onConfigSave: saveDrainConfig, onConfigValidate: validateDrainConfig, onConfigPublish: publishDrainConfig, onConfigRollback: rollbackDrainConfig, onSemanticCreate: createSemanticCandidate, onSemanticLoadVersion: loadSemanticDictionaryVersion, onSemanticSave: saveSemanticDictionary, onSemanticValidate: validateSemanticDictionary, onSemanticPublish: publishSemanticDictionary, onSemanticRollback: rollbackSemanticDictionary, onSemanticTest: testSemanticDictionary }),
         view === "streaming" && h(StreamingPage, { data: streamingData, onRefresh: function () { loadStreaming().catch(function (reason) { setError(reason.message); }); }, onResume: function (taskId) { return resumeStreamingTask(taskId).catch(function (reason) { setError(reason.message); throw reason; }); } }),

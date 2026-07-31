@@ -76,9 +76,9 @@ PostgreSQL 模式下，所有结构化运行时业务状态统一写入 PostgreS
 
 原始日志、API Key、Token、密码和含密 DSN 不得进入业务表、AI Trace、Observation 或 Replay。
 
-## 64 张表与代码映射
+## 69 张表与代码映射
 
-当前逻辑结构共 64 张表：63 张由版本化 migration 创建，`schema_migrations` 由数据库适配层创建。
+当前逻辑结构共 69 张表：68 张由版本化 migration 创建，`schema_migrations` 由数据库适配层创建。
 
 ### 管理与迁移（3）
 
@@ -148,6 +148,16 @@ PostgreSQL 模式下，所有结构化运行时业务状态统一写入 PostgreS
 | `runtime_maintenance_runs` | Retention 预览与执行记录 | `src/logrisk/runtime/repository.py`、`src/logrisk/runtime/service.py` |
 | `runtime_quota_snapshots` | 接受上传或分析前的最新存储用量快照 | `src/logrisk/runtime/repository.py`、`src/logrisk/runtime/service.py` |
 | `runtime_audit_events` | PACAS/RBAC 身份上下文下的脱敏运行审计 | `src/logrisk/runtime/repository.py`、`src/pipeline/dashboard_server.py` |
+
+### 多来源智能关联（5）
+
+| 表 | 用途 | 主要代码 |
+|---|---|---|
+| `multi_source_rules` | 确定性来源组合和阈值规则 | `src/logrisk/multi_source/repository.py`、`src/logrisk/multi_source/service.py` |
+| `multi_source_observations` | 聚合模板窗口形成的脱敏实体观察 | `src/logrisk/multi_source/service.py`、`src/logrisk/multi_source/repository.py` |
+| `multi_source_correlations` | 跨来源证据链头信息 | `src/logrisk/multi_source/correlation.py`、`src/logrisk/multi_source/repository.py` |
+| `multi_source_correlation_items` | 证据链与观察的有序成员关系 | `src/logrisk/multi_source/repository.py` |
+| `multi_source_audit_events` | 关联规则修改审计 | `src/logrisk/multi_source/repository.py`、`src/pipeline/dashboard_server.py` |
 
 ### Drain3 治理（10）
 
@@ -272,6 +282,20 @@ resolve_database_runtime()
 ```
 
 数据库选择发生在 Store 创建之前，因此业务代码不需要分别维护 SQLite SQL 和 PostgreSQL SQL；两端差异集中在 migration 和数据库适配层。
+
+### 多来源实体与时间线
+
+```text
+Normalizer → Entity Router → Drain3（仅处理 message_core）
+  → TemplateEventAggregator（透传 entity_keys / entity_relations）
+  → Risk Engine
+  → MultiSourceService
+  → multi_source_observations
+  → Correlation Engine
+  → multi_source_correlations / multi_source_correlation_items
+```
+
+实体路由只使用日志元数据中的明确标识、配置别名和容器—Pod—命名空间—节点等显式关系。不同集群永不关联；缺少可靠标识时记录为不可路由。数据库只保存 Drain3 脱敏模板、计数、风险、实体和时间，不保存 `samples`、`raw_sample`、`message_core` 或原始日志。
 
 ## 如何定位字段调用
 

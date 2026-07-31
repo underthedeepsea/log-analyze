@@ -1,4 +1,4 @@
-schema_version: 10
+schema_version: 11
 database: logrisk
 description: LOGRISK 双模式运行时数据字典；SQLite 是默认本地实现，PostgreSQL 用于显式配置的外部生产部署。
 authoritative_ddl:
@@ -145,6 +145,31 @@ tables:
     primary_key: audit_id
     indexes: [idx_runtime_audit_created(created_at DESC, audit_id DESC), idx_runtime_audit_resource(resource_type, resource_id, created_at DESC)]
     columns: {audit_id: 审计标识, action: 操作名称, resource_type: 资源类别, resource_id: 资源标识, actor: PACAS/RBAC 传入的操作人, roles_json: 角色名称列表, request_id: 请求标识, outcome: success/failed/denied, attributes_json: 脱敏操作元数据, schema_version: 结构版本, created_at: 发生时间}
+  multi_source_rules:
+    description: 确定性跨来源关联规则；仅使用实体、来源、时间窗口、计数和风险阈值
+    primary_key: rule_id
+    columns: {rule_id: 规则标识, display_name: 显示名称, enabled: 是否启用, definition_json: 来源组合与阈值定义, version: 乐观版本, schema_version: 结构版本, created_at: 创建时间, updated_at: 更新时间}
+  multi_source_observations:
+    description: 从聚合模板窗口生成的脱敏多来源观察；不保存样例、原始日志或 message_core
+    primary_key: observation_id
+    indexes: [idx_multi_source_observation_time(cluster, window_start DESC), idx_multi_source_observation_source(source_family, window_start DESC)]
+    columns: {observation_id: 稳定观察摘要, source_job_id: 来源任务, cluster: 集群, source_type: 原始来源类型, source_family: 规范来源族, component: 组件, severity: 严重度, template_hash: Drain3 模板摘要, template: 脱敏模板, occurrence_count: 聚合次数, risk_score: 实体风险分, risk_level: 风险等级, window_start: 窗口开始, window_end: 窗口结束, entity_keys_json: 规范实体键, relations_json: 显式实体层级关系, schema_version: 结构版本, created_at: 创建时间, updated_at: 更新时间}
+  multi_source_correlations:
+    description: 满足确定性规则的跨来源证据链头信息
+    primary_key: correlation_id
+    foreign_keys: {rule_id: multi_source_rules.rule_id}
+    indexes: [idx_multi_source_correlation_entity(primary_entity_key, window_start DESC)]
+    columns: {correlation_id: 稳定关联摘要, rule_id: 命中规则, rule_version: 命中时版本, cluster: 集群, primary_entity_key: 主实体键, window_start: 关联开始, window_end: 关联结束, confidence: 规则确定置信度, risk_score: 关联最高风险分, source_families_json: 来源族集合, schema_version: 结构版本, created_at: 创建时间, updated_at: 更新时间}
+  multi_source_correlation_items:
+    description: 关联证据链与脱敏观察的有序成员关系
+    primary_key: [correlation_id, observation_id]
+    foreign_keys: {correlation_id: multi_source_correlations.correlation_id ON DELETE CASCADE, observation_id: multi_source_observations.observation_id ON DELETE CASCADE}
+    columns: {correlation_id: 关联标识, observation_id: 观察标识, position: 时间线位置}
+  multi_source_audit_events:
+    description: 多来源规则修改的追加式脱敏审计
+    primary_key: audit_id
+    indexes: [idx_multi_source_audit_created(created_at DESC, audit_id DESC)]
+    columns: {audit_id: 审计标识, action: 操作, resource_type: 资源类型, resource_id: 资源标识, actor: 外部身份主体, request_id: 请求标识, attributes_json: 脱敏属性, schema_version: 结构版本, created_at: 创建时间}
   ai_cache_entries:
     description: Evidence、Prompt、Provider 和模型组合缓存
     primary_key: signature

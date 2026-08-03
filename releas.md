@@ -19,6 +19,7 @@
 - 新增框架无关的核心只读 API Facade；本地 Dashboard 与 Django 共享健康、运行就绪、模型画像、Prompt、规则治理和发布就绪响应逻辑，避免并行维护两套业务查询实现。
 - Django 新增受 PACAS/RBAC 身份与角色约束的特征任务提交接口：任务和编排记录先持久化，再触发 Airflow；触发失败会保留可审计的 `dispatch_failed` 状态且不执行本地回退。
 - 新增 Airflow 2.3.2 可部署 DAG 与延迟装配的任务入口；DAG 解析不连接数据库、模型或共享目录，Task/XCom 仅传递稳定 ID、状态和计数。
+- Django 新增受 PACAS/RBAC 保护的特征审批、受控导出与发布就绪校验接口；这些操作与本地 Dashboard 复用同一 API Facade，并写入仅含操作元数据的运行审计记录。
 
 ## 1.30.0 - 2026-07-31
 

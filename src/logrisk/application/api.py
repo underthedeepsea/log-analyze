@@ -6,6 +6,7 @@ from typing import Any, Callable, Mapping
 from logrisk.application.container import ApplicationContainer
 from logrisk.feature_extractor_ollama import FEATURE_PROMPT_ID
 from logrisk.feature_jobs import FeatureJobError
+from logrisk.runtime.identity import RequestIdentity, require_write_access
 
 
 @dataclass(frozen=True)
@@ -144,8 +145,93 @@ class ApiFacade:
             profile_snapshot=profile.public_dict(),
         )
 
+    def update_feature(
+        self,
+        job_id: str,
+        candidate_id: str,
+        payload: Mapping[str, Any],
+        identity: RequestIdentity,
+    ) -> ApiResult:
+        self._require_write(identity)
+        feature = self._service("feature_jobs", self.container.feature_jobs).update_feature(
+            str(job_id), str(candidate_id), dict(payload)
+        )
+        status = str(feature.get("status") or "pending")
+        self._audit(
+            "feature.approved" if status == "approved" else "feature.reviewed",
+            "feature_candidate",
+            identity,
+            resource_id=str(candidate_id),
+            attributes={"job_id": str(job_id), "status": status},
+        )
+        return ApiResult(200, feature)
+
+    def export_approved(self, job_id: str, identity: RequestIdentity) -> ApiResult:
+        self._require_write(identity)
+        package = self._service("feature_jobs", self.container.feature_jobs).export_approved(str(job_id))
+        self._audit(
+            "feature.exported",
+            "feature_job",
+            identity,
+            resource_id=str(job_id),
+            attributes={
+                "approved_count": int(dict(package.get("review_statistics") or {}).get("approved") or 0),
+            },
+        )
+        return ApiResult(
+            200,
+            package,
+            {"Content-Disposition": 'attachment; filename="logrisk-feature-package.json"'},
+        )
+
+    def validate_release(
+        self,
+        payload: Mapping[str, Any],
+        identity: RequestIdentity,
+        *,
+        idempotency_key: str,
+    ) -> ApiResult:
+        self._require_write(identity)
+        key = str(idempotency_key).strip()
+        if not key:
+            raise ValueError("发布校验需要 Idempotency-Key 或 idempotency_key")
+        result = self._service("release_readiness", self.container.release_readiness).validate(
+            target_version=str(payload.get("target_version") or self.version),
+            idempotency_key=key,
+        )
+        self._audit(
+            "release_readiness.validated",
+            "release_validation",
+            identity,
+            resource_id=str(result["validation_id"]),
+            attributes={"target_version": result["target_version"], "status": result["status"]},
+        )
+        return ApiResult(200, {**result, "request_id": identity.request_id, "resource_id": result["validation_id"]})
+
     def _service(self, name: str, default: Any) -> Any:
         return self.service_resolver(name, default) if self.service_resolver else default
+
+    def _require_write(self, identity: RequestIdentity) -> None:
+        require_write_access(identity, self.container.runtime_config)
+
+    def _audit(
+        self,
+        action: str,
+        resource_type: str,
+        identity: RequestIdentity,
+        *,
+        resource_id: str | None,
+        attributes: Mapping[str, Any],
+    ) -> None:
+        self._service("runtime_repository", self.container.runtime_repository).append_audit(
+            action,
+            resource_type,
+            identity.actor,
+            identity.request_id,
+            attributes,
+            resource_id=resource_id,
+            roles=identity.roles,
+        )
 
     @staticmethod
     def _query(query: Mapping[str, Any], name: str) -> str | None:

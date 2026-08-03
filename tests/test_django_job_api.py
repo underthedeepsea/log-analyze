@@ -98,4 +98,4 @@ def test_django_job_write_fails_closed_without_authenticated_identity(tmp_path) 
         clear_cached_container()
 
     assert response.status_code == 403
-    assert response.json()["code"] == "identity_required"
+    assert response.json()["code"] == "runtime_identity_required"

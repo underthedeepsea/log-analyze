@@ -9,21 +9,17 @@ from django.views.decorators.http import require_POST
 from logrisk.orchestration import AirflowOrchestratorError
 from logrisk_django.service_factory import (
     get_airflow_orchestrator,
-    get_config,
     get_container,
     get_facade,
-    get_identity_resolver,
 )
+from logrisk_django.views.access import require_django_write_access
 
 
 @require_POST
 def create_job(request: HttpRequest) -> JsonResponse:
-    identity = get_identity_resolver().resolve(request)
-    config = get_config()
-    if not identity.authenticated:
-        return _error(403, "identity_required", "写操作需要 PACAS/RBAC 认证身份")
-    if config.write_roles and not set(config.write_roles).intersection(identity.roles):
-        return _error(403, "write_role_required", "当前身份缺少 LOGRISK 写操作角色")
+    identity = require_django_write_access(request)
+    if isinstance(identity, JsonResponse):
+        return identity
     try:
         payload = json.loads(request.body.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):

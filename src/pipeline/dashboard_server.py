@@ -843,13 +843,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 if not isinstance(payload, dict):
                     raise ValueError("请求体必须是 JSON object")
                 idempotency_key = str(self.headers.get("Idempotency-Key") or payload.get("idempotency_key") or "").strip()
-                if not idempotency_key:
-                    raise ValueError("发布校验需要 Idempotency-Key 或 idempotency_key")
-                result = self.server.release_readiness.validate(  # type: ignore[attr-defined]
-                    target_version=str(payload.get("target_version") or APP_VERSION),
-                    idempotency_key=idempotency_key,
-                )
-                self._json(HTTPStatus.OK, {**result, "request_id": identity.request_id, "resource_id": result["validation_id"]})
+                result = self.server.api_facade.validate_release(payload, identity, idempotency_key=idempotency_key)  # type: ignore[attr-defined]
+                self._json(HTTPStatus(result.status), dict(result.body), dict(result.headers))
                 return
             if path == "/api/runtime/retention/policy":
                 if not isinstance(payload, dict):
@@ -1269,12 +1264,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 return
             match = re.fullmatch(r"/api/jobs/([a-f0-9]+)/export", path)
             if match:
-                package = self.server.manager.export_approved(match.group(1))  # type: ignore[attr-defined]
-                self._json(
-                    HTTPStatus.OK,
-                    package,
-                    {"Content-Disposition": 'attachment; filename="logrisk-feature-package.json"'},
-                )
+                result = self.server.api_facade.export_approved(match.group(1), identity)  # type: ignore[attr-defined]
+                self._json(HTTPStatus(result.status), dict(result.body), dict(result.headers))
                 return
             self._json(HTTPStatus.NOT_FOUND, {"error": "资源不存在"})
         except ReplayError as exc:
@@ -1405,8 +1396,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if not match:
                 self._json(HTTPStatus.NOT_FOUND, {"error": "资源不存在"})
                 return
-            feature = self.server.manager.update_feature(match.group(1), match.group(2), payload)  # type: ignore[attr-defined]
-            self._json(HTTPStatus.OK, feature)
+            result = self.server.api_facade.update_feature(match.group(1), match.group(2), payload, self._runtime_request_identity())  # type: ignore[attr-defined]
+            self._json(HTTPStatus(result.status), dict(result.body), dict(result.headers))
         except RuntimeAccessError as exc:
             self._json(HTTPStatus.FORBIDDEN, {"error": str(exc), "code": exc.code, "error_code": exc.code, "request_id": self._runtime_request_identity().request_id})
         except MultiSourceConflictError as exc:

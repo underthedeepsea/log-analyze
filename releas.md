@@ -23,6 +23,7 @@
 - 新增 Django 可分发静态包：React 纯静态产物可通过 `sync_django_static.sh` 确定性同步至 `logrisk_django/static/logrisk/`，支持 `collectstatic` 与 API 优先的 SPA 回退。
 - Airflow DAG 补齐预处理、Drain3 分区、模板合并、规则复用、模型批次与校验阶段，并按 `logrisk_cpu_pool`/`logrisk_llm_pool` 和 Celery 队列进行基础动态映射；模型实体失败会准确收敛为失败编排状态。
 - Django 生产适配层改为不在启动或 Airflow Worker 初始化时自动迁移数据库；新增 `logrisk_check`、`logrisk_migrate` 和 `logrisk_reconcile_dispatch` 管理命令，用于显式检查/迁移与恢复待分派任务。
+- 新增 Django/Airflow 生产部署指南、无密配置示例和数据库调用关系说明，覆盖独立数据库、共享目录、Celery 队列、显式迁移、安全边界与回滚流程。
 
 ## 1.30.0 - 2026-07-31
 

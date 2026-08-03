@@ -4,7 +4,7 @@
   <img src="frontend/logo/logrisk-app-icon-orange-v2.png" width="112" alt="LOGRISK 应用图标" />
 </p>
 
-当前版本：`1.30.0`。完整变更记录见 [`releas.md`](releas.md)。
+当前版本：`1.31.0`。完整变更记录见 [`releas.md`](releas.md)。
 
 LOGRISK 在本地完成日志规范化、Drain3 模板化、确定性语义增强、风险评分、规则复用、模型特征识别和人工审批。系统只生成可审查、可导出的日志特征，不执行根因分析（RCA），也不会把原始日志直接发送给模型。
 
@@ -246,6 +246,12 @@ DASHBOARD_CORS_ORIGINS=https://logrisk.example.internal \
 ```
 
 常用环境变量包括 `LOGRISK_DB_PATH`、`OLLAMA_MODEL`、`OLLAMA_HOST`、`OLLAMA_TIMEOUT`、`DASHBOARD_HOST` 和 `DASHBOARD_PORT`。Dashboard 默认仅监听 `127.0.0.1`。
+
+### Django + Airflow 生产适配
+
+生产环境可将纯静态 React 包、PACAS/RBAC 控制面和调度分离部署：Django 4.2.16 提供 API/静态入口，Airflow 2.3.2 `CeleryExecutor` 负责调度，LOGRISK PostgreSQL 独立于 Django 与 Airflow 元数据库。所有 Web 与 Worker 实例必须共享 `LOGRISK_SHARED_ROOT`；DAG conf/XCom 只传任务、编排和请求 ID，不传日志正文。
+
+Django 不会自动迁移数据库。上线窗口通过 `python manage.py logrisk_migrate --check`、`python manage.py logrisk_migrate` 和 `python manage.py logrisk_check` 显式完成迁移和检查。详见 [Django 与 Airflow 生产部署指南](DJANGO_AIRFLOW_DEPLOYMENT_GUIDE.md)，可复制配置见 `examples/django_integration/` 与 `examples/airflow/`。
 
 ## 发布就绪检查
 

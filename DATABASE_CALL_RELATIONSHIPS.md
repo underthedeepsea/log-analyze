@@ -1,6 +1,6 @@
 # 数据库调用关系
 
-本文说明 LOGRISK 在 SQLite/PostgreSQL 双模式下，从配置解析、建表迁移、领域读写到 Dashboard API 的数据库调用关系。项目不使用 ORM，表结构由 SQL migration 管理，业务代码通过统一 `Database` 接口执行参数化 SQL。
+本文说明 LOGRISK 在 SQLite/PostgreSQL 双模式下，从配置解析、建表迁移、领域读写到 Dashboard/Django API 的数据库调用关系。项目不使用 ORM，表结构由 SQL migration 管理，业务代码通过统一 `Database` 接口执行参数化 SQL。
 
 ## 四层结构与权威来源
 
@@ -10,6 +10,7 @@
 | 真实建表结构 | `database/migrations/`、`database/postgres/migrations/` | 分别定义 SQLite 与 PostgreSQL 的表、字段、约束和索引 |
 | 领域数据访问 | `src/logrisk/` 下的 Repository、Store | 执行 `SELECT`、`INSERT`、`UPDATE` 和事务 |
 | 运行时装配 | `src/pipeline/dashboard_server.py` | 选择数据库 Provider，并把同一数据库对象注入各领域服务 |
+| Django / Airflow 装配 | `src/logrisk/application/container.py`、`src/logrisk_django/service_factory.py`、`src/logrisk/airflow_tasks.py` | Django 与 Worker 复用容器；生产仅经显式命令迁移 |
 
 当数据字典与迁移文件不一致时，以已经应用的 migration SQL 为真实数据库结构；`schema.yaml` 必须同步修正。已经执行的 migration 不允许修改，校验摘要记录在 `schema_migrations`。
 
@@ -76,9 +77,9 @@ PostgreSQL 模式下，所有结构化运行时业务状态统一写入 PostgreS
 
 原始日志、API Key、Token、密码和含密 DSN 不得进入业务表、AI Trace、Observation 或 Replay。
 
-## 71 张表与代码映射
+## 73 张表与代码映射
 
-当前逻辑结构共 71 张表：70 张由版本化 migration 创建，`schema_migrations` 由数据库适配层创建。
+当前逻辑结构共 73 张表：72 张由版本化 migration 创建，`schema_migrations` 由数据库适配层创建。
 
 ### 管理与迁移（3）
 
@@ -105,6 +106,12 @@ PostgreSQL 模式下，所有结构化运行时业务状态统一写入 PostgreS
 | `feature_job_entities` | 风险实体处理、重试和规则复用状态 | `src/logrisk/sqlite_stores.py` |
 | `feature_candidates` | 模型或规则产生的候选特征与审批状态 | `src/logrisk/sqlite_stores.py` |
 | `feature_job_events` | 任务追加式事件流 | `src/logrisk/sqlite_stores.py` |
+
+### Airflow 编排（1）
+
+| 表 | 用途 | 主要代码 |
+|---|---|---|
+| `orchestration_runs` | Feature Job 与 Airflow DAG Run 的持久化状态、重试、心跳和脱敏失败摘要 | `src/logrisk/orchestration/repository.py`、`src/logrisk/orchestration/service.py` |
 
 ### 规则治理（5）
 
@@ -271,6 +278,20 @@ Dashboard POST/PUT/PATCH/DELETE
 ```
 
 运行中心读取现有 `feature_jobs`、`input_jobs`、`streaming_tasks`、`benchmark_runs` 和 `replay_runs`，不会复制任务记录。Retention 只读取 `artifacts` 的元数据；文件本体仍位于文件系统，删除前会校验受控根目录、年龄、任务状态和受保护 Artifact 类型。`runtime_audit_events` 仅记录方法、路径、状态、外部主体、角色和请求 ID 等脱敏元数据。
+
+### Django 与 Airflow 生产调用
+
+```text
+Django View
+  → PACAS/RBAC IdentityResolver
+  → ApiFacade / OrchestrationService
+  → LOGRISK PostgreSQL
+  → Airflow REST v1（job_id、orchestration_run_id、request_id）
+  → Celery Worker 的 ApplicationContainer
+  → 同一 LOGRISK PostgreSQL + LOGRISK_SHARED_ROOT
+```
+
+`src/logrisk_django/management/commands/logrisk_migrate.py` 是生产 schema 唯一迁移入口；`logrisk_check.py` 只读取迁移状态，不应用 SQL；`logrisk_reconcile_dispatch.py` 仅重试可恢复编排状态。Django ORM 数据库、Airflow Metadata Database 与 LOGRISK 数据库之间没有跨库 SQL 或外键。
 
 ### PostgreSQL 复用 Store
 

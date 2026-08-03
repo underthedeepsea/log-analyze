@@ -18,6 +18,7 @@ from logrisk.ai_harness.model_profile import ModelProfileRegistry
 from logrisk.ai_harness.prompt_registry import PromptTemplate, SQLitePromptRegistry
 from logrisk.ai_harness.providers import create_model_client
 from logrisk.ai_harness.trace_logger import AITraceLogger
+from logrisk.artifact_storage import SharedArtifactStore
 from logrisk.benchmark_center import BenchmarkRepository, BenchmarkService
 from logrisk.database import Database, create_database, utc_now
 from logrisk.database_config import DatabaseConnectionSettings, resolve_database_runtime
@@ -66,6 +67,7 @@ class ApplicationConfig:
     database_provider: str | None = None
     database_url: str | None = None
     database_path: Path | None = None
+    shared_root: Path | None = None
     default_model: str = "qwen3:1.7b"
     default_ollama_url: str = "http://127.0.0.1:11434"
     default_timeout: float = 120.0
@@ -109,6 +111,7 @@ class ApplicationContainer:
     replay_service: ReplayService
     upload_store: SQLiteUploadSessionStore
     input_jobs: SQLiteInputJobStore
+    artifact_store: SharedArtifactStore
     streaming_state: StreamingStateRepository
     drain_quality: Any
     semantic_dictionaries: Any
@@ -133,6 +136,7 @@ def build_application_container(
     root = config.project_root.resolve()
     state_root = config.state_root.resolve()
     output_root = config.output_root.resolve()
+    shared_root = Path(config.shared_root or os.getenv("LOGRISK_SHARED_ROOT") or state_root).resolve()
     database_settings = DatabaseConnectionSettings(state_root / "database_connection.json")
     database_runtime = resolve_database_runtime(
         provider=config.database_provider,
@@ -323,8 +327,13 @@ def build_application_container(
     )
     feature_jobs.observability = span_recorder
     rule_governance = RuleGovernanceService(RuleGovernanceRepository(database))
-    upload_store = SQLiteUploadSessionStore(UploadConfig(upload_dir=state_root / "uploads"), database)
-    input_jobs = SQLiteInputJobStore(InputJobConfig(output_dir=output_root / "uploads"), database)
+    artifact_store = SharedArtifactStore(shared_root)
+    upload_store = SQLiteUploadSessionStore(
+        UploadConfig(upload_dir=state_root / "uploads", artifact_store=artifact_store), database
+    )
+    input_jobs = SQLiteInputJobStore(
+        InputJobConfig(output_dir=output_root / "uploads", artifact_store=artifact_store), database
+    )
     streaming_state = StreamingStateRepository(database)
     if config.interrupt_streaming_tasks:
         streaming_state.interrupt_running_tasks()
@@ -365,6 +374,7 @@ def build_application_container(
         replay_service=replay_service,
         upload_store=upload_store,
         input_jobs=input_jobs,
+        artifact_store=artifact_store,
         streaming_state=streaming_state,
         drain_quality=drain_quality,
         semantic_dictionaries=semantic_dictionaries,
@@ -425,9 +435,10 @@ def build_application_container(
 
     def run_input_job(input_job_id: str) -> None:
         job = container.input_jobs.get_job(input_job_id)
+        source_path = container.input_jobs.resolve_source_path(job)
         config_path = job.get("drain_config_path") or root / "configs" / "drain3_recommended.ini"
         if not job.get("streaming_task_id"):
-            source = FileIncrementalSource(job["source_path"], filename=job["filename"])
+            source = FileIncrementalSource(source_path, filename=job["filename"])
             config_hash = hashlib.sha256(Path(config_path).read_bytes()).hexdigest()
             streaming_task = container.streaming_state.create_or_load(
                 descriptor=source.descriptor(),
@@ -441,7 +452,7 @@ def build_application_container(
         try:
             result = run_large_file_pipeline(
                 input_job_id=input_job_id,
-                input_path=job["source_path"],
+                input_path=source_path,
                 filename=job["filename"],
                 config_path=config_path,
                 rules_path=root / "configs" / "risk_rules.yaml",

@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from logrisk.artifact_storage import SharedArtifactStore
+
 
 @dataclass(frozen=True)
 class UploadConfig:
@@ -18,6 +20,7 @@ class UploadConfig:
     max_upload_bytes: int = 500 * 1024 * 1024
     retain_days: int = 7
     allowed_extensions: tuple[str, ...] = (".json", ".jsonl", ".ndjson", ".txt", ".log", ".gz", "")
+    artifact_store: SharedArtifactStore | None = None
 
 
 class UploadSessionStore:
@@ -76,18 +79,35 @@ class UploadSessionStore:
         if missing:
             raise ValueError(f"Missing chunks: {missing[:10]}")
         root = self._root(upload_id)
-        target = root / "source.log"
+        assembled = root / "source.log.assembled"
         digest = hashlib.sha256()
-        with target.open("wb") as out:
+        with assembled.open("wb") as out:
             for index in range(int(manifest["total_chunks"])):
                 data = (root / "chunks" / f"{index:06d}.part").read_bytes()
                 out.write(data)
                 digest.update(data)
         actual = digest.hexdigest()
         if final_sha256 and actual != final_sha256:
+            assembled.unlink(missing_ok=True)
             raise ValueError("Final file SHA256 mismatch")
-        if target.stat().st_size != int(manifest["size_bytes"]):
+        if assembled.stat().st_size != int(manifest["size_bytes"]):
+            assembled.unlink(missing_ok=True)
             raise ValueError("Final file size mismatch")
+        if self.config.artifact_store:
+            try:
+                staged = self.config.artifact_store.stage_file("uploads", assembled)
+                artifact = self.config.artifact_store.promote(
+                    staged,
+                    f"uploads/{upload_id}/source.log",
+                    expected_sha256=actual,
+                )
+            finally:
+                assembled.unlink(missing_ok=True)
+            manifest["artifact_relative_path"] = artifact.relative_path
+        else:
+            target = root / "source.log"
+            assembled.replace(target)
+            manifest["artifact_relative_path"] = None
         manifest.update({"sha256": actual, "status": "completed", "completed_at": self._now(), "updated_at": self._now()})
         self._write_manifest(upload_id, manifest)
         (root / "upload.done").write_text("done", encoding="utf-8")
@@ -100,10 +120,24 @@ class UploadSessionStore:
         return json.loads(path.read_text(encoding="utf-8"))
 
     def source_path(self, upload_id: str) -> Path:
+        manifest = self.get(upload_id)
+        relative_path = manifest.get("artifact_relative_path")
+        if relative_path and self.config.artifact_store:
+            path = self.config.artifact_store.resolve(str(relative_path))
+            if not path.is_file():
+                raise FileNotFoundError(path)
+            return path
         path = self._root(upload_id) / "source.log"
         if not path.is_file():
             raise FileNotFoundError(path)
         return path
+
+    def source_reference(self, upload_id: str) -> str:
+        manifest = self.get(upload_id)
+        relative_path = manifest.get("artifact_relative_path")
+        if relative_path:
+            return str(relative_path)
+        return str(self.source_path(upload_id))
 
     def _root(self, upload_id: str) -> Path:
         return self.config.upload_dir / upload_id

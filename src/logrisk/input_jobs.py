@@ -7,10 +7,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from logrisk.artifact_storage import SharedArtifactStore
+
 
 @dataclass(frozen=True)
 class InputJobConfig:
     output_dir: Path
+    artifact_store: SharedArtifactStore | None = None
 
 
 class InputJobStore:
@@ -30,11 +33,12 @@ class InputJobStore:
         input_job_id = "input_job_" + uuid.uuid4().hex
         self.root(input_job_id).mkdir(parents=True, exist_ok=False)
         now = self._now()
+        source_reference = self._source_reference(source_path)
         job = {
             "input_job_id": input_job_id,
             "upload_id": upload_id,
             "filename": filename,
-            "source_path": source_path,
+            "source_path": source_reference,
             "status": "queued",
             "stage": "queued",
             "created_at": now,
@@ -42,6 +46,8 @@ class InputJobStore:
             "completed_at": None,
             "error": None,
         }
+        if self.config.artifact_store:
+            job["source_artifact_path"] = source_reference
         if drain_config:
             job.update({
                 "drain_config_id": drain_config["config_id"],
@@ -79,6 +85,19 @@ class InputJobStore:
     def get_result(self, input_job_id: str) -> dict[str, Any]:
         return json.loads(self.result_path(input_job_id).read_text(encoding="utf-8"))
 
+    def resolve_source_path(self, job: dict[str, Any] | str) -> Path:
+        record = self.get_job(job) if isinstance(job, str) else job
+        source = str(record.get("source_artifact_path") or record.get("source_path") or "").strip()
+        if not source:
+            raise FileNotFoundError("输入任务缺少来源文件")
+        if self.config.artifact_store:
+            path = self.config.artifact_store.resolve(source)
+        else:
+            path = Path(source)
+        if not path.is_file():
+            raise FileNotFoundError(path)
+        return path
+
     def write_job(self, input_job_id: str, job: dict[str, Any]) -> None:
         self._atomic_write(self.job_path(input_job_id), job)
 
@@ -92,6 +111,11 @@ class InputJobStore:
         tmp = path.with_suffix(path.suffix + ".tmp")
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp.replace(path)
+
+    def _source_reference(self, source_path: str) -> str:
+        if not self.config.artifact_store:
+            return str(source_path)
+        return self.config.artifact_store.relative_path(source_path)
 
     def _now(self) -> str:
         return time.strftime("%Y-%m-%dT%H:%M:%S%z")

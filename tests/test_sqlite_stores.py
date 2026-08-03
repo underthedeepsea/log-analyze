@@ -125,3 +125,36 @@ def test_sqlite_upload_and_input_job_keep_metadata_in_database(tmp_path):
     assert completed["status"] == "completed"
     assert not (tmp_path / "uploads" / manifest["upload_id"] / "manifest.json").exists()
     assert SQLiteInputJobStore(InputJobConfig(tmp_path / "output"), database).get_result(job["input_job_id"]) == {"risk_entities": []}
+
+
+def test_sqlite_upload_metadata_uses_relative_shared_artifact_paths(tmp_path):
+    from logrisk.artifact_storage import SharedArtifactStore
+
+    database = SQLiteDatabase(tmp_path / "logrisk.sqlite3")
+    shared = SharedArtifactStore(tmp_path / "shared")
+    uploads = SQLiteUploadSessionStore(
+        UploadConfig(tmp_path / "work" / "uploads", chunk_size_bytes=4, artifact_store=shared),
+        database,
+    )
+    manifest = uploads.create(filename="messages", size_bytes=4)
+    uploads.append_chunk(upload_id=manifest["upload_id"], index=0, data=b"safe")
+    uploads.complete(upload_id=manifest["upload_id"])
+
+    jobs = SQLiteInputJobStore(InputJobConfig(tmp_path / "output", artifact_store=shared), database)
+    job = jobs.create(
+        upload_id=manifest["upload_id"],
+        filename="messages",
+        source_path=str(uploads.source_path(manifest["upload_id"])),
+    )
+    with database.connect() as connection:
+        source_path = connection.execute(
+            "SELECT source_path FROM upload_sessions WHERE upload_id=?", (manifest["upload_id"],)
+        ).fetchone()[0]
+        job_json = connection.execute(
+            "SELECT job_json FROM input_jobs WHERE input_job_id=?", (job["input_job_id"],)
+        ).fetchone()[0]
+
+    expected = f"uploads/{manifest['upload_id']}/source.log"
+    assert source_path == expected
+    assert expected in job_json
+    assert str(shared.root) not in job_json

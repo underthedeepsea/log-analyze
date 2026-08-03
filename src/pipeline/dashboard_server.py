@@ -1156,7 +1156,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             match = re.fullmatch(r"/api/uploads/([A-Za-z0-9_-]+)/complete", path)
             if match:
                 manifest = self.server.upload_store.complete(upload_id=match.group(1), final_sha256=payload.get("sha256") if isinstance(payload, dict) else None)  # type: ignore[attr-defined]
-                self._json(HTTPStatus.OK, {"upload_id": manifest["upload_id"], "status": manifest["status"], "path": str(self.server.upload_store.source_path(match.group(1)))})  # type: ignore[attr-defined]
+                self._json(HTTPStatus.OK, {"upload_id": manifest["upload_id"], "status": manifest["status"], "path": self.server.upload_store.source_reference(match.group(1))})  # type: ignore[attr-defined]
                 return
             if path == "/api/inputs/analyze-upload":
                 if not isinstance(payload, dict):

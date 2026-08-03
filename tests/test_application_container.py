@@ -21,3 +21,4 @@ def test_application_container_builds_shared_services_without_starting_http(tmp_
     assert container.feature_jobs is not None
     assert container.runtime_service is not None
     assert container.release_readiness is not None
+    assert container.artifact_store.root == (tmp_path / "state").resolve()

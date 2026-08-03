@@ -79,6 +79,7 @@ class ApplicationConfig:
     import_legacy_state: bool = False
     interrupt_streaming_tasks: bool = False
     feature_jobs_auto_start: bool = True
+    migrate_database: bool = True
 
     @classmethod
     def for_test(cls, *, project_root: str | Path, state_root: str | Path) -> "ApplicationConfig":
@@ -152,6 +153,7 @@ def build_application_container(
         sqlite_path=database_runtime.sqlite_path,
         database_url=database_runtime.database_url,
         state_root=state_root,
+        migrate=config.migrate_database,
     )
     runtime_config = config.runtime_config or _load_runtime_config(config, root)
 

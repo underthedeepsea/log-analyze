@@ -6,6 +6,7 @@ from pathlib import Path
 
 import django
 from django.test import Client, override_settings
+from django.core.management import call_command
 
 
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "tests.django_test_project.settings")
@@ -87,6 +88,7 @@ def test_django_feature_approval_and_export_share_governed_services(tmp_path) ->
 
     with override_settings(LOGRISK=_config(tmp_path, "tests.django_test_project.resolver.OperatorIdentityResolver")):
         clear_cached_container()
+        call_command("logrisk_migrate", "--json")
         container, job_id = _completed_job()
         approved = Client().patch(
             f"/api/jobs/{job_id}/features/candidate-node-1",
@@ -111,6 +113,7 @@ def test_django_governed_write_fails_closed_and_audits_denial(tmp_path) -> None:
 
     with override_settings(LOGRISK=_config(tmp_path, "tests.django_test_project.resolver.AnonymousIdentityResolver")):
         clear_cached_container()
+        call_command("logrisk_migrate", "--json")
         response = Client().post("/api/release-readiness/validate", data="{}", content_type="application/json")
         audits = get_container().runtime_repository.list_audits(limit=20)["items"]
         clear_cached_container()

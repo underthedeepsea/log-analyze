@@ -107,6 +107,14 @@ class OrchestrationService:
             error_summary=error_summary,
         )
 
+    def retry_dispatch(self, orchestration_run_id: str, *, expected_version: int) -> dict[str, Any]:
+        return self.repository.transition(
+            orchestration_run_id,
+            from_status="dispatch_failed",
+            to_status="pending_dispatch",
+            expected_version=expected_version,
+        )
+
     def list_reconcilable(self, *, limit: int = 100) -> list[dict[str, Any]]:
         return self.repository.list_reconcilable(limit=limit)
 

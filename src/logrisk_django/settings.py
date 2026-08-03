@@ -116,6 +116,7 @@ class LogriskConfig:
             import_legacy_state=False,
             interrupt_streaming_tasks=False,
             feature_jobs_auto_start=False,
+            migrate_database=False,
         )
 
     def public_dict(self) -> dict[str, Any]:

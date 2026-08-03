@@ -24,6 +24,7 @@ def build_worker_container() -> ApplicationContainer:
         import_legacy_state=False,
         interrupt_streaming_tasks=False,
         feature_jobs_auto_start=False,
+        migrate_database=False,
     ))
 
 

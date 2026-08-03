@@ -5,6 +5,7 @@ from pathlib import Path
 
 import django
 from django.test import Client, override_settings
+from django.core.management import call_command
 
 
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "tests.django_test_project.settings")
@@ -54,6 +55,7 @@ def test_django_job_is_durable_when_airflow_trigger_fails(tmp_path, monkeypatch)
     monkeypatch.setattr(jobs, "get_airflow_orchestrator", lambda: FailingAirflow())
     with override_settings(LOGRISK=_config(tmp_path, "tests.django_test_project.resolver.OperatorIdentityResolver")):
         clear_cached_container()
+        call_command("logrisk_migrate", "--json")
         response = Client().post("/api/jobs", data={"result": _result(), "model_profile_id": "qwen3_1_7b_fast"}, content_type="application/json")
         container = get_container()
         run = container.orchestration.for_job(response.json()["job_id"])
@@ -80,6 +82,7 @@ def test_django_job_dispatches_after_persisting_with_authenticated_pacas_identit
     monkeypatch.setattr(jobs, "get_airflow_orchestrator", lambda: ReadyAirflow())
     with override_settings(LOGRISK=_config(tmp_path, "tests.django_test_project.resolver.OperatorIdentityResolver")):
         clear_cached_container()
+        call_command("logrisk_migrate", "--json")
         response = Client().post("/api/jobs", data={"result": _result(), "model_profile_id": "qwen3_1_7b_fast"}, content_type="application/json")
         run = get_container().orchestration.for_job(response.json()["job_id"])
         clear_cached_container()
@@ -94,6 +97,7 @@ def test_django_job_write_fails_closed_without_authenticated_identity(tmp_path) 
 
     with override_settings(LOGRISK=_config(tmp_path, "tests.django_test_project.resolver.AnonymousIdentityResolver")):
         clear_cached_container()
+        call_command("logrisk_migrate", "--json")
         response = Client().post("/api/jobs", data={"result": _result(), "model_profile_id": "qwen3_1_7b_fast"}, content_type="application/json")
         clear_cached_container()
 

@@ -5,6 +5,7 @@ from pathlib import Path
 
 import django
 from django.test import Client, override_settings
+from django.core.management import call_command
 
 
 os.environ.setdefault("DJANGO_SETTINGS_MODULE", "tests.django_test_project.settings")
@@ -27,6 +28,7 @@ def test_django_core_read_apis_use_the_shared_api_facade(tmp_path) -> None:
     }
     with override_settings(LOGRISK=config):
         clear_cached_container()
+        call_command("logrisk_migrate", "--json")
         client = Client()
         responses = [client.get(path) for path in (
             "/api/health",

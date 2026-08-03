@@ -5,6 +5,7 @@ from typing import Any, Callable, Mapping
 
 from logrisk.application.container import ApplicationContainer
 from logrisk.feature_extractor_ollama import FEATURE_PROMPT_ID
+from logrisk.feature_jobs import FeatureJobError
 
 
 @dataclass(frozen=True)
@@ -113,6 +114,35 @@ class ApiFacade:
 
     def release_readiness(self) -> ApiResult:
         return ApiResult(200, self._service("release_readiness", self.container.release_readiness).overview())
+
+    def create_feature_job(self, payload: Mapping[str, Any]) -> str:
+        document = payload.get("result")
+        if not isinstance(document, Mapping):
+            raise FeatureJobError("result 必须是 JSON object")
+        self._service("runtime_service", self.container.runtime_service).require_capacity("特征识别")
+        profile = self._service("model_profiles", self.container.model_profiles).get(payload.get("model_profile_id"))
+        connection = self._service("connections", self.container.connections).get(profile.connection_id)
+        if not connection.get("enabled"):
+            raise FeatureJobError("模型连接已停用")
+        provider = str(connection.get("provider") or "")
+        if provider == "openai_compatible" and not connection.get("api_key_configured"):
+            raise FeatureJobError("远端模型连接缺少 API Key 环境变量")
+        if provider == "extension" and not all(dict(connection.get("credential_envs_configured") or {}).values()):
+            raise FeatureJobError("扩展模型连接缺少所需凭据环境变量")
+        return self._service("feature_jobs", self.container.feature_jobs).create_job(
+            dict(document),
+            model=profile.model,
+            min_score=float(payload.get("min_score", 40)),
+            base_url=str(connection["base_url"]),
+            timeout=float(connection["timeout_seconds"]),
+            prompt_id=str(payload.get("prompt_id") or profile.default_prompt_id),
+            cache_enabled=payload.get("cache_enabled"),
+            model_profile_id=profile.profile_id,
+            retry_count=int(payload.get("retry_count", 0)),
+            provider=provider,
+            connection_snapshot=connection,
+            profile_snapshot=profile.public_dict(),
+        )
 
     def _service(self, name: str, default: Any) -> Any:
         return self.service_resolver(name, default) if self.service_resolver else default

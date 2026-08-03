@@ -115,6 +115,7 @@ class LogriskConfig:
             runtime_config_path=self.runtime_config_path,
             import_legacy_state=False,
             interrupt_streaming_tasks=False,
+            feature_jobs_auto_start=False,
         )
 
     def public_dict(self) -> dict[str, Any]:

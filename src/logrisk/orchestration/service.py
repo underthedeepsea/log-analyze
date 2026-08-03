@@ -109,3 +109,9 @@ class OrchestrationService:
 
     def list_reconcilable(self, *, limit: int = 100) -> list[dict[str, Any]]:
         return self.repository.list_reconcilable(limit=limit)
+
+    def for_job(self, job_id: str) -> dict[str, Any] | None:
+        return self.repository.for_job(job_id)
+
+    def get(self, orchestration_run_id: str) -> dict[str, Any]:
+        return self.repository.get(orchestration_run_id)

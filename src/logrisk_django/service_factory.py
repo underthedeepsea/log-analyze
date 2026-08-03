@@ -6,6 +6,7 @@ from django.conf import settings
 from django.utils.module_loading import import_string
 
 from logrisk.application import ApiFacade, ApplicationContainer, build_application_container
+from logrisk.orchestration import AirflowOrchestrator
 from logrisk_django.identity import IdentityResolver
 from logrisk_django.settings import LogriskConfig
 
@@ -38,6 +39,16 @@ def get_identity_resolver() -> IdentityResolver:
     if not callable(getattr(resolver, "resolve", None)):
         raise TypeError("identity_resolver 必须实现 resolve(request)")
     return resolver
+
+
+def get_airflow_orchestrator() -> AirflowOrchestrator:
+    config = get_config()
+    return AirflowOrchestrator(
+        config.airflow_base_url,
+        config.airflow_dag_id,
+        timeout=config.airflow_timeout_seconds,
+        authorization_env=config.airflow_authorization_env,
+    )
 
 
 def clear_cached_container() -> None:

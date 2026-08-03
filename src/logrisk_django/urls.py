@@ -3,6 +3,7 @@ from __future__ import annotations
 from django.urls import path
 
 from logrisk_django.views.api import core_read
+from logrisk_django.views.frontend import frontend
 from logrisk_django.views.governance import export_approved, update_feature, validate_release
 from logrisk_django.views.jobs import create_job
 
@@ -19,4 +20,5 @@ urlpatterns = [
     path("api/ai-harness/prompts", core_read, {"endpoint": "ai-harness/prompts"}),
     path("api/rule-governance/rules", core_read, {"endpoint": "rule-governance/rules"}),
     path("api/release-readiness", core_read, {"endpoint": "release-readiness"}),
+    path("<path:path>", frontend),
 ]

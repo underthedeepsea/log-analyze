@@ -25,3 +25,14 @@ def test_airflow_dag_is_lazy_and_keeps_raw_payloads_out_of_conf_and_xcom() -> No
     assert "raw_log" not in source
     assert "samples" not in source
     assert "message_core" not in source
+
+
+def test_input_preprocess_dag_only_passes_input_and_orchestration_ids() -> None:
+    source = Path("integrations/airflow/dags/logrisk_input_preprocess.py").read_text(encoding="utf-8")
+
+    assert 'dag_id="logrisk_input_preprocess"' in source
+    assert "preprocess_uploaded_input" in source
+    assert '"input_job_id"' in source
+    assert '"input_orchestration_run_id"' in source
+    assert "raw_log" not in source
+    assert "samples" not in source

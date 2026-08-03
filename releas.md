@@ -24,6 +24,7 @@
 - Airflow DAG 补齐预处理、Drain3 分区、模板合并、规则复用、模型批次与校验阶段，并按 `logrisk_cpu_pool`/`logrisk_llm_pool` 和 Celery 队列进行基础动态映射；模型实体失败会准确收敛为失败编排状态。
 - Django 生产适配层改为不在启动或 Airflow Worker 初始化时自动迁移数据库；新增 `logrisk_check`、`logrisk_migrate` 和 `logrisk_reconcile_dispatch` 管理命令，用于显式检查/迁移与恢复待分派任务。
 - 新增 Django/Airflow 生产部署指南、无密配置示例和数据库调用关系说明，覆盖独立数据库、共享目录、Celery 队列、显式迁移、安全边界与回滚流程。
+- 新增上传预处理的独立 `logrisk_input_preprocess` DAG、跨 SQLite/PostgreSQL 输入编排状态与 Django 分片上传接口；上传日志仅以受控共享目录路径保存，DAG conf/XCom 只传输入任务、编排运行和请求 ID。Django/Worker 不再把跨进程已排队的特征任务误标为中断，并会从运行时数据库刷新 Airflow 写回的任务状态和事件。
 
 ## 1.30.0 - 2026-07-31
 

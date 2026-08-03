@@ -5,7 +5,7 @@
 ## 组件边界
 
 - Django：复用 PACAS/RBAC 身份，提供同源 API 与静态页面入口。
-- Airflow：调度预处理、Drain3、规则复用和模型批次；CPU 任务使用 `logrisk_cpu_pool` / `logrisk_cpu`，模型任务使用 `logrisk_llm_pool` / `logrisk_llm`。
+- Airflow：`logrisk_input_preprocess` DAG 负责已上传日志的预处理和 Drain3，`logrisk_analysis` DAG 负责规则复用和模型特征识别；CPU 任务使用 `logrisk_cpu_pool` / `logrisk_cpu`，模型任务使用 `logrisk_llm_pool` / `logrisk_llm`。
 - LOGRISK PostgreSQL：唯一的结构化业务状态权威。
 - `LOGRISK_SHARED_ROOT`：所有 Web 与 Worker 都能读写的共享目录，保存上传本体、Drain3 产物和导出文件；数据库只保存受控相对路径和摘要。
 
@@ -38,7 +38,7 @@ python manage.py logrisk_migrate --json
 python manage.py logrisk_check --json
 ```
 
-确认 `pending_migrations=0` 且共享目录可写后，部署 Django、Airflow DAG 和 Worker。Airflow 恢复时可运行 `python manage.py logrisk_reconcile_dispatch --json`，它只重试 `pending_dispatch` 或 `dispatch_failed` 记录，不启动本地回退。
+确认 `pending_migrations=0` 且共享目录可写后，部署 Django、`logrisk_input_preprocess` / `logrisk_analysis` 两个 Airflow DAG 和 Worker。上传完成后，Django 先持久化输入编排记录，再只向 `logrisk_input_preprocess` 传递输入任务 ID、编排运行 ID 和请求 ID；完成后浏览器再按既有流程创建特征任务。Airflow 恢复时可运行 `python manage.py logrisk_reconcile_dispatch --json`，它只重试 `pending_dispatch` 或 `dispatch_failed` 的特征与输入编排记录，不启动本地回退。
 
 ## 安全与回滚
 

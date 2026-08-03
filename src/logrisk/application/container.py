@@ -33,7 +33,12 @@ from logrisk.multi_source.config import load_multi_source_config
 from logrisk.multi_source.repository import MultiSourceRepository
 from logrisk.multi_source.service import MultiSourceService
 from logrisk.node_risk import NodeRiskService
-from logrisk.orchestration import OrchestrationRepository, OrchestrationService
+from logrisk.orchestration import (
+    InputOrchestrationRepository,
+    InputOrchestrationService,
+    OrchestrationRepository,
+    OrchestrationService,
+)
 from logrisk.observability import ObservabilityRepository, PromptSnapshotResolver, ReplayError, ReplayService, SpanRecorder
 from logrisk.release_readiness import ReleaseReadinessRepository, ReleaseReadinessService
 from logrisk.risk_semantics import RiskSemanticService
@@ -79,6 +84,7 @@ class ApplicationConfig:
     import_legacy_state: bool = False
     interrupt_streaming_tasks: bool = False
     feature_jobs_auto_start: bool = True
+    interrupt_feature_jobs: bool = True
     migrate_database: bool = True
 
     @classmethod
@@ -111,6 +117,7 @@ class ApplicationContainer:
     observability_repository: ObservabilityRepository
     feature_jobs: FeatureJobManager
     orchestration: OrchestrationService
+    input_orchestration: InputOrchestrationService
     rule_governance: RuleGovernanceService
     replay_service: ReplayService
     upload_store: SQLiteUploadSessionStore
@@ -330,10 +337,12 @@ def build_application_container(
         persistence=SQLiteFeatureJobStore(database),
         observability=span_recorder,
         auto_start=config.feature_jobs_auto_start,
+        interrupt_on_restore=config.interrupt_feature_jobs,
     )
     feature_jobs.observability = span_recorder
     rule_governance = RuleGovernanceService(RuleGovernanceRepository(database))
     orchestration = OrchestrationService(OrchestrationRepository(database))
+    input_orchestration = InputOrchestrationService(InputOrchestrationRepository(database))
     artifact_store = SharedArtifactStore(shared_root)
     upload_store = SQLiteUploadSessionStore(
         UploadConfig(upload_dir=state_root / "uploads", artifact_store=artifact_store), database
@@ -378,6 +387,7 @@ def build_application_container(
         observability_repository=observability_repository,
         feature_jobs=feature_jobs,
         orchestration=orchestration,
+        input_orchestration=input_orchestration,
         rule_governance=rule_governance,
         replay_service=replay_service,
         upload_store=upload_store,

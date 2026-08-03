@@ -15,6 +15,7 @@ LOGRISK = {
     "shared_root": os.environ["LOGRISK_SHARED_ROOT"],
     "airflow_base_url": os.environ["LOGRISK_AIRFLOW_URL"],
     "airflow_dag_id": "logrisk_analysis",
+    "airflow_input_dag_id": "logrisk_input_preprocess",
     "airflow_authorization_env": "LOGRISK_AIRFLOW_TOKEN",
     "identity_resolver": "company.pacas.LogriskIdentityResolver",
     "write_roles": ["logrisk:operator"],

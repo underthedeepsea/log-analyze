@@ -388,7 +388,8 @@ def test_upload_accepts_result_and_raw_log_formats():
     assert "/api/uploads" in source
     assert "/api/inputs/analyze-upload" in source
     assert "/api/input-jobs/" in source
-    assert "file.size > INLINE_MAX_BYTES" in source
+    assert "return this.uploadAndAnalyzeLargeFile(file, callbacks);" in source
+    assert 'jsonRequest("/api/inputs/analyze",' not in source
     assert "上传进度" in source
     assert "预处理阶段" in source
     assert "Drain3 分片" in source

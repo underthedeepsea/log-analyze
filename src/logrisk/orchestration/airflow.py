@@ -37,6 +37,8 @@ class AirflowRun:
     job_id: str | None
     orchestration_run_id: str | None
     request_id: str | None
+    input_job_id: str | None = None
+    input_orchestration_run_id: str | None = None
 
 
 class AirflowOrchestrator:
@@ -88,6 +90,39 @@ class AirflowOrchestrator:
             raise AirflowOrchestratorError("Airflow DAG Run 标识已被其他任务占用", code="airflow_run_conflict", status_code=409) from exc
         result = self._run(payload)
         if result.external_run_id != external_run_id or result.job_id != job or result.orchestration_run_id != run:
+            raise AirflowOrchestratorError("Airflow 返回的 DAG Run 信息无效", code="airflow_invalid_response")
+        return result
+
+    def trigger_input(self, input_job_id: str, input_orchestration_run_id: str, request_id: str) -> AirflowRun:
+        """Trigger upload preprocessing with IDs only; raw file content stays in shared storage."""
+        input_job = self._identifier(input_job_id, "输入任务 ID")
+        run = self._identifier(input_orchestration_run_id, "输入编排运行 ID")
+        request = self._identifier(request_id, "请求 ID")
+        external_run_id = self._identifier("logrisk_input__" + input_job, "Airflow DAG Run ID")
+        conf = {
+            "input_job_id": input_job,
+            "input_orchestration_run_id": run,
+            "request_id": request,
+        }
+        try:
+            payload = self._request("POST", self._dag_path("dagRuns"), {"dag_run_id": external_run_id, "conf": conf})
+        except AirflowOrchestratorError as exc:
+            if exc.code != "airflow_run_conflict":
+                raise
+            existing = self.get_run(external_run_id)
+            if (
+                existing.input_job_id == input_job
+                and existing.input_orchestration_run_id == run
+                and existing.request_id == request
+            ):
+                return existing
+            raise AirflowOrchestratorError("Airflow DAG Run 标识已被其他任务占用", code="airflow_run_conflict", status_code=409) from exc
+        result = self._run(payload)
+        if (
+            result.external_run_id != external_run_id
+            or result.input_job_id != input_job
+            or result.input_orchestration_run_id != run
+        ):
             raise AirflowOrchestratorError("Airflow 返回的 DAG Run 信息无效", code="airflow_invalid_response")
         return result
 
@@ -161,6 +196,10 @@ class AirflowOrchestrator:
                 job_id=self._optional_identifier(conf.get("job_id"), "任务 ID"),
                 orchestration_run_id=self._optional_identifier(conf.get("orchestration_run_id"), "编排运行 ID"),
                 request_id=self._optional_identifier(conf.get("request_id"), "请求 ID"),
+                input_job_id=self._optional_identifier(conf.get("input_job_id"), "输入任务 ID"),
+                input_orchestration_run_id=self._optional_identifier(
+                    conf.get("input_orchestration_run_id"), "输入编排运行 ID"
+                ),
             )
         except ValueError as exc:
             raise AirflowOrchestratorError("Airflow DAG Run 响应字段无效", code="airflow_invalid_response") from exc

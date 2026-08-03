@@ -3,8 +3,8 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from django.http import HttpRequest, JsonResponse
-from django.views.decorators.http import require_POST
+from django.http import HttpRequest, JsonResponse, StreamingHttpResponse
+from django.views.decorators.http import require_GET, require_POST
 
 from logrisk.orchestration import AirflowOrchestratorError
 from logrisk_django.service_factory import (
@@ -64,6 +64,25 @@ def create_job(request: HttpRequest) -> JsonResponse:
     }, status=202, json_dumps_params={"ensure_ascii": False})
 
 
+@require_GET
+def job_detail(_request: HttpRequest, job_id: str) -> JsonResponse:
+    try:
+        result = get_facade().feature_job(job_id)
+    except (KeyError, ValueError) as exc:
+        return _error(404, "feature_job_not_found", _safe_message(exc))
+    return JsonResponse(dict(result.body), status=result.status, json_dumps_params={"ensure_ascii": False})
+
+
+@require_GET
+def job_events(request: HttpRequest, job_id: str) -> StreamingHttpResponse | JsonResponse:
+    try:
+        cursor = _event_cursor(request)
+        events, _next_cursor = get_facade().feature_job_events(job_id, cursor)
+    except (KeyError, ValueError) as exc:
+        return _error(404, "feature_job_not_found", _safe_message(exc))
+    return StreamingHttpResponse(_sse(events, cursor), content_type="text/event-stream; charset=utf-8")
+
+
 def _error(status: int, code: str, message: str) -> JsonResponse:
     return JsonResponse({"code": code, "error": message}, status=status, json_dumps_params={"ensure_ascii": False})
 
@@ -73,3 +92,21 @@ def _safe_message(exc: Exception) -> str:
     if code:
         return "LOGRISK 任务创建失败"
     return str(exc)[:300]
+
+
+def _event_cursor(request: HttpRequest) -> int:
+    value = request.headers.get("Last-Event-ID") or request.GET.get("cursor") or "0"
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _sse(events: list[dict[str, object]], cursor: int):
+    if not events:
+        yield b": heartbeat\n\n"
+        return
+    for offset, event in enumerate(events, start=1):
+        event_type = str(event.get("type") or "message").replace("\n", "")[:100]
+        data = json.dumps(event, ensure_ascii=False, separators=(",", ":"))
+        yield f"id: {cursor + offset}\nevent: {event_type}\ndata: {data}\n\n".encode("utf-8")

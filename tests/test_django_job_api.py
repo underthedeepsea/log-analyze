@@ -103,3 +103,35 @@ def test_django_job_write_fails_closed_without_authenticated_identity(tmp_path) 
 
     assert response.status_code == 403
     assert response.json()["code"] == "runtime_identity_required"
+
+
+def test_django_job_detail_reads_the_latest_persisted_job_state(tmp_path) -> None:
+    from logrisk_django.service_factory import clear_cached_container, get_container
+
+    with override_settings(LOGRISK=_config(tmp_path, "tests.django_test_project.resolver.OperatorIdentityResolver")):
+        clear_cached_container()
+        call_command("logrisk_migrate", "--json")
+        job_id = get_container().feature_jobs.create_job(_result(), model="test-model")
+        response = Client().get(f"/api/jobs/{job_id}")
+        clear_cached_container()
+
+    assert response.status_code == 200
+    assert response.json()["job_id"] == job_id
+    assert response.json()["status"] == "queued"
+
+
+def test_django_job_events_replay_persisted_events_as_sse(tmp_path) -> None:
+    from logrisk_django.service_factory import clear_cached_container, get_container
+
+    with override_settings(LOGRISK=_config(tmp_path, "tests.django_test_project.resolver.OperatorIdentityResolver")):
+        clear_cached_container()
+        call_command("logrisk_migrate", "--json")
+        job_id = get_container().feature_jobs.create_job(_result(), model="test-model")
+        response = Client().get(f"/api/jobs/{job_id}/events?cursor=0")
+        body = b"".join(response.streaming_content).decode("utf-8")
+        clear_cached_container()
+
+    assert response.status_code == 200
+    assert response["Content-Type"].startswith("text/event-stream")
+    assert "event: job_created" in body
+    assert "data:" in body

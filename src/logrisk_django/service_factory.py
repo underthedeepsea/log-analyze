@@ -51,6 +51,16 @@ def get_airflow_orchestrator() -> AirflowOrchestrator:
     )
 
 
+def get_input_airflow_orchestrator() -> AirflowOrchestrator:
+    config = get_config()
+    return AirflowOrchestrator(
+        config.airflow_base_url,
+        config.airflow_input_dag_id,
+        timeout=config.airflow_timeout_seconds,
+        authorization_env=config.airflow_authorization_env,
+    )
+
+
 def clear_cached_container() -> None:
     """Test-only hook; production never hot-switches LOGRISK storage."""
     global _container, _facade

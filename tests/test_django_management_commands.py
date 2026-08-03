@@ -69,17 +69,42 @@ def test_reconcile_dispatch_retries_only_reconcilable_runs(tmp_path, monkeypatch
         def trigger(self, job_id: str, run_id: str, request_id: str) -> AirflowRun:
             return AirflowRun("logrisk__" + job_id, "queued", job_id, run_id, request_id)
 
+    class ReadyInputAirflow:
+        dag_id = "logrisk_input_preprocess"
+
+        def trigger_input(self, input_job_id: str, run_id: str, request_id: str) -> AirflowRun:
+            return AirflowRun(
+                "logrisk_input__" + input_job_id,
+                "queued",
+                None,
+                None,
+                request_id,
+                input_job_id,
+                run_id,
+            )
+
     monkeypatch.setattr(logrisk_reconcile_dispatch, "get_airflow_orchestrator", lambda: ReadyAirflow())
+    monkeypatch.setattr(logrisk_reconcile_dispatch, "get_input_airflow_orchestrator", lambda: ReadyInputAirflow())
     with override_settings(LOGRISK=_config(tmp_path)):
         clear_cached_container()
         call_command("logrisk_migrate", "--json")
         container = get_container()
         job_id = container.feature_jobs.create_job({"summary": {}, "risk_entities": []}, model="test")
         pending = container.orchestration.create_pending(job_id, "request-1", "pacas-alice")
+        source = container.artifact_store.resolve("uploads/reconcile.log")
+        source.parent.mkdir(parents=True, exist_ok=True)
+        source.write_text("sanitized", encoding="utf-8")
+        upload = container.upload_store.create(filename="messages", size_bytes=len(b"sanitized"))
+        input_job = container.input_jobs.create(upload_id=upload["upload_id"], filename="messages", source_path=str(source))
+        input_pending = container.input_orchestration.create_pending(input_job["input_job_id"], "request-2", "pacas-alice")
         result = json.loads(call_command("logrisk_reconcile_dispatch", "--json"))
         updated = container.orchestration.get(pending["orchestration_run_id"])
+        input_updated = container.input_orchestration.get(input_pending["input_orchestration_run_id"])
         clear_cached_container()
 
     assert result["retried"] == [pending["orchestration_run_id"]]
+    assert result["input_retried"] == [input_pending["input_orchestration_run_id"]]
     assert result["failed"] == []
+    assert result["input_failed"] == []
     assert updated["status"] == "dispatched"
+    assert input_updated["status"] == "dispatched"

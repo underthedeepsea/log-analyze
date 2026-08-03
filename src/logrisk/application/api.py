@@ -145,6 +145,16 @@ class ApiFacade:
             profile_snapshot=profile.public_dict(),
         )
 
+    def feature_job(self, job_id: str) -> ApiResult:
+        manager = self._service("feature_jobs", self.container.feature_jobs)
+        manager.refresh_from_persistence(str(job_id))
+        return ApiResult(200, manager.get_job(str(job_id)))
+
+    def feature_job_events(self, job_id: str, cursor: int) -> tuple[list[dict[str, Any]], int]:
+        manager = self._service("feature_jobs", self.container.feature_jobs)
+        manager.refresh_from_persistence(str(job_id))
+        return manager.wait_for_events(str(job_id), max(0, int(cursor)), timeout=0)
+
     def update_feature(
         self,
         job_id: str,

@@ -48,6 +48,56 @@ def test_prepare_job_is_idempotent_and_returns_only_safe_ids(tmp_path) -> None:
     assert "sanitized error" not in str(first)
 
 
+def test_preprocess_uploaded_input_runs_only_on_the_airflow_worker(tmp_path) -> None:
+    from logrisk.application import ApplicationConfig, build_application_container
+    from logrisk.airflow_tasks import preprocess_uploaded_input
+
+    config = replace(
+        ApplicationConfig.for_test(project_root=PROJECT_ROOT, state_root=tmp_path / "state"),
+        feature_jobs_auto_start=False,
+    )
+    container = build_application_container(config)
+    source = container.artifact_store.resolve("uploads/input.log")
+    source.parent.mkdir(parents=True, exist_ok=True)
+    source.write_text("sanitized source", encoding="utf-8")
+    upload = container.upload_store.create(filename="messages", size_bytes=len(b"sanitized source"))
+    input_job = container.input_jobs.create(
+        upload_id=upload["upload_id"],
+        filename="messages",
+        source_path=str(source),
+    )
+    run = container.input_orchestration.create_pending(input_job["input_job_id"], "request-input", "pacas-alice")
+    dispatched = container.input_orchestration.mark_dispatched(
+        run["input_orchestration_run_id"],
+        "logrisk_input_preprocess",
+        "logrisk_input__" + input_job["input_job_id"],
+        expected_version=run["state_version"],
+    )
+    called: list[str] = []
+
+    def finish(input_job_id: str) -> None:
+        called.append(input_job_id)
+        job = container.input_jobs.get_job(input_job_id)
+        job.update({"status": "completed", "stage": "completed"})
+        container.input_jobs.write_job(input_job_id, job)
+
+    container.run_input_job = finish
+    result = preprocess_uploaded_input(
+        input_job["input_job_id"],
+        dispatched["input_orchestration_run_id"],
+        "request-input",
+        container=container,
+    )
+
+    assert called == [input_job["input_job_id"]]
+    assert result == {
+        "input_job_id": input_job["input_job_id"],
+        "input_orchestration_run_id": dispatched["input_orchestration_run_id"],
+        "status": "completed",
+    }
+    assert container.input_orchestration.get(dispatched["input_orchestration_run_id"])["status"] == "completed"
+
+
 def test_finalize_job_marks_orchestration_without_returning_candidates(tmp_path) -> None:
     from logrisk.application import ApplicationConfig, build_application_container
     from logrisk.airflow_tasks import finalize_job, prepare_job

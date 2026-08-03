@@ -24,6 +24,7 @@ def build_worker_container() -> ApplicationContainer:
         import_legacy_state=False,
         interrupt_streaming_tasks=False,
         feature_jobs_auto_start=False,
+        interrupt_feature_jobs=False,
         migrate_database=False,
     ))
 
@@ -50,6 +51,57 @@ def prepare_job(
 def preprocess_input(job_id: str, orchestration_run_id: str, *, container: ApplicationContainer | None = None) -> dict[str, str]:
     _ensure_running(job_id, orchestration_run_id, container)
     return {"job_id": str(job_id), "orchestration_run_id": str(orchestration_run_id), "status": "prepared"}
+
+
+def preprocess_uploaded_input(
+    input_job_id: str,
+    input_orchestration_run_id: str,
+    request_id: str,
+    *,
+    container: ApplicationContainer | None = None,
+) -> dict[str, str]:
+    """Run Drain3 preprocessing in the Airflow worker, passing no file data through XCom."""
+    services = container or build_worker_container()
+    run = services.input_orchestration.get(input_orchestration_run_id)
+    if run["input_job_id"] != str(input_job_id) or run["request_id"] != str(request_id):
+        raise ValueError("输入编排运行与任务标识不匹配")
+    if run["status"] == "dispatched":
+        run = services.input_orchestration.mark_running(
+            input_orchestration_run_id,
+            expected_version=run["state_version"],
+        )
+    if run["status"] != "running":
+        raise ValueError("输入编排运行不处于可执行状态")
+    if services.run_input_job is None:
+        raise RuntimeError("输入任务执行器未配置")
+    try:
+        services.run_input_job(str(input_job_id))
+    except Exception:
+        current = services.input_orchestration.get(input_orchestration_run_id)
+        if current["status"] == "running":
+            services.input_orchestration.mark_finished(
+                input_orchestration_run_id,
+                "failed",
+                expected_version=current["state_version"],
+                error_code="input_job_failed",
+                error_summary="输入日志预处理失败",
+            )
+        raise
+    job = services.input_jobs.get_job(str(input_job_id))
+    target = "completed" if job.get("status") == "completed" else "failed"
+    current = services.input_orchestration.get(input_orchestration_run_id)
+    finished = services.input_orchestration.mark_finished(
+        input_orchestration_run_id,
+        target,
+        expected_version=current["state_version"],
+        error_code="input_job_failed" if target == "failed" else None,
+        error_summary="输入日志预处理失败" if target == "failed" else None,
+    )
+    return {
+        "input_job_id": str(input_job_id),
+        "input_orchestration_run_id": str(input_orchestration_run_id),
+        "status": str(finished["status"]),
+    }
 
 
 def list_drain_partitions(job_id: str, orchestration_run_id: str, *, container: ApplicationContainer | None = None) -> dict[str, Any]:

@@ -107,6 +107,24 @@ def test_airflow_trigger_sends_only_sanitized_ids(fake_airflow: FakeAirflow) -> 
     }
 
 
+def test_airflow_input_trigger_sends_only_stable_input_ids(fake_airflow: FakeAirflow) -> None:
+    from logrisk.orchestration.airflow import AirflowOrchestrator
+
+    client = AirflowOrchestrator(fake_airflow.url, "logrisk_input_preprocess", timeout=10)
+    result = client.trigger_input("input_job-1", "input_orchestration-1", "request-1")
+
+    assert result.external_run_id == "logrisk_input__input_job-1"
+    assert result.input_job_id == "input_job-1"
+    assert fake_airflow.last_json == {
+        "dag_run_id": "logrisk_input__input_job-1",
+        "conf": {
+            "input_job_id": "input_job-1",
+            "input_orchestration_run_id": "input_orchestration-1",
+            "request_id": "request-1",
+        },
+    }
+
+
 @pytest.mark.parametrize(
     ("status", "code"),
     [(401, "airflow_auth_failed"), (403, "airflow_access_denied"), (404, "airflow_dag_not_found")],

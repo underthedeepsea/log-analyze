@@ -23,6 +23,7 @@ _ALLOWED = {
     "shared_root",
     "airflow_base_url",
     "airflow_dag_id",
+    "airflow_input_dag_id",
     "airflow_timeout_seconds",
     "airflow_authorization_env",
     "identity_resolver",
@@ -42,6 +43,7 @@ class LogriskConfig:
     shared_root: Path
     airflow_base_url: str
     airflow_dag_id: str
+    airflow_input_dag_id: str
     airflow_timeout_seconds: float
     airflow_authorization_env: str | None
     identity_resolver: str
@@ -72,6 +74,9 @@ class LogriskConfig:
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise LogriskSettingsError("airflow_base_url 必须是有效的 HTTP(S) 地址")
         airflow_dag_id = _identifier(raw.get("airflow_dag_id") or "logrisk_analysis", "airflow_dag_id")
+        airflow_input_dag_id = _identifier(
+            raw.get("airflow_input_dag_id") or "logrisk_input_preprocess", "airflow_input_dag_id"
+        )
         timeout = raw.get("airflow_timeout_seconds", 10)
         if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 0 < float(timeout) <= 300:
             raise LogriskSettingsError("airflow_timeout_seconds 必须是 0 到 300 的数字")
@@ -93,6 +98,7 @@ class LogriskConfig:
             shared_root=shared_root,
             airflow_base_url=airflow_base_url,
             airflow_dag_id=airflow_dag_id,
+            airflow_input_dag_id=airflow_input_dag_id,
             airflow_timeout_seconds=float(timeout),
             airflow_authorization_env=authorization_env,
             identity_resolver=identity_resolver,
@@ -116,6 +122,7 @@ class LogriskConfig:
             import_legacy_state=False,
             interrupt_streaming_tasks=False,
             feature_jobs_auto_start=False,
+            interrupt_feature_jobs=False,
             migrate_database=False,
         )
 
@@ -126,6 +133,7 @@ class LogriskConfig:
             "shared_root": str(self.shared_root),
             "airflow_base_url": self.airflow_base_url,
             "airflow_dag_id": self.airflow_dag_id,
+            "airflow_input_dag_id": self.airflow_input_dag_id,
             "airflow_timeout_seconds": self.airflow_timeout_seconds,
             "airflow_authorization_env": self.airflow_authorization_env,
             "identity_resolver": self.identity_resolver,

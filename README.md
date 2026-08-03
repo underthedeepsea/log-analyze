@@ -249,7 +249,7 @@ DASHBOARD_CORS_ORIGINS=https://logrisk.example.internal \
 
 ### Django + Airflow 生产适配
 
-生产环境可将纯静态 React 包、PACAS/RBAC 控制面和调度分离部署：Django 4.2.16 提供 API/静态入口，Airflow 2.3.2 `CeleryExecutor` 负责调度，LOGRISK PostgreSQL 独立于 Django 与 Airflow 元数据库。所有 Web 与 Worker 实例必须共享 `LOGRISK_SHARED_ROOT`；DAG conf/XCom 只传任务、编排和请求 ID，不传日志正文。
+生产环境可将纯静态 React 包、PACAS/RBAC 控制面和调度分离部署：Django 4.2.16 提供 API/静态入口，Airflow 2.3.2 `CeleryExecutor` 负责调度，LOGRISK PostgreSQL 独立于 Django 与 Airflow 元数据库。`logrisk_input_preprocess` 只接收上传任务、输入编排和请求 ID 后在 Worker 读取共享目录，`logrisk_analysis` 处理已生成的风险结果；所有 Web 与 Worker 实例必须共享 `LOGRISK_SHARED_ROOT`。DAG conf/XCom 不传日志正文。
 
 Django 不会自动迁移数据库。上线窗口通过 `python manage.py logrisk_migrate --check`、`python manage.py logrisk_migrate` 和 `python manage.py logrisk_check` 显式完成迁移和检查。详见 [Django 与 Airflow 生产部署指南](DJANGO_AIRFLOW_DEPLOYMENT_GUIDE.md)，可复制配置见 `examples/django_integration/` 与 `examples/airflow/`。
 

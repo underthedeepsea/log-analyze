@@ -1,4 +1,4 @@
-schema_version: 11
+schema_version: 12
 database: logrisk
 description: LOGRISK 双模式运行时数据字典；SQLite 是默认本地实现，PostgreSQL 用于显式配置的外部生产部署。
 authoritative_ddl:
@@ -145,6 +145,18 @@ tables:
     primary_key: audit_id
     indexes: [idx_runtime_audit_created(created_at DESC, audit_id DESC), idx_runtime_audit_resource(resource_type, resource_id, created_at DESC)]
     columns: {audit_id: 审计标识, action: 操作名称, resource_type: 资源类别, resource_id: 资源标识, actor: PACAS/RBAC 传入的操作人, roles_json: 角色名称列表, request_id: 请求标识, outcome: success/failed/denied, attributes_json: 脱敏操作元数据, schema_version: 结构版本, created_at: 发生时间}
+  release_validations:
+    description: 发布就绪中心的不可变校验运行；只保存脱敏摘要，不保存原始日志、凭据或模型内容
+    primary_key: validation_id
+    constraints: idempotency_key 唯一；status 为 passed/warning/blocked；target_version 为语义版本号
+    indexes: [idx_release_validation_created(created_at DESC, validation_id DESC)]
+    columns: {validation_id: 校验运行标识, target_version: 目标发布版本, idempotency_key: 请求幂等键, status: 总体就绪状态, summary_json: 脱敏汇总计数与说明, schema_version: 结构版本, created_at: 校验发生时间}
+  release_validation_checks:
+    description: 单次发布校验的有序检查明细；证据仅为脱敏运行元数据
+    primary_key: [validation_id, check_id]
+    foreign_keys: {validation_id: release_validations.validation_id ON DELETE CASCADE}
+    indexes: [idx_release_validation_check_status(validation_id, status, position)]
+    columns: {validation_id: 所属校验运行, check_id: 稳定检查标识, position: 展示顺序, title: 检查名称, status: passed/warning/blocked, code: 稳定结果码, message: 脱敏结果说明, evidence_json: 脱敏佐证数据, schema_version: 结构版本, created_at: 检查发生时间}
   multi_source_rules:
     description: 确定性跨来源关联规则；仅使用实体、来源、时间窗口、计数和风险阈值
     primary_key: rule_id

@@ -6,6 +6,20 @@
 - 仅修复 Bug 时提升最后一位，例如 `1.2.0 → 1.2.1`；
 - 每次代码更新必须同步更新本文件。
 
+## 1.30.0 - 2026-07-31
+
+### Added
+
+- 新增发布就绪中心：可在 Dashboard 的“系统 → 发布就绪”执行确定性、只读发布前检查，覆盖运行时/数据库迁移、前端静态包、基础配置、默认模型 Profile 与连接、默认 Prompt、Drain3、语义词典、多来源规则和 Benchmark 门禁。
+- 新增 SQLite/PostgreSQL 对等 `0012` migration，以及 `release_validations`、`release_validation_checks` 两张表；结果以目标版本和幂等键保存，支持查看最近记录、历史和脱敏诊断。
+- 新增 `/api/release-readiness`、`/history`、`/diagnostic` 和受外部身份保护的 `/validate` API；校验不会调用模型、迁移数据库、切换配置或自动发布。
+- 新增发布就绪 React 页面，显示总体状态、通过/复核/阻断计数、检查明细、版本输入、校验历史和复制诊断信息入口。
+
+### Security
+
+- 发布校验仅保存脱敏状态和有限元数据；不会记录原始日志、样例、Prompt 正文、模型内容、API Key、Token、密码或 DSN。
+- `blocked` 状态阻止“可发布”结论；`warning` 仅提示人工复核，系统不自动绕过或修复任何检查。
+
 ## 1.29.0 - 2026-07-30
 
 ### Added

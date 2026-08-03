@@ -76,9 +76,9 @@ PostgreSQL 模式下，所有结构化运行时业务状态统一写入 PostgreS
 
 原始日志、API Key、Token、密码和含密 DSN 不得进入业务表、AI Trace、Observation 或 Replay。
 
-## 69 张表与代码映射
+## 71 张表与代码映射
 
-当前逻辑结构共 69 张表：68 张由版本化 migration 创建，`schema_migrations` 由数据库适配层创建。
+当前逻辑结构共 71 张表：70 张由版本化 migration 创建，`schema_migrations` 由数据库适配层创建。
 
 ### 管理与迁移（3）
 
@@ -140,7 +140,7 @@ PostgreSQL 模式下，所有结构化运行时业务状态统一写入 PostgreS
 | `streaming_task_events` | 流式任务审计事件 | `src/logrisk/streaming_state.py` |
 | `artifacts` | 文件产物路径、大小和校验值 | `src/logrisk/sqlite_stores.py` |
 
-### 生产运行（4）
+### 生产运行与发布就绪（6）
 
 | 表 | 用途 | 主要代码 |
 |---|---|---|
@@ -148,6 +148,8 @@ PostgreSQL 模式下，所有结构化运行时业务状态统一写入 PostgreS
 | `runtime_maintenance_runs` | Retention 预览与执行记录 | `src/logrisk/runtime/repository.py`、`src/logrisk/runtime/service.py` |
 | `runtime_quota_snapshots` | 接受上传或分析前的最新存储用量快照 | `src/logrisk/runtime/repository.py`、`src/logrisk/runtime/service.py` |
 | `runtime_audit_events` | PACAS/RBAC 身份上下文下的脱敏运行审计 | `src/logrisk/runtime/repository.py`、`src/pipeline/dashboard_server.py` |
+| `release_validations` | 发布就绪中心的不可变、脱敏校验运行 | `src/logrisk/release_readiness/repository.py`、`src/logrisk/release_readiness/service.py` |
+| `release_validation_checks` | 单次发布校验的有序检查明细 | `src/logrisk/release_readiness/repository.py`、`src/logrisk/release_readiness/service.py` |
 
 ### 多来源智能关联（5）
 

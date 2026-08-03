@@ -174,6 +174,38 @@ def test_runtime_retention_policy_is_versioned_and_audited(runtime_dashboard) ->
     assert payload["error_code"] == "runtime_version_conflict"
 
 
+def test_release_readiness_requires_identity_and_records_an_idempotent_validation(runtime_dashboard) -> None:
+    headers = {
+        "X-LOGRISK-Actor": "alice",
+        "X-LOGRISK-Roles": "logrisk:operator",
+        "X-Request-ID": "gateway-release-ready-1",
+    }
+
+    status, overview, _ = request_json(runtime_dashboard + "/api/release-readiness")
+    assert status == 200
+    assert overview["latest"] is None
+
+    status, denied, _ = request_json(
+        runtime_dashboard + "/api/release-readiness/validate",
+        "POST",
+        {"target_version": "1.30.0", "idempotency_key": "release-ready-api-test"},
+    )
+    assert status == 403
+    assert denied["error_code"] == "runtime_identity_required"
+
+    payload = {"target_version": "1.30.0", "idempotency_key": "release-ready-api-test"}
+    status, first, _ = request_json(runtime_dashboard + "/api/release-readiness/validate", "POST", payload, headers)
+    duplicate_status, duplicate, _ = request_json(runtime_dashboard + "/api/release-readiness/validate", "POST", payload, headers)
+    history_status, history, _ = request_json(runtime_dashboard + "/api/release-readiness/history")
+
+    assert status == 200
+    assert first["status"] in {"passed", "warning", "blocked"}
+    assert duplicate_status == 200
+    assert duplicate["validation_id"] == first["validation_id"]
+    assert history_status == 200
+    assert history["items"][0]["validation_id"] == first["validation_id"]
+
+
 def test_runtime_quota_blocks_new_upload_session(quota_dashboard) -> None:
     status, payload, _ = request_json(
         quota_dashboard + "/api/uploads",

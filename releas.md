@@ -14,6 +14,7 @@
 - 本地 Dashboard 已改为仅承载 HTTP 路由与静态页面，服务装配迁移至 `logrisk.application`；Airflow Worker 不会触发本地服务启动时的流式任务中断或历史文件导入。
 - 新增跨 SQLite/PostgreSQL 的 Airflow 编排运行状态表与乐观并发仓储，持久化调度、心跳、取消、完成和可恢复分派状态；外部编排错误仅保存脱敏摘要，不保存凭据或任务内容。
 - 新增受控共享 Artifact 存储：上传完成后以 SHA256 校验、同目录临时文件和原子替换写入 `LOGRISK_SHARED_ROOT`；数据库与任务快照仅保存共享根目录内的相对路径。
+- 新增仅依赖标准库的 Airflow 2.3 REST v1 适配器，可安全触发、查询和取消 DAG Run；DAG conf 只传递任务、编排运行和请求 ID，错误与凭据均不会回显或持久化。
 
 ## 1.30.0 - 2026-07-31
 

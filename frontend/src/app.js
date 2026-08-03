@@ -44,6 +44,8 @@
     runtimeStorage: function () { return jsonRequest("/api/runtime/storage"); },
     runtimeRetention: function () { return jsonRequest("/api/runtime/retention"); },
     runtimeAudit: function () { return jsonRequest("/api/runtime/audits?limit=100"); },
+    releaseReadiness: function () { return jsonRequest("/api/release-readiness"); },
+    validateReleaseReadiness: function (targetVersion) { const key = "release-readiness-" + Date.now(); return jsonRequest("/api/release-readiness/validate", { method: "POST", headers: { "Idempotency-Key": key }, body: JSON.stringify({ target_version: targetVersion, idempotency_key: key }) }); },
     saveRuntimeRetention: function (payload) { return jsonRequest("/api/runtime/retention/policy", { method: "POST", body: JSON.stringify(payload) }); },
     previewRuntimeRetention: function () { return jsonRequest("/api/runtime/retention/preview", { method: "POST", body: "{}" }); },
     executeRuntimeRetention: function () { return jsonRequest("/api/runtime/retention/execute", { method: "POST", body: "{}" }); },
@@ -209,7 +211,7 @@
     { id: "ai", label: "AI 工程", items: [["observability", "AI 分析观测"], ["traces", "AI 调用追踪"], ["prompts", "Prompt 管理"], ["modelProfiles", "模型画像"]] },
     { id: "risk", label: "规则与风险", items: [["rules", "规则治理"], ["nodeRisks", "服务器风险"], ["multiSource", "多来源关联"], ["semanticLibrary", "风险语义库"]] },
     { id: "governance", label: "数据治理", items: [["streaming", "流式处理"], ["drainQuality", "评测中心 · 模板质量"], ["benchmarkCenter", "评测与基准"]] },
-    { id: "system", label: "系统", items: [["runtime", "运行中心"], ["settings", "系统设置"]] },
+    { id: "system", label: "系统", items: [["runtime", "运行中心"], ["releaseReadiness", "发布就绪"], ["settings", "系统设置"]] },
   ];
   function navigationGroupForView(view) {
     return NAV_GROUPS.find(function (group) {
@@ -300,6 +302,7 @@
   function pathToView(path) {
     if (path === "/benchmark-center") return "benchmarkCenter";
     if (path === "/runtime") return "runtime";
+    if (path === "/release-readiness") return "releaseReadiness";
     if (path === "/streaming") return "streaming";
     if (path === "/prompts") return "prompts";
     if (path === "/model-profiles") return "modelProfiles";
@@ -315,7 +318,7 @@
   }
   function routeForView(view) {
     return {
-      benchmarkCenter: "/benchmark-center", runtime: "/runtime", streaming: "/streaming", prompts: "/prompts", modelProfiles: "/model-profiles",
+      benchmarkCenter: "/benchmark-center", runtime: "/runtime", releaseReadiness: "/release-readiness", streaming: "/streaming", prompts: "/prompts", modelProfiles: "/model-profiles",
       traces: "/ai-traces", observability: "/ai-observability", drainQuality: "/drain-quality", rules: "/rules",
       nodeRisks: "/node-risks", multiSource: "/multi-source", semanticLibrary: "/semantic-library", settings: "/settings",
     }[view] || "/";
@@ -1545,6 +1548,53 @@
       h("section", { className: "surface runtime-audit-table" }, h("div", { className: "surface-head" }, h("div", null, h("b", null, "审计日志"), h("span", null, "只记录脱敏操作元数据，不记录 API Key、Token 或原始日志")), h("span", null, audits.length + " 条")), !audits.length && h("div", { className: "empty-state compact" }, "尚无运行中心审计记录"), audits.slice(0, 12).map(function (item) { return h("article", { key: item.audit_id }, h("div", null, h("b", null, item.action), h("small", null, item.resource_type + (item.resource_id ? " · " + item.resource_id : ""))), h("span", null, item.actor || "系统"), h("span", { className: "status-chip " + (item.outcome === "success" ? "completed" : "failed") }, item.outcome), h("small", null, "request_id: " + (item.request_id || "—")), h("small", null, timeText(item.created_at))); })));
   }
 
+  function ReleaseReadinessPage(props) {
+    const data = props.data || {}, latest = data.latest || null, history = data.history || [];
+    const [targetVersion, setTargetVersion] = useState(function () { return latest && latest.target_version || "1.30.0"; });
+    const [working, setWorking] = useState(false), [notice, setNotice] = useState("");
+    useEffect(function () { if (latest && latest.target_version) setTargetVersion(latest.target_version); }, [latest && latest.validation_id]);
+    function statusText(status) { return { passed: "可发布", warning: "需复核", blocked: "已阻断" }[status] || "尚未校验"; }
+    function copyDiagnostic() {
+      const value = JSON.stringify({ page: "release-readiness", api_base: currentApiBase(), target_version: latest && latest.target_version || targetVersion, status: latest && latest.status || "not_validated", summary: latest && latest.summary || {}, checks: (latest && latest.checks || []).map(function (item) { return { check_id: item.check_id, status: item.status, code: item.code }; }) }, null, 2);
+      if (navigator.clipboard) navigator.clipboard.writeText(value);
+      setNotice("诊断信息已复制；内容不包含原始日志、Prompt 正文或凭据。");
+    }
+    async function validate() {
+      setWorking(true); setNotice("");
+      try {
+        const result = await props.onValidate(targetVersion);
+        setNotice("发布校验完成：" + statusText(result.status) + "。");
+      } catch (reason) {
+        setNotice(reason.message || "发布校验失败，请检查外部身份和运行状态。");
+      } finally { setWorking(false); }
+    }
+    if (data.loading) return h("div", { className: "release-readiness-page" }, h("div", { className: "release-readiness-state" }, h("b", null, "正在读取发布就绪状态"), h("span", null, "仅汇总本地配置、运行时和已保存评测元数据，不调用模型。")));
+    if (data.failure) return h("div", { className: "release-readiness-page" }, h("div", { className: "release-readiness-state error" }, h("b", null, "发布就绪数据加载失败"), h("span", null, data.failure), h("div", null, h("button", { className: "secondary-button", onClick: props.onRefresh }, "重试"), h("button", { className: "text-button", onClick: copyDiagnostic }, "复制诊断信息"))));
+    const checks = latest && latest.checks || [];
+    const summary = latest && latest.summary || {};
+    const historyItems = history.slice(0, 12).map(function (item) {
+      return h("article", { key: item.validation_id },
+        h("div", null, h("b", null, item.target_version), h("small", null, item.validation_id)),
+        h("span", { className: "status-chip " + item.status }, statusText(item.status)),
+        h("span", null, "通过 " + (item.summary && item.summary.passed || 0) + " · 复核 " + (item.summary && item.summary.warnings || 0) + " · 阻断 " + (item.summary && item.summary.blocked || 0)),
+        h("time", null, timeText(item.created_at)));
+    });
+    return h("div", { className: "release-readiness-page" },
+      h("section", { className: "release-readiness-hero" },
+        h("div", null, h("span", { className: "eyebrow" }, "RELEASE READINESS CENTER"), h("h2", null, "发布就绪中心"), h("p", null, "在发布前执行确定性、只读校验：不调用大模型、不迁移数据库、不修改运行配置，也不读取或展示原始日志。")),
+        h("div", { className: "release-readiness-actions" }, h("label", null, h("span", null, "目标版本"), h("input", { value: targetVersion, inputMode: "decimal", pattern: "\\d+\\.\\d+\\.\\d+", onChange: function (event) { setTargetVersion(event.target.value); } })), h("button", { className: "secondary-button", onClick: props.onRefresh, disabled: working }, "刷新"), h("button", { className: "primary-button", onClick: validate, disabled: working }, working ? "校验中…" : "执行发布校验"))),
+      h("section", { className: "release-readiness-metrics" },
+        [[statusText(latest && latest.status), "总体状态", latest && latest.status || ""], [String(summary.passed || 0), "通过检查", "passed"], [String(summary.warnings || 0), "待人工复核", "warning"], [String(summary.blocked || 0), "阻断项", "blocked"], [latest ? timeText(latest.created_at) : "—", "最近校验", ""]].map(function (item) { return h("article", { className: item[2], key: item[1] }, h("b", null, item[0]), h("span", null, item[1])); })),
+      notice && h("p", { className: "release-readiness-notice" }, notice),
+      h("section", { className: "surface release-check-list" }, h("div", { className: "surface-head" }, h("div", null, h("b", null, "发布检查"), h("span", null, "每次校验结果会作为脱敏运行记录保存，便于追溯。")), h("button", { className: "text-button", onClick: copyDiagnostic }, "复制诊断信息")),
+        !latest && h("div", { className: "empty-state compact" }, "尚未执行发布校验。选择目标版本后开始，系统不会自动发布。"),
+        checks.map(function (item) { return h("article", { key: item.check_id, className: "release-check " + item.status }, h("span", { className: "status-chip " + item.status }, statusText(item.status)), h("div", null, h("b", null, item.title), h("small", null, item.message)), h("code", null, item.code)); })),
+      h("section", { className: "surface release-history" }, h("div", { className: "surface-head" }, h("div", null, h("b", null, "校验历史"), h("span", null, "重试使用幂等键，不会重复写入同一条校验。")), h("span", null, history.length + " 条")),
+        !history.length && h("div", { className: "empty-state compact" }, "暂无历史校验记录"),
+        historyItems),
+    );
+  }
+
   function multiSourceRuleDraft(rule) {
     return {
       display_name: String(rule.display_name || ""),
@@ -1708,6 +1758,7 @@
     const [benchmarkData, setBenchmarkData] = useState({ overview: {}, suites: [], runs: [], trends: [], leaderboard: [], selectedRun: null, loading: false, failure: "" });
     const [streamingData, setStreamingData] = useState({ tasks: [], sources: {}, templates: [] });
     const [runtimeData, setRuntimeData] = useState({ identity: {}, health: {}, readiness: {}, tasks: { items: [] }, storage: {}, retention: {}, audits: { items: [] }, loading: false, failure: "", failureCode: "" });
+    const [releaseReadinessData, setReleaseReadinessData] = useState({ latest: null, history: [], loading: false, failure: "" });
     const [multiSourceData, setMultiSourceData] = useState({ summary: {}, entities: [], rules: [], timeline: [], correlations: [], selected: null, loading: false, failure: "" });
     const [sidebarCollapsed, setSidebarCollapsed] = useState(false), [mobileMenuOpen, setMobileMenuOpen] = useState(false);
     const [narrowSidebar, setNarrowSidebar] = useState(function () { return window.matchMedia("(max-width: 900px)").matches; });
@@ -1737,6 +1788,7 @@
       if (next === "streaming") loadStreaming().catch(function (reason) { setError(reason.message); });
       if (next === "benchmarkCenter") loadBenchmark().catch(function () {});
       if (next === "runtime") loadRuntime().catch(function () {});
+      if (next === "releaseReadiness") loadReleaseReadiness().catch(function () {});
       if (next === "multiSource") loadMultiSource().catch(function () {});
     }
     function toggleSidebar() {
@@ -1809,6 +1861,23 @@
         throw reason;
       }
     }
+    async function loadReleaseReadiness() {
+      setReleaseReadinessData(function (current) { return Object.assign({}, current, { loading: true, failure: "" }); });
+      try {
+        const value = await api.releaseReadiness();
+        const next = { latest: value.latest || null, history: value.history || [], loading: false, failure: "" };
+        setReleaseReadinessData(next);
+        return next;
+      } catch (reason) {
+        setReleaseReadinessData(function (current) { return Object.assign({}, current, { loading: false, failure: reason.message || "未知错误" }); });
+        throw reason;
+      }
+    }
+    async function validateReleaseReadiness(targetVersion) {
+      const result = await api.validateReleaseReadiness(targetVersion);
+      await loadReleaseReadiness();
+      return result;
+    }
     async function resumeStreamingTask(taskId) { await api.resumeStreamingTask(taskId); await loadStreaming(); }
     async function createBenchmarkRun(payload) { const created = await api.createBenchmarkRun(payload); await loadBenchmark(created.run_id); return created; }
     async function evaluateBenchmarkGate(payload) { const gate = await api.evaluateBenchmarkGate(payload); await loadBenchmark(payload.candidate_run_id); return gate; }
@@ -1831,8 +1900,8 @@
     async function refresh(id) { const next = await api.job(id || jobId); setSnapshot(next); if (["completed", "completed_with_errors"].includes(next.status) && events.current) events.current.close(); loadHarness().catch(function () {}); }
     useEffect(function () {
       const query = window.location.pathname === "/ai-traces" ? traceFilterQuery(traceFiltersFromSearch(window.location.search)) : "?limit=50";
-      Promise.all([api.config(), api.status(), Promise.all([api.governedRules("?page_size=100"), api.ruleReviewQueue()]), api.metrics(), api.harnessStatus(), api.prompts(), api.traces(query), api.modelProfiles()]).then(function (values) { setModel(values[0].default_model); setOllama(values[1]); setRules(values[2][0].items || []); setRuleReviewQueue(values[2][1]); setSystemMetrics(values[3]); setHarness(values[4]); setPrompts(values[5].items || []); setPromptId(values[5].current_prompt_id || values[4].current_prompt_id || "feature_extract_v3_compact_strict_json_en"); setTraces(values[6].items || []); setModelProfiles(values[7]); setModelProfileId(values[7].default_profile_id || ""); if (window.location.pathname === "/ai-observability") loadObservability().catch(function (reason) { setError(reason.message); }); if (window.location.pathname === "/drain-quality") loadDrainQuality().catch(function (reason) { setError(reason.message); }); if (window.location.pathname.startsWith("/node-risks")) loadNodeRisks().catch(function (reason) { setError(reason.message); }); if (window.location.pathname === "/multi-source") loadMultiSource().catch(function () {}); if (window.location.pathname === "/semantic-library") loadRiskSemantics().catch(function (reason) { setError(reason.message); }); if (window.location.pathname === "/streaming") loadStreaming().catch(function (reason) { setError(reason.message); }); if (window.location.pathname === "/benchmark-center") loadBenchmark().catch(function () {}); if (window.location.pathname === "/runtime") loadRuntime().catch(function () {}); }).catch(function (reason) { setError(reason.message); });
-      function onPop() { const filters = traceFiltersFromSearch(window.location.search); setView(pathToView(window.location.pathname)); setTraceFilters(filters); if (window.location.pathname === "/ai-traces") loadHarness(traceFilterQuery(filters)).catch(function () {}); if (window.location.pathname === "/ai-observability") loadObservability().catch(function () {}); if (window.location.pathname === "/drain-quality") loadDrainQuality().catch(function () {}); if (window.location.pathname === "/rules") loadRules().catch(function () {}); if (window.location.pathname.startsWith("/node-risks")) loadNodeRisks().catch(function () {}); if (window.location.pathname === "/multi-source") loadMultiSource().catch(function () {}); if (window.location.pathname === "/semantic-library") loadRiskSemantics().catch(function () {}); if (window.location.pathname === "/streaming") loadStreaming().catch(function () {}); if (window.location.pathname === "/benchmark-center") loadBenchmark().catch(function () {}); if (window.location.pathname === "/runtime") loadRuntime().catch(function () {}); }
+      Promise.all([api.config(), api.status(), Promise.all([api.governedRules("?page_size=100"), api.ruleReviewQueue()]), api.metrics(), api.harnessStatus(), api.prompts(), api.traces(query), api.modelProfiles()]).then(function (values) { setModel(values[0].default_model); setOllama(values[1]); setRules(values[2][0].items || []); setRuleReviewQueue(values[2][1]); setSystemMetrics(values[3]); setHarness(values[4]); setPrompts(values[5].items || []); setPromptId(values[5].current_prompt_id || values[4].current_prompt_id || "feature_extract_v3_compact_strict_json_en"); setTraces(values[6].items || []); setModelProfiles(values[7]); setModelProfileId(values[7].default_profile_id || ""); if (window.location.pathname === "/ai-observability") loadObservability().catch(function (reason) { setError(reason.message); }); if (window.location.pathname === "/drain-quality") loadDrainQuality().catch(function (reason) { setError(reason.message); }); if (window.location.pathname.startsWith("/node-risks")) loadNodeRisks().catch(function (reason) { setError(reason.message); }); if (window.location.pathname === "/multi-source") loadMultiSource().catch(function () {}); if (window.location.pathname === "/semantic-library") loadRiskSemantics().catch(function (reason) { setError(reason.message); }); if (window.location.pathname === "/streaming") loadStreaming().catch(function (reason) { setError(reason.message); }); if (window.location.pathname === "/benchmark-center") loadBenchmark().catch(function () {}); if (window.location.pathname === "/runtime") loadRuntime().catch(function () {}); if (window.location.pathname === "/release-readiness") loadReleaseReadiness().catch(function () {}); }).catch(function (reason) { setError(reason.message); });
+      function onPop() { const filters = traceFiltersFromSearch(window.location.search); setView(pathToView(window.location.pathname)); setTraceFilters(filters); if (window.location.pathname === "/ai-traces") loadHarness(traceFilterQuery(filters)).catch(function () {}); if (window.location.pathname === "/ai-observability") loadObservability().catch(function () {}); if (window.location.pathname === "/drain-quality") loadDrainQuality().catch(function () {}); if (window.location.pathname === "/rules") loadRules().catch(function () {}); if (window.location.pathname.startsWith("/node-risks")) loadNodeRisks().catch(function () {}); if (window.location.pathname === "/multi-source") loadMultiSource().catch(function () {}); if (window.location.pathname === "/semantic-library") loadRiskSemantics().catch(function () {}); if (window.location.pathname === "/streaming") loadStreaming().catch(function () {}); if (window.location.pathname === "/benchmark-center") loadBenchmark().catch(function () {}); if (window.location.pathname === "/runtime") loadRuntime().catch(function () {}); if (window.location.pathname === "/release-readiness") loadReleaseReadiness().catch(function () {}); }
       window.addEventListener("popstate", onPop);
       return function () { window.removeEventListener("popstate", onPop); if (events.current) events.current.close(); };
     }, []);
@@ -1897,7 +1966,7 @@
       h(Sidebar, { active: view, onChange: changeView }),
       h("button", { className: "sidebar-overlay", type: "button", "aria-label": "关闭菜单", onClick: function () { setMobileMenuOpen(false); } }),
       h("main", null,
-        !["drainQuality", "benchmarkCenter", "streaming", "runtime", "settings", "rules", "nodeRisks", "multiSource", "semanticLibrary"].includes(view) && h("div", { className: "page-head" }, h("div", null, h("h1", null, "日志特征工作台"), h("p", null, "上传日志、复用规则、识别未知特征并人工审批")), h("label", { className: "new-analysis" }, "＋ 新建分析", h("input", { type: "file", onChange: function (event) { loadFile(event.target.files && event.target.files[0]); } }))),
+        !["drainQuality", "benchmarkCenter", "streaming", "runtime", "releaseReadiness", "settings", "rules", "nodeRisks", "multiSource", "semanticLibrary"].includes(view) && h("div", { className: "page-head" }, h("div", null, h("h1", null, "日志特征工作台"), h("p", null, "上传日志、复用规则、识别未知特征并人工审批")), h("label", { className: "new-analysis" }, "＋ 新建分析", h("input", { type: "file", onChange: function (event) { loadFile(event.target.files && event.target.files[0]); } }))),
         error && h("div", { className: "error-banner" }, error, h("button", { onClick: function () { setError(""); } }, "×")),
         view === "overview" && h(React.Fragment, null,
           h("section", { className: "upload-panel" }, h("div", null, h("b", null, fileName || "选择 result.json、JSONL、TXT、LOG、GZ 或无后缀日志"), h("span", null, result ? (result.risk_entities || []).length + " 个风险实体，已完成本地预处理" : "10MB 以内直接分析；超过 10MB 自动分片上传，Linux messages / syslog 无后缀文件也支持上传")), busy && h("div", { className: "upload-progress" }, uploadProgress && h("span", null, "上传进度：" + Math.round((uploadProgress.progress || 0) * 100) + "%（" + uploadProgress.received_chunks + " / " + uploadProgress.total_chunks + " chunks）"), preprocessProgress && h("span", null, "预处理阶段：" + (preprocessProgress.stage || "queued") + "，记录 " + (preprocessProgress.records_parsed || 0) + (preprocessProgress.drain3_partitions_total ? "，Drain3 分片 " + (preprocessProgress.drain3_partitions_completed || 0) + " / " + preprocessProgress.drain3_partitions_total : ""))), h("div", { className: "analysis-config" }, h("label", null, "分析流程", h("select", { value: "feature_extract", disabled: true }, h("option", { value: "feature_extract" }, "日志特征识别"))), h("label", null, "模型 Profile", h("select", { value: modelProfileId, onChange: function (event) { const profile = activeProfiles.find(function (item) { return item.profile_id === event.target.value; }) || {}; setModelProfileId(event.target.value); if (profile.model) setModel(profile.model); if (profile.default_prompt_id) setPromptId(profile.default_prompt_id); } }, activeProfiles.map(function (profile) { return h("option", { value: profile.profile_id, key: profile.profile_id }, (profile.display_name || profile.profile_id) + " · " + profile.provider); }))), h("label", null, "Provider / 连接", h("input", { value: (selectedModelProfile.provider || "—") + " / " + (selectedModelProfile.connection_id || "—"), disabled: true })), h("label", null, "模型", h("input", { value: model, onChange: function (event) { setModel(event.target.value); } })), h("label", null, "Prompt", h("select", { value: promptId, onChange: function (event) { setPromptId(event.target.value); } }, activePrompts.map(function (prompt) { return h("option", { value: prompt.prompt_id, key: prompt.prompt_id }, prompt.prompt_id); }))), h("label", null, "重试次数", h("select", { value: retryCount, onChange: function (event) { setRetryCount(Number(event.target.value)); } }, [0, 1, 2, 3].map(function (count) { return h("option", { value: count, key: count }, count + " 次"); }))), h("label", null, "阈值", h("input", { type: "number", value: threshold, onChange: function (event) { setThreshold(event.target.value); } })), h("button", { className: "primary-button", disabled: !result || busy, onClick: start }, busy ? "处理中…" : "开始识别"))), h(MetricsGrid, { snapshot: snapshot, result: result, daily: systemMetrics }), h(LiveProcessing, { snapshot: snapshot, result: result })),
@@ -1918,6 +1987,7 @@
         view === "streaming" && h(StreamingPage, { data: streamingData, onRefresh: function () { loadStreaming().catch(function (reason) { setError(reason.message); }); }, onResume: function (taskId) { return resumeStreamingTask(taskId).catch(function (reason) { setError(reason.message); throw reason; }); } }),
         view === "benchmarkCenter" && h(BenchmarkCenterPage, { data: benchmarkData, prompts: activePrompts, profiles: activeProfiles, onRefresh: loadBenchmark, onCreateRun: createBenchmarkRun, onSelectRun: loadBenchmark, onEvaluateGate: evaluateBenchmarkGate }),
         view === "runtime" && h(RuntimeCenterPage, { data: runtimeData, onRefresh: loadRuntime, onPreview: function () { return api.previewRuntimeRetention().then(loadRuntime); }, onExecute: function () { return api.executeRuntimeRetention().then(loadRuntime); }, onSavePolicy: function (payload) { return api.saveRuntimeRetention(payload).then(loadRuntime); } }),
+        view === "releaseReadiness" && h(ReleaseReadinessPage, { data: releaseReadinessData, onRefresh: loadReleaseReadiness, onValidate: validateReleaseReadiness }),
         view === "settings" && h(BackendSettings, { onSaved: function () { setError(""); } }),
         view === "export" && h("section", { className: "surface export-surface" }, h("h2", null, "导出记录"), h("p", null, "导出包只包含人工批准或历史规则复用的脱敏特征，不包含原始日志和 RCA 结论。"), h("button", { className: "primary-button", disabled: !jobId || !(snapshot && snapshot.features || []).some(function (feature) { return feature.status === "approved"; }), onClick: function () { api.exportApproved(jobId).catch(function (reason) { setError(reason.message); }); } }, "导出已批准特征 JSON"))),
       h(Drawer, { title: drawer.type === "prompt" ? "Prompt 详情" : "Trace 详情", subtitle: drawer.item && (drawer.item.prompt_id || drawer.item.trace_id), item: drawer.item, onClose: function () { setDrawer({ type: null, item: null }); } }, drawerContent));

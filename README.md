@@ -4,7 +4,7 @@
   <img src="frontend/logo/logrisk-app-icon-orange-v2.png" width="112" alt="LOGRISK 应用图标" />
 </p>
 
-当前版本：`1.29.0`。完整变更记录见 [`releas.md`](releas.md)。
+当前版本：`1.30.0`。完整变更记录见 [`releas.md`](releas.md)。
 
 LOGRISK 在本地完成日志规范化、Drain3 模板化、确定性语义增强、风险评分、规则复用、模型特征识别和人工审批。系统只生成可审查、可导出的日志特征，不执行根因分析（RCA），也不会把原始日志直接发送给模型。
 
@@ -18,6 +18,7 @@ LOGRISK 在本地完成日志规范化、Drain3 模板化、确定性语义增�
 - 提供 Prompt 版本、模型 Profile、AI Trace、Observation/Span 链路、缓存、评测、Drain3 配置和语义词典治理。
 - 提供统一的评测与基准中心，可比较 Prompt、模型 Profile、失败 Case、趋势及发布门禁。
 - 提供生产运行中心：统一查看任务、就绪状态、存储配额、Retention 维护和脱敏审计记录。
+- 提供发布就绪中心：发布前以确定性、只读检查汇总运行时、前端静态包、模型 Profile、Prompt、Drain3、语义词典、多来源规则和评测门禁；不会自动发布或调用模型。
 - 提供多来源智能关联：按确定实体、显式层级和时间窗口汇总跨来源脱敏证据链。
 - 提供服务器风险总览、风险事件台账、可解释评分，以及可编辑、可发布、可回滚的风险语义库。
 - Dashboard 导航按分析工作台、AI 工程、规则与风险、数据治理和系统归类；一级分组可折叠，所有原有页面路由保持不变。
@@ -245,6 +246,12 @@ DASHBOARD_CORS_ORIGINS=https://logrisk.example.internal \
 ```
 
 常用环境变量包括 `LOGRISK_DB_PATH`、`OLLAMA_MODEL`、`OLLAMA_HOST`、`OLLAMA_TIMEOUT`、`DASHBOARD_HOST` 和 `DASHBOARD_PORT`。Dashboard 默认仅监听 `127.0.0.1`。
+
+## 发布就绪检查
+
+“系统 → 发布就绪”在发布前执行确定性、只读检查，并把脱敏结果保存为可追溯记录。它检查数据库迁移和目录/配额、前端静态包与基础配置、默认模型 Profile/连接、默认 Prompt、活动 Drain3 配置、语义词典、多来源规则及 Benchmark 门禁。
+
+校验不会调用模型、迁移数据库、修改任何配置或自动创建 GitHub Release；`blocked` 必须修复后再发布，`warning` 需要人工确认。生产环境中执行校验属于写入审计记录的操作，仍须由受信任 PACAS/RBAC 代理传入允许角色。接口为 `GET /api/release-readiness` 和 `POST /api/release-readiness/validate`；保存内容不包含原始日志、Prompt 正文、API Key、Token 或 DSN。
 
 ## 生产运行与外部身份边界
 

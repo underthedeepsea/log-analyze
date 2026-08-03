@@ -99,7 +99,7 @@
         <a href="#multi-source">06 · 多来源关联规则</a>
         <a href="#drain-evaluation">07 · Drain3 与评测</a>
         <a href="#streaming">08 · 流式处理与大文件</a>
-        <a href="#runtime">09 · 运行中心与数据库</a>
+        <a href="#runtime">09 · 运行中心、发布就绪与数据库</a>
         <a href="#faq">10 · 常见问题与检查单</a>
       </nav>
       <div class="side-note"><b>安全边界</b><br>仅识别、审批与导出日志特征；不执行 RCA 或自动修复。</div>
@@ -109,7 +109,7 @@
         <p class="eyebrow">LOGRISK ADMINISTRATOR GUIDE</p>
         <h1>日志特征分析与审批系统<br>完整管理员使用手册</h1>
         <p>面向平台管理员、日志分析人员与规则维护人员。从导入日志到人工批准、规则复用、Drain3 治理、模型观测及生产运行，按安全边界完成每一步。</p>
-        <div class="badges"><span class="badge">适用于 v1.29.0</span><span class="badge green">可离线阅读</span><span class="badge">更新日期：2026-07-30</span></div>
+        <div class="badges"><span class="badge">适用于 v1.30.0</span><span class="badge green">可离线阅读</span><span class="badge">更新日期：2026-07-31</span></div>
       </header>
 
       <div class="intro-grid">
@@ -186,9 +186,9 @@
       </section>
 
       <section id="runtime">
-        <div class="section-head"><div><p class="section-number">09 / PRODUCTION RUNTIME</p><h2>运行中心、外部身份与数据库运行模式</h2><p>运行中心是生产管理员的只读总览与受控维护入口。它聚合分析、流式、评测和回放任务，并展示存储配额、Retention 预览/执行和脱敏审计记录。</p></div></div>
+        <div class="section-head"><div><p class="section-number">09 / PRODUCTION RUNTIME</p><h2>运行中心、发布就绪、外部身份与数据库运行模式</h2><p>运行中心是生产管理员的只读总览与受控维护入口；“发布就绪”在发布前汇总确定性检查。两者都不会读取原始日志或执行 RCA。</p></div></div>
         <div class="card-grid"><article class="card"><b>身份边界</b><small>生产环境由外部 PACAS/RBAC 代理传入可信身份头。写操作在未识别身份或角色不符时应被拒绝。</small></article><article class="card"><b>Retention</b><small>先预览、再执行。仅清理允许范围内的受控文件产物；原始日志、导出、配置、数据库与 WAL/SHM 受保护。</small></article><article class="card"><b>数据库</b><small>默认 SQLite；生产可显式切换 PostgreSQL。切换采用停机的一次性元数据迁移，不自动回退或双写。</small></article></div>
-        <ol class="steps"><li>打开“运行中心”，确认就绪状态为 <code>Ready</code>，并检查数据库、迁移、状态/输出目录和配额状态。</li><li>使用任务中心按最近更新、状态或类型浏览任务；它不展示原始日志。</li><li>调整 Retention 前先点击“预览清理”，审核候选数量和大小；确认无误后才可执行清理。</li><li>查看审计日志中的操作者、Request ID、资源、结果和时间。审计不保存 Token、Cookie、API Key 或原始日志。</li><li>切换到 PostgreSQL 前按部署文档配置 <code>LOGRISK_DATABASE_PROVIDER=postgres</code> 与 <code>LOGRISK_DATABASE_URL</code>，运行离线迁移及核验，再重启服务。</li></ol>
+        <ol class="steps"><li>打开“运行中心”，确认就绪状态为 <code>Ready</code>，并检查数据库、迁移、状态/输出目录和配额状态。</li><li>进入“发布就绪”，填写将要发布的版本并点击“执行发布校验”。该操作只检查当前状态，不调用模型、不迁移数据库、不修改配置或自动发布。</li><li>检查结果为 <code>blocked</code> 时先修复阻断项；为 <code>warning</code> 时记录人工复核结论。可使用“复制诊断信息”提供不含敏感内容的排障摘要。</li><li>调整 Retention 前先点击“预览清理”，审核候选数量和大小；确认无误后才可执行清理。</li><li>查看审计日志中的操作者、Request ID、资源、结果和时间。审计不保存 Token、Cookie、API Key 或原始日志。</li><li>切换到 PostgreSQL 前按部署文档配置 <code>LOGRISK_DATABASE_PROVIDER=postgres</code> 与 <code>LOGRISK_DATABASE_URL</code>，运行离线迁移及核验，再重启服务。</li></ol>
         <figure><img src="manual-assets/08-runtime.png" alt="LOGRISK 运行中心的就绪状态、任务统计与存储用量概览"><figcaption>运行中心：顶部显示外部身份状态、系统就绪、任务数、运行/排队数、存储用量和审计数。截图已裁剪，不含任务详情。</figcaption></figure>
       </section>
 
@@ -198,12 +198,12 @@
         <details><summary>为什么已批准规则不再调用模型？</summary><p>这是规则复用收益。已批准规则代表人工确认过的可复用模式；命中时系统保留实体和指标记录，但跳过 LLM，避免把同类证据反复交给模型。</p></details>
         <details><summary>导出为空或缺少节点信息怎么办？</summary><p>只有已批准特征可导出。节点信息来自与批准特征关联的 <code>entity_type=node</code> 实体；未批准、低风险跳过或未解析到节点的记录不会进入 <code>approved_risk_nodes</code>。</p></details>
         <details><summary>远端模型或扩展适配器如何安全接入？</summary><p>使用 API 连接或已注册扩展 Provider 合同。密钥放入环境变量；Profile 固定连接和输出策略；任务重试始终使用同一 Provider，不会自动回退到其他模型。</p></details>
-        <details><summary>运行中心显示未就绪或无权限怎么办？</summary><p>先检查 Dashboard 健康与就绪接口、数据库迁移、状态目录可写性和配额。生产环境还需由可信代理注入 PACAS/RBAC 身份头；不要在前端或本地数据库模拟生产凭据。</p></details>
+        <details><summary>运行中心显示未就绪、发布校验被阻断或无权限怎么办？</summary><p>先检查 Dashboard 健康与就绪接口、数据库迁移、状态目录可写性和配额。发布就绪会将失败归为具体检查项；它不提供自动修复。生产环境还需由可信代理注入 PACAS/RBAC 身份头；不要在前端或本地数据库模拟生产凭据。</p></details>
         <h3>每次上线前检查</h3>
-        <ul class="checklist"><li>连接测试通过，API Key 只存在于环境变量。</li><li>模型 Profile、Prompt 和 Drain3 配置均为明确版本。</li><li>上传数据的处理范围符合本地存储和保留政策。</li><li>候选特征已经人工审批；未批准项不会导出。</li><li>评测结果支持本次 Drain3 / 语义 / Prompt 变更。</li><li>运行中心 Ready，存储配额未超过硬限制。</li><li>生产写操作由外部 PACAS/RBAC 边界授权。</li><li>SQLite → PostgreSQL 迁移已在停机窗口完成核验。</li></ul>
+        <ul class="checklist"><li>连接测试通过，API Key 只存在于环境变量。</li><li>模型 Profile、Prompt 和 Drain3 配置均为明确版本。</li><li>上传数据的处理范围符合本地存储和保留政策。</li><li>候选特征已经人工审批；未批准项不会导出。</li><li>评测结果支持本次 Drain3 / 语义 / Prompt 变更。</li><li>运行中心 Ready，存储配额未超过硬限制。</li><li>发布就绪中心的最新校验没有 <code>blocked</code> 项，所有 <code>warning</code> 已完成人工复核。</li><li>生产写操作由外部 PACAS/RBAC 边界授权。</li><li>SQLite → PostgreSQL 迁移已在停机窗口完成核验。</li></ul>
       </section>
 
-      <footer class="footer">LOGRISK 完整管理员使用手册 · v1.29.0 · 本手册为离线静态文档，截图为脱敏界面示例。请以实际部署策略、权限边界和已发布版本为准。</footer>
+      <footer class="footer">LOGRISK 完整管理员使用手册 · v1.30.0 · 本手册为离线静态文档，截图为脱敏界面示例。请以实际部署策略、权限边界和已发布版本为准。</footer>
     </main>
   </div>
   <script>

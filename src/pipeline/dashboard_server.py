@@ -58,6 +58,7 @@ from logrisk.processing_metrics import ProcessingMetricsError, ProcessingMetrics
 from logrisk.rule_governance import RuleGovernanceError, RuleGovernanceRepository, RuleGovernanceService
 from logrisk.node_risk import NodeRiskError, NodeRiskService
 from logrisk.risk_semantics import RiskSemanticError, RiskSemanticService, validate_rule
+from logrisk.release_readiness import ReleaseReadinessRepository, ReleaseReadinessService
 from logrisk.runtime.config import RuntimeConfig, RuntimeConfigError
 from logrisk.runtime.identity import RequestIdentity, RuntimeAccessError, require_write_access
 from logrisk.runtime.repository import RuntimeConflictError, RuntimeRepository
@@ -89,6 +90,7 @@ from pipeline.manual_import_pipeline import analyze_records
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 MAX_LARGE_UPLOAD_BYTES = 500 * 1024 * 1024
 DEFAULT_MODEL = "qwen3:1.7b"
+APP_VERSION = "1.30.0"
 
 
 class DashboardHTTPServer(ThreadingHTTPServer):
@@ -391,6 +393,18 @@ def build_server(
     server.node_risks = node_risks  # type: ignore[attr-defined]
     server.multi_source = multi_source  # type: ignore[attr-defined]
     server.benchmark_center = benchmark_center  # type: ignore[attr-defined]
+    server.release_readiness = ReleaseReadinessService(  # type: ignore[attr-defined]
+        ReleaseReadinessRepository(database),
+        runtime_service=server.runtime_service,
+        project_root=root,
+        connections=connections,
+        model_profiles=profiles,
+        prompt_registry=prompts,
+        drain_quality=drain_quality,
+        semantic_dictionaries=semantic_dictionaries,
+        multi_source=multi_source,
+        benchmark_center=benchmark_center,
+    )
     configured_origins = cors_origins if cors_origins is not None else os.getenv("DASHBOARD_CORS_ORIGINS", "").split(",")
     server.cors_origins = {str(origin).strip().rstrip("/") for origin in configured_origins if str(origin).strip()}  # type: ignore[attr-defined]
     server.cors_request_headers = (  # type: ignore[attr-defined]
@@ -570,7 +584,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
         outcome = "success" if 200 <= int(status) < 300 else ("denied" if int(status) in {401, 403} else "failed")
         resource_id = None
         if isinstance(payload, dict):
-            for key in ("resource_id", "job_id", "input_job_id", "task_id", "run_id", "replay_id"):
+            for key in ("resource_id", "job_id", "input_job_id", "task_id", "run_id", "replay_id", "validation_id"):
                 value = payload.get(key)
                 if isinstance(value, (str, int)) and str(value):
                     resource_id = str(value)
@@ -627,7 +641,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if path == "/help":
                 self._serve_help()
                 return
-            if path in {"/", "/prompts", "/ai-traces", "/ai-observability", "/model-profiles", "/drain-quality", "/benchmark-center", "/rules", "/settings", "/runtime", "/node-risks", "/semantic-library", "/multi-source"} or path.startswith("/node-risks/"):
+            if path in {"/", "/prompts", "/ai-traces", "/ai-observability", "/model-profiles", "/drain-quality", "/benchmark-center", "/rules", "/settings", "/runtime", "/release-readiness", "/node-risks", "/semantic-library", "/multi-source"} or path.startswith("/node-risks/"):
                 self._serve_frontend()
                 return
             if path == "/config.js":
@@ -692,6 +706,21 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     limit=int(query.get("limit", ["100"])[0]),
                     before=query.get("before", [None])[0],
                 ))
+                return
+            if path == "/api/release-readiness":
+                self._json(HTTPStatus.OK, self.server.release_readiness.overview())  # type: ignore[attr-defined]
+                return
+            if path == "/api/release-readiness/history":
+                self._json(HTTPStatus.OK, self.server.release_readiness.repository.list_history(  # type: ignore[attr-defined]
+                    limit=int(query.get("limit", ["30"])[0]),
+                ))
+                return
+            if path == "/api/release-readiness/diagnostic":
+                self._json(HTTPStatus.OK, self.server.release_readiness.diagnostic())  # type: ignore[attr-defined]
+                return
+            match = re.fullmatch(r"/api/release-readiness/([A-Za-z0-9_-]+)", path)
+            if match:
+                self._json(HTTPStatus.OK, self.server.release_readiness.repository.get(match.group(1)))  # type: ignore[attr-defined]
                 return
             if path == "/api/multi-source/summary":
                 self._json(HTTPStatus.OK, self.server.multi_source.summary())  # type: ignore[attr-defined]
@@ -772,7 +801,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "schema_version": "logrisk_health_v1",
                     "service": "logrisk-dashboard",
                     "status": "ok",
-                    "version": "1.29.0",
+                    "version": APP_VERSION,
                     "storage": self.server.database_runtime.provider,  # type: ignore[attr-defined]
                 })
                 return
@@ -1075,6 +1104,18 @@ class DashboardHandler(BaseHTTPRequestHandler):
         try:
             identity = self._require_runtime_write_access()
             payload = self._read_json()
+            if path == "/api/release-readiness/validate":
+                if not isinstance(payload, dict):
+                    raise ValueError("请求体必须是 JSON object")
+                idempotency_key = str(self.headers.get("Idempotency-Key") or payload.get("idempotency_key") or "").strip()
+                if not idempotency_key:
+                    raise ValueError("发布校验需要 Idempotency-Key 或 idempotency_key")
+                result = self.server.release_readiness.validate(  # type: ignore[attr-defined]
+                    target_version=str(payload.get("target_version") or APP_VERSION),
+                    idempotency_key=idempotency_key,
+                )
+                self._json(HTTPStatus.OK, {**result, "request_id": identity.request_id, "resource_id": result["validation_id"]})
+                return
             if path == "/api/runtime/retention/policy":
                 if not isinstance(payload, dict):
                     raise ValueError("请求体必须是 JSON object")

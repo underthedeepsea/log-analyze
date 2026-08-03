@@ -69,3 +69,26 @@ def test_finalize_job_marks_orchestration_without_returning_candidates(tmp_path)
 
     assert result["status"] == "completed"
     assert set(result) == {"job_id", "orchestration_run_id", "status"}
+
+
+def test_finalize_job_marks_model_errors_as_failed_orchestration(tmp_path) -> None:
+    from logrisk.application import ApplicationConfig, build_application_container
+    from logrisk.airflow_tasks import finalize_job, prepare_job
+
+    config = replace(
+        ApplicationConfig.for_test(project_root=PROJECT_ROOT, state_root=tmp_path / "state"),
+        feature_jobs_auto_start=False,
+    )
+    container = build_application_container(config)
+    container.feature_jobs.extractor = lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("model failed"))
+    job_id = container.feature_jobs.create_job(_document(), model="qwen3:1.7b")
+    run = container.orchestration.create_pending(job_id, "request-3", "pacas-alice")
+    dispatched = container.orchestration.mark_dispatched(
+        run["orchestration_run_id"], "logrisk_analysis", "logrisk__" + job_id, expected_version=run["state_version"]
+    )
+    prepared = prepare_job(job_id, dispatched["orchestration_run_id"], "request-3", container=container)
+    container.feature_jobs.run_job(job_id)
+
+    result = finalize_job(job_id, prepared["orchestration_run_id"], container=container)
+
+    assert result["status"] == "failed"

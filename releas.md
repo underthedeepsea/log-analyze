@@ -21,6 +21,7 @@
 - 新增 Airflow 2.3.2 可部署 DAG 与延迟装配的任务入口；DAG 解析不连接数据库、模型或共享目录，Task/XCom 仅传递稳定 ID、状态和计数。
 - Django 新增受 PACAS/RBAC 保护的特征审批、受控导出与发布就绪校验接口；这些操作与本地 Dashboard 复用同一 API Facade，并写入仅含操作元数据的运行审计记录。
 - 新增 Django 可分发静态包：React 纯静态产物可通过 `sync_django_static.sh` 确定性同步至 `logrisk_django/static/logrisk/`，支持 `collectstatic` 与 API 优先的 SPA 回退。
+- Airflow DAG 补齐预处理、Drain3 分区、模板合并、规则复用、模型批次与校验阶段，并按 `logrisk_cpu_pool`/`logrisk_llm_pool` 和 Celery 队列进行基础动态映射；模型实体失败会准确收敛为失败编排状态。
 
 ## 1.30.0 - 2026-07-31
 

@@ -119,7 +119,9 @@ def finalize_job(job_id: str, orchestration_run_id: str, *, container: Applicati
     if run["status"] in {"completed", "failed", "cancelled"}:
         return {"job_id": str(job_id), "orchestration_run_id": str(orchestration_run_id), "status": str(run["status"])}
     job = services.feature_jobs.get_job(job_id)
-    target = "cancelled" if run["status"] == "cancel_requested" else ("failed" if job.get("status") == "failed" else "completed")
+    target = "cancelled" if run["status"] == "cancel_requested" else (
+        "failed" if job.get("status") in {"failed", "completed_with_errors"} else "completed"
+    )
     finished = services.orchestration.mark_finished(
         orchestration_run_id,
         target,

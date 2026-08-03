@@ -12,6 +12,7 @@
 
 - 新增框架无关的 LOGRISK Application Container；Django、Airflow 与本地 Dashboard 后续可复用同一组数据库、模型、规则、任务、运行时、评测和发布就绪服务，避免复制业务装配逻辑。
 - 本地 Dashboard 已改为仅承载 HTTP 路由与静态页面，服务装配迁移至 `logrisk.application`；Airflow Worker 不会触发本地服务启动时的流式任务中断或历史文件导入。
+- 新增跨 SQLite/PostgreSQL 的 Airflow 编排运行状态表与乐观并发仓储，持久化调度、心跳、取消、完成和可恢复分派状态；外部编排错误仅保存脱敏摘要，不保存凭据或任务内容。
 
 ## 1.30.0 - 2026-07-31
 

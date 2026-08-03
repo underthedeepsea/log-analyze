@@ -5,12 +5,13 @@ from typing import Any
 from django.conf import settings
 from django.utils.module_loading import import_string
 
-from logrisk.application import ApplicationContainer, build_application_container
+from logrisk.application import ApiFacade, ApplicationContainer, build_application_container
 from logrisk_django.identity import IdentityResolver
 from logrisk_django.settings import LogriskConfig
 
 
 _container: ApplicationContainer | None = None
+_facade: ApiFacade | None = None
 
 
 def get_config() -> LogriskConfig:
@@ -24,6 +25,13 @@ def get_container() -> ApplicationContainer:
     return _container
 
 
+def get_facade() -> ApiFacade:
+    global _facade
+    if _facade is None:
+        _facade = ApiFacade(get_container(), version="1.31.0")
+    return _facade
+
+
 def get_identity_resolver() -> IdentityResolver:
     resolver_type: Any = import_string(get_config().identity_resolver)
     resolver = resolver_type()
@@ -34,5 +42,6 @@ def get_identity_resolver() -> IdentityResolver:
 
 def clear_cached_container() -> None:
     """Test-only hook; production never hot-switches LOGRISK storage."""
-    global _container
+    global _container, _facade
     _container = None
+    _facade = None

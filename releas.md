@@ -16,6 +16,7 @@
 - 新增受控共享 Artifact 存储：上传完成后以 SHA256 校验、同目录临时文件和原子替换写入 `LOGRISK_SHARED_ROOT`；数据库与任务快照仅保存共享根目录内的相对路径。
 - 新增仅依赖标准库的 Airflow 2.3 REST v1 适配器，可安全触发、查询和取消 DAG Run；DAG conf 只传递任务、编排运行和请求 ID，错误与凭据均不会回显或持久化。
 - 新增可安装的 Django 4.2.16 App 基础层，提供严格生产配置、可替换 PACAS/RBAC Django User 身份适配和共享服务工厂；不创建 Django Model、迁移或本地账号体系。
+- 新增框架无关的核心只读 API Facade；本地 Dashboard 与 Django 共享健康、运行就绪、模型画像、Prompt、规则治理和发布就绪响应逻辑，避免并行维护两套业务查询实现。
 
 ## 1.30.0 - 2026-07-31
 

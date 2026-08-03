@@ -20,6 +20,7 @@ from urllib.request import Request, urlopen
 import yaml
 
 from logrisk.ai_harness.connections import ConnectionStore
+from logrisk.application import ApiFacade
 from logrisk.application.container import ApplicationConfig, build_application_container
 from logrisk.ai_harness.model_client import ModelClientError
 from logrisk.ai_harness.model_profile import ModelProfileRegistry
@@ -227,6 +228,11 @@ def build_server(
     server.input_analyzer = container.input_analyzer  # type: ignore[attr-defined]
     server.input_analyzer_accepts_config = container.input_analyzer_accepts_config  # type: ignore[attr-defined]
     server.run_input_job = container.run_input_job  # type: ignore[attr-defined]
+    server.api_facade = ApiFacade(  # type: ignore[attr-defined]
+        container,
+        version=APP_VERSION,
+        service_resolver=lambda name, default: getattr(server, name, default),
+    )
     configured_origins = cors_origins if cors_origins is not None else os.getenv("DASHBOARD_CORS_ORIGINS", "").split(",")
     server.cors_origins = {str(origin).strip().rstrip("/") for origin in configured_origins if str(origin).strip()}  # type: ignore[attr-defined]
     server.cors_request_headers = (  # type: ignore[attr-defined]
@@ -377,6 +383,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 return
             if path.startswith("/assets/"):
                 self._serve_asset(path)
+                return
+            facade_result = self.server.api_facade.dispatch_read(path, query)  # type: ignore[attr-defined]
+            if facade_result is not None:
+                self._json(HTTPStatus(facade_result.status), dict(facade_result.body))
                 return
             if path == "/api/config":
                 self._json(HTTPStatus.OK, {

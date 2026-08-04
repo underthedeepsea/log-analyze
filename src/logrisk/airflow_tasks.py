@@ -132,7 +132,10 @@ def list_feature_batches(job_id: str, orchestration_run_id: str, *, container: A
     job = services.feature_jobs.get_job(job_id)
     return {
         "job_id": str(job_id), "orchestration_run_id": str(orchestration_run_id),
-        "batch_ids": ["all"] if job.get("entities") else [],
+        # Keep one stable no-op batch for empty jobs so the worker can close
+        # the FeatureJob instead of leaving it queued when dynamic mapping
+        # creates zero extract tasks.
+        "batch_ids": ["all"],
     }
 
 

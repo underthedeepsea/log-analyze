@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 try:
     from airflow import DAG
@@ -9,6 +9,8 @@ except ImportError:  # Airflow is installed only in the external scheduler image
     dag = None
 else:
     from integrations.airflow.tasks import preprocess_uploaded_input
+
+    _START_DATE = datetime(2024, 1, 1, tzinfo=timezone.utc)
 
     def _conf() -> dict[str, str]:
         from airflow.operators.python import get_current_context
@@ -22,6 +24,7 @@ else:
 
     with DAG(
         dag_id="logrisk_input_preprocess",
+        start_date=_START_DATE,
         schedule_interval=None,
         catchup=False,
         max_active_runs=4,

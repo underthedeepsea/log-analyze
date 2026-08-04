@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 try:
@@ -9,6 +9,8 @@ try:
 except ImportError:  # Airflow is installed only in the external scheduler image.
     dag = None
 else:
+    from airflow.utils.trigger_rule import TriggerRule
+
     from integrations.airflow.tasks import (
         drain_partition,
         extract_feature_batch,
@@ -21,6 +23,8 @@ else:
         score_and_reuse,
         validate_candidates,
     )
+
+    _START_DATE = datetime(2024, 1, 1, tzinfo=timezone.utc)
 
     def _conf() -> dict[str, str]:
         from airflow.operators.python import get_current_context
@@ -41,21 +45,22 @@ else:
 
     with DAG(
         dag_id="logrisk_analysis",
+        start_date=_START_DATE,
         schedule_interval=None,
         catchup=False,
         max_active_runs=4,
         default_args={"retries": 2, "retry_delay": timedelta(seconds=30)},
     ) as dag:
-        @task
+        @task(pool="logrisk_cpu_pool", queue="logrisk_cpu")
         def prepare() -> dict[str, str]:
             return prepare_job(**_conf())
 
-        @task
+        @task(pool="logrisk_cpu_pool", queue="logrisk_cpu")
         def preprocess(prepared: dict[str, str]) -> dict[str, str]:
             values = _identity(prepared)
             return preprocess_input(**values)
 
-        @task
+        @task(pool="logrisk_cpu_pool", queue="logrisk_cpu")
         def partitions(preprocessed: dict[str, str]) -> list[dict[str, str]]:
             values = _identity(preprocessed)
             listed = list_drain_partitions(**values)
@@ -64,19 +69,19 @@ else:
                 for partition_id in listed["partition_ids"]
             ]
 
-        @task
+        @task(pool="logrisk_cpu_pool", queue="logrisk_cpu")
         def drain(partition: dict[str, str]) -> dict[str, str]:
             return drain_partition(**partition)
 
-        @task
-        def merge(preprocessed: dict[str, str], _drained: list[dict[str, str]]) -> dict[str, str]:
+        @task(pool="logrisk_cpu_pool", queue="logrisk_cpu", trigger_rule=TriggerRule.NONE_FAILED)
+        def merge(preprocessed: dict[str, str]) -> dict[str, str]:
             return merge_templates(**_identity(preprocessed))
 
-        @task
+        @task(pool="logrisk_cpu_pool", queue="logrisk_cpu")
         def score(merged: dict[str, str]) -> dict[str, str]:
             return score_and_reuse(**_identity(merged))
 
-        @task
+        @task(pool="logrisk_cpu_pool", queue="logrisk_cpu")
         def batches(scored: dict[str, str]) -> list[dict[str, str]]:
             values = _identity(scored)
             listed = list_feature_batches(**values)
@@ -85,24 +90,27 @@ else:
                 for batch_id in listed["batch_ids"]
             ]
 
-        @task
+        @task(pool="logrisk_llm_pool", queue="logrisk_llm")
         def extract(batch: dict[str, str]) -> dict[str, object]:
             return extract_feature_batch(**batch)
 
-        @task
-        def validate(scored: dict[str, str], _extracted: list[dict[str, object]]) -> dict[str, object]:
+        @task(pool="logrisk_cpu_pool", queue="logrisk_cpu", trigger_rule=TriggerRule.NONE_FAILED)
+        def validate(scored: dict[str, str]) -> dict[str, object]:
             return validate_candidates(**_identity(scored))
 
-        @task
+        @task(pool="logrisk_cpu_pool", queue="logrisk_cpu")
         def finalize(validated: dict[str, object]) -> dict[str, str]:
             return finalize_job(**_identity(validated))
 
         prepared = prepare()
         preprocessed = preprocess(prepared)
         partition_list = partitions(preprocessed)
-        drained = drain.partial(pool="logrisk_cpu_pool", queue="logrisk_cpu").expand(partition=partition_list)
-        merged = merge(preprocessed, drained)
+        drained = drain.expand(partition=partition_list)
+        merged = merge(preprocessed)
+        drained >> merged
         scored = score(merged)
         batch_list = batches(scored)
-        extracted = extract.partial(pool="logrisk_llm_pool", queue="logrisk_llm").expand(batch=batch_list)
-        finalize(validate(scored, extracted))
+        extracted = extract.expand(batch=batch_list)
+        validated = validate(scored)
+        extracted >> validated
+        finalize(validated)

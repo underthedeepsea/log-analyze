@@ -180,6 +180,16 @@ class OrchestrationRepository:
             ).fetchall()
         return [self._run(row) for row in rows]
 
+    def list_active(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        safe_limit = max(1, min(int(limit), 500))
+        with self.database.connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM orchestration_runs WHERE status IN ('dispatched', 'running', 'cancel_requested') "
+                "AND external_run_id IS NOT NULL ORDER BY updated_at, orchestration_run_id LIMIT ?",
+                (safe_limit,),
+            ).fetchall()
+        return [self._run(row) for row in rows]
+
     @staticmethod
     def _status(value: Any) -> str:
         status = str(value).strip()

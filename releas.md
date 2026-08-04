@@ -6,6 +6,15 @@
 - 仅修复 Bug 时提升最后一位，例如 `1.2.0 → 1.2.1`；
 - 每次代码更新必须同步更新本文件。
 
+## 1.31.1 - 2026-08-04
+
+### Fixed
+
+- 修复 PostgreSQL 内置风险语义种子向 `BOOLEAN` 字段写入整数导致应用容器启动失败的问题。
+- 修复 `PostgresCursor` 无法被现有 Store 迭代，导致 PostgreSQL 模式恢复任务时启动失败的问题。
+- 修复 Airflow 2.3.2 DAG 缺少 `start_date`、动态映射错误传递队列参数，以及默认队列未被 Celery Worker 消费的问题。
+- 修复 Drain3/特征批次为空时动态映射跳过下游任务、任务长期停留在排队状态的问题；空任务现在可正常完成并收敛编排状态。
+
 ## 1.31.0 - 2026-08-03
 
 ### Added
@@ -25,6 +34,12 @@
 - Django 生产适配层改为不在启动或 Airflow Worker 初始化时自动迁移数据库；新增 `logrisk_check`、`logrisk_migrate` 和 `logrisk_reconcile_dispatch` 管理命令，用于显式检查/迁移与恢复待分派任务。
 - 新增 Django/Airflow 生产部署指南、无密配置示例和数据库调用关系说明，覆盖独立数据库、共享目录、Celery 队列、显式迁移、安全边界与回滚流程。
 - 新增上传预处理的独立 `logrisk_input_preprocess` DAG、跨 SQLite/PostgreSQL 输入编排状态与 Django 分片上传接口；上传日志仅以受控共享目录路径保存，DAG conf/XCom 只传输入任务、编排运行和请求 ID。Django/Worker 不再把跨进程已排队的特征任务误标为中断，并会从运行时数据库刷新 Airflow 写回的任务状态和事件。
+- Django 生产适配补齐模型连接、模型画像、Prompt 版本、规则治理、Retention 与数据库候选配置的受控写接口；所有写操作统一经过 PACAS/RBAC 身份、乐观版本校验和脱敏运行审计。
+- 新增规则治理的详情、复审队列、状态变更、反馈、回滚以及 Airflow 编排运行的取消/重试接口；取消和重试只推进持久化状态，不在 Django 进程内启动模型任务。
+- 新增风险语义规则的创建、覆盖、编辑、校验、发布、停用、恢复默认、回滚与导入接口，内置规则保持只读，审计事件不保存操作备注或规则正文。
+- 新增 Drain3 数据集、标注、评测、候选配置和调参任务的 Django 受控接口，并新增 Benchmark Suite、Run、取消、对比和门禁评估接口，复用现有 SQLite/PostgreSQL Repository。
+- 新增 Airflow 运行状态同步接口与输入预处理编排详情接口；Django 只校验稳定的 DAG Run 标识和生命周期状态，使用乐观锁更新本地记录，并将 Airflow 健康状态单独暴露给运行中心。
+- 新增 `logrisk_reconcile_runs` 管理命令，支持 `--dry-run` 查询活动 DAG Run 并在停滞或 Worker 异常后安全收敛本地状态；不复制 DAG conf、XCom 或日志内容。
 
 ## 1.30.0 - 2026-07-31
 

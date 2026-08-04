@@ -319,6 +319,10 @@ class PostgresCursor:
     def __init__(self, cursor: Any) -> None:
         self._cursor = cursor
 
+    def __iter__(self) -> Iterator[RowRecord]:
+        """Match sqlite3 cursors used by the existing stores."""
+        return iter(self.fetchall())
+
     @property
     def rowcount(self) -> int:
         return int(self._cursor.rowcount or 0)

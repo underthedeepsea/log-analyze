@@ -7,7 +7,7 @@ from django.core.management.base import BaseCommand
 from logrisk.database import MigrationManager
 from logrisk.runtime.health import directory_writable
 from logrisk_django.management.commands._database import configured_database
-from logrisk_django.service_factory import get_config
+from logrisk_django.service_factory import get_airflow_readiness, get_config
 
 
 class Command(BaseCommand):
@@ -23,11 +23,12 @@ class Command(BaseCommand):
             shared_root_ready = directory_writable(config.shared_root)
         except OSError:
             shared_root_ready = False
+        airflow = get_airflow_readiness()
         payload = {
             "ready": bool(database_status["ready"] and shared_root_ready),
             "database": database_status,
             "shared_root": {"ready": shared_root_ready},
-            "airflow": {"configured": bool(config.airflow_base_url), "online": "not_checked"},
+            "airflow": {"configured": bool(config.airflow_base_url), **airflow},
         }
         return json.dumps(payload, ensure_ascii=False, sort_keys=True) if options.get("json_output") else _plain(payload)
 

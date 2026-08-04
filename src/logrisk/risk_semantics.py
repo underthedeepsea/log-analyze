@@ -222,7 +222,7 @@ class RiskSemanticService:
                 snapshot = dict(seed_content, version=version)
                 connection.execute(
                     "INSERT INTO risk_semantic_rules(rule_id, source, override_of, status, enabled, current_version, "
-                    "content_json, content_hash, created_at, updated_at) VALUES (?, 'builtin', NULL, 'published', 1, ?, ?, ?, ?, ?) "
+                    "content_json, content_hash, created_at, updated_at) VALUES (?, 'builtin', NULL, 'published', TRUE, ?, ?, ?, ?, ?) "
                     "ON CONFLICT(rule_id) DO UPDATE SET current_version=excluded.current_version, content_json=excluded.content_json, "
                     "content_hash=excluded.content_hash, status='published', enabled=TRUE, updated_at=excluded.updated_at",
                     (snapshot["id"], version, _json(snapshot), digest, now, now),

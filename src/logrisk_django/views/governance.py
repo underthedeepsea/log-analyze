@@ -6,6 +6,7 @@ from django.http import HttpRequest, JsonResponse
 from django.views.decorators.http import require_http_methods
 
 from logrisk.feature_jobs import FeatureJobError
+from logrisk.rule_governance import RuleGovernanceError
 from logrisk_django.service_factory import get_facade
 from logrisk_django.views.access import require_django_write_access
 
@@ -50,6 +51,42 @@ def validate_release(request: HttpRequest) -> JsonResponse:
         result = get_facade().validate_release(payload, identity, idempotency_key=key)
     except (KeyError, ValueError) as exc:
         return _error(422, getattr(exc, "code", "release_validation_failed"), _safe_message(exc))
+    return _response(result.body, result.status, result.headers)
+
+
+def rule_review_queue(request: HttpRequest) -> JsonResponse:
+    result = get_facade().rule_review_queue()
+    return _response(result.body, result.status, result.headers)
+
+
+def rule_detail(request: HttpRequest, rule_id: str) -> JsonResponse:
+    try:
+        result = get_facade().rule_governance_detail(rule_id)
+    except RuleGovernanceError as exc:
+        return _error(exc.status_code, exc.code, _safe_message(exc))
+    return _response(result.body, result.status, result.headers)
+
+
+@require_http_methods(["POST"])
+def rule_action(request: HttpRequest, rule_id: str, action: str) -> JsonResponse:
+    identity = require_django_write_access(request)
+    if isinstance(identity, JsonResponse):
+        return identity
+    payload = _payload(request)
+    if isinstance(payload, JsonResponse):
+        return payload
+    try:
+        facade = get_facade()
+        if action == "status":
+            result = facade.change_rule_status(rule_id, payload, identity)
+        elif action == "feedback":
+            result = facade.record_rule_feedback(rule_id, payload, identity)
+        else:
+            result = facade.rollback_rule(rule_id, payload, identity)
+    except RuleGovernanceError as exc:
+        return _error(exc.status_code, exc.code, _safe_message(exc))
+    except (KeyError, TypeError, ValueError) as exc:
+        return _error(422, "rule_invalid", _safe_message(exc))
     return _response(result.body, result.status, result.headers)
 
 

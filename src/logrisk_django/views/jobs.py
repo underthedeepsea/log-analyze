@@ -6,7 +6,7 @@ from typing import Any
 from django.http import HttpRequest, JsonResponse, StreamingHttpResponse
 from django.views.decorators.http import require_GET, require_POST
 
-from logrisk.orchestration import AirflowOrchestratorError
+from logrisk.orchestration import AirflowOrchestratorError, InputOrchestrationConflict, OrchestrationConflict
 from logrisk_django.service_factory import (
     get_airflow_orchestrator,
     get_container,
@@ -81,6 +81,71 @@ def job_events(request: HttpRequest, job_id: str) -> StreamingHttpResponse | Jso
     except (KeyError, ValueError) as exc:
         return _error(404, "feature_job_not_found", _safe_message(exc))
     return StreamingHttpResponse(_sse(events, cursor), content_type="text/event-stream; charset=utf-8")
+
+
+@require_POST
+def orchestration_action(request: HttpRequest, orchestration_run_id: str, action: str) -> JsonResponse:
+    identity = require_django_write_access(request)
+    if isinstance(identity, JsonResponse):
+        return identity
+    try:
+        payload = json.loads(request.body.decode("utf-8") or "{}")
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return _error(400, "invalid_json", "请求体必须是 JSON object")
+    if not isinstance(payload, dict):
+        return _error(400, "invalid_payload", "请求体必须是 JSON object")
+    try:
+        facade = get_facade()
+        if action == "cancel":
+            result = facade.cancel_orchestration(orchestration_run_id, payload, identity)
+        elif action == "retry-dispatch":
+            result = facade.retry_orchestration(orchestration_run_id, payload, identity)
+        elif action == "sync":
+            result = facade.sync_orchestration(orchestration_run_id, payload, identity)
+        else:
+            return _error(404, "orchestration_action_not_found", "不支持的编排操作")
+    except OrchestrationConflict as exc:
+        return _error(409, getattr(exc, "code", "orchestration_state_conflict"), _safe_message(exc))
+    except AirflowOrchestratorError as exc:
+        return _error(exc.status_code, exc.code, _safe_message(exc))
+    except (KeyError, TypeError, ValueError) as exc:
+        return _error(422, "orchestration_invalid", _safe_message(exc))
+    return JsonResponse(dict(result.body), status=result.status, json_dumps_params={"ensure_ascii": False})
+
+
+@require_GET
+def input_orchestration_detail(_request: HttpRequest, input_orchestration_run_id: str) -> JsonResponse:
+    try:
+        result = get_facade().input_orchestration_detail(input_orchestration_run_id)
+    except (KeyError, ValueError) as exc:
+        return _error(404, "input_orchestration_not_found", _safe_message(exc))
+    return JsonResponse(dict(result.body), status=result.status, json_dumps_params={"ensure_ascii": False})
+
+
+@require_POST
+def input_orchestration_action(request: HttpRequest, input_orchestration_run_id: str, action: str) -> JsonResponse:
+    identity = require_django_write_access(request)
+    if isinstance(identity, JsonResponse):
+        return identity
+    try:
+        payload = json.loads(request.body.decode("utf-8") or "{}")
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return _error(400, "invalid_json", "请求体必须是 JSON object")
+    if not isinstance(payload, dict):
+        return _error(400, "invalid_payload", "请求体必须是 JSON object")
+    try:
+        facade = get_facade()
+        if action == "sync":
+            result = facade.sync_input_orchestration(input_orchestration_run_id, payload, identity)
+        else:
+            return _error(404, "input_orchestration_action_not_found", "不支持的输入编排操作")
+    except InputOrchestrationConflict as exc:
+        return _error(409, getattr(exc, "code", "input_orchestration_state_conflict"), _safe_message(exc))
+    except AirflowOrchestratorError as exc:
+        return _error(exc.status_code, exc.code, _safe_message(exc))
+    except (KeyError, TypeError, ValueError) as exc:
+        return _error(422, "input_orchestration_invalid", _safe_message(exc))
+    return JsonResponse(dict(result.body), status=result.status, json_dumps_params={"ensure_ascii": False})
 
 
 def _error(status: int, code: str, message: str) -> JsonResponse:

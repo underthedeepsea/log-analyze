@@ -13,20 +13,18 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
-from urllib.error import URLError
 from urllib.parse import parse_qs, unquote, urlparse
-from urllib.request import Request, urlopen
 
 import yaml
 
 from logrisk.ai_harness.connections import ConnectionStore
+from logrisk.ai_harness.connection_check import check_model_connection, check_ollama
 from logrisk.application import ApiFacade
 from logrisk.application.container import ApplicationConfig, build_application_container
 from logrisk.ai_harness.model_client import ModelClientError
 from logrisk.ai_harness.model_profile import ModelProfileRegistry
 from logrisk.ai_harness.prompt_registry import PromptRegistry, PromptTemplate, SQLitePromptRegistry
 from logrisk.ai_harness.providers import create_model_client
-from logrisk.ai_harness.providers.extension import redact_model_error
 from logrisk.ai_harness.providers.extensions.registry import (
     get_extension_adapter,
     list_extension_descriptors,
@@ -97,54 +95,6 @@ APP_VERSION = "1.31.0"
 
 class DashboardHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
-
-
-def check_ollama(base_url: str, timeout: float = 2) -> dict[str, Any]:
-    try:
-        with urlopen(f"{base_url.rstrip('/')}/api/tags", timeout=timeout) as response:
-            payload = json.load(response)
-        models = [item.get("name") for item in payload.get("models", []) if item.get("name")]
-        return {"online": True, "models": models}
-    except (OSError, URLError, ValueError, json.JSONDecodeError) as exc:
-        return {"online": False, "models": [], "error": str(exc)}
-
-
-def check_model_connection(connection: dict[str, Any]) -> dict[str, Any]:
-    if not connection.get("enabled"):
-        return {"online": False, "models": [], "error": "连接已停用"}
-    if connection.get("provider") == "ollama":
-        return check_ollama(str(connection["base_url"]), float(connection.get("timeout_seconds") or 2))
-    if connection.get("provider") == "extension":
-        values = [
-            os.environ.get(str(env_name), "")
-            for env_name in dict(connection.get("credential_envs") or {}).values()
-        ]
-        try:
-            result = get_extension_adapter(str(connection.get("adapter_id") or "")).check_connection(connection)
-            if not isinstance(result, dict):
-                raise ModelClientError("扩展适配器连接检查必须返回 JSON object")
-            result["models"] = list(result.get("models") or [])
-            result["online"] = bool(result.get("online"))
-            if result.get("error"):
-                result["error"] = redact_model_error(str(result["error"]), values)
-            return result
-        except Exception as exc:
-            return {"online": False, "models": [], "error": redact_model_error(str(exc), values)}
-    api_key_env = str(connection.get("api_key_env") or "")
-    api_key = os.environ.get(api_key_env)
-    if not api_key:
-        return {"online": False, "models": [], "error": f"未配置环境变量: {api_key_env}"}
-    request = Request(
-        f"{str(connection['base_url']).rstrip('/')}/models",
-        headers={"Accept": "application/json", "Authorization": f"Bearer {api_key}"},
-    )
-    try:
-        with urlopen(request, timeout=float(connection.get("timeout_seconds") or 10)) as response:
-            payload = json.load(response)
-        models = [item.get("id") for item in payload.get("data", []) if isinstance(item, dict) and item.get("id")]
-        return {"online": True, "models": models}
-    except (OSError, URLError, ValueError, json.JSONDecodeError) as exc:
-        return {"online": False, "models": [], "error": str(exc)}
 
 
 def build_server(

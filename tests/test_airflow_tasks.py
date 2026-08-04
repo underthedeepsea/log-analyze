@@ -121,6 +121,27 @@ def test_finalize_job_marks_orchestration_without_returning_candidates(tmp_path)
     assert set(result) == {"job_id", "orchestration_run_id", "status"}
 
 
+def test_empty_job_still_gets_a_feature_batch_for_completion(tmp_path) -> None:
+    from logrisk.application import ApplicationConfig, build_application_container
+    from logrisk.airflow_tasks import list_feature_batches, prepare_job
+
+    config = replace(
+        ApplicationConfig.for_test(project_root=PROJECT_ROOT, state_root=tmp_path / "state"),
+        feature_jobs_auto_start=False,
+    )
+    container = build_application_container(config)
+    job_id = container.feature_jobs.create_job({"summary": {}, "risk_entities": []}, model="qwen3:1.7b")
+    run = container.orchestration.create_pending(job_id, "request-empty-batch", "pacas-alice")
+    dispatched = container.orchestration.mark_dispatched(
+        run["orchestration_run_id"], "logrisk_analysis", "logrisk__" + job_id, expected_version=run["state_version"]
+    )
+    prepared = prepare_job(job_id, dispatched["orchestration_run_id"], "request-empty-batch", container=container)
+
+    result = list_feature_batches(job_id, prepared["orchestration_run_id"], container=container)
+
+    assert result["batch_ids"] == ["all"]
+
+
 def test_finalize_job_marks_model_errors_as_failed_orchestration(tmp_path) -> None:
     from logrisk.application import ApplicationConfig, build_application_container
     from logrisk.airflow_tasks import finalize_job, prepare_job

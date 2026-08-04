@@ -6,6 +6,11 @@ from logrisk.database import utc_now
 from logrisk.orchestration.repository import OrchestrationRepository
 
 
+_ACTIVE_AIRFLOW_STATES = {"queued", "scheduled", "up_for_retry", "up_for_reschedule", "deferred"}
+_FAILED_AIRFLOW_STATES = {"failed", "upstream_failed", "removed"}
+_CANCELLED_AIRFLOW_STATES = {"canceled", "cancelled"}
+
+
 class OrchestrationService:
     """Domain operations for dispatch, recovery, cancellation, and completion."""
 
@@ -115,8 +120,51 @@ class OrchestrationService:
             expected_version=expected_version,
         )
 
+    def reconcile_external(
+        self,
+        orchestration_run_id: str,
+        external_state: str,
+        *,
+        expected_version: int,
+    ) -> dict[str, Any]:
+        """Apply a verified Airflow state without accepting task payloads.
+
+        Airflow is queried by the adapter, but only its small lifecycle state is
+        allowed to change the durable LOGRISK orchestration record.  Unknown
+        states are rejected instead of being guessed as success or failure.
+        """
+        state = str(external_state or "").strip().casefold()
+        current = self.repository.get(orchestration_run_id)
+        if current["status"] in {"completed", "failed", "cancelled"}:
+            return current
+        if state in _ACTIVE_AIRFLOW_STATES:
+            return current
+        if state == "running":
+            if current["status"] == "dispatched":
+                return self.mark_running(orchestration_run_id, expected_version=expected_version)
+            if current["status"] == "running":
+                return self.heartbeat(orchestration_run_id, expected_version=expected_version)
+            return current
+        if state == "success":
+            target = "cancelled" if current["status"] == "cancel_requested" else "completed"
+            return self.mark_finished(orchestration_run_id, target, expected_version=expected_version)
+        if state in _CANCELLED_AIRFLOW_STATES:
+            return self.mark_finished(orchestration_run_id, "cancelled", expected_version=expected_version)
+        if state in _FAILED_AIRFLOW_STATES:
+            return self.mark_finished(
+                orchestration_run_id,
+                "failed",
+                expected_version=expected_version,
+                error_code="airflow_run_failed",
+                error_summary="Airflow DAG Run 执行失败",
+            )
+        raise ValueError("不支持的 Airflow DAG Run 状态")
+
     def list_reconcilable(self, *, limit: int = 100) -> list[dict[str, Any]]:
         return self.repository.list_reconcilable(limit=limit)
+
+    def list_active(self, *, limit: int = 100) -> list[dict[str, Any]]:
+        return self.repository.list_active(limit=limit)
 
     def for_job(self, job_id: str) -> dict[str, Any] | None:
         return self.repository.for_job(job_id)

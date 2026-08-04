@@ -40,6 +40,8 @@ python manage.py logrisk_check --json
 
 确认 `pending_migrations=0` 且共享目录可写后，部署 Django、`logrisk_input_preprocess` / `logrisk_analysis` 两个 Airflow DAG 和 Worker。上传完成后，Django 先持久化输入编排记录，再只向 `logrisk_input_preprocess` 传递输入任务 ID、编排运行 ID 和请求 ID；完成后浏览器再按既有流程创建特征任务。Airflow 恢复时可运行 `python manage.py logrisk_reconcile_dispatch --json`，它只重试 `pending_dispatch` 或 `dispatch_failed` 的特征与输入编排记录，不启动本地回退。
 
+若 Airflow 已经接受 DAG Run，但 Worker 在完成回写前中断，可先运行 `python manage.py logrisk_reconcile_runs --dry-run --json` 查看活动运行，再去掉 `--dry-run` 同步 `dispatched`、`running` 和 `cancel_requested` 状态。该命令会校验 DAG Run 的任务/编排标识；网络错误、标识不匹配和未知状态只记录为本次报告错误，不会猜测为成功，也不会把 DAG conf、XCom 或日志内容写入 LOGRISK。
+
 ## 安全与回滚
 
 PACAS/RBAC 是唯一身份权威。Django 写请求要求现有认证用户和配置角色；运行审计仅保存操作、主体、角色、请求 ID 和脱敏状态。原始日志不得进入 DAG conf 或 XCom，亦不得写入 Trace、审计或错误响应。

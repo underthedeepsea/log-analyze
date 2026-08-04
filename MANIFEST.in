@@ -1,0 +1,3 @@
+recursive-include src/logrisk_django/static/logrisk *
+include requirements-django.txt
+include requirements-postgres.txt

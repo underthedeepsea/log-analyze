@@ -6,6 +6,7 @@ import json
 import re
 import sqlite3
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Protocol, Sequence
@@ -26,6 +27,64 @@ class Database(Protocol):
     def connect(self) -> Any: ...
 
     def transaction(self) -> Any: ...
+
+
+@dataclass(frozen=True)
+class MigrationStatus:
+    provider: str
+    applied_versions: tuple[str, ...]
+    pending_versions: tuple[str, ...]
+    changed_versions: tuple[str, ...]
+    latest_version: str | None
+
+    def public_dict(self) -> dict[str, Any]:
+        return {
+            "provider": self.provider,
+            "applied_migrations": len(self.applied_versions),
+            "pending_migrations": len(self.pending_versions),
+            "changed_migrations": list(self.changed_versions),
+            "latest_version": self.latest_version,
+            "ready": not self.pending_versions and not self.changed_versions,
+        }
+
+
+def migration_status(database: Database) -> MigrationStatus:
+    """Inspect migration state without applying any schema change."""
+    migrations_dir = Path(getattr(database, "migrations_dir"))
+    expected = {
+        path.name.split("_", 1)[0]: hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in sorted(migrations_dir.glob("*.sql"))
+    }
+    try:
+        with database.connect() as connection:
+            rows = connection.execute("SELECT version, sha256 FROM schema_migrations").fetchall()
+        applied = {str(row["version"]): str(row["sha256"]) for row in rows}
+    except Exception:
+        applied = {}
+    return MigrationStatus(
+        provider=str(database.provider),
+        applied_versions=tuple(sorted(version for version in expected if version in applied)),
+        pending_versions=tuple(sorted(version for version in expected if version not in applied)),
+        changed_versions=tuple(sorted(version for version, digest in expected.items() if applied.get(version) not in {None, digest})),
+        latest_version=max(expected) if expected else None,
+    )
+
+
+class MigrationManager:
+    """Explicit migration entrypoint used by production management commands only."""
+
+    def __init__(self, database: Database) -> None:
+        self.database = database
+
+    def status(self) -> MigrationStatus:
+        return migration_status(self.database)
+
+    def apply(self) -> MigrationStatus:
+        migrate = getattr(self.database, "migrate", None)
+        if not callable(migrate):
+            raise DatabaseError("当前数据库 Provider 不支持显式迁移")
+        migrate()
+        return self.status()
 
 
 def qmark_to_pyformat(sql: str) -> str:
@@ -186,12 +245,13 @@ def split_sql_statements(sql: str) -> list[str]:
 class SQLiteDatabase:
     provider = "sqlite"
 
-    def __init__(self, path: str | Path, migrations_dir: str | Path | None = None) -> None:
+    def __init__(self, path: str | Path, migrations_dir: str | Path | None = None, *, migrate: bool = True) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.state_root = self.path.parent
         self.migrations_dir = Path(migrations_dir) if migrations_dir else Path(__file__).parents[2] / "database" / "migrations"
-        self._migrate()
+        if migrate:
+            self.migrate()
 
     def connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=5.0)
@@ -215,7 +275,7 @@ class SQLiteDatabase:
         finally:
             connection.close()
 
-    def _migrate(self) -> None:
+    def migrate(self) -> None:
         with self.connect() as connection:
             connection.execute(
                 "CREATE TABLE IF NOT EXISTS schema_migrations ("
@@ -258,6 +318,10 @@ def _normalise_postgres_value(value: Any) -> Any:
 class PostgresCursor:
     def __init__(self, cursor: Any) -> None:
         self._cursor = cursor
+
+    def __iter__(self) -> Iterator[RowRecord]:
+        """Match sqlite3 cursors used by the existing stores."""
+        return iter(self.fetchall())
 
     @property
     def rowcount(self) -> int:
@@ -329,7 +393,7 @@ class PostgresDatabase:
         self.migrations_dir = Path(migrations_dir) if migrations_dir else Path(__file__).parents[2] / "database" / "postgres" / "migrations"
         self._psycopg, self._dict_row = self._load_driver()
         if migrate:
-            self._migrate()
+            self.migrate()
 
     @staticmethod
     def _load_driver() -> tuple[Any, Any]:
@@ -359,7 +423,7 @@ class PostgresDatabase:
         finally:
             connection.close()
 
-    def _migrate(self) -> None:
+    def migrate(self) -> None:
         with self.transaction() as connection:
             connection.execute(
                 "CREATE TABLE IF NOT EXISTS schema_migrations ("
@@ -391,13 +455,14 @@ def create_database(
     sqlite_path: str | Path,
     state_root: str | Path,
     database_url: str | None = None,
+    migrate: bool = True,
 ) -> SQLiteDatabase | PostgresDatabase:
     """Build the explicitly selected runtime storage provider without fallback."""
 
     if provider == "sqlite":
-        return SQLiteDatabase(sqlite_path)
+        return SQLiteDatabase(sqlite_path, migrate=migrate)
     if provider == "postgres":
         if not database_url:
             raise ValueError("PostgreSQL 模式需要数据库连接地址")
-        return PostgresDatabase(database_url, state_root=state_root)
+        return PostgresDatabase(database_url, state_root=state_root, migrate=migrate)
     raise ValueError("数据库 Provider 必须是 sqlite 或 postgres")

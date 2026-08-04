@@ -1,3 +1,29 @@
 [tool.pytest.ini_options]
 pythonpath = ["src"]
 testpaths = ["tests"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "logrisk"
+version = "1.31.0"
+description = "Sanitized log feature review and export service"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+django = ["Django==4.2.16"]
+postgres = ["psycopg[binary]>=3.1,<4"]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["logrisk*", "logrisk_django*", "pipeline*"]
+
+[tool.setuptools.package-data]
+logrisk_django = ["static/logrisk/**/*"]

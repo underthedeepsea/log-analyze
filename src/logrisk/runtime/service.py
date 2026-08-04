@@ -300,7 +300,7 @@ class RuntimeService:
         result.update({"schema_version": "runtime_health_v1", "storage_usage": self.storage_usage()})
         return result
 
-    def readiness(self) -> dict[str, Any]:
+    def readiness(self, *, airflow: Mapping[str, Any] | None = None) -> dict[str, Any]:
         liveness_status = liveness(self.database)
         directories: dict[str, bool] = {}
         for label, path in (("state", self.state_root), ("output", self.output_root)):
@@ -310,11 +310,33 @@ class RuntimeService:
                 directories[label] = False
         usage = self.storage_usage()
         migrations_ready = bool(liveness_status.get("migrations"))
-        ready = bool(liveness_status["alive"] and migrations_ready and all(directories.values()) and usage["level"] != "blocked")
+        airflow_ready = True if airflow is None else bool(airflow.get("ready"))
+        ready = bool(
+            liveness_status["alive"]
+            and migrations_ready
+            and all(directories.values())
+            and usage["level"] != "blocked"
+            and airflow_ready
+        )
+        airflow_dependency = dict(airflow or {
+            "status": "not_checked",
+            "ready": True,
+            "online": None,
+            "dag_registered": None,
+        })
         return {
             "ready": ready,
             "status": "ready" if ready else "not_ready",
-            "checks": {"database": liveness_status["alive"], "migrations": migrations_ready, "directories": directories, "quota": usage["level"]},
-            "dependencies": {"model_connections": {"status": "unknown", "required": False}},
+            "checks": {
+                "database": liveness_status["alive"],
+                "migrations": migrations_ready,
+                "directories": directories,
+                "quota": usage["level"],
+                "airflow": airflow_ready,
+            },
+            "dependencies": {
+                "model_connections": {"status": "unknown", "required": False},
+                "airflow": airflow_dependency,
+            },
             "storage_usage": usage,
         }

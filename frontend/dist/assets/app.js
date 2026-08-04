@@ -2,7 +2,7 @@
   "use strict";
   const h = React.createElement;
   const { useEffect, useMemo, useRef, useState } = React;
-  const INLINE_MAX_BYTES = 10 * 1024 * 1024;
+  const INLINE_RESULT_MAX_BYTES = 10 * 1024 * 1024;
   const LARGE_CHUNK_BYTES = 1024 * 1024;
   const DEPLOYMENT_API_BASE = String(window.LOGRISK_CONFIG && window.LOGRISK_CONFIG.apiBase || "").replace(/\/$/, "");
   const SEMANTIC_TEST_EXAMPLES = {
@@ -150,17 +150,15 @@
     update: function (jobId, candidateId, changes) {
       return jsonRequest("/api/jobs/" + jobId + "/features/" + candidateId, { method: "PATCH", body: JSON.stringify(changes) });
     },
-    async analyzeFile(file) {
-      if (file.size > INLINE_MAX_BYTES) return this.uploadAndAnalyzeLargeFile(file);
-      const content = await file.text();
-      if (file.name.toLowerCase().endsWith(".json")) {
+    async analyzeFile(file, callbacks) {
+      if (file.size <= INLINE_RESULT_MAX_BYTES && file.name.toLowerCase().endsWith(".json")) {
         try {
+          const content = await file.text();
           const value = JSON.parse(content);
           if (value && Array.isArray(value.risk_entities)) return value;
         } catch (_) { /* Server returns the authoritative format error. */ }
       }
-      const payload = await jsonRequest("/api/inputs/analyze", { method: "POST", body: JSON.stringify({ filename: file.name, content: content }) });
-      return payload.result;
+      return this.uploadAndAnalyzeLargeFile(file, callbacks);
     },
     async uploadAndAnalyzeLargeFile(file, callbacks) {
       callbacks = callbacks || {};
@@ -1922,7 +1920,7 @@
       const timer = setInterval(function () { if (!document.hidden) loadStreaming().catch(function () {}); }, 1500);
       return function () { clearInterval(timer); };
     }, [view, (streamingData.tasks || []).map(function (task) { return task.task_id + ":" + task.status + ":" + task.updated_at; }).join("|")]);
-    async function loadFile(file) { if (!file) return; setBusy(true); setError(""); setUploadProgress(null); setPreprocessProgress(null); try { const next = file.size > INLINE_MAX_BYTES ? await api.uploadAndAnalyzeLargeFile(file, { onUploadProgress: setUploadProgress, onPreprocessProgress: setPreprocessProgress }) : await api.analyzeFile(file); setResult(next); setFileName(file.name); setSnapshot(null); setJobId(null); changeView("overview"); } catch (reason) { setError(reason.message); } finally { setBusy(false); } }
+    async function loadFile(file) { if (!file) return; setBusy(true); setError(""); setUploadProgress(null); setPreprocessProgress(null); try { const next = await api.analyzeFile(file, { onUploadProgress: setUploadProgress, onPreprocessProgress: setPreprocessProgress }); setResult(next); setFileName(file.name); setSnapshot(null); setJobId(null); changeView("overview"); } catch (reason) { setError(reason.message); } finally { setBusy(false); } }
     async function start() { if (!result) return; setBusy(true); setError(""); try { const created = await api.createJob(result, model, threshold, promptId, modelProfileId, retryCount); setJobId(created.job_id); changeView("queue"); await refresh(created.job_id); if (events.current) events.current.close(); events.current = api.subscribe(created.job_id, function () { refresh(created.job_id).catch(function (reason) { setError(reason.message); }); }); } catch (reason) { setError(reason.message); } finally { setBusy(false); } }
     async function save(changes) { try { await api.update(jobId, selectedId, changes); await refresh(); await loadRules(); } catch (reason) { setError(reason.message); } }
     function retry(entityId) { api.retry(jobId, entityId).then(function () { return refresh(); }).catch(function (reason) { setError(reason.message); }); }

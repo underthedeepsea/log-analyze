@@ -196,6 +196,7 @@ class FeatureJobManager:
         auto_start: bool = True,
         persistence: FeatureJobFileStore | None = None,
         observability: Any | None = None,
+        interrupt_on_restore: bool = True,
     ) -> None:
         self.extractor = extractor
         self.rule_store = rule_store
@@ -204,6 +205,7 @@ class FeatureJobManager:
         self.auto_start = auto_start
         self.persistence = persistence
         self.observability = observability
+        self.interrupt_on_restore = bool(interrupt_on_restore)
         self._jobs: Dict[str, Dict[str, Any]] = {}
         self._lock = threading.RLock()
         self._restore_jobs()
@@ -217,12 +219,13 @@ class FeatureJobManager:
             job.setdefault("events", [])
             job.setdefault("processed_samples", [])
             job["started_monotonic"] = self.monotonic()
-            interrupted = job.get("status") in {"queued", "running"}
-            for record in job.get("entities", []):
-                if record.get("status") in {"queued", "running"}:
-                    record["status"] = "interrupted"
-                    record["error"] = "服务重启中断，需人工重试"
-                    interrupted = True
+            interrupted = self.interrupt_on_restore and job.get("status") in {"queued", "running"}
+            if self.interrupt_on_restore:
+                for record in job.get("entities", []):
+                    if record.get("status") in {"queued", "running"}:
+                        record["status"] = "interrupted"
+                        record["error"] = "服务重启中断，需人工重试"
+                        interrupted = True
             if interrupted:
                 job["status"] = "interrupted"
                 job["completed_at"] = None
@@ -652,6 +655,22 @@ class FeatureJobManager:
         with self._lock:
             job_ids = sorted(self._jobs, key=lambda item: self._jobs[item]["created_at"], reverse=True)
         return [self.get_job(job_id) for job_id in job_ids]
+
+    def refresh_from_persistence(self, job_id: str) -> None:
+        """Refresh one job written by another process without changing its lifecycle state."""
+        if not self.persistence:
+            return
+        target = str(job_id)
+        persisted = next((job for job in self.persistence.load() if str(job.get("job_id")) == target), None)
+        if persisted is None:
+            raise FeatureJobError("任务不存在")
+        with self._lock:
+            existing = self._jobs.get(target)
+            persisted["condition"] = existing.get("condition") if existing else threading.Condition(self._lock)
+            persisted.setdefault("events", [])
+            persisted.setdefault("processed_samples", [])
+            persisted["started_monotonic"] = self.monotonic()
+            self._jobs[target] = persisted
 
     def wait_for_events(
         self,

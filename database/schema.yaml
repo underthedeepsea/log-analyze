@@ -1,4 +1,4 @@
-schema_version: 12
+schema_version: 14
 database: logrisk
 description: LOGRISK 双模式运行时数据字典；SQLite 是默认本地实现，PostgreSQL 用于显式配置的外部生产部署。
 authoritative_ddl:
@@ -157,6 +157,20 @@ tables:
     foreign_keys: {validation_id: release_validations.validation_id ON DELETE CASCADE}
     indexes: [idx_release_validation_check_status(validation_id, status, position)]
     columns: {validation_id: 所属校验运行, check_id: 稳定检查标识, position: 展示顺序, title: 检查名称, status: passed/warning/blocked, code: 稳定结果码, message: 脱敏结果说明, evidence_json: 脱敏佐证数据, schema_version: 结构版本, created_at: 检查发生时间}
+  orchestration_runs:
+    description: Django 请求与 Airflow DAG Run 之间的持久化编排状态；只保存任务标识、状态和脱敏错误，不保存日志、Prompt、模型内容或凭据
+    primary_key: orchestration_run_id
+    foreign_keys: {job_id: feature_jobs.job_id ON DELETE CASCADE}
+    constraints: orchestrator 仅 airflow；每个 job_id/orchestrator 唯一；status 为 pending_dispatch/dispatched/running/cancel_requested/completed/failed/cancelled/dispatch_failed；state_version 用于乐观并发控制
+    indexes: [idx_orchestration_runs_reconcile(status, updated_at, orchestration_run_id)]
+    columns: {orchestration_run_id: 编排运行标识, job_id: 所属特征任务, orchestrator: 外部编排器, external_dag_id: Airflow DAG 标识, external_run_id: Airflow DAG Run 标识, status: 编排状态, attempt: 已分派尝试次数, state_version: 乐观锁版本, request_id: 外部请求标识, actor: PACAS/RBAC 操作人, roles_json: 操作角色列表, last_heartbeat_at: 最近心跳时间, started_at: 开始时间, completed_at: 结束时间, error_code: 稳定脱敏错误码, error_summary: 脱敏错误摘要, created_at: 创建时间, updated_at: 更新时间}
+  input_orchestration_runs:
+    description: Django 上传预处理与 Airflow DAG Run 的持久化编排状态；只保存输入任务标识、状态和脱敏错误，不保存日志、Prompt、模型内容或凭据
+    primary_key: input_orchestration_run_id
+    foreign_keys: {input_job_id: input_jobs.input_job_id ON DELETE CASCADE}
+    constraints: orchestrator 仅 airflow；每个 input_job_id/orchestrator 唯一；status 为 pending_dispatch/dispatched/running/cancel_requested/completed/failed/cancelled/dispatch_failed；state_version 用于乐观并发控制
+    indexes: [idx_input_orchestration_runs_reconcile(status, updated_at, input_orchestration_run_id)]
+    columns: {input_orchestration_run_id: 输入编排运行标识, input_job_id: 所属上传预处理任务, orchestrator: 外部编排器, external_dag_id: Airflow DAG 标识, external_run_id: Airflow DAG Run 标识, status: 编排状态, attempt: 已分派尝试次数, state_version: 乐观锁版本, request_id: 外部请求标识, actor: PACAS/RBAC 操作人, roles_json: 操作角色列表, last_heartbeat_at: 最近心跳时间, started_at: 开始时间, completed_at: 结束时间, error_code: 稳定脱敏错误码, error_summary: 脱敏错误摘要, created_at: 创建时间, updated_at: 更新时间}
   multi_source_rules:
     description: 确定性跨来源关联规则；仅使用实体、来源、时间窗口、计数和风险阈值
     primary_key: rule_id

@@ -291,6 +291,7 @@ class SQLiteUploadSessionStore(UploadSessionStore):
 
     def _write_manifest(self, upload_id: str, manifest: dict[str, Any]) -> None:
         source = self._root(upload_id) / "source.log"
+        source_reference = manifest.get("artifact_relative_path") or (str(source) if source.is_file() else None)
         with self.database.transaction() as connection:
             connection.execute(
                 "INSERT INTO upload_sessions(upload_id, status, filename, source_path, size_bytes, sha256, manifest_json, created_at, updated_at) "
@@ -300,7 +301,7 @@ class SQLiteUploadSessionStore(UploadSessionStore):
                     upload_id,
                     manifest["status"],
                     manifest["filename"],
-                    str(source) if source.is_file() else None,
+                    source_reference,
                     int(manifest["size_bytes"]),
                     manifest.get("sha256"),
                     _json(manifest),

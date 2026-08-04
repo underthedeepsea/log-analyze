@@ -33,3 +33,18 @@ def test_input_job_persists_semantic_dictionary_snapshot(tmp_path):
     persisted = store.get_job(job["input_job_id"])
     assert persisted["semantic_dictionary_snapshot"] == snapshot
     assert persisted["semantic_dictionary_versions"]["linux"]["version"] == 2
+
+
+def test_input_job_persists_shared_source_as_a_relative_artifact_path(tmp_path):
+    from logrisk.artifact_storage import SharedArtifactStore
+
+    shared = SharedArtifactStore(tmp_path / "shared")
+    staged = shared.stage_bytes("uploads", b"safe")
+    artifact = shared.promote(staged, "uploads/messages")
+    store = InputJobStore(InputJobConfig(output_dir=tmp_path / "jobs", artifact_store=shared))
+
+    job = store.create(upload_id="upl_a", filename="messages", source_path=str(shared.resolve(artifact.relative_path)))
+
+    assert job["source_path"] == "uploads/messages"
+    assert job["source_artifact_path"] == "uploads/messages"
+    assert store.resolve_source_path(job) == shared.resolve("uploads/messages")

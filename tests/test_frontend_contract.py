@@ -388,7 +388,8 @@ def test_upload_accepts_result_and_raw_log_formats():
     assert "/api/uploads" in source
     assert "/api/inputs/analyze-upload" in source
     assert "/api/input-jobs/" in source
-    assert "file.size > INLINE_MAX_BYTES" in source
+    assert "return this.uploadAndAnalyzeLargeFile(file, callbacks);" in source
+    assert 'jsonRequest("/api/inputs/analyze",' not in source
     assert "上传进度" in source
     assert "预处理阶段" in source
     assert "Drain3 分片" in source
@@ -547,7 +548,8 @@ def test_release_docs_describe_current_feature_version():
     assert "## 1.28.0 - 2026-07-29" in release
     assert "## 1.29.0 - 2026-07-30" in release
     assert "## 1.30.0 - 2026-07-31" in release
-    assert "当前版本：`1.30.0`" in readme
+    assert "## 1.31.0 - 2026-08-03" in release
+    assert "当前版本：`1.31.0`" in readme
     assert "## 1.24.0 - 2026-07-22" in release
     assert "## 1.24.1 - 2026-07-22" in release
     assert "## 1.24.2 - 2026-07-22" in release

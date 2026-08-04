@@ -13,18 +13,18 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Callable
-from urllib.error import URLError
 from urllib.parse import parse_qs, unquote, urlparse
-from urllib.request import Request, urlopen
 
 import yaml
 
 from logrisk.ai_harness.connections import ConnectionStore
+from logrisk.ai_harness.connection_check import check_model_connection, check_ollama
+from logrisk.application import ApiFacade
+from logrisk.application.container import ApplicationConfig, build_application_container
 from logrisk.ai_harness.model_client import ModelClientError
 from logrisk.ai_harness.model_profile import ModelProfileRegistry
 from logrisk.ai_harness.prompt_registry import PromptRegistry, PromptTemplate, SQLitePromptRegistry
 from logrisk.ai_harness.providers import create_model_client
-from logrisk.ai_harness.providers.extension import redact_model_error
 from logrisk.ai_harness.providers.extensions.registry import (
     get_extension_adapter,
     list_extension_descriptors,
@@ -90,59 +90,11 @@ from pipeline.manual_import_pipeline import analyze_records
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 MAX_LARGE_UPLOAD_BYTES = 500 * 1024 * 1024
 DEFAULT_MODEL = "qwen3:1.7b"
-APP_VERSION = "1.30.0"
+APP_VERSION = "1.31.0"
 
 
 class DashboardHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
-
-
-def check_ollama(base_url: str, timeout: float = 2) -> dict[str, Any]:
-    try:
-        with urlopen(f"{base_url.rstrip('/')}/api/tags", timeout=timeout) as response:
-            payload = json.load(response)
-        models = [item.get("name") for item in payload.get("models", []) if item.get("name")]
-        return {"online": True, "models": models}
-    except (OSError, URLError, ValueError, json.JSONDecodeError) as exc:
-        return {"online": False, "models": [], "error": str(exc)}
-
-
-def check_model_connection(connection: dict[str, Any]) -> dict[str, Any]:
-    if not connection.get("enabled"):
-        return {"online": False, "models": [], "error": "连接已停用"}
-    if connection.get("provider") == "ollama":
-        return check_ollama(str(connection["base_url"]), float(connection.get("timeout_seconds") or 2))
-    if connection.get("provider") == "extension":
-        values = [
-            os.environ.get(str(env_name), "")
-            for env_name in dict(connection.get("credential_envs") or {}).values()
-        ]
-        try:
-            result = get_extension_adapter(str(connection.get("adapter_id") or "")).check_connection(connection)
-            if not isinstance(result, dict):
-                raise ModelClientError("扩展适配器连接检查必须返回 JSON object")
-            result["models"] = list(result.get("models") or [])
-            result["online"] = bool(result.get("online"))
-            if result.get("error"):
-                result["error"] = redact_model_error(str(result["error"]), values)
-            return result
-        except Exception as exc:
-            return {"online": False, "models": [], "error": redact_model_error(str(exc), values)}
-    api_key_env = str(connection.get("api_key_env") or "")
-    api_key = os.environ.get(api_key_env)
-    if not api_key:
-        return {"online": False, "models": [], "error": f"未配置环境变量: {api_key_env}"}
-    request = Request(
-        f"{str(connection['base_url']).rstrip('/')}/models",
-        headers={"Accept": "application/json", "Authorization": f"Bearer {api_key}"},
-    )
-    try:
-        with urlopen(request, timeout=float(connection.get("timeout_seconds") or 10)) as response:
-            payload = json.load(response)
-        models = [item.get("id") for item in payload.get("data", []) if isinstance(item, dict) and item.get("id")]
-        return {"online": True, "models": models}
-    except (OSError, URLError, ValueError, json.JSONDecodeError) as exc:
-        return {"online": False, "models": [], "error": str(exc)}
 
 
 def build_server(
@@ -165,356 +117,85 @@ def build_server(
     runtime_config: RuntimeConfig | None = None,
     runtime_config_path: str | Path | None = None,
 ) -> DashboardHTTPServer:
+    """Create the local development HTTP shell around shared application services."""
     root = Path(__file__).resolve().parents[2]
-    state_root = Path(state_root) if state_root else (Path(database_path).parent if database_path else root / "state")
-    database_settings = DatabaseConnectionSettings(state_root / "database_connection.json")
-    database_runtime = resolve_database_runtime(
-        provider=database_provider,
-        database_url=database_url,
-        database_path=database_path or os.getenv("LOGRISK_DB_PATH") or state_root / "logrisk.sqlite3",
-        settings=database_settings,
+    selected_state_root = Path(state_root) if state_root else (
+        Path(database_path).parent if database_path else root / "state"
     )
-    database = create_database(
-        provider=database_runtime.provider,
-        sqlite_path=database_runtime.sqlite_path,
-        database_url=database_runtime.database_url,
-        state_root=state_root,
+    container = build_application_container(
+        ApplicationConfig(
+            project_root=root,
+            state_root=selected_state_root,
+            output_root=root / "output",
+            database_provider=database_provider,
+            database_url=database_url,
+            database_path=Path(database_path) if database_path else None,
+            default_model=default_model,
+            default_ollama_url=default_ollama_url,
+            default_timeout=default_timeout,
+            drain_quality_root=Path(drain_quality_root) if drain_quality_root else None,
+            semantic_root=Path(semantic_root) if semantic_root else None,
+            runtime_config=runtime_config,
+            runtime_config_path=Path(runtime_config_path) if runtime_config_path else None,
+            import_legacy_state=True,
+            interrupt_streaming_tasks=True,
+        ),
+        manager=manager,
+        input_analyzer=input_analyzer,
     )
-    if runtime_config is None:
-        selected_runtime_config = Path(runtime_config_path or root / "configs" / "runtime.yaml")
-        try:
-            runtime_payload = yaml.safe_load(selected_runtime_config.read_text(encoding="utf-8")) or {}
-        except (OSError, UnicodeError, yaml.YAMLError) as exc:
-            raise RuntimeConfigError("运行时配置文件无效") from exc
-        runtime_config = RuntimeConfig.from_mapping({"runtime": runtime_payload.get("runtime", {})})
-    connections = ConnectionStore(database)
-    connections.seed_defaults(default_ollama_url)
-    profiles = ModelProfileRegistry(root / "configs" / "model_profiles.yaml", database=database)
-    prompts = SQLitePromptRegistry(database, root / "prompts", root / "configs" / "ai_harness.yaml")
-    traces = SQLiteAITraceLogger(database)
-    observability_repository = ObservabilityRepository(database)
-    span_recorder = SpanRecorder(observability_repository)
-    ai_cache = SQLiteAICache(database)
-    drain_quality = (
-        DrainQualityService(drain_quality_root, root / "configs" / "drain3_profiles", root / "configs" / "drain3_recommended.ini")
-        if drain_quality_root else SQLiteDrainQualityService(database, root / "configs" / "drain3_profiles", root / "configs" / "drain3_recommended.ini")
-    )
-    semantic_dictionaries = (
-        SemanticDictionaryStore(semantic_root, root / "configs" / "semantic_dictionary")
-        if semantic_root else SQLiteSemanticDictionaryStore(database, root / "configs" / "semantic_dictionary")
-    )
-    risk_semantics = RiskSemanticService(database, root / "configs" / "risk_semantics" / "builtin.yaml")
-    node_risks = NodeRiskService(database, root / "configs" / "node_risk.yaml")
-    multi_source_config = load_multi_source_config(root / "configs" / "multi_source.yaml")
-    multi_source = MultiSourceService(
-        MultiSourceRepository(database),
-        aliases=multi_source_config["aliases"],
-        rules=multi_source_config["rules"],
-        enabled=multi_source_config["enabled"],
-    )
-    LegacyStateImporter(database, state_root, root / "output" / "uploads").run()
-
-    def configured_extractor(entity: dict[str, Any], **kwargs: Any) -> list[dict[str, Any]]:
-        import logrisk.feature_extractor_ollama as feature_extractor
-
-        profile_snapshot = kwargs.get("profile_snapshot")
-        profile = profiles.from_snapshot(profile_snapshot) if isinstance(profile_snapshot, dict) else profiles.get(kwargs.get("model_profile_id"))
-        connection_snapshot = kwargs.get("connection_snapshot")
-        connection = dict(connection_snapshot) if isinstance(connection_snapshot, dict) else connections.get(profile.connection_id)
-        prompt_snapshot = kwargs.get("prompt_snapshot")
-        prompt_template = PromptTemplate(**prompt_snapshot) if isinstance(prompt_snapshot, dict) else None
-        if not connection["enabled"]:
-            raise FeatureJobError(f"模型连接已停用: {profile.connection_id}")
-        feature_extractor.PROMPT_REGISTRY = prompts
-        feature_extractor.TRACE_LOGGER = traces
-        feature_extractor.AI_CACHE = ai_cache
-        return feature_extractor.extract_features_for_entity(
-            entity,
-            model=profile.model,
-            base_url=connection["base_url"],
-            timeout=float(kwargs.get("timeout") or connection["timeout_seconds"]),
-            model_client=create_model_client(connection),
-            prompt_id=kwargs.get("prompt_id") or profile.default_prompt_id,
-            prompt_template=prompt_template,
-            job_id=kwargs.get("job_id"),
-            cache_enabled=bool(kwargs.get("cache_enabled", True)),
-            model_profile_id=profile.profile_id,
-            provider=connection["provider"],
-            model_profile=profile,
-            connection_snapshot=connection,
-        )
-
-    def validate_replay_output(snapshot: dict[str, Any], output: dict[str, Any]) -> dict[str, Any]:
-        source = dict(snapshot.get("source_trace") or {})
-        evidence = dict(source.get("input_evidence") or {})
-        known_hashes = {
-            str(item.get("template_hash"))
-            for item in evidence.get("templates") or []
-            if item.get("template_hash")
-        }
-        try:
-            features = [_validate_model_feature(item, known_hashes) for item in output.get("features") or []]
-        except Exception as exc:
-            return {
-                "parsed_output": output,
-                "validation_result": {"valid": False, "errors": [str(exc)], "warnings": []},
-                "evaluator_result": {"passed": False, "errors": [], "warnings": [], "score": 0.0},
-            }
-        evaluator_results = [
-            evaluate_feature_output(
-                feature=feature,
-                entity={"entity_id": (evidence.get("entity") or {}).get("id")},
-                evidence=evidence,
-            )
-            for feature in features
-        ]
-        errors = [error for result in evaluator_results for error in result.get("errors", [])]
-        return {
-            "parsed_output": {"features": features},
-            "validation_result": {"valid": True, "errors": [], "warnings": []},
-            "evaluator_result": {
-                "passed": not errors,
-                "errors": errors,
-                "warnings": [warning for result in evaluator_results for warning in result.get("warnings", [])],
-                "score": min((float(result.get("score") or 0) for result in evaluator_results), default=1.0),
-            },
-        }
-
-    def replay_model(snapshot: dict[str, Any]) -> dict[str, Any]:
-        source = dict(snapshot.get("source_trace") or {})
-        evidence = dict(source.get("input_evidence") or {})
-        prompt = dict(snapshot.get("prompt") or {})
-        connection = dict(source.get("connection_snapshot") or {})
-        if not evidence or not prompt.get("prompt_content") or not connection:
-            raise ReplayError(
-                "来源 Trace 缺少锁定 Evidence、Prompt 或连接快照",
-                code="replay_snapshot_incomplete",
-                status_code=422,
-            )
-        if not connection.get("enabled"):
-            raise ReplayError("来源模型连接已停用", code="connection_disabled", status_code=409)
-        client = create_model_client(connection)
-        started = time.perf_counter()
-        output = client.generate_json(
-            [
-                {"role": "system", "content": prompt["prompt_content"]},
-                {"role": "user", "content": json.dumps(evidence, ensure_ascii=False, separators=(",", ":"))},
-            ],
-            FEATURE_RESPONSE_SCHEMA,
-            model=str(source.get("model") or ""),
-            timeout=float(connection.get("timeout_seconds") or 120),
-            options=dict(source.get("model_options") or {}),
-        )
-        return {
-            **validate_replay_output(snapshot, output),
-            "latency_ms": int((time.perf_counter() - started) * 1000),
-            "usage": dict(getattr(client, "last_metadata", {}).get("usage") or {}),
-        }
-
-    benchmark_cases = load_cases()
-
-    def benchmark_asset_inventory() -> dict[str, int]:
-        table_names = {
-            "ai_traces": "ai_traces",
-            "model_profiles": "model_profiles",
-            "prompt_templates": "prompt_templates",
-            "drain_eval_runs": "drain_eval_runs",
-            "drain_templates": "drain_templates",
-            "ai_cache_entries": "ai_cache_entries",
-        }
-        with database.connect() as connection:
-            counts = {
-                key: int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
-                for key, table in table_names.items()
-            }
-        counts["canonical_eval_cases"] = len(benchmark_cases)
-        return counts
-
-    benchmark_center = BenchmarkService(
-        BenchmarkRepository(database),
-        canonical_cases=benchmark_cases,
-        real_extractor=configured_extractor,
-        asset_inventory=benchmark_asset_inventory,
-        profile_resolver=lambda profile_id: profiles.get(profile_id).public_dict(),
-        connection_resolver=connections.get,
-        prompt_resolver=lambda prompt_id: dict(prompts.load(prompt_id).__dict__),
-    )
-
     server = DashboardHTTPServer((host, port), DashboardHandler)
-    server.database = database  # type: ignore[attr-defined]
-    server.database_runtime = database_runtime  # type: ignore[attr-defined]
-    server.database_settings = database_settings  # type: ignore[attr-defined]
-    server.runtime_config = runtime_config  # type: ignore[attr-defined]
-    server.runtime_repository = RuntimeRepository(database)  # type: ignore[attr-defined]
-    server.runtime_service = RuntimeService(  # type: ignore[attr-defined]
-        database,
-        state_root=state_root,
-        output_root=root / "output",
-        config=runtime_config,
-        repository=server.runtime_repository,
-    )
-    server.connections = connections  # type: ignore[attr-defined]
-    rule_store = SQLiteApprovedRuleStore(database)
-    if manager is not None and manager.rule_store is None:
-        manager.rule_store = rule_store
-    server.manager = manager or FeatureJobManager(  # type: ignore[attr-defined]
-        extractor=configured_extractor,
-        rule_store=rule_store,
-        metrics_store=SQLiteProcessingMetricsStore(database),
-        persistence=SQLiteFeatureJobStore(database),
-        observability=span_recorder,
-    )
-    server.manager.observability = span_recorder  # type: ignore[attr-defined]
-    server.rule_governance = RuleGovernanceService(RuleGovernanceRepository(database))  # type: ignore[attr-defined]
+    server.database = container.database  # type: ignore[attr-defined]
+    server.database_runtime = container.database_runtime  # type: ignore[attr-defined]
+    server.database_settings = container.database_settings  # type: ignore[attr-defined]
+    server.runtime_config = container.runtime_config  # type: ignore[attr-defined]
+    server.runtime_repository = container.runtime_repository  # type: ignore[attr-defined]
+    server.runtime_service = container.runtime_service  # type: ignore[attr-defined]
+    server.connections = container.connections  # type: ignore[attr-defined]
+    server.manager = container.feature_jobs  # type: ignore[attr-defined]
+    server.rule_governance = container.rule_governance  # type: ignore[attr-defined]
     server.frontend_path = Path(frontend_path or root / "frontend" / "dist" / "index.html")  # type: ignore[attr-defined]
     server.help_path = root / "LOGRISK_USER_MANUAL.html"  # type: ignore[attr-defined]
     server.manual_assets_path = root / "manual-assets"  # type: ignore[attr-defined]
     server.default_model = default_model  # type: ignore[attr-defined]
     server.default_ollama_url = default_ollama_url  # type: ignore[attr-defined]
     server.default_timeout = default_timeout  # type: ignore[attr-defined]
-    server.prompt_registry = prompts  # type: ignore[attr-defined]
-    server.model_profiles = profiles  # type: ignore[attr-defined]
-    server.trace_logger = traces  # type: ignore[attr-defined]
-    server.observability_repository = observability_repository  # type: ignore[attr-defined]
-    server.replay_service = ReplayService(  # type: ignore[attr-defined]
-        observability_repository,
-        traces,
-        PromptSnapshotResolver(prompts),
-        model_runner=replay_model,
-        validation_runner=validate_replay_output,
-    )
-    server.upload_store = SQLiteUploadSessionStore(UploadConfig(upload_dir=state_root / "uploads"), database)  # type: ignore[attr-defined]
-    server.input_jobs = SQLiteInputJobStore(InputJobConfig(output_dir=root / "output" / "uploads"), database)  # type: ignore[attr-defined]
-    server.streaming_state = StreamingStateRepository(database)  # type: ignore[attr-defined]
-    server.streaming_state.interrupt_running_tasks()  # type: ignore[attr-defined]
-    server.drain_quality = drain_quality  # type: ignore[attr-defined]
-    server.semantic_dictionaries = semantic_dictionaries  # type: ignore[attr-defined]
-    server.risk_semantics = risk_semantics  # type: ignore[attr-defined]
-    server.node_risks = node_risks  # type: ignore[attr-defined]
-    server.multi_source = multi_source  # type: ignore[attr-defined]
-    server.benchmark_center = benchmark_center  # type: ignore[attr-defined]
-    server.release_readiness = ReleaseReadinessService(  # type: ignore[attr-defined]
-        ReleaseReadinessRepository(database),
-        runtime_service=server.runtime_service,
-        project_root=root,
-        connections=connections,
-        model_profiles=profiles,
-        prompt_registry=prompts,
-        drain_quality=drain_quality,
-        semantic_dictionaries=semantic_dictionaries,
-        multi_source=multi_source,
-        benchmark_center=benchmark_center,
+    server.prompt_registry = container.prompt_registry  # type: ignore[attr-defined]
+    server.model_profiles = container.model_profiles  # type: ignore[attr-defined]
+    server.trace_logger = container.trace_logger  # type: ignore[attr-defined]
+    server.observability_repository = container.observability_repository  # type: ignore[attr-defined]
+    server.replay_service = container.replay_service  # type: ignore[attr-defined]
+    server.upload_store = container.upload_store  # type: ignore[attr-defined]
+    server.input_jobs = container.input_jobs  # type: ignore[attr-defined]
+    server.streaming_state = container.streaming_state  # type: ignore[attr-defined]
+    server.drain_quality = container.drain_quality  # type: ignore[attr-defined]
+    server.semantic_dictionaries = container.semantic_dictionaries  # type: ignore[attr-defined]
+    server.risk_semantics = container.risk_semantics  # type: ignore[attr-defined]
+    server.node_risks = container.node_risks  # type: ignore[attr-defined]
+    server.multi_source = container.multi_source  # type: ignore[attr-defined]
+    server.benchmark_center = container.benchmark_center  # type: ignore[attr-defined]
+    server.release_readiness = container.release_readiness  # type: ignore[attr-defined]
+    server.govern_drain_result = container.govern_drain_result  # type: ignore[attr-defined]
+    server.input_analyzer = container.input_analyzer  # type: ignore[attr-defined]
+    server.input_analyzer_accepts_config = container.input_analyzer_accepts_config  # type: ignore[attr-defined]
+    server.run_input_job = container.run_input_job  # type: ignore[attr-defined]
+    server.api_facade = ApiFacade(  # type: ignore[attr-defined]
+        container,
+        version=APP_VERSION,
+        service_resolver=lambda name, default: getattr(server, name, default),
     )
     configured_origins = cors_origins if cors_origins is not None else os.getenv("DASHBOARD_CORS_ORIGINS", "").split(",")
     server.cors_origins = {str(origin).strip().rstrip("/") for origin in configured_origins if str(origin).strip()}  # type: ignore[attr-defined]
     server.cors_request_headers = (  # type: ignore[attr-defined]
         "Content-Type, X-Chunk-SHA256, Idempotency-Key, "
         + ", ".join((
-            runtime_config.identity.actor_header,
-            runtime_config.identity.roles_header,
-            runtime_config.identity.request_id_header,
+            container.runtime_config.identity.actor_header,
+            container.runtime_config.identity.roles_header,
+            container.runtime_config.identity.request_id_header,
         ))
     )
     server.ollama_checker = ollama_checker or (  # type: ignore[attr-defined]
         lambda: check_ollama(default_ollama_url)
     )
-
-    def govern_drain_result(result: dict[str, Any]) -> dict[str, Any]:
-        def active_templates(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
-            governed = [server.drain_quality.templates.apply_override(item) for item in items]  # type: ignore[attr-defined]
-            return [item for item in governed if item.get("template_governance_status") not in {"ignored", "deleted"}]
-
-        risk_levels: dict[str, set[str]] = {}
-        for entity in result.get("risk_entities") or []:
-            for template in entity.get("top_templates") or []:
-                template_hash = str(template.get("template_hash") or "")
-                if template_hash:
-                    risk_levels.setdefault(template_hash, set()).add(str(entity.get("risk_level") or "unknown"))
-        catalog_rows = []
-        for template in result.get("top_templates") or []:
-            if template.get("template_hash") and template.get("template"):
-                catalog_rows.append(dict(template, risk_levels=sorted(risk_levels.get(str(template["template_hash"]), set()))))
-        if catalog_rows:
-            server.drain_quality.templates.import_templates(catalog_rows)  # type: ignore[attr-defined]
-        governed = dict(result)
-        governed["top_templates"] = active_templates(result.get("top_templates") or [])
-        governed["risk_entities"] = [dict(entity, top_templates=active_templates(entity.get("top_templates") or [])) for entity in result.get("risk_entities") or []]
-        return governed
-
-    server.govern_drain_result = govern_drain_result  # type: ignore[attr-defined]
-    analysis_lock = threading.Lock()
-
-    def default_input_analyzer(
-        records: list[dict[str, Any]],
-        config_path: str | Path | None = None,
-        semantic_snapshot: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        with analysis_lock:
-            result = analyze_records(
-                records,
-                config_path=str(config_path or root / "configs" / "drain3_recommended.ini"),
-                rules_path=str(root / "configs" / "risk_rules.yaml"),
-                state_dir=str(state_root / "dashboard_drain3"),
-                semantic_snapshot=semantic_snapshot,
-                risk_semantics=risk_semantics,
-                node_risks=node_risks,
-            )
-            result.setdefault("summary", {})["multi_source"] = multi_source.ingest_risk_entities(
-                result.get("risk_entities") or [],
-                source_job_id=None,
-            )
-            return result
-
-    server.input_analyzer = input_analyzer or default_input_analyzer  # type: ignore[attr-defined]
-    server.input_analyzer_accepts_config = input_analyzer is None  # type: ignore[attr-defined]
-
-    def run_input_job(input_job_id: str) -> None:
-        store = server.input_jobs  # type: ignore[attr-defined]
-        job = store.get_job(input_job_id)
-        config_path = job.get("drain_config_path") or root / "configs" / "drain3_recommended.ini"
-        if not job.get("streaming_task_id"):
-            source = FileIncrementalSource(job["source_path"], filename=job["filename"])
-            config_hash = hashlib.sha256(Path(config_path).read_bytes()).hexdigest()
-            streaming_task = server.streaming_state.create_or_load(  # type: ignore[attr-defined]
-                descriptor=source.descriptor(),
-                config_hash=config_hash,
-            )
-            server.streaming_state.attach_input_job(streaming_task["task_id"], input_job_id)  # type: ignore[attr-defined]
-            job["streaming_task_id"] = streaming_task["task_id"]
-            store.write_job(input_job_id, job)
-        job.update({"status": "running", "stage": "reading", "started_at": _now()})
-        store.write_job(input_job_id, job)
-        try:
-            result = run_large_file_pipeline(
-                input_job_id=input_job_id,
-                input_path=job["source_path"],
-                filename=job["filename"],
-                config_path=config_path,
-                rules_path=root / "configs" / "risk_rules.yaml",
-                state_dir=state_root / "dashboard_drain3_large" / input_job_id,
-                progress_callback=lambda progress: store.write_progress(input_job_id, progress),
-                semantic_snapshot=job.get("semantic_dictionary_snapshot"),
-                risk_semantics=risk_semantics,
-                node_risks=node_risks,
-                multi_source=multi_source,
-                streaming_repository=server.streaming_state,  # type: ignore[attr-defined]
-                resume_task_id=job["streaming_task_id"],
-            )
-            result = server.govern_drain_result(result)  # type: ignore[attr-defined]
-            store.write_result(input_job_id, result)
-            job.update({"status": "completed", "stage": "completed", "completed_at": _now(), "error": None})
-            store.write_job(input_job_id, job)
-            store.write_progress(input_job_id, {"input_job_id": input_job_id, "status": "completed", "stage": "completed", "progress": 1.0, "risk_entities": len(result.get("risk_entities") or [])})
-        except Exception as exc:
-            if job.get("streaming_task_id"):
-                server.streaming_state.mark_failed(  # type: ignore[attr-defined]
-                    job["streaming_task_id"], str(exc), conflict=isinstance(exc, StreamingConflictError)
-                )
-            job.update({"status": "failed", "stage": "failed", "completed_at": _now(), "error": str(exc)})
-            store.write_job(input_job_id, job)
-            store.write_progress(input_job_id, {"input_job_id": input_job_id, "status": "failed", "stage": "failed", "progress": 1.0, "error": str(exc)})
-
-    server.run_input_job = run_input_job  # type: ignore[attr-defined]
     return server
 
 
@@ -652,6 +333,10 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 return
             if path.startswith("/assets/"):
                 self._serve_asset(path)
+                return
+            facade_result = self.server.api_facade.dispatch_read(path, query)  # type: ignore[attr-defined]
+            if facade_result is not None:
+                self._json(HTTPStatus(facade_result.status), dict(facade_result.body))
                 return
             if path == "/api/config":
                 self._json(HTTPStatus.OK, {
@@ -1108,13 +793,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 if not isinstance(payload, dict):
                     raise ValueError("请求体必须是 JSON object")
                 idempotency_key = str(self.headers.get("Idempotency-Key") or payload.get("idempotency_key") or "").strip()
-                if not idempotency_key:
-                    raise ValueError("发布校验需要 Idempotency-Key 或 idempotency_key")
-                result = self.server.release_readiness.validate(  # type: ignore[attr-defined]
-                    target_version=str(payload.get("target_version") or APP_VERSION),
-                    idempotency_key=idempotency_key,
-                )
-                self._json(HTTPStatus.OK, {**result, "request_id": identity.request_id, "resource_id": result["validation_id"]})
+                result = self.server.api_facade.validate_release(payload, identity, idempotency_key=idempotency_key)  # type: ignore[attr-defined]
+                self._json(HTTPStatus(result.status), dict(result.body), dict(result.headers))
                 return
             if path == "/api/runtime/retention/policy":
                 if not isinstance(payload, dict):
@@ -1431,7 +1111,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             match = re.fullmatch(r"/api/uploads/([A-Za-z0-9_-]+)/complete", path)
             if match:
                 manifest = self.server.upload_store.complete(upload_id=match.group(1), final_sha256=payload.get("sha256") if isinstance(payload, dict) else None)  # type: ignore[attr-defined]
-                self._json(HTTPStatus.OK, {"upload_id": manifest["upload_id"], "status": manifest["status"], "path": str(self.server.upload_store.source_path(match.group(1)))})  # type: ignore[attr-defined]
+                self._json(HTTPStatus.OK, {"upload_id": manifest["upload_id"], "status": manifest["status"], "path": self.server.upload_store.source_reference(match.group(1))})  # type: ignore[attr-defined]
                 return
             if path == "/api/inputs/analyze-upload":
                 if not isinstance(payload, dict):
@@ -1534,12 +1214,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 return
             match = re.fullmatch(r"/api/jobs/([a-f0-9]+)/export", path)
             if match:
-                package = self.server.manager.export_approved(match.group(1))  # type: ignore[attr-defined]
-                self._json(
-                    HTTPStatus.OK,
-                    package,
-                    {"Content-Disposition": 'attachment; filename="logrisk-feature-package.json"'},
-                )
+                result = self.server.api_facade.export_approved(match.group(1), identity)  # type: ignore[attr-defined]
+                self._json(HTTPStatus(result.status), dict(result.body), dict(result.headers))
                 return
             self._json(HTTPStatus.NOT_FOUND, {"error": "资源不存在"})
         except ReplayError as exc:
@@ -1670,8 +1346,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if not match:
                 self._json(HTTPStatus.NOT_FOUND, {"error": "资源不存在"})
                 return
-            feature = self.server.manager.update_feature(match.group(1), match.group(2), payload)  # type: ignore[attr-defined]
-            self._json(HTTPStatus.OK, feature)
+            result = self.server.api_facade.update_feature(match.group(1), match.group(2), payload, self._runtime_request_identity())  # type: ignore[attr-defined]
+            self._json(HTTPStatus(result.status), dict(result.body), dict(result.headers))
         except RuntimeAccessError as exc:
             self._json(HTTPStatus.FORBIDDEN, {"error": str(exc), "code": exc.code, "error_code": exc.code, "request_id": self._runtime_request_identity().request_id})
         except MultiSourceConflictError as exc:

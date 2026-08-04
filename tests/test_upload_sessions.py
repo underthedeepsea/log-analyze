@@ -33,3 +33,22 @@ def test_upload_session_rejects_bad_size_and_missing_chunks(tmp_path):
     sessions.append_chunk(upload_id=manifest["upload_id"], index=0, data=b"ab")
     with pytest.raises(ValueError, match="Missing chunks"):
         sessions.complete(upload_id=manifest["upload_id"])
+
+
+def test_upload_session_promotes_completed_source_into_shared_artifact_root(tmp_path):
+    from logrisk.artifact_storage import SharedArtifactStore
+
+    shared = SharedArtifactStore(tmp_path / "shared")
+    sessions = UploadSessionStore(UploadConfig(
+        upload_dir=tmp_path / "work" / "uploads",
+        max_upload_bytes=20,
+        artifact_store=shared,
+    ))
+    manifest = sessions.create(filename="messages", size_bytes=4, chunk_size_bytes=4)
+    sessions.append_chunk(upload_id=manifest["upload_id"], index=0, data=b"safe")
+
+    completed = sessions.complete(upload_id=manifest["upload_id"])
+
+    assert completed["artifact_relative_path"] == f"uploads/{manifest['upload_id']}/source.log"
+    assert sessions.source_path(manifest["upload_id"]) == shared.resolve(completed["artifact_relative_path"])
+    assert sessions.source_path(manifest["upload_id"]).read_bytes() == b"safe"

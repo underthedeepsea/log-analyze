@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "package_id": "linux-node-baseline",
+  "name": "Linux 节点基础知识包",
+  "version": "1.0.0",
+  "description": "面向 Linux 节点日志特征治理的脱敏基础资产示例",
+  "platform": {
+    "min_version": "1.32.0",
+    "max_version_exclusive": "2.0.0"
+  },
+  "dependencies": [],
+  "assets": [
+    {
+      "asset_id": "linux-drain3-profile",
+      "type": "drain3_profile",
+      "path": "assets/drain3_profile.ini",
+      "sha256": "fc1a508ea701568e6f3a040f65664aa3402ffcd15e8bd400d8650cecd34927b0",
+      "media_type": "text/plain"
+    },
+    {
+      "asset_id": "linux-semantic-dictionary",
+      "type": "semantic_dictionary",
+      "path": "assets/semantic_dictionary.yaml",
+      "sha256": "86f58384c0e35266fc9e9f60a87ca5cb926fb3a396b71cdb981c9ee019e38d37",
+      "media_type": "application/yaml"
+    },
+    {
+      "asset_id": "feature-extract-prompt",
+      "type": "feature_prompt",
+      "path": "assets/feature_prompt.md",
+      "sha256": "495924d667003ccb024da4d36ed793a02ddc27df29730c70d22b93bc3aa5ffac",
+      "media_type": "text/markdown"
+    },
+    {
+      "asset_id": "linux-risk-semantics",
+      "type": "risk_semantics",
+      "path": "assets/risk_semantics.yaml",
+      "sha256": "567b69481dfc9800d15a06b3117df8d474eb9ad6a262918df7dd521603d7f1f8",
+      "media_type": "application/yaml"
+    },
+    {
+      "asset_id": "approved-rule-candidates",
+      "type": "approved_rule_candidates",
+      "path": "assets/approved_rule_candidates.json",
+      "sha256": "0a24666092f9dce203b351dc63e830d384653cff2f7de4d5d5165b059efd1ab4",
+      "media_type": "application/json"
+    },
+    {
+      "asset_id": "linux-gold-dataset",
+      "type": "gold_dataset",
+      "path": "assets/gold_dataset.jsonl",
+      "sha256": "e9a1075ed2c51a8ddd48716f3c48558b17da22193977691e4630b45f5efba6d9",
+      "media_type": "application/jsonl"
+    }
+  ]
+}

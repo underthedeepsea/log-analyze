@@ -51,7 +51,7 @@ def test_database_migration_is_idempotent(tmp_path):
     with sqlite3.connect(path) as connection:
         count = connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0]
 
-    assert count == 14
+    assert count == 15
 
 
 def test_extension_provider_migration_upgrades_existing_connection_and_profile(tmp_path):

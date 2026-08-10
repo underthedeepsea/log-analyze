@@ -27,6 +27,8 @@ from logrisk.feature_extractor_ollama import FEATURE_RESPONSE_SCHEMA, _validate_
 from logrisk.feature_jobs import FeatureJobError, FeatureJobManager
 from logrisk.incremental_sources import FileIncrementalSource
 from logrisk.input_jobs import InputJobConfig
+from logrisk.knowledge_packages.service import KnowledgePackageService
+from logrisk.knowledge_packages.asset_adapters import build_domain_adapter_registry
 from logrisk.large_file_pipeline import run_large_file_pipeline
 from logrisk.legacy_import import LegacyStateImporter
 from logrisk.multi_source.config import load_multi_source_config
@@ -123,6 +125,7 @@ class ApplicationContainer:
     upload_store: SQLiteUploadSessionStore
     input_jobs: SQLiteInputJobStore
     artifact_store: SharedArtifactStore
+    knowledge_packages: KnowledgePackageService
     streaming_state: StreamingStateRepository
     drain_quality: Any
     semantic_dictionaries: Any
@@ -344,6 +347,17 @@ def build_application_container(
     orchestration = OrchestrationService(OrchestrationRepository(database))
     input_orchestration = InputOrchestrationService(InputOrchestrationRepository(database))
     artifact_store = SharedArtifactStore(shared_root)
+    knowledge_packages = KnowledgePackageService(
+        database,
+        artifact_store,
+        app_version="1.32.0",
+        adapters=build_domain_adapter_registry(
+            prompt_registry=prompts,
+            drain_quality=drain_quality,
+            semantic_dictionaries=semantic_dictionaries,
+            risk_semantics=risk_semantics,
+        ),
+    )
     upload_store = SQLiteUploadSessionStore(
         UploadConfig(upload_dir=state_root / "uploads", artifact_store=artifact_store), database
     )
@@ -393,6 +407,7 @@ def build_application_container(
         upload_store=upload_store,
         input_jobs=input_jobs,
         artifact_store=artifact_store,
+        knowledge_packages=knowledge_packages,
         streaming_state=streaming_state,
         drain_quality=drain_quality,
         semantic_dictionaries=semantic_dictionaries,

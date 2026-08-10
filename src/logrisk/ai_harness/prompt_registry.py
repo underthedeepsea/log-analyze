@@ -136,7 +136,6 @@ class PromptRegistry:
         path.write_text(content, encoding="utf-8")
         return self.load(prompt_id)
 
-
 class SQLitePromptRegistry(PromptRegistry):
     def __init__(
         self,
@@ -311,5 +310,43 @@ class SQLitePromptRegistry(PromptRegistry):
             connection.execute(
                 "UPDATE prompt_templates SET current_version=?, updated_at=? WHERE prompt_id=?",
                 (version, now, prompt_id),
+            )
+        return self.load(prompt_id)
+
+    def create_candidate(
+        self,
+        prompt_id: str,
+        content: str,
+        *,
+        display_name: str | None = None,
+        description: str | None = None,
+        note: str = "知识包导入候选",
+    ) -> PromptTemplate:
+        """Create a disabled/candidate Prompt without changing any active Prompt."""
+        if not isinstance(content, str) or not content.strip():
+            raise ValueError("prompt content must be non-empty")
+        validate_feature_prompt_contract(content)
+        digest = hashlib.sha256(content.encode("utf-8")).hexdigest()
+        now = utc_now()
+        with self.database.transaction() as connection:
+            existing = connection.execute(
+                "SELECT t.current_version, v.content_sha256 FROM prompt_templates t "
+                "JOIN prompt_versions v ON v.prompt_id=t.prompt_id AND v.version=t.current_version "
+                "WHERE t.prompt_id=?",
+                (prompt_id,),
+            ).fetchone()
+            if existing:
+                if str(existing["content_sha256"]) != digest:
+                    raise ValueError("候选 Prompt ID 已存在不同内容")
+                return self.load(prompt_id)
+            connection.execute(
+                "INSERT INTO prompt_templates(prompt_id, analysis_type, display_name, description, status, is_default, "
+                "current_version, created_at, updated_at) VALUES (?, 'feature_extract', ?, ?, 'candidate', 0, 1, ?, ?)",
+                (prompt_id, display_name, description, now, now),
+            )
+            connection.execute(
+                "INSERT INTO prompt_versions(prompt_id, version, content, content_sha256, note, created_at) "
+                "VALUES (?, 1, ?, ?, ?, ?)",
+                (prompt_id, content, digest, note, now),
             )
         return self.load(prompt_id)

@@ -6,6 +6,20 @@
 - 仅修复 Bug 时提升最后一位，例如 `1.2.0 → 1.2.1`；
 - 每次代码更新必须同步更新本文件。
 
+## 1.32.0 - 2026-08-10
+
+### Added
+
+- 新增知识包中心与 `.logrisk-package.zip` 离线包格式，支持 Drain3 配置、语义词典、特征 Prompt、风险语义、批准规则候选和 Gold Dataset 的 Manifest、SHA256、版本范围与精确依赖校验。
+- 新增跨 SQLite/PostgreSQL 的知识包注册表迁移 `0015`，记录包版本、资产状态、导入阶段、受控 Artifact 路径和脱敏审计事件；包内容不写入数据库。
+- 新增知识包上传、只读预览、确认安装、资产逐项登记候选、版本退休和审计查询 API，并加入 Dashboard “数据治理 → 知识包中心”工作区与内置示例包下载。
+- 新增 `python -m logrisk.knowledge_packages.archive build|validate` 离线命令；Prompt、Drain3、语义、风险语义和 Gold Dataset 资产通过现有候选服务登记，规则候选保留为待人工审查引用。
+
+### Security
+
+- 知识包拒绝 Zip Slip、绝对路径、符号链接、脚本/插件、远程地址、未知扩展名和超限压缩包；Gold Dataset 禁止 `samples`、原始日志、Token、密码、DSN 等敏感字段。
+- 安装后的资产默认禁用；登记候选不等于生产发布，不会绕过人工审批或改写当前 Drain3、Prompt、语义词典和规则配置。数据库、Trace、错误与审计只保存摘要和操作元数据。
+
 ## 1.31.1 - 2026-08-04
 
 ### Fixed

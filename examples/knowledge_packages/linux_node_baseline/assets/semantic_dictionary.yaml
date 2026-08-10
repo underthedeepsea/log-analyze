@@ -1,0 +1,15 @@
+schema_version: semantic_dictionary_v1
+dictionary_id: linux
+name: Linux 系统语义（知识包示例）
+version: 1
+rules:
+  - rule_id: linux-errno-number
+    field: errno
+    pattern: '\berrno(?:=|\s+)(?P<value>\d+)\b'
+    group: value
+    value_type: integer
+    typed_mask: ERRNO
+    tags: [系统错误, errno]
+    priority: 100
+    source_types: []
+    components: []

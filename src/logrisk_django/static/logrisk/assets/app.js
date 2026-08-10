@@ -37,6 +37,20 @@
     health: function () { return jsonRequest("/api/health"); },
     config: function () { return jsonRequest("/api/config"); },
     databaseRuntime: function () { return jsonRequest("/api/system/database"); },
+    knowledgePackages: function () { return jsonRequest("/api/knowledge-packages"); },
+    knowledgePackage: function (packageId) { return jsonRequest("/api/knowledge-packages/" + encodeURIComponent(packageId)); },
+    knowledgePackageVersion: function (packageId, version) { return jsonRequest("/api/knowledge-packages/" + encodeURIComponent(packageId) + "/versions/" + encodeURIComponent(version)); },
+    knowledgePackageAudit: function () { return jsonRequest("/api/knowledge-packages/audit-events?limit=100"); },
+    knowledgePackageUpload: async function (file) {
+      const response = await fetch(apiUrl("/api/knowledge-packages/uploads"), { method: "POST", headers: { "Content-Type": "application/zip", "X-Package-Filename": file.name }, body: file });
+      const payload = await response.json().catch(function () { return {}; });
+      if (!response.ok) { const error = new Error(payload.error || "知识包上传失败"); error.code = payload.code || "http_" + response.status; throw error; }
+      return payload;
+    },
+    knowledgePackageUploadStatus: function (uploadId) { return jsonRequest("/api/knowledge-packages/uploads/" + encodeURIComponent(uploadId)); },
+    installKnowledgePackage: function (uploadId, previewSha256) { return jsonRequest("/api/knowledge-packages/uploads/" + encodeURIComponent(uploadId) + "/install", { method: "POST", body: JSON.stringify({ confirmed: true, preview_sha256: previewSha256 }) }); },
+    materializeKnowledgePackageAsset: function (packageId, version, assetId) { return jsonRequest("/api/knowledge-packages/" + encodeURIComponent(packageId) + "/versions/" + encodeURIComponent(version) + "/assets/" + encodeURIComponent(assetId) + "/materialize", { method: "POST", body: JSON.stringify({ confirmed: true }) }); },
+    retireKnowledgePackage: function (packageId, version) { return jsonRequest("/api/knowledge-packages/" + encodeURIComponent(packageId) + "/versions/" + encodeURIComponent(version) + "/retire", { method: "POST", body: JSON.stringify({ confirmed: true }) }); },
     runtimeIdentity: function () { return jsonRequest("/api/runtime/identity"); },
     runtimeHealth: function () { return jsonRequest("/api/runtime/health"); },
     runtimeReadiness: function () { return jsonRequest("/api/runtime/readiness"); },
@@ -208,7 +222,7 @@
     { id: "analysis", label: "分析工作台", items: [["overview", "特征总览"], ["queue", "识别队列"], ["review", "人工审批"], ["export", "导出记录"]] },
     { id: "ai", label: "AI 工程", items: [["observability", "AI 分析观测"], ["traces", "AI 调用追踪"], ["prompts", "Prompt 管理"], ["modelProfiles", "模型画像"]] },
     { id: "risk", label: "规则与风险", items: [["rules", "规则治理"], ["nodeRisks", "服务器风险"], ["multiSource", "多来源关联"], ["semanticLibrary", "风险语义库"]] },
-    { id: "governance", label: "数据治理", items: [["streaming", "流式处理"], ["drainQuality", "评测中心 · 模板质量"], ["benchmarkCenter", "评测与基准"]] },
+    { id: "governance", label: "数据治理", items: [["streaming", "流式处理"], ["drainQuality", "评测中心 · 模板质量"], ["benchmarkCenter", "评测与基准"], ["knowledgePackages", "知识包中心"]] },
     { id: "system", label: "系统", items: [["runtime", "运行中心"], ["releaseReadiness", "发布就绪"], ["settings", "系统设置"]] },
   ];
   function navigationGroupForView(view) {
@@ -299,6 +313,7 @@
   function timeText(value) { return value ? new Date(value).toLocaleString() : "—"; }
   function pathToView(path) {
     if (path === "/benchmark-center") return "benchmarkCenter";
+    if (path === "/knowledge-packages") return "knowledgePackages";
     if (path === "/runtime") return "runtime";
     if (path === "/release-readiness") return "releaseReadiness";
     if (path === "/streaming") return "streaming";
@@ -1734,6 +1749,114 @@
       h(MultiSourceRuleEditor, { rules: rules, onSave: props.onRule }));
   }
 
+  function packageBytes(value) {
+    const bytes = Number(value || 0);
+    if (!bytes) return "0 B";
+    if (bytes < 1024) return bytes + " B";
+    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + " KB";
+    if (bytes < 1024 * 1024 * 1024) return (bytes / 1024 / 1024).toFixed(1) + " MB";
+    return (bytes / 1024 / 1024 / 1024).toFixed(1) + " GB";
+  }
+
+  function packageStatusLabel(status) {
+    return ({ uploaded: "待预览", validated: "可安装", installed: "已安装", rejected: "校验失败", retired: "已退休", disabled: "默认禁用", materialized: "已登记候选", failed: "处理失败" })[status] || status || "未知";
+  }
+
+  function KnowledgePackagesPage() {
+    const [packages, setPackages] = useState([]), [selectedPackage, setSelectedPackage] = useState(null), [selectedVersion, setSelectedVersion] = useState(null);
+    const [upload, setUpload] = useState(null), [preview, setPreview] = useState(null), [audit, setAudit] = useState([]);
+    const [busy, setBusy] = useState(false), [notice, setNotice] = useState(""), [failure, setFailure] = useState("");
+    async function refresh() {
+      const values = await Promise.all([api.knowledgePackages(), api.knowledgePackageAudit()]);
+      setPackages(values[0].items || []); setAudit(values[1].items || []);
+    }
+    useEffect(function () { refresh().catch(function (reason) { setFailure(reason.message); }); }, []);
+    async function selectPackage(item) {
+      setFailure("");
+      try {
+        const value = await api.knowledgePackage(item.package_id);
+        setSelectedPackage(value);
+        const versions = value.versions || [];
+        if (versions.length) setSelectedVersion(versions[0]);
+      } catch (reason) { setFailure(reason.message); }
+    }
+    async function selectVersion(packageId, version) {
+      try { setSelectedVersion(await api.knowledgePackageVersion(packageId, version)); } catch (reason) { setFailure(reason.message); }
+    }
+    async function chooseFile(event) {
+      const file = event.target.files && event.target.files[0];
+      event.target.value = "";
+      if (!file) return;
+      setBusy(true); setFailure(""); setNotice(""); setPreview(null); setUpload(null);
+      try {
+        const record = await api.knowledgePackageUpload(file);
+        const inspected = await api.knowledgePackageUploadStatus(record.upload_id);
+        setUpload(inspected); setPreview(inspected.inspection || inspected.report || null);
+        setNotice(inspected.status === "validated" ? "知识包已通过预览校验，可以安装。" : "知识包已上传，请查看校验结果。 ");
+      } catch (reason) { setFailure(reason.message); }
+      finally { setBusy(false); }
+    }
+    async function install() {
+      if (!upload || !preview || !preview.package_sha256) return;
+      if (!window.confirm("确认安装该知识包？安装只写入知识包注册表，资产仍保持默认禁用。")) return;
+      setBusy(true); setFailure("");
+      try {
+        const result = await api.installKnowledgePackage(upload.upload_id, preview.package_sha256);
+        setSelectedVersion(result); setNotice("知识包已安装，资产尚未进入生产配置。"); await refresh();
+        const detail = await api.knowledgePackage(result.package_id); setSelectedPackage(detail);
+      } catch (reason) { setFailure(reason.message); }
+      finally { setBusy(false); }
+    }
+    async function materialize(asset) {
+      if (!selectedVersion) return;
+      setBusy(true); setFailure("");
+      try {
+        const result = await api.materializeKnowledgePackageAsset(selectedVersion.package_id, selectedVersion.version, asset.asset_id);
+        setSelectedVersion(function (current) { return Object.assign({}, current, { assets: (current.assets || []).map(function (item) { return item.asset_id === result.asset_id ? result : item; }) }); });
+        setNotice("已登记为候选资源，未自动发布到生产配置。"); await refresh();
+      } catch (reason) { setFailure(reason.message); }
+      finally { setBusy(false); }
+    }
+    async function retire() {
+      if (!selectedVersion || !window.confirm("确认退休该版本？已登记的候选资源不会被自动删除。")) return;
+      setBusy(true); setFailure("");
+      try { const result = await api.retireKnowledgePackage(selectedVersion.package_id, selectedVersion.version); setSelectedVersion(result); setNotice("版本已退休。"); await refresh(); } catch (reason) { setFailure(reason.message); }
+      finally { setBusy(false); }
+    }
+    const manifest = preview && preview.manifest || {};
+    const previewAssets = manifest.assets || preview && preview.assets || [];
+    const selectedAssets = selectedVersion && selectedVersion.assets || [];
+    return h("section", { className: "knowledge-packages-page" },
+      h("div", { className: "knowledge-packages-hero" },
+        h("div", null, h("span", { className: "eyebrow" }, "KNOWLEDGE PACKAGE GOVERNANCE"), h("h2", null, "知识包中心"), h("p", null, "知识包上传、预览与安装：管理可审计的规则、Prompt、语义词典与评测数据。知识包只登记候选资源，不执行代码，也不会自动改写生产配置。")),
+        h("div", { className: "knowledge-packages-hero-actions" }, h("label", { className: "primary-button" }, busy ? "处理中…" : "上传知识包", h("input", { type: "file", disabled: busy, onChange: chooseFile })), h("a", { className: "secondary-button", href: apiUrl("/api/knowledge-packages/example") }, "下载示例包"))),
+      notice && h("p", { className: "knowledge-package-notice success" }, notice),
+      failure && h("p", { className: "knowledge-package-notice error" }, failure),
+      h("div", { className: "knowledge-package-safety" },
+        h("article", null, h("b", null, "只读预览"), h("span", null, "安装前展示 SHA256、兼容范围、依赖和资产清单。")),
+        h("article", null, h("b", null, "导入候选区 · 默认禁用"), h("span", null, "资产需人工登记为候选，不能绕过审批进入生产。")),
+        h("article", null, h("b", null, "安全边界"), h("span", null, "拒绝脚本、插件、远程地址和原始日志字段。"))),
+      h("div", { className: "knowledge-package-layout" },
+        h("div", { className: "surface knowledge-package-catalog" },
+          h("div", { className: "surface-head" }, h("b", null, "已登记知识包"), h("span", null, packages.length + " 个包")),
+          packages.length ? packages.map(function (item) { return h("button", { className: "knowledge-package-card " + (selectedPackage && selectedPackage.package_id === item.package_id ? "active" : ""), key: item.package_id, onClick: function () { selectPackage(item); } }, h("div", null, h("b", null, item.name || item.package_id), h("small", null, item.package_id), h("span", null, item.version_count + " 个版本")), h("em", null, item.latest_updated_at ? timeText(item.latest_updated_at) : "—")); }) : h("div", { className: "empty-state" }, "尚未安装知识包")),
+        h("div", { className: "knowledge-package-detail" },
+          preview && h("div", { className: "surface knowledge-package-preview" },
+            h("div", { className: "surface-head" }, h("b", null, "安装前确认"), h("span", { className: "status-chip " + (upload && upload.status === "validated" ? "approved" : "rejected") }, packageStatusLabel(upload && upload.status))),
+            h("div", { className: "knowledge-package-summary" }, h("strong", null, manifest.name || "未命名知识包"), h("span", null, (manifest.package_id || "—") + " · " + (manifest.version || "—")), h("code", null, "SHA256 " + (preview.package_sha256 || "—"))),
+            h("div", { className: "knowledge-package-meta" }, h("span", null, "压缩 " + packageBytes(preview.compressed_bytes)), h("span", null, "展开 " + packageBytes(preview.expanded_bytes)), h("span", null, "资产 " + previewAssets.length + " 个")),
+            h("p", { className: "knowledge-package-compat " + (preview.compatibility && preview.compatibility.compatible ? "ok" : "bad") }, preview.compatibility ? (preview.compatibility.compatible ? "兼容当前平台 " : "不兼容当前平台 ") + preview.compatibility.current_version + " · " + preview.compatibility.min_version + " ≤ version < " + preview.compatibility.max_version_exclusive : "未完成兼容性校验"),
+            preview.conflicts && preview.conflicts.length ? h("p", { className: "knowledge-package-compat bad" }, preview.conflicts.map(function (item) { return item.message; }).join("；")) : null,
+            h("div", { className: "knowledge-package-asset-list" }, previewAssets.map(function (asset) { return h("div", { key: asset.asset_id }, h("b", null, asset.asset_id), h("span", null, asset.type + " · " + asset.path), h("code", null, shortHash(asset.sha256 || asset.asset_sha256))); })),
+            h("button", { className: "primary-button", disabled: busy || !upload || upload.status !== "validated", onClick: install }, "确认安装")),
+          selectedVersion ? h("div", { className: "surface knowledge-package-version" },
+            h("div", { className: "surface-head" }, h("b", null, (selectedPackage && selectedPackage.name || selectedVersion.package_id) + " · v" + selectedVersion.version), h("span", { className: "status-chip " + (selectedVersion.status === "installed" ? "approved" : "disabled") }, packageStatusLabel(selectedVersion.status))),
+            h("p", { className: "knowledge-package-description" }, "版本状态、资产登记和审计轨迹均由数据库保存；原始包文件只保留为受控 Artifact。"),
+            h("div", { className: "knowledge-package-asset-list installed" }, selectedAssets.map(function (asset) { return h("div", { key: asset.asset_id }, h("div", null, h("b", null, asset.asset_id), h("span", null, asset.asset_type + " · " + asset.asset_path)), h("span", { className: "status-chip " + (asset.status === "materialized" ? "approved" : asset.status === "failed" ? "failed" : "disabled") }, packageStatusLabel(asset.status)), h("button", { className: "secondary-button", disabled: busy || asset.status !== "disabled", onClick: function () { materialize(asset); } }, asset.status === "materialized" ? "已登记" : "登记候选")); })),
+            h("div", { className: "knowledge-package-version-actions" }, h("button", { className: "secondary-button", disabled: busy || selectedVersion.status !== "installed", onClick: retire }, "退休版本"))) : h("div", { className: "surface empty-state knowledge-package-empty" }, "选择左侧知识包查看版本和资产"))),
+      h("div", { className: "surface knowledge-package-audit" }, h("div", { className: "surface-head" }, h("b", null, "最近审计事件"), h("span", null, "只显示操作元数据")), audit.length ? audit.slice(0, 8).map(function (item) { return h("div", { className: "knowledge-package-audit-row", key: item.audit_id }, h("span", null, timeText(item.created_at)), h("b", null, item.action), h("span", null, item.package_id + (item.asset_id ? " · " + item.asset_id : "")), h("em", null, item.outcome)); }) : h("div", { className: "empty-state" }, "暂无知识包审计事件")));
+  }
+
   function App() {
     const [view, setView] = useState(pathToView(window.location.pathname)), [model, setModel] = useState("qwen3:1.7b"), [threshold, setThreshold] = useState(40), [promptId, setPromptId] = useState("feature_extract_v3_compact_strict_json_en"), [retryCount, setRetryCount] = useState(1);
     const [ollama, setOllama] = useState({ online: false }), [result, setResult] = useState(null), [fileName, setFileName] = useState("");
@@ -1899,7 +2022,7 @@
     useEffect(function () {
       const query = window.location.pathname === "/ai-traces" ? traceFilterQuery(traceFiltersFromSearch(window.location.search)) : "?limit=50";
       Promise.all([api.config(), api.status(), Promise.all([api.governedRules("?page_size=100"), api.ruleReviewQueue()]), api.metrics(), api.harnessStatus(), api.prompts(), api.traces(query), api.modelProfiles()]).then(function (values) { setModel(values[0].default_model); setOllama(values[1]); setRules(values[2][0].items || []); setRuleReviewQueue(values[2][1]); setSystemMetrics(values[3]); setHarness(values[4]); setPrompts(values[5].items || []); setPromptId(values[5].current_prompt_id || values[4].current_prompt_id || "feature_extract_v3_compact_strict_json_en"); setTraces(values[6].items || []); setModelProfiles(values[7]); setModelProfileId(values[7].default_profile_id || ""); if (window.location.pathname === "/ai-observability") loadObservability().catch(function (reason) { setError(reason.message); }); if (window.location.pathname === "/drain-quality") loadDrainQuality().catch(function (reason) { setError(reason.message); }); if (window.location.pathname.startsWith("/node-risks")) loadNodeRisks().catch(function (reason) { setError(reason.message); }); if (window.location.pathname === "/multi-source") loadMultiSource().catch(function () {}); if (window.location.pathname === "/semantic-library") loadRiskSemantics().catch(function (reason) { setError(reason.message); }); if (window.location.pathname === "/streaming") loadStreaming().catch(function (reason) { setError(reason.message); }); if (window.location.pathname === "/benchmark-center") loadBenchmark().catch(function () {}); if (window.location.pathname === "/runtime") loadRuntime().catch(function () {}); if (window.location.pathname === "/release-readiness") loadReleaseReadiness().catch(function () {}); }).catch(function (reason) { setError(reason.message); });
-      function onPop() { const filters = traceFiltersFromSearch(window.location.search); setView(pathToView(window.location.pathname)); setTraceFilters(filters); if (window.location.pathname === "/ai-traces") loadHarness(traceFilterQuery(filters)).catch(function () {}); if (window.location.pathname === "/ai-observability") loadObservability().catch(function () {}); if (window.location.pathname === "/drain-quality") loadDrainQuality().catch(function () {}); if (window.location.pathname === "/rules") loadRules().catch(function () {}); if (window.location.pathname.startsWith("/node-risks")) loadNodeRisks().catch(function () {}); if (window.location.pathname === "/multi-source") loadMultiSource().catch(function () {}); if (window.location.pathname === "/semantic-library") loadRiskSemantics().catch(function () {}); if (window.location.pathname === "/streaming") loadStreaming().catch(function () {}); if (window.location.pathname === "/benchmark-center") loadBenchmark().catch(function () {}); if (window.location.pathname === "/runtime") loadRuntime().catch(function () {}); if (window.location.pathname === "/release-readiness") loadReleaseReadiness().catch(function () {}); }
+      function onPop() { const filters = traceFiltersFromSearch(window.location.search); setView(pathToView(window.location.pathname)); setTraceFilters(filters); if (window.location.pathname === "/ai-traces") loadHarness(traceFilterQuery(filters)).catch(function () {}); if (window.location.pathname === "/ai-observability") loadObservability().catch(function () {}); if (window.location.pathname === "/drain-quality") loadDrainQuality().catch(function () {}); if (window.location.pathname === "/rules") loadRules().catch(function () {}); if (window.location.pathname.startsWith("/node-risks")) loadNodeRisks().catch(function () {}); if (window.location.pathname === "/multi-source") loadMultiSource().catch(function () {}); if (window.location.pathname === "/semantic-library") loadRiskSemantics().catch(function () {}); if (window.location.pathname === "/streaming") loadStreaming().catch(function () {}); if (window.location.pathname === "/benchmark-center") loadBenchmark().catch(function () {}); if (window.location.pathname === "/runtime") loadRuntime().catch(function () {}); if (window.location.pathname === "/release-readiness") loadReleaseReadiness().catch(function () {}); if (window.location.pathname === "/knowledge-packages") { /* page owns its refresh */ } }
       window.addEventListener("popstate", onPop);
       return function () { window.removeEventListener("popstate", onPop); if (events.current) events.current.close(); };
     }, []);
@@ -1964,7 +2087,7 @@
       h(Sidebar, { active: view, onChange: changeView }),
       h("button", { className: "sidebar-overlay", type: "button", "aria-label": "关闭菜单", onClick: function () { setMobileMenuOpen(false); } }),
       h("main", null,
-        !["drainQuality", "benchmarkCenter", "streaming", "runtime", "releaseReadiness", "settings", "rules", "nodeRisks", "multiSource", "semanticLibrary"].includes(view) && h("div", { className: "page-head" }, h("div", null, h("h1", null, "日志特征工作台"), h("p", null, "上传日志、复用规则、识别未知特征并人工审批")), h("label", { className: "new-analysis" }, "＋ 新建分析", h("input", { type: "file", onChange: function (event) { loadFile(event.target.files && event.target.files[0]); } }))),
+        !["drainQuality", "benchmarkCenter", "streaming", "runtime", "releaseReadiness", "settings", "rules", "nodeRisks", "multiSource", "semanticLibrary"].includes(view) && view !== "knowledgePackages" && h("div", { className: "page-head" }, h("div", null, h("h1", null, "日志特征工作台"), h("p", null, "上传日志、复用规则、识别未知特征并人工审批")), h("label", { className: "new-analysis" }, "＋ 新建分析", h("input", { type: "file", onChange: function (event) { loadFile(event.target.files && event.target.files[0]); } }))),
         error && h("div", { className: "error-banner" }, error, h("button", { onClick: function () { setError(""); } }, "×")),
         view === "overview" && h(React.Fragment, null,
           h("section", { className: "upload-panel" }, h("div", null, h("b", null, fileName || "选择 result.json、JSONL、TXT、LOG、GZ 或无后缀日志"), h("span", null, result ? (result.risk_entities || []).length + " 个风险实体，已完成本地预处理" : "10MB 以内直接分析；超过 10MB 自动分片上传，Linux messages / syslog 无后缀文件也支持上传")), busy && h("div", { className: "upload-progress" }, uploadProgress && h("span", null, "上传进度：" + Math.round((uploadProgress.progress || 0) * 100) + "%（" + uploadProgress.received_chunks + " / " + uploadProgress.total_chunks + " chunks）"), preprocessProgress && h("span", null, "预处理阶段：" + (preprocessProgress.stage || "queued") + "，记录 " + (preprocessProgress.records_parsed || 0) + (preprocessProgress.drain3_partitions_total ? "，Drain3 分片 " + (preprocessProgress.drain3_partitions_completed || 0) + " / " + preprocessProgress.drain3_partitions_total : ""))), h("div", { className: "analysis-config" }, h("label", null, "分析流程", h("select", { value: "feature_extract", disabled: true }, h("option", { value: "feature_extract" }, "日志特征识别"))), h("label", null, "模型 Profile", h("select", { value: modelProfileId, onChange: function (event) { const profile = activeProfiles.find(function (item) { return item.profile_id === event.target.value; }) || {}; setModelProfileId(event.target.value); if (profile.model) setModel(profile.model); if (profile.default_prompt_id) setPromptId(profile.default_prompt_id); } }, activeProfiles.map(function (profile) { return h("option", { value: profile.profile_id, key: profile.profile_id }, (profile.display_name || profile.profile_id) + " · " + profile.provider); }))), h("label", null, "Provider / 连接", h("input", { value: (selectedModelProfile.provider || "—") + " / " + (selectedModelProfile.connection_id || "—"), disabled: true })), h("label", null, "模型", h("input", { value: model, onChange: function (event) { setModel(event.target.value); } })), h("label", null, "Prompt", h("select", { value: promptId, onChange: function (event) { setPromptId(event.target.value); } }, activePrompts.map(function (prompt) { return h("option", { value: prompt.prompt_id, key: prompt.prompt_id }, prompt.prompt_id); }))), h("label", null, "重试次数", h("select", { value: retryCount, onChange: function (event) { setRetryCount(Number(event.target.value)); } }, [0, 1, 2, 3].map(function (count) { return h("option", { value: count, key: count }, count + " 次"); }))), h("label", null, "阈值", h("input", { type: "number", value: threshold, onChange: function (event) { setThreshold(event.target.value); } })), h("button", { className: "primary-button", disabled: !result || busy, onClick: start }, busy ? "处理中…" : "开始识别"))), h(MetricsGrid, { snapshot: snapshot, result: result, daily: systemMetrics }), h(LiveProcessing, { snapshot: snapshot, result: result })),
@@ -1987,6 +2110,7 @@
         view === "runtime" && h(RuntimeCenterPage, { data: runtimeData, onRefresh: loadRuntime, onPreview: function () { return api.previewRuntimeRetention().then(loadRuntime); }, onExecute: function () { return api.executeRuntimeRetention().then(loadRuntime); }, onSavePolicy: function (payload) { return api.saveRuntimeRetention(payload).then(loadRuntime); } }),
         view === "releaseReadiness" && h(ReleaseReadinessPage, { data: releaseReadinessData, onRefresh: loadReleaseReadiness, onValidate: validateReleaseReadiness }),
         view === "settings" && h(BackendSettings, { onSaved: function () { setError(""); } }),
+        view === "knowledgePackages" && h(KnowledgePackagesPage),
         view === "export" && h("section", { className: "surface export-surface" }, h("h2", null, "导出记录"), h("p", null, "导出包只包含人工批准或历史规则复用的脱敏特征，不包含原始日志和 RCA 结论。"), h("button", { className: "primary-button", disabled: !jobId || !(snapshot && snapshot.features || []).some(function (feature) { return feature.status === "approved"; }), onClick: function () { api.exportApproved(jobId).catch(function (reason) { setError(reason.message); }); } }, "导出已批准特征 JSON"))),
       h(Drawer, { title: drawer.type === "prompt" ? "Prompt 详情" : "Trace 详情", subtitle: drawer.item && (drawer.item.prompt_id || drawer.item.trace_id), item: drawer.item, onClose: function () { setDrawer({ type: null, item: null }); } }, drawerContent));
   }

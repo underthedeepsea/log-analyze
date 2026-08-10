@@ -53,6 +53,8 @@ from logrisk.feature_jobs import FeatureJobError, FeatureJobFileStore, FeatureJo
 from logrisk.input_jobs import InputJobConfig, InputJobStore
 from logrisk.input_parser import parse_log_content
 from logrisk.incremental_sources import FileIncrementalSource, source_capabilities
+from logrisk.knowledge_packages import build_archive
+from logrisk.knowledge_packages.errors import KnowledgePackageError
 from logrisk.large_file_pipeline import run_large_file_pipeline
 from logrisk.processing_metrics import ProcessingMetricsError, ProcessingMetricsStore
 from logrisk.rule_governance import RuleGovernanceError, RuleGovernanceRepository, RuleGovernanceService
@@ -90,7 +92,7 @@ from pipeline.manual_import_pipeline import analyze_records
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 MAX_LARGE_UPLOAD_BYTES = 500 * 1024 * 1024
 DEFAULT_MODEL = "qwen3:1.7b"
-APP_VERSION = "1.31.0"
+APP_VERSION = "1.32.0"
 
 
 class DashboardHTTPServer(ThreadingHTTPServer):
@@ -166,6 +168,7 @@ def build_server(
     server.replay_service = container.replay_service  # type: ignore[attr-defined]
     server.upload_store = container.upload_store  # type: ignore[attr-defined]
     server.input_jobs = container.input_jobs  # type: ignore[attr-defined]
+    server.knowledge_packages = container.knowledge_packages  # type: ignore[attr-defined]
     server.streaming_state = container.streaming_state  # type: ignore[attr-defined]
     server.drain_quality = container.drain_quality  # type: ignore[attr-defined]
     server.semantic_dictionaries = container.semantic_dictionaries  # type: ignore[attr-defined]
@@ -186,7 +189,7 @@ def build_server(
     configured_origins = cors_origins if cors_origins is not None else os.getenv("DASHBOARD_CORS_ORIGINS", "").split(",")
     server.cors_origins = {str(origin).strip().rstrip("/") for origin in configured_origins if str(origin).strip()}  # type: ignore[attr-defined]
     server.cors_request_headers = (  # type: ignore[attr-defined]
-        "Content-Type, X-Chunk-SHA256, Idempotency-Key, "
+        "Content-Type, X-Chunk-SHA256, X-Package-Filename, Idempotency-Key, "
         + ", ".join((
             container.runtime_config.identity.actor_header,
             container.runtime_config.identity.roles_header,
@@ -322,7 +325,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if path == "/help":
                 self._serve_help()
                 return
-            if path in {"/", "/prompts", "/ai-traces", "/ai-observability", "/model-profiles", "/drain-quality", "/benchmark-center", "/rules", "/settings", "/runtime", "/release-readiness", "/node-risks", "/semantic-library", "/multi-source"} or path.startswith("/node-risks/"):
+            if path in {"/", "/prompts", "/ai-traces", "/ai-observability", "/model-profiles", "/drain-quality", "/benchmark-center", "/rules", "/settings", "/runtime", "/release-readiness", "/node-risks", "/semantic-library", "/multi-source", "/knowledge-packages"} or path.startswith("/node-risks/"):
                 self._serve_frontend()
                 return
             if path == "/config.js":
@@ -346,6 +349,30 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "ai_cache_enabled": _cache_enabled_default(),
                     "max_upload_bytes": MAX_UPLOAD_BYTES,
                 })
+                return
+            if path == "/api/knowledge-packages":
+                self._json(HTTPStatus.OK, {"items": self.server.knowledge_packages.list_packages()})  # type: ignore[attr-defined]
+                return
+            if path == "/api/knowledge-packages/example":
+                self._serve_knowledge_package_example()
+                return
+            if path == "/api/knowledge-packages/audit-events":
+                self._json(HTTPStatus.OK, {"items": self.server.knowledge_packages.audit(  # type: ignore[attr-defined]
+                    package_id=query.get("package_id", [None])[0],
+                    limit=int(query.get("limit", ["100"])[0]),
+                )})
+                return
+            match = re.fullmatch(r"/api/knowledge-packages/uploads/([A-Za-z0-9]+)", path)
+            if match:
+                self._json(HTTPStatus.OK, self.server.knowledge_packages.inspect_upload(match.group(1)))  # type: ignore[attr-defined]
+                return
+            match = re.fullmatch(r"/api/knowledge-packages/([a-z0-9-]+)/versions/([0-9]+\.[0-9]+\.[0-9]+)", path)
+            if match:
+                self._json(HTTPStatus.OK, self.server.knowledge_packages.get_version(match.group(1), match.group(2)))  # type: ignore[attr-defined]
+                return
+            match = re.fullmatch(r"/api/knowledge-packages/([a-z0-9-]+)", path)
+            if match:
+                self._json(HTTPStatus.OK, self.server.knowledge_packages.get_package(match.group(1)))  # type: ignore[attr-defined]
                 return
             if path == "/api/system/database":
                 candidate = self.server.database_settings.load()  # type: ignore[attr-defined]
@@ -777,6 +804,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._json(exc.status_code, {"error": str(exc), "code": exc.code, "request_id": f"request-{uuid.uuid4().hex}"})
         except (RiskSemanticError, NodeRiskError) as exc:
             self._json(exc.status_code, {"error": str(exc), "code": exc.code})
+        except KnowledgePackageError as exc:
+            status = HTTPStatus.CONFLICT if exc.code in {"package_preview_conflict", "package_version_checksum_conflict"} else (
+                HTTPStatus.REQUEST_ENTITY_TOO_LARGE if exc.code in {"package_too_large", "package_too_many_files", "package_expanded_too_large"} else HTTPStatus.UNPROCESSABLE_ENTITY
+            )
+            self._json(status, {"error": str(exc), "code": exc.code, "error_code": exc.code})
         except RuleGovernanceError as exc:
             self._json(exc.status_code, {"error": str(exc), "code": exc.code, "request_id": f"request-{uuid.uuid4().hex}"})
         except (FeatureJobError, ApprovedRuleError, ProcessingMetricsError, DrainQualityError, SemanticValidationError) as exc:
@@ -788,6 +820,18 @@ class DashboardHandler(BaseHTTPRequestHandler):
         path, _ = self._route_parts()
         try:
             identity = self._require_runtime_write_access()
+            if path == "/api/knowledge-packages/uploads":
+                try:
+                    package_size = int(self.headers.get("Content-Length", "0"))
+                except ValueError as exc:
+                    raise KnowledgePackageError("Content-Length 无效", code="package_size_invalid") from exc
+                if package_size > 100 * 1024 * 1024:
+                    raise KnowledgePackageError("知识包压缩大小超过限制", code="package_too_large")
+                data = self._read_bytes(100 * 1024 * 1024)
+                filename = self.headers.get("X-Package-Filename") or self.headers.get("X-Filename") or "upload.logrisk-package.zip"
+                upload = self.server.knowledge_packages.upload(filename, data)  # type: ignore[attr-defined]
+                self._json(HTTPStatus.CREATED, upload)
+                return
             payload = self._read_json()
             if path == "/api/release-readiness/validate":
                 if not isinstance(payload, dict):
@@ -847,6 +891,33 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 except DatabaseError:
                     raise ValueError("无法连接 PostgreSQL；请检查地址、网络、SSL 和密码环境变量")
                 self._json(HTTPStatus.OK, {"online": True, "provider": "postgres", "message": "PostgreSQL 连接成功"})
+                return
+            match = re.fullmatch(r"/api/knowledge-packages/uploads/([A-Za-z0-9]+)/install", path)
+            if match:
+                if not isinstance(payload, dict):
+                    raise KnowledgePackageError("安装请求必须是 JSON object")
+                result = self.server.knowledge_packages.install(  # type: ignore[attr-defined]
+                    match.group(1),
+                    preview_sha256=str(payload.get("preview_sha256") or ""),
+                    confirmed=payload.get("confirmed") is True,
+                    actor=str(identity.actor or "unknown"),
+                    request_id=identity.request_id,
+                )
+                self._json(HTTPStatus.OK, result)
+                return
+            match = re.fullmatch(r"/api/knowledge-packages/([a-z0-9-]+)/versions/([0-9]+\.[0-9]+\.[0-9]+)/assets/([a-z0-9-]+)/materialize", path)
+            if match:
+                result = self.server.knowledge_packages.materialize_asset(  # type: ignore[attr-defined]
+                    match.group(1), match.group(2), match.group(3), actor=str(identity.actor or "unknown"), request_id=identity.request_id,
+                )
+                self._json(HTTPStatus.OK, result)
+                return
+            match = re.fullmatch(r"/api/knowledge-packages/([a-z0-9-]+)/versions/([0-9]+\.[0-9]+\.[0-9]+)/retire", path)
+            if match:
+                result = self.server.knowledge_packages.retire_version(  # type: ignore[attr-defined]
+                    match.group(1), match.group(2), actor=str(identity.actor or "unknown"), request_id=identity.request_id,
+                )
+                self._json(HTTPStatus.OK, result)
                 return
             if path == "/api/benchmark-center/suites":
                 if not isinstance(payload, dict):
@@ -1236,6 +1307,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._json(HTTPStatus.INSUFFICIENT_STORAGE, {"error": str(exc), "code": exc.code, "error_code": exc.code, "request_id": self._runtime_request_identity().request_id})
         except RuntimeConflictError as exc:
             self._json(HTTPStatus.CONFLICT, {"error": str(exc), "code": exc.code, "error_code": exc.code, "request_id": self._runtime_request_identity().request_id})
+        except KnowledgePackageError as exc:
+            status = HTTPStatus.CONFLICT if exc.code in {"package_preview_conflict", "package_version_checksum_conflict"} else (
+                HTTPStatus.REQUEST_ENTITY_TOO_LARGE if exc.code in {"package_too_large", "package_too_many_files", "package_expanded_too_large"} else HTTPStatus.UNPROCESSABLE_ENTITY
+            )
+            self._json(status, {"error": str(exc), "code": exc.code, "error_code": exc.code, "request_id": self._runtime_request_identity().request_id})
         except (FeatureJobError, ApprovedRuleError, ProcessingMetricsError, DrainQualityError, SemanticValidationError) as exc:
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc), "code": "invalid_request", "error_code": "invalid_request", "request_id": self._runtime_request_identity().request_id})
         except (TypeError, ValueError) as exc:
@@ -1377,6 +1453,30 @@ class DashboardHandler(BaseHTTPRequestHandler):
         body = path.read_bytes()
         self.send_response(HTTPStatus.OK)
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self._cors_headers()
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _serve_knowledge_package_example(self) -> None:
+        import tempfile
+
+        source = Path(__file__).resolve().parents[2] / "examples" / "knowledge_packages" / "linux_node_baseline"
+        if not source.is_dir():
+            self._json(HTTPStatus.NOT_FOUND, {"error": "示例知识包不存在"})
+            return
+        descriptor, temporary_name = tempfile.mkstemp(prefix="logrisk-example-", suffix=".logrisk-package.zip")
+        os.close(descriptor)
+        temporary = Path(temporary_name)
+        try:
+            build_archive(source, temporary)
+            body = temporary.read_bytes()
+        finally:
+            temporary.unlink(missing_ok=True)
+        self.send_response(HTTPStatus.OK)
+        self.send_header("Content-Type", "application/zip")
+        self.send_header("Content-Disposition", "attachment; filename=linux-node-baseline-1.0.0.logrisk-package.zip")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self._cors_headers()

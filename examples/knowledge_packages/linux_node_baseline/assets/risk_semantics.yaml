@@ -1,0 +1,9 @@
+schema_version: risk_semantic_catalog_v1
+rules:
+  - id: package.linux.errno
+    display_name: Linux errno 异常
+    description: 识别包含 errno 数字的脱敏模板
+    risk_type: linux.system_error
+    severity: medium
+    base_score: 45
+    pattern: '(?i)\berrno(?:=|\s+)\d+\b'

@@ -375,6 +375,40 @@ tables:
     foreign_keys: {run_id: benchmark_runs.run_id ON DELETE CASCADE}
     indexes: [idx_benchmark_audit_run_created(run_id, created_at DESC)]
     columns: {event_id: 审计事件标识, run_id: 可选关联 Run, event_type: 事件类型, event_json: 脱敏事件详情, operator: 操作者, created_at: 创建时间, schema_version: 结构版本}
+  knowledge_packages:
+    description: 离线知识包身份目录；包内容存储在受控 Artifact，数据库只保存元数据
+    primary_key: package_id
+    columns: {package_id: 包标识, name: 包名称, description: 包描述, created_at: 创建时间, updated_at: 更新时间}
+  knowledge_package_versions:
+    description: 知识包版本、Manifest、SHA256、兼容范围和安装状态
+    primary_key: [package_id, version]
+    foreign_keys: {package_id: knowledge_packages.package_id ON DELETE CASCADE}
+    indexes: [idx_knowledge_package_versions_status(status, updated_at DESC)]
+    constraints: package version 唯一；status 为 installed/retired；Artifact 只保存相对路径、大小和摘要
+    columns: {package_id: 包标识, version: 包版本, manifest_json: Manifest 快照, package_sha256: 包摘要, artifact_path: 受控 Artifact 相对路径, compressed_bytes: 压缩大小, expanded_bytes: 展开大小, platform_min_version: 最低兼容版本, platform_max_version_exclusive: 最高兼容版本（不含）, status: 安装或退休状态, installed_by: 安装者, installed_at: 安装时间, state_version: 乐观锁版本, created_at: 创建时间, updated_at: 更新时间}
+  knowledge_package_assets:
+    description: 包内单项资产的校验、禁用状态、候选导入目标和错误摘要
+    primary_key: [package_id, version, asset_id]
+    foreign_keys: {package_id/version: knowledge_package_versions.package_id/version ON DELETE CASCADE}
+    indexes: [idx_knowledge_package_assets_status(status, updated_at DESC)]
+    constraints: status 为 disabled/materialized/retired/failed；默认 disabled；不得直接发布生产配置
+    columns: {package_id: 包标识, version: 包版本, asset_id: 资产标识, asset_type: 资产类型, asset_path: 包内相对路径, asset_sha256: 资产摘要, media_type: 媒体类型, target_domain: 导入目标领域, target_resource_id: 候选资源标识, target_version: 候选资源版本, status: 资产状态, error_code: 稳定错误码, error_message: 脱敏错误摘要, state_version: 乐观锁版本, created_at: 创建时间, updated_at: 更新时间}
+  knowledge_package_dependencies:
+    description: 知识包的精确版本依赖关系
+    primary_key: [package_id, version, dependency_package_id, dependency_version]
+    foreign_keys: {package_id/version: knowledge_package_versions.package_id/version ON DELETE CASCADE}
+    columns: {package_id: 来源包标识, version: 来源包版本, dependency_package_id: 依赖包标识, dependency_version: 精确依赖版本, created_at: 创建时间}
+  knowledge_package_imports:
+    description: 两阶段上传、预检和安装记录；上传文件位于受控 Artifact 或临时 staging
+    primary_key: upload_id
+    indexes: [idx_knowledge_package_imports_status(status, updated_at DESC)]
+    constraints: status 为 uploaded/validating/validated/installing/installed/rejected/failed；report_json 不含包原文和凭据
+    columns: {upload_id: 上传标识, filename: 安全来源文件名, staging_path: 临时相对路径, artifact_path: 安装后包相对路径, package_sha256: 包摘要, compressed_bytes: 压缩大小, expanded_bytes: 展开大小, status: 导入状态, report_json: 脱敏校验报告, confirmed_by: 二次确认人, created_at: 创建时间, updated_at: 更新时间, expires_at: 临时记录过期时间}
+  knowledge_package_audit_events:
+    description: 知识包上传、校验、安装、逐项导入和退休的追加式脱敏审计
+    primary_key: audit_id
+    indexes: [idx_knowledge_package_audit_created(created_at DESC, audit_id DESC), idx_knowledge_package_audit_resource(package_id, version, asset_id, created_at DESC)]
+    columns: {audit_id: 审计标识, package_id: 包标识, version: 包版本, asset_id: 资产标识, action: 动作, outcome: success/failed/denied, actor: 外部身份操作人, roles_json: 角色列表, request_id: 请求标识, attributes_json: 脱敏元数据, created_at: 创建时间}
 postgres_type_mapping:
   TEXT: text
   TEXT_identifier: text

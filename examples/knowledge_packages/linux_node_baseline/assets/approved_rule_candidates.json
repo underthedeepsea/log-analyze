@@ -1,0 +1,12 @@
+{
+  "schema_version": "approved_rule_candidate_v1",
+  "rules": [
+    {
+      "rule_id": "package.linux.kernel.error",
+      "display_name": "Linux kernel ERROR 模板",
+      "status": "candidate",
+      "evidence_template_hashes": ["example-template-hash"],
+      "requires_human_approval": true
+    }
+  ]
+}

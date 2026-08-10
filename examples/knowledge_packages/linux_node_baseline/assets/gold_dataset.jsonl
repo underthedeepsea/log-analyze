@@ -1,0 +1,1 @@
+{"schema_version":"drain_gold_v1","record_id":"linux-node-001","source_type":"syslog","component":"kernel","message_core":"kernel registration failed <NUM>","gold_group_id":"kernel-registration","gold_template":"kernel registration failed <NUM>","semantic_fields":{},"protected_tokens":["<NUM>"],"expected_risk_type":"linux.system_error","annotation_status":"approved"}

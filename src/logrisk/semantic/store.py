@@ -164,11 +164,22 @@ class SemanticDictionaryStore:
             metadata = catalog["items"][dictionary_id]
             version = int(metadata["latest_version"]) + 1
             source_version = int(metadata.get("active_version", 1))
+            custom_rules = payload.get("custom_rules")
+            if custom_rules is None:
+                custom_rules = self._custom_rules(dictionary_id, source_version)
+            if not isinstance(custom_rules, list):
+                raise SemanticValidationError("custom_rules 必须是数组")
+            validate_dictionary({
+                "dictionary_id": dictionary_id,
+                "name": self._builtins[dictionary_id]["name"],
+                "version": version,
+                "rules": [*self._builtins[dictionary_id]["rules"], *custom_rules],
+            }, expected_id=dictionary_id)
             self._write_version_payload(dictionary_id, version, {
                 "schema_version": "semantic_custom_version_v1",
                 "dictionary_id": dictionary_id,
                 "version": version,
-                "custom_rules": self._custom_rules(dictionary_id, source_version),
+                "custom_rules": custom_rules,
                 "created_by": str(payload.get("operator") or "local-operator"),
             })
             metadata["latest_version"] = version

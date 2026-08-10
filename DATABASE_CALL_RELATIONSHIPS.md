@@ -77,9 +77,9 @@ PostgreSQL 模式下，所有结构化运行时业务状态统一写入 PostgreS
 
 原始日志、API Key、Token、密码和含密 DSN 不得进入业务表、AI Trace、Observation 或 Replay。
 
-## 74 张表与代码映射
+## 80 张表与代码映射
 
-当前逻辑结构共 74 张表：73 张由版本化 migration 创建，`schema_migrations` 由数据库适配层创建。
+当前逻辑结构共 80 张表：79 张由版本化 migration 创建，`schema_migrations` 由数据库适配层创建。
 
 ### 管理与迁移（3）
 
@@ -224,6 +224,17 @@ PostgreSQL 模式下，所有结构化运行时业务状态统一写入 PostgreS
 | `benchmark_artifacts` | Benchmark 产物元数据 | `src/logrisk/benchmark_center/repository.py` |
 | `benchmark_audit_events` | Benchmark 追加式审计 | `src/logrisk/benchmark_center/repository.py` |
 
+### 知识包（6）
+
+| 表 | 用途 | 主要代码 |
+|---|---|---|
+| `knowledge_packages` | 知识包身份目录 | `src/logrisk/knowledge_packages/repository.py` |
+| `knowledge_package_versions` | Manifest、SHA256、兼容范围和安装状态 | `src/logrisk/knowledge_packages/repository.py` |
+| `knowledge_package_assets` | 包内资产校验、禁用状态和候选资源登记 | `src/logrisk/knowledge_packages/repository.py` |
+| `knowledge_package_dependencies` | 精确版本依赖关系 | `src/logrisk/knowledge_packages/repository.py` |
+| `knowledge_package_imports` | 上传、预览、确认和安装阶段记录 | `src/logrisk/knowledge_packages/repository.py`、`src/logrisk/knowledge_packages/service.py` |
+| `knowledge_package_audit_events` | 上传、安装、登记候选和退休的脱敏审计 | `src/logrisk/knowledge_packages/repository.py` |
+
 ## 典型调用示例
 
 ### AI Trace
@@ -266,6 +277,25 @@ POST /api/observability-v2/replays
 ```
 
 Span 写入失败不会中断主分析流程。Replay 使用锁定的脱敏 Evidence、Prompt、Profile 和 Provider 快照，结果不会写入候选特征或批准规则。
+
+### Knowledge Package
+
+```text
+POST /api/knowledge-packages/uploads
+  → KnowledgePackageService.upload()
+  → knowledge_package_imports + 受控 staging Artifact
+GET /api/knowledge-packages/uploads/{upload_id}
+  → validate_archive()
+  → Manifest / SHA256 / 路径 / 兼容范围 / 依赖预览
+POST .../install
+  → KnowledgePackageRepository.create_installation()
+  → knowledge_packages / knowledge_package_versions / knowledge_package_assets
+POST .../assets/{asset_id}/materialize
+  → KnowledgeAssetAdapterRegistry
+  → 候选资源标识 + knowledge_package_audit_events
+```
+
+知识包只把注册表、校验报告、状态和受控 Artifact 相对路径写入数据库；包内原文、脚本和原始日志不会进入 Trace 或业务 JSON。默认适配器只登记候选引用，真正接入 Drain3、Prompt、语义或规则服务必须由显式领域适配器负责，并继续经过人工发布流程。
 
 ### Production Runtime
 

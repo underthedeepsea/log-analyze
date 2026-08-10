@@ -4,7 +4,7 @@
   <img src="frontend/logo/logrisk-app-icon-orange-v2.png" width="112" alt="LOGRISK 应用图标" />
 </p>
 
-当前版本：`1.31.1`。完整变更记录见 [`releas.md`](releas.md)。
+当前版本：`1.32.0`。完整变更记录见 [`releas.md`](releas.md)。
 
 LOGRISK 在本地完成日志规范化、Drain3 模板化、确定性语义增强、风险评分、规则复用、模型特征识别和人工审批。系统只生成可审查、可导出的日志特征，不执行根因分析（RCA），也不会把原始日志直接发送给模型。
 
@@ -19,6 +19,7 @@ LOGRISK 在本地完成日志规范化、Drain3 模板化、确定性语义增�
 - 提供统一的评测与基准中心，可比较 Prompt、模型 Profile、失败 Case、趋势及发布门禁。
 - 提供生产运行中心：统一查看任务、就绪状态、存储配额、Retention 维护和脱敏审计记录。
 - 提供发布就绪中心：发布前以确定性、只读检查汇总运行时、前端静态包、模型 Profile、Prompt、Drain3、语义词典、多来源规则和评测门禁；不会自动发布或调用模型。
+- 提供知识包中心：通过受控 `.logrisk-package.zip` 导入可审计的 Drain3、语义、Prompt、风险规则和 Gold Dataset 资产，安装前预览并校验兼容性、依赖和 SHA256。
 - 提供多来源智能关联：按确定实体、显式层级和时间窗口汇总跨来源脱敏证据链。
 - 提供服务器风险总览、风险事件台账、可解释评分，以及可编辑、可发布、可回滚的风险语义库。
 - Dashboard 导航按分析工作台、AI 工程、规则与风险、数据治理和系统归类；一级分组可折叠，所有原有页面路由保持不变。
@@ -166,6 +167,25 @@ AI 分析观测使用一个 Observation 汇总一次任务，并以 Span 展示�
 - 回滚通过追加新版本实现，历史快照和审计事件不会被覆盖。
 
 旧规则首次迁移后默认设为 `active` 和版本 `v1`。兼容接口 `/api/rules` 继续可用；治理接口统一位于 `/api/rule-governance/`。
+
+## 知识包中心
+
+“数据治理 → 知识包中心”用于在不同环境之间搬运经过审查的知识资产。知识包是一个 `.logrisk-package.zip`，根目录必须包含严格校验的 `manifest.json`，资产只能放在 `assets/` 下，并使用受支持的类型：`drain3_profile`、`semantic_dictionary`、`feature_prompt`、`risk_semantics`、`approved_rule_candidates` 和 `gold_dataset`。
+
+操作流程为“上传 → 预览 → 确认安装 → 逐项登记候选”。预览会展示包和资产 SHA256、大小、平台版本范围、精确依赖与文件清单；校验会拒绝 Zip Slip、符号链接、脚本/插件、远程地址、未知资产类型以及 Gold Dataset 中的原始日志或凭据字段。安装只写入知识包注册表并保留受控 Artifact，资产默认 `disabled`；“登记候选”只记录待接入领域服务的候选资源，不会自动发布 Drain3 配置、Prompt、词典、规则或评测基线。退休版本仍保留审计历史，全部写入当前 SQLite/PostgreSQL Provider。
+
+可直接下载内置示例包进行演练：页面点击“下载示例包”，或访问 `GET /api/knowledge-packages/example`。生产环境需先通过 PACAS/RBAC 身份代理，写接口不会保存 API Key、Token、DSN、原始日志或包内原文。
+
+也可以在离线环境构建和校验包：
+
+```bash
+PYTHONPATH=src python -m logrisk.knowledge_packages.archive build \
+  examples/knowledge_packages/linux_node_baseline /tmp/linux-node-baseline.logrisk-package.zip
+PYTHONPATH=src python -m logrisk.knowledge_packages.archive validate \
+  /tmp/linux-node-baseline.logrisk-package.zip
+```
+
+API 导入保持两阶段确认：先 `POST /api/knowledge-packages/uploads`（二进制请求体并携带 `X-Package-Filename`），再读取上传记录中的 `inspection.package_sha256`，最后向 `/api/knowledge-packages/uploads/{upload_id}/install` 提交 `{"preview_sha256":"...","confirmed":true}`。
 
 ## Drain3 与语义治理
 

@@ -1,4 +1,4 @@
-schema_version: 14
+schema_version: 16
 database: logrisk
 description: LOGRISK 双模式运行时数据字典；SQLite 是默认本地实现，PostgreSQL 用于显式配置的外部生产部署。
 authoritative_ddl:
@@ -409,6 +409,38 @@ tables:
     primary_key: audit_id
     indexes: [idx_knowledge_package_audit_created(created_at DESC, audit_id DESC), idx_knowledge_package_audit_resource(package_id, version, asset_id, created_at DESC)]
     columns: {audit_id: 审计标识, package_id: 包标识, version: 包版本, asset_id: 资产标识, action: 动作, outcome: success/failed/denied, actor: 外部身份操作人, roles_json: 角色列表, request_id: 请求标识, attributes_json: 脱敏元数据, created_at: 创建时间}
+  agent_runs:
+    description: 受控 Agent 运行主记录；锁定实体、模型、Prompt、工具白名单、预算和脱敏输入摘要
+    primary_key: run_id
+    foreign_keys: {parent_run_id: agent_runs.run_id ON DELETE SET NULL}
+    indexes: [idx_agent_runs_status_created(status, created_at DESC), idx_agent_runs_source_entity(source_job_id, entity_id, created_at DESC)]
+    constraints: 状态受限且 actor/idempotency_key 联合唯一；不得保存原始日志或凭据
+    columns: {run_id: Run 标识, schema_version: 结构版本, parent_run_id: 重试来源, source_job_id: 来源特征任务, entity_id: 风险实体, entity_type: 实体类型, model_profile_id: 锁定模型画像, prompt_id: 锁定规划 Prompt, status: 运行状态, max_steps: 最大步骤数, max_tool_calls: 最大工具成本, used_tool_calls: 已消耗工具成本, timeout_seconds: 整体超时, allowed_tools_json: 工具白名单, locked_snapshot_json: 脱敏配置与证据摘要, goal: 受限目标, error_code: 稳定错误码, error_summary: 脱敏失败摘要, idempotency_key: 创建幂等键, actor: 外部身份, roles_json: 角色名称, request_id: 请求标识, state_version: 乐观锁版本, created_at: 创建时间, updated_at: 更新时间, started_at: 首次开始时间, completed_at: 完成时间}
+  agent_run_steps:
+    description: 经严格 Schema、工具白名单和步骤预算校验的有序计划
+    primary_key: [run_id, step_id]
+    foreign_keys: {run_id: agent_runs.run_id ON DELETE CASCADE}
+    indexes: [idx_agent_run_steps_run_sequence(run_id, sequence)]
+    columns: {run_id: Run 标识, step_id: 步骤标识, sequence: 执行顺序, tool_name: 白名单工具名, arguments_json: 脱敏参数, status: 步骤状态, attempt: 尝试次数, result_summary_json: 脱敏结果摘要, error_code: 稳定错误码, error_summary: 脱敏错误摘要, started_at: 开始时间, completed_at: 完成时间, created_at: 创建时间, updated_at: 更新时间, schema_version: 结构版本}
+  agent_tool_calls:
+    description: 工具调用、成本、延迟和结果摘要；只允许读工具与写待审批 Candidate
+    primary_key: tool_call_id
+    foreign_keys: {run_id: agent_runs.run_id ON DELETE CASCADE, run_id/step_id: agent_run_steps.run_id/step_id ON DELETE CASCADE}
+    indexes: [idx_agent_tool_calls_run_created(run_id, created_at)]
+    constraints: run_id/idempotency_key 联合唯一；不得保存原始日志或凭据
+    columns: {tool_call_id: 调用标识, run_id: Run 标识, step_id: 步骤标识, tool_name: 工具名, arguments_summary_json: 脱敏参数摘要, result_summary_json: 脱敏结果摘要, status: 调用状态, cost_units: 预算成本, latency_ms: 延迟毫秒, error_code: 稳定错误码, error_summary: 脱敏错误摘要, idempotency_key: 调用幂等键, created_at: 创建时间, completed_at: 完成时间, schema_version: 结构版本}
+  agent_artifacts:
+    description: Evaluator 结果与待审批 Candidate 引用；不得成为批准规则或外部导出
+    primary_key: artifact_id
+    foreign_keys: {run_id: agent_runs.run_id ON DELETE CASCADE}
+    indexes: [idx_agent_artifacts_run_type(run_id, artifact_type, created_at)]
+    columns: {artifact_id: 产物标识, run_id: Run 标识, step_id: 来源步骤, artifact_type: 受控产物类型, payload_json: 脱敏结构化结果, fingerprint: Candidate 确定性摘要, created_at: 创建时间, schema_version: 结构版本}
+  agent_run_events:
+    description: Agent 状态、计划和控制动作的追加式脱敏审计事件
+    primary_key: event_id
+    foreign_keys: {run_id: agent_runs.run_id ON DELETE CASCADE}
+    constraints: 同一 Run 的 sequence 唯一且单调递增；run_id/idempotency_key 联合唯一
+    columns: {event_id: 事件标识, run_id: Run 标识, sequence: 事件序号, event_type: 事件类型, attributes_json: 脱敏属性, idempotency_key: 控制操作幂等键, created_at: 创建时间, schema_version: 结构版本}
 postgres_type_mapping:
   TEXT: text
   TEXT_identifier: text

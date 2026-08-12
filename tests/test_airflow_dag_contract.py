@@ -51,3 +51,13 @@ def test_input_preprocess_dag_only_passes_input_and_orchestration_ids() -> None:
     assert '"input_orchestration_run_id"' in source
     assert "raw_log" not in source
     assert "samples" not in source
+
+
+def test_agent_dag_is_lazy_and_passes_only_run_identifier() -> None:
+    source = Path("integrations/airflow/dags/logrisk_agent_run.py").read_text(encoding="utf-8")
+
+    assert 'dag_id="logrisk_agent_run"' in source
+    assert "execute_agent_run" in source
+    assert '"agent_run_id"' in source
+    for forbidden in ("raw_log", "raw_sample", "samples", "api_key", "Authorization"):
+        assert forbidden not in source

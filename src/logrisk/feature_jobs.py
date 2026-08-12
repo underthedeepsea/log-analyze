@@ -651,6 +651,106 @@ class FeatureJobManager:
                 "features": copy.deepcopy(list(job["features"].values())),
             }
 
+    def get_agent_evidence(self, job_id: str, entity_id: str) -> Dict[str, Any]:
+        """Return the same sanitized template facts used by model extraction, never raw samples."""
+        with self._lock:
+            job = self._job(job_id)
+            record = next((item for item in job["entities"] if item["entity_id"] == str(entity_id)), None)
+            if record is None:
+                raise FeatureJobError("风险实体不存在")
+            source = record["source"]
+            return {
+                "schema_version": "1.0",
+                "entity": {
+                    "type": source.get("entity_type"),
+                    "id": source.get("entity_id"),
+                    "cluster": source.get("cluster"),
+                },
+                "window": {"start": source.get("window_start"), "end": source.get("window_end")},
+                "risk_score": source.get("risk_score"),
+                "risk_level": source.get("risk_level"),
+                "affected_entities": copy.deepcopy(source.get("affected_entities") or []),
+                "templates": copy.deepcopy(_sanitized_templates(source)),
+            }
+
+    def register_agent_candidate(
+        self,
+        job_id: str,
+        entity_id: str,
+        feature: Dict[str, Any],
+        *,
+        run_id: str,
+    ) -> Dict[str, Any]:
+        evidence = self.get_agent_evidence(job_id, entity_id)
+        known_hashes = {
+            str(item.get("template_hash"))
+            for item in evidence["templates"]
+            if item.get("template_hash")
+        }
+        known_components = {
+            str(item.get("component"))
+            for item in evidence["templates"]
+            if item.get("component")
+        }
+        hashes = feature.get("template_hashes")
+        components = feature.get("components")
+        if not isinstance(hashes, list) or not hashes or set(map(str, hashes)) - known_hashes:
+            raise FeatureJobError("Agent Candidate 的 template_hash 无效")
+        if not isinstance(components, list) or not components or set(map(str, components)) - known_components:
+            raise FeatureJobError("Agent Candidate 的 component 无效")
+        required_strings = ("feature_type", "title", "summary", "importance", "selection_reason")
+        if any(not isinstance(feature.get(field), str) or not feature[field].strip() for field in required_strings):
+            raise FeatureJobError("Agent Candidate 缺少必填字段")
+        if feature["importance"] not in IMPORTANCE_LEVELS:
+            raise FeatureJobError("Agent Candidate importance 无效")
+        tags = feature.get("tags")
+        if not isinstance(tags, list) or not tags or any(not isinstance(item, str) or not item.strip() for item in tags):
+            raise FeatureJobError("Agent Candidate tags 无效")
+        material = "|".join((str(run_id), str(entity_id), feature["feature_type"], *sorted(map(str, hashes))))
+        candidate = {
+            **copy.deepcopy(feature),
+            "candidate_id": hashlib.sha256(material.encode("utf-8")).hexdigest()[:20],
+            "status": "pending",
+            "reviewer_note": "",
+            "approved_at": None,
+            "agent_run_id": str(run_id),
+            "origin": "agentic",
+            "provider": "agentic",
+            "model": None,
+            "cluster": evidence["entity"].get("cluster"),
+            "entity": {"type": evidence["entity"].get("type"), "id": evidence["entity"].get("id")},
+            "window_start": evidence["window"].get("start"),
+            "window_end": evidence["window"].get("end"),
+            "risk_score": evidence.get("risk_score"),
+            "risk_level": evidence.get("risk_level"),
+            "affected_entities": copy.deepcopy(evidence.get("affected_entities") or []),
+            "occurrence_count": sum(
+                int(item.get("count") or 0) for item in evidence["templates"]
+                if item.get("template_hash") in hashes
+            ),
+            "source_templates": [
+                copy.deepcopy(item) for item in evidence["templates"]
+                if item.get("template_hash") in hashes
+            ],
+        }
+        with self._lock:
+            job = self._job(job_id)
+            record = next((item for item in job["entities"] if item["entity_id"] == str(entity_id)), None)
+            if record is None:
+                raise FeatureJobError("风险实体不存在")
+            if candidate["candidate_id"] not in job["features"]:
+                job["features"][candidate["candidate_id"]] = copy.deepcopy(candidate)
+                if candidate["candidate_id"] not in record["feature_ids"]:
+                    record["feature_ids"].append(candidate["candidate_id"])
+                self._emit_locked(
+                    job,
+                    "agent_candidate_registered",
+                    entity_id=str(entity_id),
+                    candidate_id=candidate["candidate_id"],
+                    agent_run_id=str(run_id),
+                )
+        return copy.deepcopy(candidate)
+
     def list_jobs(self) -> list[Dict[str, Any]]:
         with self._lock:
             job_ids = sorted(self._jobs, key=lambda item: self._jobs[item]["created_at"], reverse=True)

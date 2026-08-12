@@ -4,7 +4,15 @@ trace:
   path: state/ai_traces.jsonl
 defaults:
   feature_extract: feature_extract_v3_compact_strict_json_en
+  agent_plan: agent_plan_v1
 prompts:
+  - prompt_id: agent_plan_v1
+    display_name: Agent 顺序规划 v1
+    description: 用于受控白名单工具的单 Agent 顺序计划
+    analysis_type: agent_plan
+    status: active
+    is_default: true
+    version: v1
   - prompt_id: feature_extract_v1
     display_name: 日志特征识别 v1
     description: 用于从风险实体证据包中识别可复用异常特征

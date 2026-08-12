@@ -38,6 +38,10 @@
     config: function () { return jsonRequest("/api/config"); },
     databaseRuntime: function () { return jsonRequest("/api/system/database"); },
     knowledgePackages: function () { return jsonRequest("/api/knowledge-packages"); },
+    agentRuns: function () { return jsonRequest("/api/agent-runs"); },
+    agentRun: function (runId) { return jsonRequest("/api/agent-runs/" + encodeURIComponent(runId)); },
+    agentRunAction: function (runId, action) { return jsonRequest("/api/agent-runs/" + encodeURIComponent(runId) + "/" + action, { method: "POST", body: JSON.stringify({ idempotency_key: "agent-control-" + Date.now() }) }); },
+    createAgentRun: function (payload) { const key = "agent-run-" + Date.now(); return jsonRequest("/api/agent-runs", { method: "POST", headers: { "Idempotency-Key": key }, body: JSON.stringify(Object.assign({}, payload, { idempotency_key: key })) }); },
     knowledgePackage: function (packageId) { return jsonRequest("/api/knowledge-packages/" + encodeURIComponent(packageId)); },
     knowledgePackageVersion: function (packageId, version) { return jsonRequest("/api/knowledge-packages/" + encodeURIComponent(packageId) + "/versions/" + encodeURIComponent(version)); },
     knowledgePackageAudit: function () { return jsonRequest("/api/knowledge-packages/audit-events?limit=100"); },
@@ -220,7 +224,7 @@
 
   const NAV_GROUPS = [
     { id: "analysis", label: "分析工作台", items: [["overview", "特征总览"], ["queue", "识别队列"], ["review", "人工审批"], ["export", "导出记录"]] },
-    { id: "ai", label: "AI 工程", items: [["observability", "AI 分析观测"], ["traces", "AI 调用追踪"], ["prompts", "Prompt 管理"], ["modelProfiles", "模型画像"]] },
+    { id: "ai", label: "AI 工程", items: [["observability", "AI 分析观测"], ["traces", "AI 调用追踪"], ["agentRuns", "Agent 运行"], ["prompts", "Prompt 管理"], ["modelProfiles", "模型画像"]] },
     { id: "risk", label: "规则与风险", items: [["rules", "规则治理"], ["nodeRisks", "服务器风险"], ["multiSource", "多来源关联"], ["semanticLibrary", "风险语义库"]] },
     { id: "governance", label: "数据治理", items: [["streaming", "流式处理"], ["drainQuality", "评测中心 · 模板质量"], ["benchmarkCenter", "评测与基准"], ["knowledgePackages", "知识包中心"]] },
     { id: "system", label: "系统", items: [["runtime", "运行中心"], ["releaseReadiness", "发布就绪"], ["settings", "系统设置"]] },
@@ -314,6 +318,7 @@
   function pathToView(path) {
     if (path === "/benchmark-center") return "benchmarkCenter";
     if (path === "/knowledge-packages") return "knowledgePackages";
+    if (path === "/agent-runs") return "agentRuns";
     if (path === "/runtime") return "runtime";
     if (path === "/release-readiness") return "releaseReadiness";
     if (path === "/streaming") return "streaming";
@@ -331,7 +336,7 @@
   }
   function routeForView(view) {
     return {
-      benchmarkCenter: "/benchmark-center", runtime: "/runtime", releaseReadiness: "/release-readiness", streaming: "/streaming", prompts: "/prompts", modelProfiles: "/model-profiles",
+      benchmarkCenter: "/benchmark-center", runtime: "/runtime", releaseReadiness: "/release-readiness", streaming: "/streaming", prompts: "/prompts", modelProfiles: "/model-profiles", agentRuns: "/agent-runs",
       traces: "/ai-traces", observability: "/ai-observability", drainQuality: "/drain-quality", rules: "/rules",
       nodeRisks: "/node-risks", multiSource: "/multi-source", semanticLibrary: "/semantic-library", settings: "/settings",
     }[view] || "/";
@@ -1857,6 +1862,61 @@
       h("div", { className: "surface knowledge-package-audit" }, h("div", { className: "surface-head" }, h("b", null, "最近审计事件"), h("span", null, "只显示操作元数据")), audit.length ? audit.slice(0, 8).map(function (item) { return h("div", { className: "knowledge-package-audit-row", key: item.audit_id }, h("span", null, timeText(item.created_at)), h("b", null, item.action), h("span", null, item.package_id + (item.asset_id ? " · " + item.asset_id : "")), h("em", null, item.outcome)); }) : h("div", { className: "empty-state" }, "暂无知识包审计事件")));
   }
 
+  function AgentRunsPage(props) {
+    const runs = props.data.items || [], selected = props.data.selected;
+    const toolNames = ["get_sanitized_evidence", "find_approved_rules", "inspect_knowledge_assets", "evaluate_candidate", "register_feature_candidate"];
+    const [draft, setDraft] = useState({ source_job_id: "", entity_id: "", model_profile_id: "", prompt_id: "agent_plan_v1", max_steps: 6, max_tool_calls: 10, timeout_seconds: 120, allowed_tools: toolNames });
+    const [showCreate, setShowCreate] = useState(false), [creating, setCreating] = useState(false);
+    function field(name, value) { setDraft(function (current) { return Object.assign({}, current, { [name]: value }); }); }
+    async function create() { setCreating(true); try { await props.onCreate(draft); setShowCreate(false); } finally { setCreating(false); } }
+    function actionsFor(status) {
+      const items = [];
+      if (["queued", "planning", "running"].includes(status)) items.push("pause");
+      if (status === "paused") items.push("resume");
+      if (["queued", "planning", "running", "paused", "awaiting_human"].includes(status)) items.push("cancel");
+      if (["failed", "cancelled"].includes(status)) items.push("retry");
+      items.push("replay");
+      return items;
+    }
+    return h("section", { className: "agent-runs-page" },
+      h("div", { className: "agent-runs-hero" }, h("div", null, h("span", { className: "eyebrow" }, "GOVERNED AGENT RUNTIME"), h("h2", null, "Agent 运行"), h("p", null, "受限规划、白名单工具、预算与人工闸门。Agent 只能生成待审批候选，不能自动批准、导出或执行 RCA。")), h("div", { className: "agent-runs-hero-actions" }, h("button", { className: "secondary-button", onClick: props.onRefresh }, "刷新"), h("button", { className: "primary-button", onClick: function () { setShowCreate(!showCreate); } }, showCreate ? "收起创建" : "新建 Run"))),
+      showCreate && h("section", { className: "surface agent-run-create" }, h("div", { className: "section-title" }, h("h3", null, "创建受控 Run"), h("span", null, "配置将锁定为运行快照")), h("div", { className: "agent-run-create-grid" },
+        h("label", null, "来源任务", h("input", { value: draft.source_job_id, onChange: function (event) { field("source_job_id", event.target.value); } })),
+        h("label", null, "风险实体", h("input", { value: draft.entity_id, onChange: function (event) { field("entity_id", event.target.value); } })),
+        h("label", null, "模型 Profile", h("select", { value: draft.model_profile_id, onChange: function (event) { field("model_profile_id", event.target.value); } }, h("option", { value: "" }, "请选择"), (props.profiles || []).map(function (profile) { return h("option", { key: profile.profile_id, value: profile.profile_id }, (profile.display_name || profile.profile_id) + " · " + profile.provider); }))),
+        h("label", null, "规划 Prompt", h("select", { value: draft.prompt_id, onChange: function (event) { field("prompt_id", event.target.value); } }, (props.prompts || []).map(function (prompt) { return h("option", { key: prompt.prompt_id, value: prompt.prompt_id }, prompt.display_name || prompt.prompt_id); }))),
+        h("label", null, "最大步骤", h("input", { type: "number", min: 1, max: 20, value: draft.max_steps, onChange: function (event) { field("max_steps", Number(event.target.value)); } })),
+        h("label", null, "工具预算", h("input", { type: "number", min: 1, max: 100, value: draft.max_tool_calls, onChange: function (event) { field("max_tool_calls", Number(event.target.value)); } })),
+        h("label", null, "超时秒数", h("input", { type: "number", min: 1, max: 3600, value: draft.timeout_seconds, onChange: function (event) { field("timeout_seconds", Number(event.target.value)); } })),
+        h("fieldset", { className: "agent-run-tools" }, h("legend", null, "允许工具"), toolNames.map(function (tool) { return h("label", { key: tool }, h("input", { type: "checkbox", checked: draft.allowed_tools.includes(tool), onChange: function (event) { field("allowed_tools", event.target.checked ? draft.allowed_tools.concat([tool]) : draft.allowed_tools.filter(function (item) { return item !== tool; })); } }), tool); }))),
+        h("div", { className: "agent-run-create-note" }, h("b", null, "运行边界"), h("span", null, "模型计划 → 确定性工具 → 质量门禁 → 人工 Gate；不展示思考过程，不自动批准。")),
+        h("button", { className: "primary-button", disabled: creating || !draft.source_job_id || !draft.entity_id || !draft.model_profile_id, onClick: create }, creating ? "创建中…" : "创建并执行")),
+      props.data.failure && h("p", { className: "agent-runs-notice error" }, props.data.failure),
+      h("div", { className: "agent-runs-metrics" },
+        h("article", null, h("b", null, runs.length), h("span", null, "Run 总数")),
+        h("article", null, h("b", null, runs.filter(function (run) { return ["queued", "planning", "running"].includes(run.status); }).length), h("span", null, "运行中")),
+        h("article", null, h("b", null, runs.filter(function (run) { return run.status === "paused"; }).length), h("span", null, "已暂停")),
+        h("article", null, h("b", null, runs.filter(function (run) { return run.status === "awaiting_human"; }).length), h("span", null, "等待人工审批")),
+        h("article", null, h("b", null, runs.filter(function (run) { return run.status === "failed"; }).length), h("span", null, "失败")),
+        h("article", null, h("b", null, runs.reduce(function (sum, run) { return sum + Number(run.used_tool_calls || 0); }, 0)), h("span", null, "工具调用"))),
+      h("div", { className: "agent-runs-layout" },
+        h("section", { className: "surface agent-run-list" }, h("div", { className: "section-title" }, h("h3", null, "运行记录"), h("span", null, runs.length + " 个")), runs.length ? runs.map(function (run) {
+          const completed = (run.steps || []).filter(function (step) { return step.status === "completed"; }).length;
+          return h("button", { key: run.run_id, className: "agent-run-row " + (selected && selected.run_id === run.run_id ? "active" : ""), onClick: function () { props.onSelect(run.run_id); } }, h("div", null, h("b", null, run.entity_id || "—"), h("small", null, shortHash(run.run_id) + " · " + (run.model_profile_id || "—") + " · " + (run.actor || "—") + " · " + timeText(run.created_at))), h("span", { className: "status-chip " + run.status }, run.status), h("em", null, completed + "/" + ((run.steps || []).length || run.max_steps) + " · " + (run.used_tool_calls || 0) + "/" + (run.max_tool_calls || 0)));
+        }) : h("div", { className: "empty-state" }, "尚无 Agent Run")),
+        h("section", { className: "surface agent-run-detail" }, selected ? h(React.Fragment, null,
+          h("div", { className: "section-title" }, h("h3", null, "Run 详情"), h("span", { className: "status-chip " + selected.status }, selected.status)),
+          h("div", { className: "agent-run-summary" }, h("div", null, h("span", null, "实体"), h("b", null, selected.entity_type + " / " + selected.entity_id)), h("div", null, h("span", null, "步骤预算"), h("b", null, (selected.steps || []).length + " / " + selected.max_steps)), h("div", null, h("span", null, "工具预算"), h("b", null, selected.used_tool_calls + " / " + selected.max_tool_calls)), h("div", null, h("span", null, "Prompt"), h("b", null, selected.prompt_id))),
+          h("div", { className: "agent-run-actions" }, actionsFor(selected.status).map(function (action) { return h("button", { key: action, className: action === "cancel" ? "danger-button" : "secondary-button", onClick: function () { props.onAction(selected.run_id, action); } }, { pause: "暂停", resume: "继续", cancel: "取消", retry: "重试", replay: "只读回放" }[action]); }), selected.status === "awaiting_human" && h("button", { className: "primary-button", onClick: props.onReview }, "进入人工审批")),
+          selected.error_code && h("div", { className: "agent-run-failure" }, h("b", null, "运行失败 · " + selected.error_code), h("span", null, selected.error_summary || "请查看审计事件并按原快照重试")),
+          h("h4", null, "模型计划与确定性工具"), h("div", { className: "agent-step-list" }, (selected.steps || []).map(function (step) { const kind = step.tool_name === "evaluate_candidate" ? "质量门禁" : step.tool_name === "register_feature_candidate" ? "人工 Gate" : "确定性工具"; return h("article", { key: step.step_id }, h("i", { className: step.status }), h("div", null, h("b", null, step.tool_name), h("small", null, kind + " · " + step.step_id)), h("span", null, step.status)); })),
+          h("h4", null, "ToolCall"), h("div", { className: "agent-tool-list" }, (selected.tool_calls || []).length ? selected.tool_calls.map(function (call) { return h("article", { key: call.tool_call_id }, h("div", null, h("b", null, call.tool_name), h("small", null, "成本 " + call.cost_units + " · " + (call.latency_ms || 0) + "ms")), h("span", { className: "status-chip " + call.status }, call.status)); }) : h("div", { className: "empty-state compact" }, "暂无工具调用")),
+          h("h4", null, "Artifact"), h("div", { className: "agent-artifact-list" }, (selected.artifacts || []).length ? selected.artifacts.map(function (artifact) { return h("article", { key: artifact.artifact_id }, h("b", null, artifact.artifact_type), h("span", null, artifact.step_id || "Run 级产物"), artifact.payload && artifact.payload.candidate_id && h("em", null, "Candidate " + shortHash(artifact.payload.candidate_id))); }) : h("div", { className: "empty-state compact" }, "暂无受控产物")),
+          h("h4", null, "审计事件"), h("div", { className: "agent-event-list" }, (selected.events || []).slice().reverse().map(function (event) { return h("article", { key: event.event_id }, h("b", null, event.type), h("time", null, timeText(event.created_at))); }))
+        ) : h("div", { className: "empty-state" }, "选择一条 Run 查看只读计划、步骤、工具调用与审计事件")))
+    );
+  }
+
   function App() {
     const [view, setView] = useState(pathToView(window.location.pathname)), [model, setModel] = useState("qwen3:1.7b"), [threshold, setThreshold] = useState(40), [promptId, setPromptId] = useState("feature_extract_v3_compact_strict_json_en"), [retryCount, setRetryCount] = useState(1);
     const [ollama, setOllama] = useState({ online: false }), [result, setResult] = useState(null), [fileName, setFileName] = useState("");
@@ -1881,6 +1941,7 @@
     const [runtimeData, setRuntimeData] = useState({ identity: {}, health: {}, readiness: {}, tasks: { items: [] }, storage: {}, retention: {}, audits: { items: [] }, loading: false, failure: "", failureCode: "" });
     const [releaseReadinessData, setReleaseReadinessData] = useState({ latest: null, history: [], loading: false, failure: "" });
     const [multiSourceData, setMultiSourceData] = useState({ summary: {}, entities: [], rules: [], timeline: [], correlations: [], selected: null, loading: false, failure: "" });
+    const [agentRunData, setAgentRunData] = useState({ items: [], selected: null, loading: false, failure: "" });
     const [sidebarCollapsed, setSidebarCollapsed] = useState(false), [mobileMenuOpen, setMobileMenuOpen] = useState(false);
     const [narrowSidebar, setNarrowSidebar] = useState(function () { return window.matchMedia("(max-width: 900px)").matches; });
     const events = useRef(null);
@@ -1924,6 +1985,18 @@
       loadHarness(query).catch(function (reason) { setError(reason.message); });
     }
     async function loadHarness(query) { const values = await Promise.all([api.harnessStatus(), api.prompts(), api.traces(query || "?limit=50"), api.modelProfiles()]); setHarness(values[0]); setPrompts(values[1].items || []); setPromptId(values[1].current_prompt_id || "feature_extract_v3_compact_strict_json_en"); setTraces(values[2].items || []); setModelProfiles(values[3]); setModelProfileId(function (current) { return current || values[3].default_profile_id || ""; }); }
+    async function loadAgentRuns(selectedId) {
+      setAgentRunData(function (current) { return Object.assign({}, current, { loading: true, failure: "" }); });
+      try {
+        const value = await api.agentRuns(), items = value.items || [];
+        const target = selectedId || (agentRunData.selected && agentRunData.selected.run_id) || (items[0] && items[0].run_id);
+        const detail = target ? await api.agentRun(target) : null;
+        setAgentRunData({ items: items, selected: detail, loading: false, failure: "" });
+      } catch (reason) {
+        setAgentRunData({ items: [], selected: null, loading: false, failure: reason.message || "Agent Run 加载失败" });
+      }
+    }
+    async function changeAgentRun(runId, action) { const result = await api.agentRunAction(runId, action); await loadAgentRuns(action === "retry" ? result.run_id : runId); return result; }
     async function loadMultiSource() {
       setMultiSourceData(function (current) { return Object.assign({}, current, { loading: true, failure: "" }); });
       try {
@@ -2021,8 +2094,8 @@
     async function refresh(id) { const next = await api.job(id || jobId); setSnapshot(next); if (["completed", "completed_with_errors"].includes(next.status) && events.current) events.current.close(); loadHarness().catch(function () {}); }
     useEffect(function () {
       const query = window.location.pathname === "/ai-traces" ? traceFilterQuery(traceFiltersFromSearch(window.location.search)) : "?limit=50";
-      Promise.all([api.config(), api.status(), Promise.all([api.governedRules("?page_size=100"), api.ruleReviewQueue()]), api.metrics(), api.harnessStatus(), api.prompts(), api.traces(query), api.modelProfiles()]).then(function (values) { setModel(values[0].default_model); setOllama(values[1]); setRules(values[2][0].items || []); setRuleReviewQueue(values[2][1]); setSystemMetrics(values[3]); setHarness(values[4]); setPrompts(values[5].items || []); setPromptId(values[5].current_prompt_id || values[4].current_prompt_id || "feature_extract_v3_compact_strict_json_en"); setTraces(values[6].items || []); setModelProfiles(values[7]); setModelProfileId(values[7].default_profile_id || ""); if (window.location.pathname === "/ai-observability") loadObservability().catch(function (reason) { setError(reason.message); }); if (window.location.pathname === "/drain-quality") loadDrainQuality().catch(function (reason) { setError(reason.message); }); if (window.location.pathname.startsWith("/node-risks")) loadNodeRisks().catch(function (reason) { setError(reason.message); }); if (window.location.pathname === "/multi-source") loadMultiSource().catch(function () {}); if (window.location.pathname === "/semantic-library") loadRiskSemantics().catch(function (reason) { setError(reason.message); }); if (window.location.pathname === "/streaming") loadStreaming().catch(function (reason) { setError(reason.message); }); if (window.location.pathname === "/benchmark-center") loadBenchmark().catch(function () {}); if (window.location.pathname === "/runtime") loadRuntime().catch(function () {}); if (window.location.pathname === "/release-readiness") loadReleaseReadiness().catch(function () {}); }).catch(function (reason) { setError(reason.message); });
-      function onPop() { const filters = traceFiltersFromSearch(window.location.search); setView(pathToView(window.location.pathname)); setTraceFilters(filters); if (window.location.pathname === "/ai-traces") loadHarness(traceFilterQuery(filters)).catch(function () {}); if (window.location.pathname === "/ai-observability") loadObservability().catch(function () {}); if (window.location.pathname === "/drain-quality") loadDrainQuality().catch(function () {}); if (window.location.pathname === "/rules") loadRules().catch(function () {}); if (window.location.pathname.startsWith("/node-risks")) loadNodeRisks().catch(function () {}); if (window.location.pathname === "/multi-source") loadMultiSource().catch(function () {}); if (window.location.pathname === "/semantic-library") loadRiskSemantics().catch(function () {}); if (window.location.pathname === "/streaming") loadStreaming().catch(function () {}); if (window.location.pathname === "/benchmark-center") loadBenchmark().catch(function () {}); if (window.location.pathname === "/runtime") loadRuntime().catch(function () {}); if (window.location.pathname === "/release-readiness") loadReleaseReadiness().catch(function () {}); if (window.location.pathname === "/knowledge-packages") { /* page owns its refresh */ } }
+      Promise.all([api.config(), api.status(), Promise.all([api.governedRules("?page_size=100"), api.ruleReviewQueue()]), api.metrics(), api.harnessStatus(), api.prompts(), api.traces(query), api.modelProfiles()]).then(function (values) { setModel(values[0].default_model); setOllama(values[1]); setRules(values[2][0].items || []); setRuleReviewQueue(values[2][1]); setSystemMetrics(values[3]); setHarness(values[4]); setPrompts(values[5].items || []); setPromptId(values[5].current_prompt_id || values[4].current_prompt_id || "feature_extract_v3_compact_strict_json_en"); setTraces(values[6].items || []); setModelProfiles(values[7]); setModelProfileId(values[7].default_profile_id || ""); if (window.location.pathname === "/ai-observability") loadObservability().catch(function (reason) { setError(reason.message); }); if (window.location.pathname === "/agent-runs") loadAgentRuns(); if (window.location.pathname === "/drain-quality") loadDrainQuality().catch(function (reason) { setError(reason.message); }); if (window.location.pathname.startsWith("/node-risks")) loadNodeRisks().catch(function (reason) { setError(reason.message); }); if (window.location.pathname === "/multi-source") loadMultiSource().catch(function () {}); if (window.location.pathname === "/semantic-library") loadRiskSemantics().catch(function (reason) { setError(reason.message); }); if (window.location.pathname === "/streaming") loadStreaming().catch(function (reason) { setError(reason.message); }); if (window.location.pathname === "/benchmark-center") loadBenchmark().catch(function () {}); if (window.location.pathname === "/runtime") loadRuntime().catch(function () {}); if (window.location.pathname === "/release-readiness") loadReleaseReadiness().catch(function () {}); }).catch(function (reason) { setError(reason.message); });
+      function onPop() { const filters = traceFiltersFromSearch(window.location.search); setView(pathToView(window.location.pathname)); setTraceFilters(filters); if (window.location.pathname === "/ai-traces") loadHarness(traceFilterQuery(filters)).catch(function () {}); if (window.location.pathname === "/ai-observability") loadObservability().catch(function () {}); if (window.location.pathname === "/agent-runs") loadAgentRuns(); if (window.location.pathname === "/drain-quality") loadDrainQuality().catch(function () {}); if (window.location.pathname === "/rules") loadRules().catch(function () {}); if (window.location.pathname.startsWith("/node-risks")) loadNodeRisks().catch(function () {}); if (window.location.pathname === "/multi-source") loadMultiSource().catch(function () {}); if (window.location.pathname === "/semantic-library") loadRiskSemantics().catch(function () {}); if (window.location.pathname === "/streaming") loadStreaming().catch(function () {}); if (window.location.pathname === "/benchmark-center") loadBenchmark().catch(function () {}); if (window.location.pathname === "/runtime") loadRuntime().catch(function () {}); if (window.location.pathname === "/release-readiness") loadReleaseReadiness().catch(function () {}); if (window.location.pathname === "/knowledge-packages") { /* page owns its refresh */ } }
       window.addEventListener("popstate", onPop);
       return function () { window.removeEventListener("popstate", onPop); if (events.current) events.current.close(); };
     }, []);
@@ -2087,7 +2160,7 @@
       h(Sidebar, { active: view, onChange: changeView }),
       h("button", { className: "sidebar-overlay", type: "button", "aria-label": "关闭菜单", onClick: function () { setMobileMenuOpen(false); } }),
       h("main", null,
-        !["drainQuality", "benchmarkCenter", "streaming", "runtime", "releaseReadiness", "settings", "rules", "nodeRisks", "multiSource", "semanticLibrary"].includes(view) && view !== "knowledgePackages" && h("div", { className: "page-head" }, h("div", null, h("h1", null, "日志特征工作台"), h("p", null, "上传日志、复用规则、识别未知特征并人工审批")), h("label", { className: "new-analysis" }, "＋ 新建分析", h("input", { type: "file", onChange: function (event) { loadFile(event.target.files && event.target.files[0]); } }))),
+        !["drainQuality", "benchmarkCenter", "streaming", "runtime", "releaseReadiness", "settings", "rules", "nodeRisks", "multiSource", "semanticLibrary", "agentRuns"].includes(view) && view !== "knowledgePackages" && h("div", { className: "page-head" }, h("div", null, h("h1", null, "日志特征工作台"), h("p", null, "上传日志、复用规则、识别未知特征并人工审批")), h("label", { className: "new-analysis" }, "＋ 新建分析", h("input", { type: "file", onChange: function (event) { loadFile(event.target.files && event.target.files[0]); } }))),
         error && h("div", { className: "error-banner" }, error, h("button", { onClick: function () { setError(""); } }, "×")),
         view === "overview" && h(React.Fragment, null,
           h("section", { className: "upload-panel" }, h("div", null, h("b", null, fileName || "选择 result.json、JSONL、TXT、LOG、GZ 或无后缀日志"), h("span", null, result ? (result.risk_entities || []).length + " 个风险实体，已完成本地预处理" : "10MB 以内直接分析；超过 10MB 自动分片上传，Linux messages / syslog 无后缀文件也支持上传")), busy && h("div", { className: "upload-progress" }, uploadProgress && h("span", null, "上传进度：" + Math.round((uploadProgress.progress || 0) * 100) + "%（" + uploadProgress.received_chunks + " / " + uploadProgress.total_chunks + " chunks）"), preprocessProgress && h("span", null, "预处理阶段：" + (preprocessProgress.stage || "queued") + "，记录 " + (preprocessProgress.records_parsed || 0) + (preprocessProgress.drain3_partitions_total ? "，Drain3 分片 " + (preprocessProgress.drain3_partitions_completed || 0) + " / " + preprocessProgress.drain3_partitions_total : ""))), h("div", { className: "analysis-config" }, h("label", null, "分析流程", h("select", { value: "feature_extract", disabled: true }, h("option", { value: "feature_extract" }, "日志特征识别"))), h("label", null, "模型 Profile", h("select", { value: modelProfileId, onChange: function (event) { const profile = activeProfiles.find(function (item) { return item.profile_id === event.target.value; }) || {}; setModelProfileId(event.target.value); if (profile.model) setModel(profile.model); if (profile.default_prompt_id) setPromptId(profile.default_prompt_id); } }, activeProfiles.map(function (profile) { return h("option", { value: profile.profile_id, key: profile.profile_id }, (profile.display_name || profile.profile_id) + " · " + profile.provider); }))), h("label", null, "Provider / 连接", h("input", { value: (selectedModelProfile.provider || "—") + " / " + (selectedModelProfile.connection_id || "—"), disabled: true })), h("label", null, "模型", h("input", { value: model, onChange: function (event) { setModel(event.target.value); } })), h("label", null, "Prompt", h("select", { value: promptId, onChange: function (event) { setPromptId(event.target.value); } }, activePrompts.map(function (prompt) { return h("option", { value: prompt.prompt_id, key: prompt.prompt_id }, prompt.prompt_id); }))), h("label", null, "重试次数", h("select", { value: retryCount, onChange: function (event) { setRetryCount(Number(event.target.value)); } }, [0, 1, 2, 3].map(function (count) { return h("option", { value: count, key: count }, count + " 次"); }))), h("label", null, "阈值", h("input", { type: "number", value: threshold, onChange: function (event) { setThreshold(event.target.value); } })), h("button", { className: "primary-button", disabled: !result || busy, onClick: start }, busy ? "处理中…" : "开始识别"))), h(MetricsGrid, { snapshot: snapshot, result: result, daily: systemMetrics }), h(LiveProcessing, { snapshot: snapshot, result: result })),
@@ -2096,6 +2169,7 @@
         view === "traces" && h(AITracePage, { traces: traces, harness: harness, traceFilters: traceFilters, onFilter: applyTraceFilters, onOpenTrace: openTrace }),
         view === "prompts" && h(PromptManagement, { prompts: prompts, currentPrompt: harness.current_prompt_id || promptId, onOpenPrompt: openPrompt }),
         view === "modelProfiles" && h(ModelProfilesPage, { profiles: modelProfiles, selectedProfileId: modelProfileId, onSelect: function (profile) { setModelProfileId(profile.profile_id); setModel(profile.model || model); setPromptId(profile.default_prompt_id || promptId); }, onSave: saveModelProfile }),
+        view === "agentRuns" && h(AgentRunsPage, { data: agentRunData, profiles: activeProfiles, prompts: prompts.filter(function (prompt) { return prompt.analysis_type === "agent_plan" && prompt.status === "active"; }), onRefresh: loadAgentRuns, onSelect: loadAgentRuns, onReview: function () { changeView("review"); }, onCreate: function (payload) { return api.createAgentRun(payload).then(function (created) { return loadAgentRuns(created.run_id); }).catch(function (reason) { setError(reason.message); throw reason; }); }, onAction: function (runId, action) { return changeAgentRun(runId, action).catch(function (reason) { setError(reason.message); throw reason; }); } }),
         view === "review" && h("section", { className: "approval-workspace" },
           h(FeatureList, { features: snapshot && snapshot.features || [], selectedId: selectedId, onSelect: setSelectedId }),
           h(FeatureEvidence, { feature: selected, onSelectTemplate: setSelectedTemplate }),

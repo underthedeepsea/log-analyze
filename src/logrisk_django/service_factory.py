@@ -31,7 +31,7 @@ def get_facade() -> ApiFacade:
     if _facade is None:
         _facade = ApiFacade(
             get_container(),
-            version="1.32.0",
+            version="1.33.0",
             service_resolver=_resolve_facade_service,
         )
     return _facade
@@ -75,13 +75,25 @@ def get_input_airflow_orchestrator() -> AirflowOrchestrator:
     )
 
 
+def get_agent_airflow_orchestrator() -> AirflowOrchestrator:
+    config = get_config()
+    return AirflowOrchestrator(
+        config.airflow_base_url,
+        config.airflow_agent_dag_id,
+        timeout=config.airflow_timeout_seconds,
+        authorization_env=config.airflow_authorization_env,
+    )
+
+
 def get_airflow_readiness() -> dict[str, Any]:
     """Probe both production DAGs and return only stable, non-sensitive status fields."""
     config = get_config()
-    probes = (
+    probes = [
         ("analysis", config.airflow_dag_id, get_airflow_orchestrator),
         ("input_preprocess", config.airflow_input_dag_id, get_input_airflow_orchestrator),
-    )
+    ]
+    if config.agentic_enabled:
+        probes.append(("agent", config.airflow_agent_dag_id, get_agent_airflow_orchestrator))
     statuses: list[dict[str, Any]] = []
     for role, expected_dag_id, factory in probes:
         try:

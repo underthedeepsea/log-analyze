@@ -164,7 +164,7 @@ def test_m11_quality_and_settings_use_workspace_design_contract():
         "secondary-button",
     ):
         assert text in source
-    assert '!["drainQuality", "benchmarkCenter", "streaming", "runtime", "releaseReadiness", "settings", "rules", "nodeRisks", "multiSource", "semanticLibrary"].includes(view)' in source
+    assert '!["drainQuality", "benchmarkCenter", "streaming", "runtime", "releaseReadiness", "settings", "rules", "nodeRisks", "multiSource", "semanticLibrary", "agentRuns"].includes(view)' in source
     assert "h(CodeBlock, { value: profile.parameters })" not in source
 
 
@@ -550,7 +550,8 @@ def test_release_docs_describe_current_feature_version():
     assert "## 1.30.0 - 2026-07-31" in release
     assert "## 1.31.0 - 2026-08-03" in release
     assert "## 1.32.0 - 2026-08-10" in release
-    assert "当前版本：`1.32.0`" in readme
+    assert "## 1.33.0 - 2026-08-12" in release
+    assert "当前版本：`1.33.0`" in readme
     assert "## 1.24.0 - 2026-07-22" in release
     assert "## 1.24.1 - 2026-07-22" in release
     assert "## 1.24.2 - 2026-07-22" in release
@@ -655,3 +656,15 @@ def test_ai_observability_v2_exposes_timeline_metrics_and_safe_replay():
         "旧版 Trace 仍可在 AI 调用追踪中查看",
     ):
         assert text in app
+
+
+def test_agent_run_ui_exposes_governed_runtime_controls():
+    source = (FRONTEND / "src" / "app.js").read_text(encoding="utf-8")
+
+    assert '["agentRuns", "Agent 运行"]' in source
+    assert '"/agent-runs"' in source
+    assert "AgentRunsPage" in source
+    assert "agentRuns:" in source
+    assert '"/" + action' in source
+    for action in ("pause", "resume", "cancel", "retry"):
+        assert '"' + action + '"' in source

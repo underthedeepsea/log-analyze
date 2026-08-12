@@ -7,7 +7,7 @@ from typing import Any
 from logrisk.application import ApplicationConfig, ApplicationContainer, build_application_container
 
 
-def build_worker_container() -> ApplicationContainer:
+def build_worker_container(*, agentic_enabled: bool = False) -> ApplicationContainer:
     """Build runtime services only when an Airflow task starts, never at DAG parse time."""
     root = Path(os.environ.get("LOGRISK_PROJECT_ROOT") or ".").resolve()
     state_root = Path(os.environ.get("LOGRISK_STATE_ROOT") or root / "state").resolve()
@@ -26,7 +26,27 @@ def build_worker_container() -> ApplicationContainer:
         feature_jobs_auto_start=False,
         interrupt_feature_jobs=False,
         migrate_database=False,
+        agentic_enabled=agentic_enabled,
     ))
+
+
+def execute_agent_run(
+    agent_run_id: str,
+    request_id: str,
+    *,
+    container: ApplicationContainer | None = None,
+) -> dict[str, str]:
+    """Resume a persisted Agent Run in an Airflow worker without moving evidence through XCom."""
+    services = container or build_worker_container(agentic_enabled=True)
+    if services.agent_runs is None:
+        raise RuntimeError("Agent 功能未启用")
+    run = services.agent_runs.get_run(str(agent_run_id))
+    if run["request_id"] != str(request_id):
+        raise ValueError("Agent Run 与请求标识不匹配")
+    if run["status"] in {"queued", "planning", "running"}:
+        services.agent_runs.recover_run(str(agent_run_id))
+    result = services.agent_runs.execute_run(str(agent_run_id))
+    return {"agent_run_id": str(agent_run_id), "status": str(result["status"])}
 
 
 def prepare_job(

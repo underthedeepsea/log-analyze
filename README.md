@@ -4,7 +4,7 @@
   <img src="frontend/logo/logrisk-app-icon-orange-v2.png" width="112" alt="LOGRISK 应用图标" />
 </p>
 
-当前版本：`1.32.0`。完整变更记录见 [`releas.md`](releas.md)。
+当前版本：`1.33.0`。完整变更记录见 [`releas.md`](releas.md)。
 
 LOGRISK 在本地完成日志规范化、Drain3 模板化、确定性语义增强、风险评分、规则复用、模型特征识别和人工审批。系统只生成可审查、可导出的日志特征，不执行根因分析（RCA），也不会把原始日志直接发送给模型。
 
@@ -20,6 +20,7 @@ LOGRISK 在本地完成日志规范化、Drain3 模板化、确定性语义增�
 - 提供生产运行中心：统一查看任务、就绪状态、存储配额、Retention 维护和脱敏审计记录。
 - 提供发布就绪中心：发布前以确定性、只读检查汇总运行时、前端静态包、模型 Profile、Prompt、Drain3、语义词典、多来源规则和评测门禁；不会自动发布或调用模型。
 - 提供知识包中心：通过受控 `.logrisk-package.zip` 导入可审计的 Drain3、语义、Prompt、风险规则和 Gold Dataset 资产，安装前预览并校验兼容性、依赖和 SHA256。
+- 提供可选的受控 Agent 运行：模型只规划白名单工具的顺序步骤，执行受步骤数、工具成本和超时预算约束；输出只能登记为待人工审批候选。
 - 提供多来源智能关联：按确定实体、显式层级和时间窗口汇总跨来源脱敏证据链。
 - 提供服务器风险总览、风险事件台账、可解释评分，以及可编辑、可发布、可回滚的风险语义库。
 - Dashboard 导航按分析工作台、AI 工程、规则与风险、数据治理和系统归类；一级分组可折叠，所有原有页面路由保持不变。
@@ -273,7 +274,23 @@ DASHBOARD_CORS_ORIGINS=https://logrisk.example.internal \
 
 Django 不会自动迁移数据库。上线窗口通过 `python manage.py logrisk_migrate --check`、`python manage.py logrisk_migrate` 和 `python manage.py logrisk_check` 显式完成迁移和检查。Airflow 恢复或 Worker 异常后，先用 `python manage.py logrisk_reconcile_runs --dry-run --json` 预览活动 DAG Run，再去掉 `--dry-run` 同步本地状态；命令只传递稳定标识和生命周期状态。详见 [Django 与 Airflow 生产部署指南](DJANGO_AIRFLOW_DEPLOYMENT_GUIDE.md)，可复制配置见 `examples/django_integration/` 与 `examples/airflow/`。
 
-Django 写接口已覆盖模型连接/画像、Prompt、规则治理、风险语义、Drain3 数据集与配置、Benchmark、Retention、审批导出和 Airflow 编排取消/重试；所有写操作都经 PACAS/RBAC 身份与 `logrisk:operator` 角色校验，并写入脱敏审计。Django 只推进数据库中的任务状态，不在 Web 进程内回退到本地模型执行。运行中心可通过 `GET /api/runtime/airflow` 查看两个 DAG 的健康状态；`POST /api/orchestration/runs/<id>/sync` 与 `POST /api/input-orchestration/runs/<id>/sync` 会校验 Airflow DAG Run 的稳定 ID 后同步生命周期状态，不接收或保存 DAG conf、XCom 和日志正文。
+Django 写接口已覆盖模型连接/画像、Prompt、规则治理、风险语义、Drain3 数据集与配置、Benchmark、Retention、审批导出和 Airflow 编排取消/重试；所有写操作都经 PACAS/RBAC 身份与 `logrisk:operator` 角色校验，并写入脱敏审计。Django 只推进数据库中的任务状态，不在 Web 进程内回退到本地模型执行。运行中心可通过 `GET /api/runtime/airflow` 查看已配置 DAG 的健康状态；`POST /api/orchestration/runs/<id>/sync` 与 `POST /api/input-orchestration/runs/<id>/sync` 会校验 Airflow DAG Run 的稳定 ID 后同步生命周期状态，不接收或保存 DAG conf、XCom 和日志正文。
+
+### 受控 Agent 运行
+
+Agent 功能默认关闭。本地 Dashboard 使用 `LOGRISK_AGENTIC_ENABLED=1 bash scripts/run_dashboard.sh` 启用；Django 在 `LOGRISK` 设置中配置 `agentic_enabled: True` 与 `airflow_agent_dag_id: "logrisk_agent_run"`。页面入口位于“AI 工程 → Agent 运行”。
+
+Agent Planner 只接收实体、风险分和模板数量等脱敏摘要，随后通过白名单工具按需读取聚合 Evidence、批准规则与已安装知识资产。每个 Run 锁定模型 Profile、Provider 连接和 Prompt 内容摘要，支持暂停、继续、取消、重试和只读 Replay；步骤、工具调用、预算和审计事件写入 SQLite/PostgreSQL。`evaluate_candidate` 必须成功后才允许 `register_feature_candidate`，候选仍需进入原有人工审批流程。Agent 不会调用批准、导出、规则发布、RCA 或修复工具。
+
+标准接口为 `GET/POST /api/agent-runs`、`GET /api/agent-runs/<run_id>`、`GET /events|artifacts`，以及 `POST /pause|resume|cancel|retry|replay`。除只读 Replay 外，创建和控制操作都必须携带 `Idempotency-Key` 或请求体中的 `idempotency_key`。工具临时失败只按同一锁定步骤自动重试一次，不重新规划或切换模型 Provider；服务重启会从数据库恢复排队、规划中和运行中的 Run。
+
+```bash
+curl http://127.0.0.1:8080/api/agent-runs
+curl -X POST http://127.0.0.1:8080/api/agent-runs/<run_id>/pause \
+  -H 'Content-Type: application/json' -H 'Idempotency-Key: pause-001' \
+  -d '{"idempotency_key":"pause-001"}'
+curl -X POST http://127.0.0.1:8080/api/agent-runs/<run_id>/replay -d '{}'
+```
 
 ## 发布就绪检查
 

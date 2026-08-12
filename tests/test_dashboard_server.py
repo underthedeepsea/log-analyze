@@ -146,7 +146,7 @@ def test_database_status_and_restart_candidate_configuration_are_available(dashb
     assert saved["candidate"]["provider"] == "postgres"
     assert saved["candidate"]["password_configured"] is False
     assert saved["restart_required"] is True
-    assert health["version"] == "1.32.0"
+    assert health["version"] == "1.33.0"
     assert health["storage"] == "sqlite"
 
 
@@ -586,7 +586,7 @@ def test_ai_harness_prompt_and_trace_routes(dashboard):
 
     assert status == 200
     assert prompts["current_prompt_id"] == "feature_extract_v3_compact_strict_json_en"
-    assert prompts["items"][0]["prompt_id"] == "feature_extract_v1"
+    assert {item["prompt_id"] for item in prompts["items"]} >= {"feature_extract_v1", "agent_plan_v1"}
     assert "prompt_hash" in prompts["items"][0]
     assert status2 == 200
     assert "items" in traces

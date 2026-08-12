@@ -6,6 +6,22 @@
 - 仅修复 Bug 时提升最后一位，例如 `1.2.0 → 1.2.1`；
 - 每次代码更新必须同步更新本文件。
 
+## 1.33.0 - 2026-08-12
+
+### Added
+
+- 新增可选的受控 Agent 日志智能运行：模型只生成严格结构化、顺序执行的白名单工具计划，并受步骤数、工具成本和超时预算限制。
+- 新增 SQLite/PostgreSQL 对等 `0016` migration 与 5 张 Agent 领域表，持久化 Run、步骤、工具调用、脱敏产物和追加式事件，支持恢复、暂停、继续、取消、幂等重试与只读 Replay。
+- 新增脱敏 Evidence、批准规则、知识资产、确定性 Evaluator 和待审批 Candidate 五类工具；Candidate 只有通过 Evaluator 后才能登记，且不会自动批准、导出或进入规则库。
+- 新增 Dashboard Agent API、Django 4.2 PACAS/RBAC 控制面和 Airflow 2.3.2 `logrisk_agent_run` DAG；生产调度只传递 Run/请求 ID，执行发生在 Celery Worker。
+- 新增“AI 工程 → Agent 运行”页面，展示运行状态、预算、计划步骤、ToolCall、Artifact、失败摘要和审计事件，并提供暂停、继续、取消、重试、只读回放与人工审批跳转。
+- Agent 服务重启后可恢复排队、规划中与运行中任务；中断步骤会回到待执行状态，同一锁定步骤最多自动重试一次且不会重新规划或切换 Provider。
+
+### Security
+
+- Agent 功能默认关闭；Planner 不接收原始日志，工具注册表递归拒绝 `samples`、`raw_sample`、原始日志、API Key、Token、密码、DSN、鉴权头和 Cookie。
+- Agent 无批准、导出、规则发布、RCA 或自动修复能力；Django 写操作继续依赖外部 PACAS/RBAC，Airflow DAG conf/XCom 不携带 Evidence、Prompt 或模型内容。
+
 ## 1.32.0 - 2026-08-10
 
 ### Added

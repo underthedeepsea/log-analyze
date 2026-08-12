@@ -55,6 +55,7 @@ from logrisk.input_parser import parse_log_content
 from logrisk.incremental_sources import FileIncrementalSource, source_capabilities
 from logrisk.knowledge_packages import build_archive
 from logrisk.knowledge_packages.errors import KnowledgePackageError
+from logrisk.agentic import AgentRunRequest, AgenticError
 from logrisk.large_file_pipeline import run_large_file_pipeline
 from logrisk.processing_metrics import ProcessingMetricsError, ProcessingMetricsStore
 from logrisk.rule_governance import RuleGovernanceError, RuleGovernanceRepository, RuleGovernanceService
@@ -92,7 +93,7 @@ from pipeline.manual_import_pipeline import analyze_records
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 MAX_LARGE_UPLOAD_BYTES = 500 * 1024 * 1024
 DEFAULT_MODEL = "qwen3:1.7b"
-APP_VERSION = "1.32.0"
+APP_VERSION = "1.33.0"
 
 
 class DashboardHTTPServer(ThreadingHTTPServer):
@@ -118,6 +119,7 @@ def build_server(
     state_root: str | Path | None = None,
     runtime_config: RuntimeConfig | None = None,
     runtime_config_path: str | Path | None = None,
+    agentic_enabled: bool = False,
 ) -> DashboardHTTPServer:
     """Create the local development HTTP shell around shared application services."""
     root = Path(__file__).resolve().parents[2]
@@ -141,6 +143,7 @@ def build_server(
             runtime_config_path=Path(runtime_config_path) if runtime_config_path else None,
             import_legacy_state=True,
             interrupt_streaming_tasks=True,
+            agentic_enabled=agentic_enabled,
         ),
         manager=manager,
         input_analyzer=input_analyzer,
@@ -169,9 +172,15 @@ def build_server(
     server.upload_store = container.upload_store  # type: ignore[attr-defined]
     server.input_jobs = container.input_jobs  # type: ignore[attr-defined]
     server.knowledge_packages = container.knowledge_packages  # type: ignore[attr-defined]
+    server.agent_runs = container.agent_runs  # type: ignore[attr-defined]
+    server.agentic_enabled = bool(container.agent_runs)  # type: ignore[attr-defined]
     server.streaming_state = container.streaming_state  # type: ignore[attr-defined]
     server.drain_quality = container.drain_quality  # type: ignore[attr-defined]
     server.semantic_dictionaries = container.semantic_dictionaries  # type: ignore[attr-defined]
+    if container.agent_runs is not None:
+        container.recover_agent_runs(
+            lambda run_id: threading.Thread(target=container.agent_runs.execute_run, args=(run_id,), daemon=True).start()
+        )
     server.risk_semantics = container.risk_semantics  # type: ignore[attr-defined]
     server.node_risks = container.node_risks  # type: ignore[attr-defined]
     server.multi_source = container.multi_source  # type: ignore[attr-defined]
@@ -325,7 +334,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if path == "/help":
                 self._serve_help()
                 return
-            if path in {"/", "/prompts", "/ai-traces", "/ai-observability", "/model-profiles", "/drain-quality", "/benchmark-center", "/rules", "/settings", "/runtime", "/release-readiness", "/node-risks", "/semantic-library", "/multi-source", "/knowledge-packages"} or path.startswith("/node-risks/"):
+            if path in {"/", "/prompts", "/ai-traces", "/ai-observability", "/model-profiles", "/drain-quality", "/benchmark-center", "/rules", "/settings", "/runtime", "/release-readiness", "/node-risks", "/semantic-library", "/multi-source", "/knowledge-packages", "/agent-runs"} or path.startswith("/node-risks/"):
                 self._serve_frontend()
                 return
             if path == "/config.js":
@@ -352,6 +361,19 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 return
             if path == "/api/knowledge-packages":
                 self._json(HTTPStatus.OK, {"items": self.server.knowledge_packages.list_packages()})  # type: ignore[attr-defined]
+                return
+            if path == "/api/agent-runs":
+                if not self.server.agentic_enabled:  # type: ignore[attr-defined]
+                    raise AgenticError("Agent 功能未启用", code="agentic_disabled", status_code=404)
+                self._json(HTTPStatus.OK, {"items": self.server.agent_runs.list_runs()})  # type: ignore[attr-defined]
+                return
+            match = re.fullmatch(r"/api/agent-runs/([A-Za-z0-9]+)(?:/(events|artifacts|replay))?", path)
+            if match:
+                if not self.server.agentic_enabled:  # type: ignore[attr-defined]
+                    raise AgenticError("Agent 功能未启用", code="agentic_disabled", status_code=404)
+                run = self.server.agent_runs.replay(match.group(1)) if match.group(2) == "replay" else self.server.agent_runs.get_run(match.group(1))  # type: ignore[attr-defined]
+                body = run.get(match.group(2), []) if match.group(2) in {"events", "artifacts"} else run
+                self._json(HTTPStatus.OK, {"items": body} if isinstance(body, list) else body)
                 return
             if path == "/api/knowledge-packages/example":
                 self._serve_knowledge_package_example()
@@ -811,6 +833,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._json(status, {"error": str(exc), "code": exc.code, "error_code": exc.code})
         except RuleGovernanceError as exc:
             self._json(exc.status_code, {"error": str(exc), "code": exc.code, "request_id": f"request-{uuid.uuid4().hex}"})
+        except AgenticError as exc:
+            self._json(exc.status_code, {"error": str(exc), "code": exc.code})
         except (FeatureJobError, ApprovedRuleError, ProcessingMetricsError, DrainQualityError, SemanticValidationError) as exc:
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
         except (TypeError, ValueError) as exc:
@@ -819,6 +843,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         path, _ = self._route_parts()
         try:
+            replay_match = re.fullmatch(r"/api/agent-runs/([A-Za-z0-9]+)/(?:actions/)?replay", path)
+            if replay_match:
+                if not self.server.agentic_enabled:  # type: ignore[attr-defined]
+                    raise AgenticError("Agent 功能未启用", code="agentic_disabled", status_code=404)
+                self._json(HTTPStatus.OK, self.server.agent_runs.replay(replay_match.group(1)))  # type: ignore[attr-defined]
+                return
             identity = self._require_runtime_write_access()
             if path == "/api/knowledge-packages/uploads":
                 try:
@@ -833,6 +863,52 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._json(HTTPStatus.CREATED, upload)
                 return
             payload = self._read_json()
+            if path == "/api/agent-runs":
+                if not self.server.agentic_enabled:  # type: ignore[attr-defined]
+                    raise AgenticError("Agent 功能未启用", code="agentic_disabled", status_code=404)
+                if not isinstance(payload, dict):
+                    raise AgenticError("请求体必须是 JSON object")
+                job_id = str(payload.get("source_job_id") or "")
+                entity_id = str(payload.get("entity_id") or "")
+                evidence = self.server.manager.get_agent_evidence(job_id, entity_id)  # type: ignore[attr-defined]
+                profile = self.server.model_profiles.get(payload.get("model_profile_id"))  # type: ignore[attr-defined]
+                connection = self.server.connections.get(profile.connection_id)  # type: ignore[attr-defined]
+                prompt = self.server.prompt_registry.load(str(payload.get("prompt_id") or "agent_plan_v1"))  # type: ignore[attr-defined]
+                request = AgentRunRequest(
+                    source_job_id=job_id, entity_id=entity_id, entity_type=str(evidence["entity"].get("type") or ""),
+                    model_profile_id=profile.profile_id, prompt_id=prompt.prompt_id,
+                    max_steps=int(payload.get("max_steps") or 6), max_tool_calls=int(payload.get("max_tool_calls") or 10),
+                    timeout_seconds=float(payload.get("timeout_seconds") or 120),
+                    allowed_tools=tuple(payload.get("allowed_tools") or ["get_sanitized_evidence", "find_approved_rules", "inspect_knowledge_assets", "evaluate_candidate", "register_feature_candidate"]),
+                    idempotency_key=str(self.headers.get("Idempotency-Key") or payload.get("idempotency_key") or ""),
+                    actor=str(identity.actor or "unknown"), roles=tuple(identity.roles), request_id=identity.request_id,
+                )
+                if not request.idempotency_key:
+                    raise AgenticError("缺少幂等键", code="idempotency_required")
+                locked = {"schema_version": "1.0", "goal": str(payload.get("goal") or "提取可审批日志特征"),
+                          "evidence_summary": {"entity": evidence["entity"], "risk_score": evidence["risk_score"], "template_count": len(evidence["templates"])},
+                          "profile_snapshot": profile.public_dict(), "connection_snapshot": connection,
+                          "prompt_id": prompt.prompt_id, "prompt_sha256": prompt.sha256}
+                run = self.server.agent_runs.create_run(request, locked_snapshot=locked)  # type: ignore[attr-defined]
+                if not run.get("idempotent_replay"):
+                    threading.Thread(target=self.server.agent_runs.execute_run, args=(run["run_id"],), daemon=True).start()  # type: ignore[attr-defined]
+                self._json(HTTPStatus.ACCEPTED, run)
+                return
+            match = re.fullmatch(r"/api/agent-runs/([A-Za-z0-9]+)/(?:actions/)?(pause|resume|cancel|retry|replay)", path)
+            if match:
+                if not self.server.agentic_enabled:  # type: ignore[attr-defined]
+                    raise AgenticError("Agent 功能未启用", code="agentic_disabled", status_code=404)
+                action = match.group(2)
+                service = self.server.agent_runs  # type: ignore[attr-defined]
+                key = str(self.headers.get("Idempotency-Key") or payload.get("idempotency_key") or "")
+                if action == "retry":
+                    result = service.retry(match.group(1), idempotency_key=key, request_id=identity.request_id)
+                else:
+                    result = getattr(service, action)(match.group(1), idempotency_key=key)
+                if action in {"resume", "retry"} and not result.get("idempotent_replay"):
+                    threading.Thread(target=service.execute_run, args=(result["run_id"],), daemon=True).start()
+                self._json(HTTPStatus.OK, result)
+                return
             if path == "/api/release-readiness/validate":
                 if not isinstance(payload, dict):
                     raise ValueError("请求体必须是 JSON object")
@@ -1301,6 +1377,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._json(exc.status_code, {"error": str(exc), "code": exc.code})
         except RuleGovernanceError as exc:
             self._json(exc.status_code, {"error": str(exc), "code": exc.code, "request_id": f"request-{uuid.uuid4().hex}"})
+        except AgenticError as exc:
+            self._json(exc.status_code, {"error": str(exc), "code": exc.code})
         except RuntimeAccessError as exc:
             self._json(HTTPStatus.FORBIDDEN, {"error": str(exc), "code": exc.code, "error_code": exc.code, "request_id": self._runtime_request_identity().request_id})
         except RuntimeQuotaError as exc:
@@ -1316,6 +1394,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc), "code": "invalid_request", "error_code": "invalid_request", "request_id": self._runtime_request_identity().request_id})
         except (TypeError, ValueError) as exc:
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc), "code": "invalid_request", "error_code": "invalid_request", "request_id": self._runtime_request_identity().request_id})
+        except Exception:
+            request_id = f"request-{uuid.uuid4().hex}"
+            self._json(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "服务内部错误", "code": "internal_error", "error_code": "internal_error", "request_id": request_id})
 
     def do_PUT(self) -> None:
         path, _ = self._route_parts()
@@ -2000,6 +2081,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--database-provider", choices=("sqlite", "postgres"), default=None, help="运行数据库 Provider；未指定时读取环境变量或保存的候选配置")
     parser.add_argument("--database-url", default=None, help="PostgreSQL DSN；优先于 LOGRISK_DATABASE_URL，禁止写入配置文件")
     parser.add_argument("--cors-origins", default=os.getenv("DASHBOARD_CORS_ORIGINS", ""), help="逗号分隔的允许跨域来源")
+    parser.add_argument("--enable-agentic", action="store_true", default=os.getenv("LOGRISK_AGENTIC_ENABLED", "0").lower() in {"1", "true", "yes"})
     return parser.parse_args(argv)
 
 
@@ -2015,6 +2097,7 @@ def main() -> None:
         database_path=args.database,
         database_provider=args.database_provider,
         database_url=args.database_url,
+        agentic_enabled=args.enable_agentic,
     )
     print(f"Feature review dashboard: http://{args.host}:{args.port}")
     try:

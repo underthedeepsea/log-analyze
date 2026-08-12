@@ -12,6 +12,8 @@ from typing import Any, Callable
 import yaml
 
 from logrisk.ai_eval.runner import load_cases
+from logrisk.agentic import AgentRepository, AgentRuntime, AgentService, ModelAgentPlanner
+from logrisk.agentic.tools import build_agent_tool_registry
 from logrisk.ai_harness.connections import ConnectionStore
 from logrisk.ai_harness.evaluator import evaluate_feature_output
 from logrisk.ai_harness.model_profile import ModelProfileRegistry
@@ -88,6 +90,7 @@ class ApplicationConfig:
     feature_jobs_auto_start: bool = True
     interrupt_feature_jobs: bool = True
     migrate_database: bool = True
+    agentic_enabled: bool = False
 
     @classmethod
     def for_test(cls, *, project_root: str | Path, state_root: str | Path) -> "ApplicationConfig":
@@ -126,6 +129,7 @@ class ApplicationContainer:
     input_jobs: SQLiteInputJobStore
     artifact_store: SharedArtifactStore
     knowledge_packages: KnowledgePackageService
+    agent_runs: AgentService | None
     streaming_state: StreamingStateRepository
     drain_quality: Any
     semantic_dictionaries: Any
@@ -138,6 +142,16 @@ class ApplicationContainer:
     input_analyzer: Callable[..., dict[str, Any]] | None = None
     input_analyzer_accepts_config: bool = True
     run_input_job: Callable[[str], None] | None = None
+
+    def recover_agent_runs(self, submit: Callable[[str], None] | None = None) -> list[str]:
+        """Recover persisted local Agent runs only when the feature is explicitly enabled."""
+        if self.agent_runs is None:
+            return []
+        run_ids = self.agent_runs.recover_active_runs()
+        if submit:
+            for run_id in run_ids:
+                submit(run_id)
+        return run_ids
 
 
 def build_application_container(
@@ -350,7 +364,7 @@ def build_application_container(
     knowledge_packages = KnowledgePackageService(
         database,
         artifact_store,
-        app_version="1.32.0",
+        app_version="1.33.0",
         adapters=build_domain_adapter_registry(
             prompt_registry=prompts,
             drain_quality=drain_quality,
@@ -358,6 +372,27 @@ def build_application_container(
             risk_semantics=risk_semantics,
         ),
     )
+    agent_repository = AgentRepository(database)
+
+    def agent_planner(run: dict[str, Any]) -> ModelAgentPlanner:
+        snapshot = dict(run.get("locked_snapshot") or {})
+        profile = profiles.from_snapshot(dict(snapshot["profile_snapshot"]))
+        connection = dict(snapshot["connection_snapshot"])
+        prompt = prompts.load_by_hash(str(snapshot["prompt_id"]), str(snapshot["prompt_sha256"]))
+        if not connection.get("enabled"):
+            raise FeatureJobError("模型连接已停用")
+        return ModelAgentPlanner(
+            create_model_client(connection),
+            model=profile.model,
+            prompt_content=prompt.content,
+            timeout=float(run["timeout_seconds"]),
+            options=profile.build_model_options(),
+        )
+
+    agent_runs = None
+    if config.agentic_enabled:
+        agent_tools = build_agent_tool_registry(feature_jobs, rule_governance, knowledge_packages)
+        agent_runs = AgentService(agent_repository, AgentRuntime(agent_repository, agent_planner, agent_tools))
     upload_store = SQLiteUploadSessionStore(
         UploadConfig(upload_dir=state_root / "uploads", artifact_store=artifact_store), database
     )
@@ -408,6 +443,7 @@ def build_application_container(
         input_jobs=input_jobs,
         artifact_store=artifact_store,
         knowledge_packages=knowledge_packages,
+        agent_runs=agent_runs,
         streaming_state=streaming_state,
         drain_quality=drain_quality,
         semantic_dictionaries=semantic_dictionaries,

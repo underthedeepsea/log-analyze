@@ -3,6 +3,7 @@ from __future__ import annotations
 from django.urls import path
 
 from logrisk_django.views.api import core_read
+from logrisk_django.views.agentic import agent_run_action, agent_run_detail, agent_runs, create_agent_run
 from logrisk_django.views.benchmark import cancel_run, compare, evaluate_gate, runs, suites
 from logrisk_django.views.drain import annotation_review, annotations, configs, datasets, eval_runs, tune_runs
 from logrisk_django.views.dictionary import dictionary_action, dictionary_candidate, dictionary_collection, dictionary_detail, dictionary_test
@@ -57,6 +58,10 @@ from logrisk_django.views.uploads import (
 
 app_name = "logrisk_django"
 urlpatterns = [
+    path("api/agent-runs", agent_runs, name="agent-runs-list"),
+    path("api/agent-runs/<str:run_id>", agent_run_detail),
+    path("api/agent-runs/<str:run_id>/<str:view>", agent_run_detail),
+    path("api/agent-runs/<str:run_id>/actions/<str:action>", agent_run_action),
     path("api/uploads", create_upload),
     path("api/uploads/<str:upload_id>/chunks/<int:index>", append_upload_chunk),
     path("api/uploads/<str:upload_id>/complete", complete_upload),

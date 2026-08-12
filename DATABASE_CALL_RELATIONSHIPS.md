@@ -77,9 +77,9 @@ PostgreSQL 模式下，所有结构化运行时业务状态统一写入 PostgreS
 
 原始日志、API Key、Token、密码和含密 DSN 不得进入业务表、AI Trace、Observation 或 Replay。
 
-## 80 张表与代码映射
+## 85 张表与代码映射
 
-当前逻辑结构共 80 张表：79 张由版本化 migration 创建，`schema_migrations` 由数据库适配层创建。
+当前逻辑结构共 85 张表：84 张由版本化 migration 创建，`schema_migrations` 由数据库适配层创建。
 
 ### 管理与迁移（3）
 
@@ -113,6 +113,18 @@ PostgreSQL 模式下，所有结构化运行时业务状态统一写入 PostgreS
 |---|---|---|
 | `orchestration_runs` | Feature Job 与 Airflow DAG Run 的持久化状态、重试、心跳和脱敏失败摘要 | `src/logrisk/orchestration/repository.py`、`src/logrisk/orchestration/service.py` |
 | `input_orchestration_runs` | Upload Input Job 与预处理 DAG Run 的持久化状态、重试、心跳和脱敏失败摘要 | `src/logrisk/orchestration/input_repository.py`、`src/logrisk/orchestration/input_service.py` |
+
+### 受控 Agent 运行（5）
+
+| 表 | 用途 | 主要代码 |
+|---|---|---|
+| `agent_runs` | 锁定实体、Profile、Prompt、工具白名单、预算、身份与脱敏快照 | `src/logrisk/agentic/repository.py`、`src/logrisk/agentic/service.py` |
+| `agent_run_steps` | 经 Schema 和白名单校验的顺序执行计划 | `src/logrisk/agentic/planner.py`、`src/logrisk/agentic/runtime.py` |
+| `agent_tool_calls` | 工具参数/结果摘要、成本、延迟和幂等记录 | `src/logrisk/agentic/tool_registry.py`、`src/logrisk/agentic/runtime.py` |
+| `agent_artifacts` | Evaluator 结果和待人工审批 Candidate 引用 | `src/logrisk/agentic/runtime.py` |
+| `agent_run_events` | Run 状态与控制动作的追加式审计事件 | `src/logrisk/agentic/repository.py` |
+
+调用链为 `Dashboard/Django → AgentService → AgentRuntime → ToolRegistry`，其中生产 Airflow Worker 直接从 `AgentService` 恢复锁定快照；`AgentRepository` 将五类记录统一写入当前 SQLite/PostgreSQL Provider。五张表只保存配置快照、脱敏摘要、稳定引用和追加式事件，不保存原始日志、模型思考过程或凭据。
 
 ### 规则治理（5）
 
@@ -323,6 +335,8 @@ Django View
 ```
 
 `src/logrisk_django/management/commands/logrisk_migrate.py` 是生产 schema 唯一迁移入口；`logrisk_check.py` 只读取迁移状态，不应用 SQL；`logrisk_reconcile_dispatch.py` 仅重试可恢复的特征或输入编排状态。Django ORM 数据库、Airflow Metadata Database 与 LOGRISK 数据库之间没有跨库 SQL 或外键。
+
+Agent 模式下，Django 先写入 `agent_runs`，再只把 `agent_run_id` 和 `request_id` 交给 `logrisk_agent_run` DAG；Worker 从同一 LOGRISK 数据库恢复快照并执行。DAG conf/XCom 不携带 Evidence、Prompt、模型正文或日志。运行结束只产生待审批 `feature_candidates`，不会自动批准、导出或写入规则库。
 
 ### PostgreSQL 复用 Store
 

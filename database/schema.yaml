@@ -1,4 +1,4 @@
-schema_version: 16
+schema_version: 17
 database: logrisk
 description: LOGRISK 双模式运行时数据字典；SQLite 是默认本地实现，PostgreSQL 用于显式配置的外部生产部署。
 authoritative_ddl:
@@ -441,6 +441,31 @@ tables:
     foreign_keys: {run_id: agent_runs.run_id ON DELETE CASCADE}
     constraints: 同一 Run 的 sequence 唯一且单调递增；run_id/idempotency_key 联合唯一
     columns: {event_id: 事件标识, run_id: Run 标识, sequence: 事件序号, event_type: 事件类型, attributes_json: 脱敏属性, idempotency_key: 控制操作幂等键, created_at: 创建时间, schema_version: 结构版本}
+  agent_workflows:
+    description: 固定角色工作流定义；保存显式依赖、预算和重试策略，不允许动态 Agent 或运行时改图
+    primary_key: workflow_id
+    indexes: [idx_agent_workflows_status_created(status, created_at DESC)]
+    constraints: actor/idempotency_key 联合唯一；definition_json 只允许注册角色和工具白名单；status 仅允许 active/disabled
+    columns: {workflow_id: 工作流标识, name: 工作流名称, description: 工作流说明, definition_json: 编译后的固定角色 DAG, status: 工作流启用状态, actor: 创建主体, idempotency_key: 创建幂等键, created_at: 创建时间, updated_at: 更新时间, schema_version: 结构版本}
+  agent_workflow_runs:
+    description: 一次受控 DAG 运行；锁定来源实体、模型、Prompt、预算、身份和脱敏 Evidence 摘要
+    primary_key: workflow_run_id
+    foreign_keys: {workflow_id: agent_workflows.workflow_id ON DELETE RESTRICT, parent_run_id: agent_workflow_runs.workflow_run_id ON DELETE SET NULL}
+    indexes: [idx_agent_workflow_runs_status_created(status, created_at DESC), idx_agent_workflow_runs_source_entity(source_job_id, entity_id, created_at DESC)]
+    constraints: actor/idempotency_key 联合唯一；不得保存原始日志、凭据或模型思考过程
+    columns: {workflow_run_id: 工作流 Run 标识, workflow_id: 锁定工作流, parent_run_id: 重试来源, source_job_id: 来源特征任务, entity_id: 风险实体, entity_type: 实体类型, model_profile_id: 锁定模型画像, prompt_id: 锁定 Prompt, status: 运行状态, max_concurrency: 最大并发节点, max_tool_calls: 全局工具预算, used_tool_calls: 已用工具预算, timeout_seconds: 全局超时, max_attempts: 节点最大尝试次数, locked_snapshot_json: DAG 与脱敏输入快照, actor: 外部身份, roles_json: 外部角色, request_id: 请求标识, idempotency_key: 创建幂等键, error_code: 稳定错误码, error_summary: 脱敏失败摘要, state_version: 乐观锁版本, created_at: 创建时间, updated_at: 更新时间, started_at: 开始时间, completed_at: 完成时间, schema_version: 结构版本}
+  agent_workflow_nodes:
+    description: DAG 节点状态与 Checkpoint；每个节点映射一个固定角色和受控子 Agent Run
+    primary_key: [workflow_run_id, node_id]
+    foreign_keys: {workflow_run_id: agent_workflow_runs.workflow_run_id ON DELETE CASCADE, child_agent_run_id: agent_runs.run_id ON DELETE SET NULL}
+    indexes: [idx_agent_workflow_nodes_run_status(workflow_run_id, status, sequence)]
+    columns: {workflow_run_id: 工作流 Run 标识, node_id: 节点标识, sequence: 确定性顺序, role_id: 固定角色标识, dependencies_json: 显式依赖节点, allowed_tools_json: 编译后工具白名单, max_steps: 节点步骤预算, max_tool_calls: 节点工具预算, timeout_seconds: 节点超时, status: 节点状态, attempt: 已尝试次数, child_agent_run_id: 当前子 Agent Run, used_tool_calls: 已用工具成本, result_summary_json: 脱敏 Artifact 引用摘要, error_code: 稳定错误码, error_summary: 脱敏错误摘要, started_at: 开始时间, completed_at: 完成时间, created_at: 创建时间, updated_at: 更新时间, schema_version: 结构版本}
+  agent_workflow_events:
+    description: 工作流与节点状态变化的追加式事件流，用于观测、回放、幂等控制和恢复审计
+    primary_key: event_id
+    foreign_keys: {workflow_run_id: agent_workflow_runs.workflow_run_id ON DELETE CASCADE}
+    constraints: 同一 Run 的 sequence 唯一且单调递增；workflow_run_id/idempotency_key 联合唯一
+    columns: {event_id: 事件标识, workflow_run_id: 工作流 Run 标识, sequence: 事件序号, event_type: 事件类型, node_id: 可选节点标识, attributes_json: 脱敏属性, idempotency_key: 控制操作幂等键, created_at: 创建时间, schema_version: 结构版本}
 postgres_type_mapping:
   TEXT: text
   TEXT_identifier: text

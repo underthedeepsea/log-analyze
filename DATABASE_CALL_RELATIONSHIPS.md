@@ -77,9 +77,9 @@ PostgreSQL 模式下，所有结构化运行时业务状态统一写入 PostgreS
 
 原始日志、API Key、Token、密码和含密 DSN 不得进入业务表、AI Trace、Observation 或 Replay。
 
-## 85 张表与代码映射
+## 89 张表与代码映射
 
-当前逻辑结构共 85 张表：84 张由版本化 migration 创建，`schema_migrations` 由数据库适配层创建。
+当前逻辑结构共 89 张表：88 张由版本化 migration 创建，`schema_migrations` 由数据库适配层创建。
 
 ### 管理与迁移（3）
 
@@ -125,6 +125,17 @@ PostgreSQL 模式下，所有结构化运行时业务状态统一写入 PostgreS
 | `agent_run_events` | Run 状态与控制动作的追加式审计事件 | `src/logrisk/agentic/repository.py` |
 
 调用链为 `Dashboard/Django → AgentService → AgentRuntime → ToolRegistry`，其中生产 Airflow Worker 直接从 `AgentService` 恢复锁定快照；`AgentRepository` 将五类记录统一写入当前 SQLite/PostgreSQL Provider。五张表只保存配置快照、脱敏摘要、稳定引用和追加式事件，不保存原始日志、模型思考过程或凭据。
+
+### 固定角色 Agent DAG（4）
+
+| 表 | 用途 | 主要代码 |
+|---|---|---|
+| `agent_workflows` | 编译后的固定角色 DAG、依赖、预算与重试策略 | `src/logrisk/agentic/compiler.py`、`src/logrisk/agentic/workflow_repository.py` |
+| `agent_workflow_runs` | 锁定实体、Profile、Prompt、全局预算、身份与脱敏 Evidence 摘要 | `src/logrisk/agentic/workflow_service.py`、`src/logrisk/agentic/workflow_repository.py` |
+| `agent_workflow_nodes` | 节点 Checkpoint、依赖、尝试次数、子 Agent Run 与 Artifact 引用 | `src/logrisk/agentic/workflow_scheduler.py`、`src/logrisk/agentic/workflow_worker.py` |
+| `agent_workflow_events` | 工作流/节点状态、幂等控制、恢复和只读回放事件 | `src/logrisk/agentic/workflow_repository.py` |
+
+调用链为 `Dashboard/Django → WorkflowService → WorkflowScheduler → WorkflowWorker → AgentService`。独立节点可在同一依赖层并行执行；生产环境的 `logrisk_agent_workflow` Airflow DAG 只传 `workflow_run_id` 与 `request_id`，Worker 从当前数据库恢复锁定快照。DAG 只能使用三个内置固定角色，不允许动态 Agent、递归工作流或运行时工具注入；最终 Candidate 仍经过 Evaluator 和人工审批。
 
 ### 规则治理（5）
 

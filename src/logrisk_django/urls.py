@@ -4,6 +4,7 @@ from django.urls import path
 
 from logrisk_django.views.api import core_read
 from logrisk_django.views.agentic import agent_run_action, agent_run_detail, agent_runs, create_agent_run
+from logrisk_django.views.agent_workflows import workflow_detail, workflow_node_retry, workflow_run_action, workflow_run_detail, workflow_runs, workflows
 from logrisk_django.views.benchmark import cancel_run, compare, evaluate_gate, runs, suites
 from logrisk_django.views.drain import annotation_review, annotations, configs, datasets, eval_runs, tune_runs
 from logrisk_django.views.dictionary import dictionary_action, dictionary_candidate, dictionary_collection, dictionary_detail, dictionary_test
@@ -58,6 +59,14 @@ from logrisk_django.views.uploads import (
 
 app_name = "logrisk_django"
 urlpatterns = [
+    path("api/agent-workflows", workflows),
+    path("api/agent-workflows/<str:workflow_id>", workflow_detail),
+    path("api/agent-workflows/<str:workflow_id>/runs", workflow_detail, {"view": "runs"}),
+    path("api/agent-workflow-runs", workflow_runs),
+    path("api/agent-workflow-runs/<str:run_id>/actions/<str:action>", workflow_run_action),
+    path("api/agent-workflow-runs/<str:run_id>/nodes/<str:node_id>/retry", workflow_node_retry),
+    path("api/agent-workflow-runs/<str:run_id>/<str:view>", workflow_run_detail),
+    path("api/agent-workflow-runs/<str:run_id>", workflow_run_detail),
     path("api/agent-runs", agent_runs, name="agent-runs-list"),
     path("api/agent-runs/<str:run_id>", agent_run_detail),
     path("api/agent-runs/<str:run_id>/<str:view>", agent_run_detail),

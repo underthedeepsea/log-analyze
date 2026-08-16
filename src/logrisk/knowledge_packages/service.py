@@ -21,7 +21,7 @@ MAX_PACKAGE_BYTES = 100 * 1024 * 1024
 
 
 class KnowledgePackageService:
-    def __init__(self, database: Database, artifact_store: SharedArtifactStore, *, app_version: str = "1.33.0", adapters: KnowledgeAssetAdapterRegistry | None = None) -> None:
+    def __init__(self, database: Database, artifact_store: SharedArtifactStore, *, app_version: str = "1.34.0", adapters: KnowledgeAssetAdapterRegistry | None = None) -> None:
         self.database = database
         self.artifact_store = artifact_store
         self.repository = KnowledgePackageRepository(database)

@@ -6,6 +6,23 @@
 - 仅修复 Bug 时提升最后一位，例如 `1.2.0 → 1.2.1`；
 - 每次代码更新必须同步更新本文件。
 
+## 1.34.0 - 2026-08-13
+
+### Added
+
+- 新增固定角色 Multi-Agent DAG：证据专家与规则专家可按显式依赖并行执行，特征专家在依赖完成后生成经过确定性 Evaluator 的待审批 Candidate。
+- 新增 DAG Compiler、Scheduler、Worker、Retry、全局 ToolCall 预算、超时、取消、幂等、Checkpoint 恢复和只读 Replay；禁止环、未知角色、客户端工具注入、动态 Agent 与递归工作流。
+- 新增 SQLite/PostgreSQL 对等 `0017` migration 与 4 张工作流表，持久化工作流定义、Run、节点 Checkpoint 和追加式事件。
+- 新增 Dashboard、Django PACAS/RBAC 与 Airflow `logrisk_agent_workflow` 接口；生产调度仅传稳定的工作流 Run/请求 ID，分派失败会持久化为可审计失败状态。
+- 新增“AI 工程 → 工作流编排”页面，可组合固定角色、编辑依赖和预算，并查看 DAG 状态、节点日志、事件、Artifact、人工 Gate、暂停、取消与节点重试。
+- 工作流 Run 现在会锁定提交时的模型 Profile、连接和 Prompt 哈希，节点重试、恢复与子 Agent 均复用同一运行快照，避免运行期间配置变更造成漂移。
+- 创建工作流 Run 时强制校验快照一致性、连接可用性和凭据配置；恢复中断节点会清理旧子 Run 引用，避免使用失效配置或重复挂接执行记录。
+
+### Security
+
+- 工作流默认关闭，只接受聚合脱敏 Evidence；递归拒绝原始日志、样本、凭据、Token、DSN、鉴权头和 Cookie。
+- Agent 工作流不能批准、导出、发布规则、执行 RCA/修复或绕过人工审批；不提供任意网络、Shell、文件或数据库工具，也不自动切换模型 Provider。
+
 ## 1.33.0 - 2026-08-12
 
 ### Added

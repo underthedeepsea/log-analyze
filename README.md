@@ -4,7 +4,7 @@
   <img src="frontend/logo/logrisk-app-icon-orange-v2.png" width="112" alt="LOGRISK 应用图标" />
 </p>
 
-当前版本：`1.33.0`。完整变更记录见 [`releas.md`](releas.md)。
+当前版本：`1.34.0`。完整变更记录见 [`releas.md`](releas.md)。
 
 LOGRISK 在本地完成日志规范化、Drain3 模板化、确定性语义增强、风险评分、规则复用、模型特征识别和人工审批。系统只生成可审查、可导出的日志特征，不执行根因分析（RCA），也不会把原始日志直接发送给模型。
 
@@ -291,6 +291,21 @@ curl -X POST http://127.0.0.1:8080/api/agent-runs/<run_id>/pause \
   -d '{"idempotency_key":"pause-001"}'
 curl -X POST http://127.0.0.1:8080/api/agent-runs/<run_id>/replay -d '{}'
 ```
+
+### 固定角色工作流编排
+
+M21 工作流在受控 Agent 之上增加显式 DAG、依赖层并行、节点重试、全局 ToolCall 预算、取消、幂等、Checkpoint 恢复和只读回放。它只允许证据专家、规则专家和特征专家三个内置角色；用户可组合角色并编辑无环依赖，但不能动态创建 Agent、注入工具或改写运行中的 DAG。所有输出仍是待审批 Candidate，不会直接修改批准规则。
+
+该能力默认关闭。本地同时启用单 Agent 与工作流：
+
+```bash
+LOGRISK_AGENTIC_ENABLED=1 LOGRISK_AGENT_WORKFLOWS_ENABLED=1 \
+  bash scripts/run_dashboard.sh
+```
+
+页面入口为“AI 工程 → 工作流编排”。主要接口为 `GET/POST /api/agent-workflows`、`POST /api/agent-workflows/<workflow_id>/runs`、`GET /api/agent-workflow-runs/<run_id>`、`GET /events|artifacts|replay`，以及 `POST /actions/pause|resume|cancel|retry` 和 `POST /nodes/<node_id>/retry`。除只读查询和回放外，写操作必须携带幂等键。
+
+Django 配置需同时设置 `agentic_enabled: True`、`agent_workflows_enabled: True` 和 `airflow_agent_workflow_dag_id: "logrisk_agent_workflow"`。生产 Airflow DAG conf 只包含 `workflow_run_id` 与 `request_id`；DAG 在 Celery Worker 中从 LOGRISK 独立数据库恢复状态，不携带 Evidence、Prompt、原始日志或模型内容。
 
 ## 发布就绪检查
 

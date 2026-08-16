@@ -5,6 +5,16 @@ trace:
 defaults:
   feature_extract: feature_extract_v3_compact_strict_json_en
   agent_plan: agent_plan_v1
+agent_workflows:
+  enabled: false
+  allowed_roles: [evidence_specialist, rule_specialist, feature_specialist]
+  max_nodes: 8
+  max_concurrency: 4
+  max_tool_calls: 40
+  timeout_seconds: 900
+  max_attempts: 3
+  network_access: false
+  approval_policy: human_required
 prompts:
   - prompt_id: agent_plan_v1
     display_name: Agent 顺序规划 v1

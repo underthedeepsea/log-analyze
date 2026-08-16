@@ -13,7 +13,7 @@ jobs:
         with:
           python-version: "3.11"
       - run: python -m venv .venv
-      - run: .venv/bin/pip install -r requirements.txt
+      - run: .venv/bin/pip install -r requirements-django.txt
       - run: .venv/bin/python -m pytest -q
       - run: .venv/bin/python -m compileall -q src
       - run: bash -n scripts/*.sh

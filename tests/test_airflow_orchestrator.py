@@ -142,6 +142,23 @@ def test_airflow_agent_trigger_sends_only_stable_agent_ids(fake_airflow: FakeAir
     }
 
 
+def test_airflow_agent_workflow_trigger_sends_only_stable_ids(fake_airflow: FakeAirflow) -> None:
+    from logrisk.orchestration.airflow import AirflowOrchestrator
+
+    fake_airflow.response = {
+        "dag_run_id": "logrisk_workflow__workflow-1",
+        "state": "queued",
+        "conf": {"workflow_run_id": "workflow-1", "request_id": "request-1"},
+    }
+    result = AirflowOrchestrator(fake_airflow.url, "logrisk_agent_workflow").trigger_agent_workflow("workflow-1", "request-1")
+
+    assert result.workflow_run_id == "workflow-1"
+    assert fake_airflow.last_json == {
+        "dag_run_id": "logrisk_workflow__workflow-1",
+        "conf": {"workflow_run_id": "workflow-1", "request_id": "request-1"},
+    }
+
+
 @pytest.mark.parametrize(
     ("status", "code"),
     [(401, "airflow_auth_failed"), (403, "airflow_access_denied"), (404, "airflow_dag_not_found")],

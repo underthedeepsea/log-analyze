@@ -3,6 +3,7 @@
 from logrisk.airflow_tasks import (
     drain_partition,
     execute_agent_run,
+    execute_agent_workflow,
     extract_feature_batch,
     finalize_job,
     list_drain_partitions,
@@ -16,7 +17,7 @@ from logrisk.airflow_tasks import (
 )
 
 __all__ = [
-    "drain_partition", "execute_agent_run", "extract_feature_batch", "finalize_job", "list_drain_partitions",
+    "drain_partition", "execute_agent_run", "execute_agent_workflow", "extract_feature_batch", "finalize_job", "list_drain_partitions",
     "list_feature_batches", "merge_templates", "prepare_job", "preprocess_input", "preprocess_uploaded_input",
     "score_and_reuse", "validate_candidates",
 ]

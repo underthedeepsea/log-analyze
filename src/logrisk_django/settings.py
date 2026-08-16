@@ -25,12 +25,14 @@ _ALLOWED = {
     "airflow_dag_id",
     "airflow_input_dag_id",
     "airflow_agent_dag_id",
+    "airflow_agent_workflow_dag_id",
     "airflow_timeout_seconds",
     "airflow_authorization_env",
     "identity_resolver",
     "write_roles",
     "runtime_config_path",
     "agentic_enabled",
+    "agent_workflows_enabled",
 }
 
 
@@ -47,11 +49,13 @@ class LogriskConfig:
     airflow_dag_id: str
     airflow_input_dag_id: str
     airflow_agent_dag_id: str
+    airflow_agent_workflow_dag_id: str
     airflow_timeout_seconds: float
     airflow_authorization_env: str | None
     identity_resolver: str
     write_roles: tuple[str, ...]
     agentic_enabled: bool = False
+    agent_workflows_enabled: bool = False
     runtime_config_path: Path | None = None
 
     @classmethod
@@ -84,6 +88,9 @@ class LogriskConfig:
         airflow_agent_dag_id = _identifier(
             raw.get("airflow_agent_dag_id") or "logrisk_agent_run", "airflow_agent_dag_id"
         )
+        airflow_agent_workflow_dag_id = _identifier(
+            raw.get("airflow_agent_workflow_dag_id") or "logrisk_agent_workflow", "airflow_agent_workflow_dag_id"
+        )
         timeout = raw.get("airflow_timeout_seconds", 10)
         if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not 0 < float(timeout) <= 300:
             raise LogriskSettingsError("airflow_timeout_seconds 必须是 0 到 300 的数字")
@@ -95,6 +102,9 @@ class LogriskConfig:
             raise LogriskSettingsError("identity_resolver 必须是 dotted import path")
         write_roles = _string_tuple(raw.get("write_roles") or [], "write_roles")
         agentic_enabled = bool(raw.get("agentic_enabled", False))
+        agent_workflows_enabled = bool(raw.get("agent_workflows_enabled", False))
+        if agent_workflows_enabled and not agentic_enabled:
+            raise LogriskSettingsError("agent_workflows_enabled 需要同时启用 agentic_enabled")
         runtime_config_path = _path(raw["runtime_config_path"], "runtime_config_path") if raw.get("runtime_config_path") else None
         return cls(
             project_root=project_root,
@@ -108,11 +118,13 @@ class LogriskConfig:
             airflow_dag_id=airflow_dag_id,
             airflow_input_dag_id=airflow_input_dag_id,
             airflow_agent_dag_id=airflow_agent_dag_id,
+            airflow_agent_workflow_dag_id=airflow_agent_workflow_dag_id,
             airflow_timeout_seconds=float(timeout),
             airflow_authorization_env=authorization_env,
             identity_resolver=identity_resolver,
             write_roles=write_roles,
             agentic_enabled=agentic_enabled,
+            agent_workflows_enabled=agent_workflows_enabled,
             runtime_config_path=runtime_config_path,
         )
 
@@ -135,6 +147,7 @@ class LogriskConfig:
             interrupt_feature_jobs=False,
             migrate_database=False,
             agentic_enabled=self.agentic_enabled,
+            agent_workflows_enabled=self.agent_workflows_enabled,
         )
 
     def public_dict(self) -> dict[str, Any]:
@@ -146,11 +159,13 @@ class LogriskConfig:
             "airflow_dag_id": self.airflow_dag_id,
             "airflow_input_dag_id": self.airflow_input_dag_id,
             "airflow_agent_dag_id": self.airflow_agent_dag_id,
+            "airflow_agent_workflow_dag_id": self.airflow_agent_workflow_dag_id,
             "airflow_timeout_seconds": self.airflow_timeout_seconds,
             "airflow_authorization_env": self.airflow_authorization_env,
             "identity_resolver": self.identity_resolver,
             "write_roles": list(self.write_roles),
             "agentic_enabled": self.agentic_enabled,
+            "agent_workflows_enabled": self.agent_workflows_enabled,
         }
 
 

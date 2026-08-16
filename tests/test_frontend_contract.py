@@ -164,7 +164,7 @@ def test_m11_quality_and_settings_use_workspace_design_contract():
         "secondary-button",
     ):
         assert text in source
-    assert '!["drainQuality", "benchmarkCenter", "streaming", "runtime", "releaseReadiness", "settings", "rules", "nodeRisks", "multiSource", "semanticLibrary", "agentRuns"].includes(view)' in source
+    assert '!["drainQuality", "benchmarkCenter", "streaming", "runtime", "releaseReadiness", "settings", "rules", "nodeRisks", "multiSource", "semanticLibrary", "agentRuns", "agentWorkflows"].includes(view)' in source
     assert "h(CodeBlock, { value: profile.parameters })" not in source
 
 
@@ -550,8 +550,8 @@ def test_release_docs_describe_current_feature_version():
     assert "## 1.30.0 - 2026-07-31" in release
     assert "## 1.31.0 - 2026-08-03" in release
     assert "## 1.32.0 - 2026-08-10" in release
-    assert "## 1.33.0 - 2026-08-12" in release
-    assert "当前版本：`1.33.0`" in readme
+    assert "## 1.34.0 - 2026-08-13" in release
+    assert "当前版本：`1.34.0`" in readme
     assert "## 1.24.0 - 2026-07-22" in release
     assert "## 1.24.1 - 2026-07-22" in release
     assert "## 1.24.2 - 2026-07-22" in release

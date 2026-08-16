@@ -93,7 +93,7 @@ from pipeline.manual_import_pipeline import analyze_records
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 MAX_LARGE_UPLOAD_BYTES = 500 * 1024 * 1024
 DEFAULT_MODEL = "qwen3:1.7b"
-APP_VERSION = "1.33.0"
+APP_VERSION = "1.34.0"
 
 
 class DashboardHTTPServer(ThreadingHTTPServer):
@@ -120,6 +120,7 @@ def build_server(
     runtime_config: RuntimeConfig | None = None,
     runtime_config_path: str | Path | None = None,
     agentic_enabled: bool = False,
+    agent_workflows_enabled: bool = False,
 ) -> DashboardHTTPServer:
     """Create the local development HTTP shell around shared application services."""
     root = Path(__file__).resolve().parents[2]
@@ -144,6 +145,7 @@ def build_server(
             import_legacy_state=True,
             interrupt_streaming_tasks=True,
             agentic_enabled=agentic_enabled,
+            agent_workflows_enabled=agent_workflows_enabled,
         ),
         manager=manager,
         input_analyzer=input_analyzer,
@@ -174,12 +176,18 @@ def build_server(
     server.knowledge_packages = container.knowledge_packages  # type: ignore[attr-defined]
     server.agent_runs = container.agent_runs  # type: ignore[attr-defined]
     server.agentic_enabled = bool(container.agent_runs)  # type: ignore[attr-defined]
+    server.agent_workflows = container.agent_workflows  # type: ignore[attr-defined]
+    server.agent_workflows_enabled = bool(container.agent_workflows)  # type: ignore[attr-defined]
     server.streaming_state = container.streaming_state  # type: ignore[attr-defined]
     server.drain_quality = container.drain_quality  # type: ignore[attr-defined]
     server.semantic_dictionaries = container.semantic_dictionaries  # type: ignore[attr-defined]
     if container.agent_runs is not None:
         container.recover_agent_runs(
             lambda run_id: threading.Thread(target=container.agent_runs.execute_run, args=(run_id,), daemon=True).start()
+        )
+    if container.agent_workflows is not None:
+        container.recover_agent_workflows(
+            lambda run_id: threading.Thread(target=container.agent_workflows.execute_run, args=(run_id,), daemon=True).start()
         )
     server.risk_semantics = container.risk_semantics  # type: ignore[attr-defined]
     server.node_risks = container.node_risks  # type: ignore[attr-defined]
@@ -334,7 +342,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if path == "/help":
                 self._serve_help()
                 return
-            if path in {"/", "/prompts", "/ai-traces", "/ai-observability", "/model-profiles", "/drain-quality", "/benchmark-center", "/rules", "/settings", "/runtime", "/release-readiness", "/node-risks", "/semantic-library", "/multi-source", "/knowledge-packages", "/agent-runs"} or path.startswith("/node-risks/"):
+            if path in {"/", "/prompts", "/ai-traces", "/ai-observability", "/model-profiles", "/drain-quality", "/benchmark-center", "/rules", "/settings", "/runtime", "/release-readiness", "/node-risks", "/semantic-library", "/multi-source", "/knowledge-packages", "/agent-runs", "/agent-workflows"} or path.startswith("/node-risks/"):
                 self._serve_frontend()
                 return
             if path == "/config.js":
@@ -366,6 +374,36 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 if not self.server.agentic_enabled:  # type: ignore[attr-defined]
                     raise AgenticError("Agent 功能未启用", code="agentic_disabled", status_code=404)
                 self._json(HTTPStatus.OK, {"items": self.server.agent_runs.list_runs()})  # type: ignore[attr-defined]
+                return
+            if path == "/api/agent-workflows":
+                if not self.server.agent_workflows_enabled:  # type: ignore[attr-defined]
+                    raise AgenticError("Agent 工作流功能未启用", code="agent_workflows_disabled", status_code=404)
+                self._json(HTTPStatus.OK, {"items": self.server.agent_workflows.list_workflows()})  # type: ignore[attr-defined]
+                return
+            match = re.fullmatch(r"/api/agent-workflows/([A-Za-z0-9]+)/runs", path)
+            if match:
+                if not self.server.agent_workflows_enabled:  # type: ignore[attr-defined]
+                    raise AgenticError("Agent 工作流功能未启用", code="agent_workflows_disabled", status_code=404)
+                self._json(HTTPStatus.OK, {"items": self.server.agent_workflows.list_runs(workflow_id=match.group(1))})  # type: ignore[attr-defined]
+                return
+            match = re.fullmatch(r"/api/agent-workflows/([A-Za-z0-9]+)", path)
+            if match:
+                if not self.server.agent_workflows_enabled:  # type: ignore[attr-defined]
+                    raise AgenticError("Agent 工作流功能未启用", code="agent_workflows_disabled", status_code=404)
+                self._json(HTTPStatus.OK, self.server.agent_workflows.get_workflow(match.group(1)))  # type: ignore[attr-defined]
+                return
+            if path == "/api/agent-workflow-runs":
+                if not self.server.agent_workflows_enabled:  # type: ignore[attr-defined]
+                    raise AgenticError("Agent 工作流功能未启用", code="agent_workflows_disabled", status_code=404)
+                self._json(HTTPStatus.OK, {"items": self.server.agent_workflows.list_runs()})  # type: ignore[attr-defined]
+                return
+            match = re.fullmatch(r"/api/agent-workflow-runs/([A-Za-z0-9]+)(?:/(events|artifacts|replay))?", path)
+            if match:
+                if not self.server.agent_workflows_enabled:  # type: ignore[attr-defined]
+                    raise AgenticError("Agent 工作流功能未启用", code="agent_workflows_disabled", status_code=404)
+                run = self.server.agent_workflows.replay(match.group(1)) if match.group(2) == "replay" else self.server.agent_workflows.get_run(match.group(1))  # type: ignore[attr-defined]
+                body = run.get(match.group(2), []) if match.group(2) in {"events", "artifacts"} else run
+                self._json(HTTPStatus.OK, {"items": body} if isinstance(body, list) else body)
                 return
             match = re.fullmatch(r"/api/agent-runs/([A-Za-z0-9]+)(?:/(events|artifacts|replay))?", path)
             if match:
@@ -843,6 +881,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         path, _ = self._route_parts()
         try:
+            workflow_replay = re.fullmatch(r"/api/agent-workflow-runs/([A-Za-z0-9]+)/(?:actions/)?replay", path)
+            if workflow_replay:
+                if not self.server.agent_workflows_enabled:  # type: ignore[attr-defined]
+                    raise AgenticError("Agent 工作流功能未启用", code="agent_workflows_disabled", status_code=404)
+                self._json(HTTPStatus.OK, self.server.agent_workflows.replay(workflow_replay.group(1)))  # type: ignore[attr-defined]
+                return
             replay_match = re.fullmatch(r"/api/agent-runs/([A-Za-z0-9]+)/(?:actions/)?replay", path)
             if replay_match:
                 if not self.server.agentic_enabled:  # type: ignore[attr-defined]
@@ -863,6 +907,57 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._json(HTTPStatus.CREATED, upload)
                 return
             payload = self._read_json()
+            if path == "/api/agent-workflows":
+                if not self.server.agent_workflows_enabled:  # type: ignore[attr-defined]
+                    raise AgenticError("Agent 工作流功能未启用", code="agent_workflows_disabled", status_code=404)
+                key = str(self.headers.get("Idempotency-Key") or payload.pop("idempotency_key", "") or "")
+                result = self.server.agent_workflows.create_workflow(payload, actor=str(identity.actor or "unknown"), idempotency_key=key)  # type: ignore[attr-defined]
+                self._json(HTTPStatus.CREATED, result)
+                return
+            workflow_run_match = re.fullmatch(r"/api/agent-workflows/([A-Za-z0-9]+)/runs", path)
+            if workflow_run_match:
+                if not self.server.agent_workflows_enabled:  # type: ignore[attr-defined]
+                    raise AgenticError("Agent 工作流功能未启用", code="agent_workflows_disabled", status_code=404)
+                job_id, entity_id = str(payload.get("source_job_id") or ""), str(payload.get("entity_id") or "")
+                evidence = self.server.manager.get_agent_evidence(job_id, entity_id)  # type: ignore[attr-defined]
+                profile = self.server.model_profiles.get(payload.get("model_profile_id"))  # type: ignore[attr-defined]
+                connection = self.server.connections.get(profile.connection_id)  # type: ignore[attr-defined]
+                prompt = self.server.prompt_registry.load(str(payload.get("prompt_id") or "agent_plan_v1"))  # type: ignore[attr-defined]
+                result = self.server.agent_workflows.create_run(  # type: ignore[attr-defined]
+                    workflow_run_match.group(1), source_job_id=job_id, entity_id=entity_id,
+                    entity_type=str(evidence["entity"].get("type") or ""), model_profile_id=profile.profile_id,
+                    prompt_id=prompt.prompt_id, actor=str(identity.actor or "unknown"), roles=tuple(identity.roles),
+                    request_id=identity.request_id, idempotency_key=str(self.headers.get("Idempotency-Key") or payload.get("idempotency_key") or ""),
+                    evidence_summary={"entity": evidence["entity"], "risk_score": evidence["risk_score"], "template_count": len(evidence["templates"])},
+                    runtime_snapshot={"profile_snapshot": profile.public_dict(), "connection_snapshot": connection,
+                                      "prompt_id": prompt.prompt_id, "prompt_sha256": prompt.sha256},
+                )
+                if not result.get("idempotent_replay"):
+                    threading.Thread(target=self.server.agent_workflows.execute_run, args=(result["workflow_run_id"],), daemon=True).start()  # type: ignore[attr-defined]
+                self._json(HTTPStatus.ACCEPTED, result)
+                return
+            workflow_action = re.fullmatch(r"/api/agent-workflow-runs/([A-Za-z0-9]+)/(?:actions/)?(pause|resume|cancel|retry)", path)
+            if workflow_action:
+                if not self.server.agent_workflows_enabled:  # type: ignore[attr-defined]
+                    raise AgenticError("Agent 工作流功能未启用", code="agent_workflows_disabled", status_code=404)
+                service = self.server.agent_workflows  # type: ignore[attr-defined]
+                key = str(self.headers.get("Idempotency-Key") or payload.get("idempotency_key") or "")
+                action = workflow_action.group(2)
+                result = service.retry(workflow_action.group(1), idempotency_key=key, request_id=identity.request_id) if action == "retry" else getattr(service, action)(workflow_action.group(1), idempotency_key=key)
+                if action in {"resume", "retry"} and not result.get("idempotent_replay"):
+                    threading.Thread(target=service.execute_run, args=(result["workflow_run_id"],), daemon=True).start()
+                self._json(HTTPStatus.OK, result)
+                return
+            workflow_node_retry = re.fullmatch(r"/api/agent-workflow-runs/([A-Za-z0-9]+)/nodes/([a-z0-9-]+)/retry", path)
+            if workflow_node_retry:
+                if not self.server.agent_workflows_enabled:  # type: ignore[attr-defined]
+                    raise AgenticError("Agent 工作流功能未启用", code="agent_workflows_disabled", status_code=404)
+                service = self.server.agent_workflows  # type: ignore[attr-defined]
+                result = service.retry_node(workflow_node_retry.group(1), workflow_node_retry.group(2), idempotency_key=str(self.headers.get("Idempotency-Key") or payload.get("idempotency_key") or ""))
+                if not result.get("idempotent_replay"):
+                    threading.Thread(target=service.execute_run, args=(result["workflow_run_id"],), daemon=True).start()
+                self._json(HTTPStatus.OK, result)
+                return
             if path == "/api/agent-runs":
                 if not self.server.agentic_enabled:  # type: ignore[attr-defined]
                     raise AgenticError("Agent 功能未启用", code="agentic_disabled", status_code=404)
@@ -2082,6 +2177,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--database-url", default=None, help="PostgreSQL DSN；优先于 LOGRISK_DATABASE_URL，禁止写入配置文件")
     parser.add_argument("--cors-origins", default=os.getenv("DASHBOARD_CORS_ORIGINS", ""), help="逗号分隔的允许跨域来源")
     parser.add_argument("--enable-agentic", action="store_true", default=os.getenv("LOGRISK_AGENTIC_ENABLED", "0").lower() in {"1", "true", "yes"})
+    parser.add_argument("--enable-agent-workflows", action="store_true", default=os.getenv("LOGRISK_AGENT_WORKFLOWS_ENABLED", "0").lower() in {"1", "true", "yes"})
     return parser.parse_args(argv)
 
 
@@ -2098,6 +2194,7 @@ def main() -> None:
         database_provider=args.database_provider,
         database_url=args.database_url,
         agentic_enabled=args.enable_agentic,
+        agent_workflows_enabled=args.enable_agent_workflows,
     )
     print(f"Feature review dashboard: http://{args.host}:{args.port}")
     try:

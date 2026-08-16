@@ -61,3 +61,11 @@ def test_agent_dag_is_lazy_and_passes_only_run_identifier() -> None:
     assert '"agent_run_id"' in source
     for forbidden in ("raw_log", "raw_sample", "samples", "api_key", "Authorization"):
         assert forbidden not in source
+
+
+def test_agent_workflow_dag_only_passes_stable_ids() -> None:
+    source = Path("integrations/airflow/dags/logrisk_agent_workflow.py").read_text(encoding="utf-8")
+    assert 'dag_id="logrisk_agent_workflow"' in source
+    assert "workflow_run_id" in source and "request_id" in source
+    for forbidden in ("raw_sample", "samples", "input_evidence", "prompt_content", "api_key"):
+        assert forbidden not in source

@@ -12,7 +12,10 @@ from typing import Any, Callable
 import yaml
 
 from logrisk.ai_eval.runner import load_cases
-from logrisk.agentic import AgentRepository, AgentRuntime, AgentService, ModelAgentPlanner
+from logrisk.agentic import (
+    AgentRepository, AgentRuntime, AgentService, ModelAgentPlanner, WorkflowLimits,
+    WorkflowRepository, WorkflowScheduler, WorkflowService, WorkflowWorker, build_role_registry,
+)
 from logrisk.agentic.tools import build_agent_tool_registry
 from logrisk.ai_harness.connections import ConnectionStore
 from logrisk.ai_harness.evaluator import evaluate_feature_output
@@ -91,6 +94,7 @@ class ApplicationConfig:
     interrupt_feature_jobs: bool = True
     migrate_database: bool = True
     agentic_enabled: bool = False
+    agent_workflows_enabled: bool = False
 
     @classmethod
     def for_test(cls, *, project_root: str | Path, state_root: str | Path) -> "ApplicationConfig":
@@ -130,6 +134,7 @@ class ApplicationContainer:
     artifact_store: SharedArtifactStore
     knowledge_packages: KnowledgePackageService
     agent_runs: AgentService | None
+    agent_workflows: WorkflowService | None
     streaming_state: StreamingStateRepository
     drain_quality: Any
     semantic_dictionaries: Any
@@ -148,6 +153,15 @@ class ApplicationContainer:
         if self.agent_runs is None:
             return []
         run_ids = self.agent_runs.recover_active_runs()
+        if submit:
+            for run_id in run_ids:
+                submit(run_id)
+        return run_ids
+
+    def recover_agent_workflows(self, submit: Callable[[str], None] | None = None) -> list[str]:
+        if self.agent_workflows is None:
+            return []
+        run_ids = self.agent_workflows.recover_active_runs()
         if submit:
             for run_id in run_ids:
                 submit(run_id)
@@ -364,7 +378,7 @@ def build_application_container(
     knowledge_packages = KnowledgePackageService(
         database,
         artifact_store,
-        app_version="1.33.0",
+        app_version="1.34.0",
         adapters=build_domain_adapter_registry(
             prompt_registry=prompts,
             drain_quality=drain_quality,
@@ -390,9 +404,19 @@ def build_application_container(
         )
 
     agent_runs = None
+    agent_workflows = None
     if config.agentic_enabled:
         agent_tools = build_agent_tool_registry(feature_jobs, rule_governance, knowledge_packages)
         agent_runs = AgentService(agent_repository, AgentRuntime(agent_repository, agent_planner, agent_tools))
+        if config.agent_workflows_enabled:
+            workflow_settings = _load_agent_workflow_settings(root)
+            workflow_repository = WorkflowRepository(database)
+            workflow_worker = WorkflowWorker(workflow_repository, agent_runs)
+            workflow_scheduler = WorkflowScheduler(workflow_repository, workflow_worker)
+            agent_workflows = WorkflowService(
+                workflow_repository, workflow_scheduler,
+                build_role_registry(workflow_settings["allowed_roles"]), workflow_settings["limits"],
+            )
     upload_store = SQLiteUploadSessionStore(
         UploadConfig(upload_dir=state_root / "uploads", artifact_store=artifact_store), database
     )
@@ -444,6 +468,7 @@ def build_application_container(
         artifact_store=artifact_store,
         knowledge_packages=knowledge_packages,
         agent_runs=agent_runs,
+        agent_workflows=agent_workflows,
         streaming_state=streaming_state,
         drain_quality=drain_quality,
         semantic_dictionaries=semantic_dictionaries,
@@ -567,6 +592,33 @@ def build_application_container(
     container.input_analyzer_accepts_config = input_analyzer is None
     container.run_input_job = run_input_job
     return container
+
+
+def _load_agent_workflow_settings(root: Path) -> dict[str, Any]:
+    """Load bounded M21 limits from the committed seed config when enabled."""
+    path = root / "configs" / "ai_harness.yaml"
+    try:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+        section = raw.get("agent_workflows") or {}
+        if not isinstance(section, dict):
+            raise ValueError("agent_workflows 必须是对象")
+        allowed = section.get("allowed_roles", ["evidence_specialist", "rule_specialist", "feature_specialist"])
+        if not isinstance(allowed, list) or not allowed or any(not isinstance(item, str) for item in allowed) or len(allowed) != len(set(allowed)):
+            raise ValueError("allowed_roles 必须是非空字符串数组")
+        if section.get("network_access", False) is not False or section.get("approval_policy", "human_required") != "human_required":
+            raise ValueError("Agent 工作流必须禁用网络访问并要求人工审批")
+        limits = WorkflowLimits(
+            max_nodes=int(section.get("max_nodes", 8)),
+            max_concurrency=int(section.get("max_concurrency", 4)),
+            max_tool_calls=int(section.get("max_tool_calls", 40)),
+            max_timeout_seconds=float(section.get("timeout_seconds", 900)),
+            max_attempts=int(section.get("max_attempts", 3)),
+        )
+        if min(limits.max_nodes, limits.max_concurrency, limits.max_tool_calls, limits.max_timeout_seconds, limits.max_attempts) <= 0:
+            raise ValueError("工作流限制必须为正数")
+        return {"allowed_roles": tuple(allowed), "limits": limits}
+    except (OSError, TypeError, ValueError, yaml.YAMLError) as exc:
+        raise RuntimeError("Agent 工作流配置无效；请检查 configs/ai_harness.yaml") from exc
 
 
 def _load_runtime_config(config: ApplicationConfig, root: Path) -> RuntimeConfig:

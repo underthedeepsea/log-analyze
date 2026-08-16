@@ -94,7 +94,7 @@
         <a href="#quick-start">01 · 快速开始</a>
         <a href="#analysis">02 · 日志分析与队列</a>
         <a href="#review-export">03 · 人工审批与导出</a>
-        <a href="#ai-engineering">04 · Prompt、模型与 AI Trace</a>
+        <a href="#ai-engineering">04 · Prompt、模型、Agent 与 AI Trace</a>
         <a href="#governance">05 · 规则、节点与风险语义</a>
         <a href="#multi-source">06 · 多来源关联规则</a>
         <a href="#drain-evaluation">07 · Drain3 与评测</a>
@@ -151,6 +151,7 @@
         <figure><img src="manual-assets/04-models.png" alt="LOGRISK 模型画像中的 API 连接、模型 Profile 和上下文预算配置"><figcaption>模型画像：连接与 Profile 分离。截图中只展示环境变量名字段，不展示密钥值。</figcaption></figure>
         <h3>如何使用 AI 调用追踪</h3>
         <p>“AI 调用追踪”按任务、Trace ID、状态和 Prompt 过滤。打开一条 Trace 可核对脱敏 Evidence、发送 Prompt、模型原始输出、解析结果和字段校验错误；它用于判断模型输出是否满足结构化约束，不用于保留原始日志。</p>
+        <div class="notice safe"><b>受控 Agent 与工作流：</b>“Agent 运行”用于单个白名单工具计划；“工作流编排”把证据专家、规则专家和特征专家组成显式无环 DAG。可编辑依赖、并发、ToolCall 预算和重试次数，并查看节点日志、事件、暂停、取消、重试与只读回放。两项能力默认关闭，工作流输出仍须通过 Evaluator 和人工审批，不能直接发布规则。</div>
         <figure><img src="manual-assets/05-trace.png" alt="LOGRISK AI 调用追踪页面的过滤与空状态"><figcaption>AI 调用追踪：完成一次识别后可按任务、Trace、状态或 Prompt 查询。Trace 页面应只含脱敏调用元数据。</figcaption></figure>
         <h3>AI 分析观测与安全 Replay</h3>
         <p>“AI 分析观测”按 Observation、Span 和阶段展示输入准备、Drain3、规则复用、Evidence、模型、解析、校验、Evaluator、候选和审批链路，并提供延迟、成功率、Token 和可选成本汇总。</p>

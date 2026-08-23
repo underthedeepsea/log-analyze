@@ -37,6 +37,42 @@ def test_sqlite_feature_jobs_round_trip_entities_candidates_and_events(tmp_path)
     assert loaded["events"][0]["type"] == "job_created"
 
 
+def test_sqlite_feature_job_replace_preserves_continuous_learning_feedback(tmp_path):
+    database = SQLiteDatabase(tmp_path / "logrisk.sqlite3")
+    store = SQLiteFeatureJobStore(database)
+    job = {
+        "job_id": "job-feedback",
+        "status": "completed",
+        "model_profile_id": None,
+        "created_at": "2026-07-16T00:00:00+00:00",
+        "completed_at": "2026-07-16T00:01:00+00:00",
+        "entities": [],
+        "features": {"candidate-feedback": {"candidate_id": "candidate-feedback", "status": "pending"}},
+        "events": [],
+    }
+    store.save(job)
+    from logrisk.continuous_learning import ContinuousLearningRepository
+
+    repository = ContinuousLearningRepository(database)
+    repository.append_feedback(
+        candidate_id="candidate-feedback",
+        job_id="job-feedback",
+        outcome="rejected",
+        reason_code="false_positive",
+        note="kept history",
+        actor="reviewer-a",
+        request_id="request-1",
+        idempotency_key="feedback-1",
+    )
+
+    job["features"]["candidate-feedback"]["status"] = "rejected"
+    store.save(job)
+
+    history = repository.list_feedback(candidate_id="candidate-feedback")
+    assert len(history) == 1
+    assert history[0]["outcome"] == "rejected"
+
+
 def test_sqlite_trace_cache_metrics_and_rules_survive_new_store_instances(tmp_path):
     database = SQLiteDatabase(tmp_path / "logrisk.sqlite3")
     traces = SQLiteAITraceLogger(database)

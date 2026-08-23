@@ -29,7 +29,9 @@ _MAX_NOTE_LENGTH = 2000
 
 
 def _db_json(database: Database, value: Any) -> Any:
-    return value if getattr(database, "provider", "sqlite") == "postgres" else canonical_json(value)
+    # psycopg does not adapt bare dict/list values consistently; JSON text is
+    # accepted by both SQLite TEXT and PostgreSQL JSONB assignments.
+    return canonical_json(value)
 
 
 def _decode(value: Any, default: Any) -> Any:

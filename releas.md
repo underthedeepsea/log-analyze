@@ -6,6 +6,17 @@
 - 仅修复 Bug 时提升最后一位，例如 `1.2.0 → 1.2.1`；
 - 每次代码更新必须同步更新本文件。
 
+## 1.35.0 - 2026-08-23
+
+### Added
+
+- 新增 M23 Central Continuous Learning 持久化基础：Candidate 人工反馈追加记录与幂等键、Drain Dataset family/revision/hash/lifecycle 元数据，以及标注和复核的 Dataset 摘要引用。
+- 新增 SQLite/PostgreSQL 对等 `0018` migration、跨 Provider SQL Repository、旧 Dataset 元数据回填和内容摘要锁定；不引入模型 Worker、自动批准或生产资产发布。
+
+### Security
+
+- Candidate 反馈保持追加式历史，禁止通过幂等重试覆盖原决策；Dataset 记录递归拒绝原始日志、样例、凭据、Token、DSN、鉴权头和 Cookie。
+
 ## 1.34.0 - 2026-08-13
 
 ### Added

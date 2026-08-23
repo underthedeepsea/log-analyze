@@ -1,7 +1,7 @@
 CREATE TABLE IF NOT EXISTS feature_candidate_feedback (
     feedback_id TEXT PRIMARY KEY,
-    candidate_id TEXT NOT NULL REFERENCES feature_candidates(candidate_id) ON DELETE CASCADE,
-    job_id TEXT NOT NULL REFERENCES feature_jobs(job_id) ON DELETE CASCADE,
+    candidate_id TEXT NOT NULL REFERENCES feature_candidates(candidate_id) ON DELETE RESTRICT,
+    job_id TEXT NOT NULL REFERENCES feature_jobs(job_id) ON DELETE RESTRICT,
     outcome TEXT NOT NULL CHECK (outcome IN ('approved', 'rejected')),
     reason_code TEXT NOT NULL CHECK (length(reason_code) BETWEEN 1 AND 120),
     note TEXT NOT NULL DEFAULT '' CHECK (length(note) <= 2000),
@@ -44,6 +44,13 @@ SET dataset_family_id = COALESCE(dataset_family_id, dataset_id),
     source_version = COALESCE(source_version, version),
     description = COALESCE(description, ''),
     split = COALESCE(split, 'validation'),
+    record_count = COALESCE(
+        record_count,
+        CASE
+            WHEN jsonb_typeof(dataset_json->'records') = 'array' THEN jsonb_array_length(dataset_json->'records')
+            ELSE 0
+        END
+    ),
     schema_version = COALESCE(schema_version, 'drain_dataset_revision_v1');
 
 CREATE UNIQUE INDEX IF NOT EXISTS uq_drain_datasets_family_revision

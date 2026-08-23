@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
+from contextlib import contextmanager
 
 import pytest
 
@@ -94,6 +96,28 @@ def test_append_feedback_is_idempotent_and_never_overwrites_a_decision(database,
         idempotency_key="key-1",
     )
     assert changed_request == first
+
+
+def test_feedback_foreign_key_blocks_candidate_delete_without_losing_history(database, seeded_candidate):
+    repository = ContinuousLearningRepository(database)
+    repository.append_feedback(
+        candidate_id=seeded_candidate["candidate_id"],
+        job_id=seeded_candidate["job_id"],
+        outcome="rejected",
+        reason_code="false_positive",
+        note="keep this history",
+        actor="reviewer-a",
+        request_id="req-1",
+        idempotency_key="key-1",
+    )
+
+    with pytest.raises(sqlite3.IntegrityError):
+        with database.transaction() as connection:
+            connection.execute(
+                "DELETE FROM feature_candidates WHERE candidate_id=?", (seeded_candidate["candidate_id"],)
+            )
+
+    assert len(repository.list_feedback(candidate_id=seeded_candidate["candidate_id"])) == 1
 
 
 def test_dataset_revision_rejects_forbidden_payload_keys(database):
@@ -226,6 +250,49 @@ def test_dataset_revision_rejects_content_tampering(database):
 
     with pytest.raises(ContinuousLearningError, match="摘要"):
         repository.get_dataset_revision(revision["dataset_id"])
+
+
+def test_dataset_parent_reference_has_a_database_foreign_key(database):
+    with database.connect() as connection:
+        foreign_keys = connection.execute("PRAGMA foreign_key_list(drain_datasets)").fetchall()
+
+    assert any(row[2] == "drain_datasets" and row[3] == "parent_dataset_id" for row in foreign_keys)
+
+
+class _PostgresBehaviorDatabase:
+    provider = "postgres"
+
+    def __init__(self, database):
+        self._database = database
+
+    def connect(self):
+        return self._database.connect()
+
+    @contextmanager
+    def transaction(self):
+        with self._database.transaction() as connection:
+            yield connection
+
+
+def test_dataset_revision_serializes_json_for_postgres_parameter_binding(database):
+    repository = ContinuousLearningRepository(_PostgresBehaviorDatabase(database))
+    revision = repository.create_dataset_revision(
+        family_id="postgres-family",
+        name="Postgres family",
+        description="",
+        split="validation",
+        records=[VALID_GOLD_RECORD],
+        parent_dataset_id=None,
+        actor="reviewer-a",
+        request_id="req-1",
+    )
+
+    with database.connect() as connection:
+        stored = connection.execute(
+            "SELECT dataset_json FROM drain_datasets WHERE dataset_id=?", (revision["dataset_id"],)
+        ).fetchone()[0]
+    assert isinstance(stored, str)
+    assert json.loads(stored)["records"] == [VALID_GOLD_RECORD]
 
 
 def test_dataset_hash_uses_sorted_canonical_json(database):

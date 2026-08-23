@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+import hashlib
+import json
 import os
 import uuid
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
@@ -68,6 +70,7 @@ def test_continuous_learning_migrations_define_the_same_metadata_contract():
         assert "content_sha256" in sql
         assert "lifecycle_status" in sql
         assert "dataset_content_sha256" in sql
+        assert "record_count" in sql
         assert "continuous_learning_feedback_v1" in sql
 
 
@@ -99,7 +102,7 @@ def test_continuous_learning_sqlite_migration_backfills_dataset_family_metadata(
     SQLiteDatabase(database_path, migrations_dir=migrations)
     with database.connect() as connection:
         row = connection.execute(
-            "SELECT dataset_family_id, revision_number, lifecycle_status, schema_version "
+            "SELECT dataset_family_id, revision_number, content_sha256, record_count, lifecycle_status, schema_version "
             "FROM drain_datasets WHERE dataset_id=?",
             ("legacy-dataset",),
         ).fetchone()
@@ -107,6 +110,10 @@ def test_continuous_learning_sqlite_migration_backfills_dataset_family_metadata(
     assert dict(row) == {
         "dataset_family_id": "legacy-dataset",
         "revision_number": 1,
+        "content_sha256": hashlib.sha256(
+            json.dumps([{"record_id": "record-1"}], ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        ).hexdigest(),
+        "record_count": 1,
         "lifecycle_status": "approved",
         "schema_version": "drain_dataset_revision_v1",
     }

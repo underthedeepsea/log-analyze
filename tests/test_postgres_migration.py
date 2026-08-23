@@ -57,6 +57,61 @@ def test_migration_digest_normalizes_json_and_boolean_values_across_providers():
     assert _digest_rows(sqlite_rows) == _digest_rows(postgres_rows)
 
 
+def test_continuous_learning_migrations_define_the_same_metadata_contract():
+    sqlite_sql = Path("database/migrations/0018_continuous_learning.sql").read_text(encoding="utf-8")
+    postgres_sql = Path("database/postgres/migrations/0018_continuous_learning.sql").read_text(encoding="utf-8")
+
+    for sql in (sqlite_sql, postgres_sql):
+        assert "feature_candidate_feedback" in sql
+        assert "dataset_family_id" in sql
+        assert "revision_number" in sql
+        assert "content_sha256" in sql
+        assert "lifecycle_status" in sql
+        assert "dataset_content_sha256" in sql
+        assert "continuous_learning_feedback_v1" in sql
+
+
+def test_continuous_learning_sqlite_migration_backfills_dataset_family_metadata(tmp_path):
+    migrations = tmp_path / "migrations"
+    migrations.mkdir()
+    source = Path("database/migrations/0001_initial.sql")
+    (migrations / source.name).write_text(source.read_text(encoding="utf-8"), encoding="utf-8")
+    database_path = tmp_path / "logrisk.sqlite3"
+    database = SQLiteDatabase(database_path, migrations_dir=migrations)
+    with database.transaction() as connection:
+        connection.execute(
+            "INSERT INTO drain_datasets(dataset_id, name, version, dataset_json, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                "legacy-dataset",
+                "Legacy",
+                "1.0.0",
+                '{"records": [{"record_id": "record-1"}]}',
+                "2026-08-23T00:00:00+00:00",
+                "2026-08-23T00:00:00+00:00",
+            ),
+        )
+
+    migration = Path("database/migrations/0018_continuous_learning.sql")
+    (migrations / migration.name).write_text(migration.read_text(encoding="utf-8"), encoding="utf-8")
+
+    # Re-applying the already installed migration must leave the row intact.
+    SQLiteDatabase(database_path, migrations_dir=migrations)
+    with database.connect() as connection:
+        row = connection.execute(
+            "SELECT dataset_family_id, revision_number, lifecycle_status, schema_version "
+            "FROM drain_datasets WHERE dataset_id=?",
+            ("legacy-dataset",),
+        ).fetchone()
+
+    assert dict(row) == {
+        "dataset_family_id": "legacy-dataset",
+        "revision_number": 1,
+        "lifecycle_status": "approved",
+        "schema_version": "drain_dataset_revision_v1",
+    }
+
+
 @pytest.mark.skipif(not os.getenv("LOGRISK_TEST_POSTGRES_URL"), reason="未设置 LOGRISK_TEST_POSTGRES_URL")
 def test_optional_postgres_integration_migrates_json_and_foreign_keys(tmp_path):
     psycopg = pytest.importorskip("psycopg")

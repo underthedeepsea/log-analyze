@@ -10,7 +10,7 @@
 
 ### Fixed
 
-- 新增 `0019` SQLite/PostgreSQL 迁移，为 Candidate 反馈建立 `(candidate_id, job_id)` 复合唯一引用，阻止并发跨 Job 重挂载产生不一致反馈，同时保留已有反馈历史与幂等重试。
+- 新增 `0019` SQLite/PostgreSQL 迁移，为 Candidate 反馈建立 `(candidate_id, job_id)` 复合唯一引用，阻止并发跨 Job 重挂载产生不一致反馈；SQLite 重建失败会完整回滚并可修复后重试，同时保留已有反馈历史与幂等重试。
 
 ## 1.35.0 - 2026-08-23
 

@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import shutil
+import sqlite3
 import uuid
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
@@ -210,6 +211,88 @@ def test_sqlite_lineage_migration_preserves_legacy_feedback_and_same_job_idempot
         idempotency_key="key-legacy",
     )
     assert repeated["feedback_id"] == "legacy-feedback"
+
+
+def test_sqlite_lineage_migration_rolls_back_failed_copy_and_can_retry(tmp_path):
+    migrations = tmp_path / "migrations"
+    migrations.mkdir()
+    for source in sorted(Path("database/migrations").glob("*.sql")):
+        if source.name.startswith("0019_"):
+            continue
+        shutil.copy(source, migrations / source.name)
+
+    path = tmp_path / "logrisk.sqlite3"
+    database = SQLiteDatabase(path, migrations_dir=migrations)
+    with database.transaction() as connection:
+        connection.execute(
+            "INSERT INTO feature_jobs(job_id, status, job_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+            ("legacy-job-a", "completed", "{}", "2026-08-23T00:00:00+00:00", "2026-08-23T00:00:00+00:00"),
+        )
+        connection.execute(
+            "INSERT INTO feature_jobs(job_id, status, job_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
+            ("legacy-job-b", "completed", "{}", "2026-08-23T00:00:00+00:00", "2026-08-23T00:00:00+00:00"),
+        )
+        connection.execute(
+            "INSERT INTO feature_candidates(candidate_id, job_id, entity_id, status, candidate_json, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                "legacy-candidate-race",
+                "legacy-job-a",
+                "entity-1",
+                "pending",
+                '{"candidate_id":"legacy-candidate-race"}',
+                "2026-08-23T00:00:00+00:00",
+                "2026-08-23T00:00:00+00:00",
+            ),
+        )
+        connection.execute(
+            "INSERT INTO feature_candidate_feedback("
+            "feedback_id, candidate_id, job_id, outcome, reason_code, note, actor, request_id, idempotency_key, created_at, schema_version"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "legacy-feedback-race",
+                "legacy-candidate-race",
+                "legacy-job-b",
+                "rejected",
+                "false_positive",
+                "legacy mismatched row",
+                "reviewer-a",
+                "request-race",
+                "key-race",
+                "2026-08-23T00:00:00+00:00",
+                "continuous_learning_feedback_v1",
+            ),
+        )
+
+    shutil.copy("database/migrations/0019_candidate_feedback_lineage.sql", migrations / "0019_candidate_feedback_lineage.sql")
+    with pytest.raises(sqlite3.IntegrityError):
+        SQLiteDatabase(path, migrations_dir=migrations)
+
+    with sqlite3.connect(path) as connection:
+        tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        feedback = connection.execute(
+            "SELECT feedback_id, candidate_id, job_id FROM feature_candidate_feedback"
+        ).fetchone()
+        applied = {row[0] for row in connection.execute("SELECT version FROM schema_migrations")}
+    assert "feature_candidate_feedback" in tables
+    assert "feature_candidate_feedback_legacy" not in tables
+    assert feedback == ("legacy-feedback-race", "legacy-candidate-race", "legacy-job-b")
+    assert "0019" not in applied
+
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "UPDATE feature_candidate_feedback SET job_id=? WHERE feedback_id=?",
+            ("legacy-job-a", "legacy-feedback-race"),
+        )
+
+    upgraded = SQLiteDatabase(path, migrations_dir=migrations)
+    with upgraded.connect() as connection:
+        feedback = connection.execute(
+            "SELECT feedback_id, candidate_id, job_id FROM feature_candidate_feedback"
+        ).fetchone()
+        applied = {row[0] for row in connection.execute("SELECT version FROM schema_migrations")}
+    assert tuple(feedback) == ("legacy-feedback-race", "legacy-candidate-race", "legacy-job-a")
+    assert "0019" in applied
 
 
 @pytest.mark.skipif(not os.getenv("LOGRISK_TEST_POSTGRES_URL"), reason="未设置 LOGRISK_TEST_POSTGRES_URL")

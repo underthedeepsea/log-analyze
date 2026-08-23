@@ -1,3 +1,5 @@
+BEGIN IMMEDIATE;
+
 CREATE UNIQUE INDEX IF NOT EXISTS uq_feature_candidates_candidate_job
     ON feature_candidates(candidate_id, job_id);
 
@@ -37,3 +39,5 @@ CREATE INDEX IF NOT EXISTS idx_feature_candidate_feedback_candidate_time
     ON feature_candidate_feedback(candidate_id, created_at DESC, feedback_id DESC);
 CREATE INDEX IF NOT EXISTS idx_feature_candidate_feedback_job_time
     ON feature_candidate_feedback(job_id, created_at DESC, feedback_id DESC);
+
+COMMIT;

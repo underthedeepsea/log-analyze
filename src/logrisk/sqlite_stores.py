@@ -75,6 +75,15 @@ class SQLiteFeatureJobStore:
                     (job["job_id"], entity["entity_id"], entity.get("status", "unknown"), entity.get("risk_score"), _json(entity), now),
                 )
             for candidate_id, candidate in (job.get("features") or {}).items():
+                existing = connection.execute(
+                    "SELECT job_id FROM feature_candidates WHERE candidate_id=?", (candidate_id,)
+                ).fetchone()
+                if existing is not None and str(existing["job_id"]) != str(job["job_id"]):
+                    feedback = connection.execute(
+                        "SELECT 1 FROM feature_candidate_feedback WHERE candidate_id=? LIMIT 1", (candidate_id,)
+                    ).fetchone()
+                    if feedback is not None:
+                        raise ValueError("cannot re-parent candidate with feedback history")
                 connection.execute(
                     "INSERT INTO feature_candidates(candidate_id, job_id, entity_id, status, candidate_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) "
                     "ON CONFLICT(candidate_id) DO UPDATE SET job_id=excluded.job_id, entity_id=excluded.entity_id, "

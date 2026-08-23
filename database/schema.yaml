@@ -69,7 +69,7 @@ tables:
   feature_candidate_feedback:
     description: Feature Candidate 的追加式人工决策反馈；按 Candidate 与幂等键去重且不覆盖历史
     primary_key: feedback_id
-    foreign_keys: {candidate_id: feature_candidates.candidate_id ON DELETE CASCADE, job_id: feature_jobs.job_id ON DELETE CASCADE}
+    foreign_keys: {candidate_id: feature_candidates.candidate_id ON DELETE RESTRICT, job_id: feature_jobs.job_id ON DELETE RESTRICT}
     constraints: outcome 仅允许 approved/rejected；(candidate_id, idempotency_key) 唯一
     indexes: [idx_feature_candidate_feedback_candidate_time(candidate_id, created_at DESC), idx_feature_candidate_feedback_job_time(job_id, created_at DESC)]
     columns: {feedback_id: 反馈标识, candidate_id: 候选特征, job_id: 所属任务, outcome: approved/rejected 决策, reason_code: 有限原因码, note: 有界人工备注, actor: 外部身份操作人, request_id: 请求标识, idempotency_key: 幂等键, created_at: 创建时间, schema_version: 反馈结构标识}

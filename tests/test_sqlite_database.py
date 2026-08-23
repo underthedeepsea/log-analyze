@@ -170,6 +170,8 @@ def test_schema_dictionary_describes_rule_lifecycle_tables():
     schema = Path("database/schema.yaml").read_text(encoding="utf-8")
 
     assert "schema_version: 18" in schema
+    assert "candidate_id: feature_candidates.candidate_id ON DELETE RESTRICT" in schema
+    assert "job_id: feature_jobs.job_id ON DELETE RESTRICT" in schema
     assert "rule_versions:" in schema
     assert "rule_feedback:" in schema
     assert "rule_audit_events:" in schema

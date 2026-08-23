@@ -311,3 +311,112 @@ def test_dataset_hash_uses_sorted_canonical_json(database):
 
     canonical = json.dumps(records, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
     assert revision["content_sha256"] == hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def test_feedback_foreign_key_requires_the_candidate_job_pair(database, seeded_candidate):
+    with database.transaction() as connection:
+        connection.execute(
+            "INSERT INTO feature_jobs(job_id, status, job_json, created_at, updated_at) "
+            "VALUES (?, 'completed', ?, ?, ?)",
+            ("job-2", "{}", "2026-08-23T00:00:00+00:00", "2026-08-23T00:00:00+00:00"),
+        )
+        foreign_keys = connection.execute("PRAGMA foreign_key_list(feature_candidate_feedback)").fetchall()
+
+    candidate_job_foreign_keys = [row for row in foreign_keys if row[2] == "feature_candidates"]
+    assert len(candidate_job_foreign_keys) == 2
+    assert len({row[0] for row in candidate_job_foreign_keys}) == 1
+    assert {(row[3], row[4]) for row in candidate_job_foreign_keys} == {
+        ("candidate_id", "candidate_id"),
+        ("job_id", "job_id"),
+    }
+
+    with pytest.raises(sqlite3.IntegrityError):
+        with database.transaction() as connection:
+            connection.execute(
+                "INSERT INTO feature_candidate_feedback("
+                "feedback_id, candidate_id, job_id, outcome, reason_code, note, actor, request_id, "
+                "idempotency_key, created_at, schema_version"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "feedback-mismatched-pair",
+                    seeded_candidate["candidate_id"],
+                    "job-2",
+                    "rejected",
+                    "false_positive",
+                    "",
+                    "reviewer-a",
+                    "request-pair",
+                    "key-pair",
+                    "2026-08-23T00:00:00+00:00",
+                    "continuous_learning_feedback_v1",
+                ),
+            )
+
+
+class _InterleavingConnection:
+    def __init__(self, connection):
+        self._connection = connection
+        self._reparented = False
+
+    def execute(self, sql, parameters=()):
+        result = self._connection.execute(sql, parameters)
+        normalized = " ".join(sql.split()).upper()
+        if (
+            not self._reparented
+            and normalized.startswith("SELECT CANDIDATE_ID, JOB_ID FROM FEATURE_CANDIDATES")
+        ):
+            self._connection.execute(
+                "UPDATE feature_candidates SET job_id=? WHERE candidate_id=?",
+                ("job-2", "candidate-1"),
+            )
+            self._reparented = True
+        return result
+
+
+class _InterleavingDatabase:
+    provider = "postgres"
+
+    def __init__(self, database):
+        self._database = database
+
+    def connect(self):
+        return self._database.connect()
+
+    @contextmanager
+    def transaction(self):
+        with self._database.transaction() as connection:
+            yield _InterleavingConnection(connection)
+
+
+def test_append_feedback_rejects_a_candidate_reparented_after_the_lineage_read(database, seeded_candidate):
+    with database.transaction() as connection:
+        connection.execute(
+            "INSERT INTO feature_jobs(job_id, status, job_json, created_at, updated_at) "
+            "VALUES (?, 'completed', ?, ?, ?)",
+            ("job-2", "{}", "2026-08-23T00:00:00+00:00", "2026-08-23T00:00:00+00:00"),
+        )
+
+    repository = ContinuousLearningRepository(_InterleavingDatabase(database))
+    with pytest.raises(sqlite3.IntegrityError):
+        repository.append_feedback(
+            candidate_id=seeded_candidate["candidate_id"],
+            job_id=seeded_candidate["job_id"],
+            outcome="rejected",
+            reason_code="false_positive",
+            note="",
+            actor="reviewer-a",
+            request_id="request-race",
+            idempotency_key="key-race",
+        )
+
+    with database.connect() as connection:
+        candidate = connection.execute(
+            "SELECT job_id FROM feature_candidates WHERE candidate_id=?",
+            (seeded_candidate["candidate_id"],),
+        ).fetchone()
+        feedback = connection.execute(
+            "SELECT COUNT(*) AS count FROM feature_candidate_feedback WHERE candidate_id=?",
+            (seeded_candidate["candidate_id"],),
+        ).fetchone()
+    assert candidate["job_id"] == seeded_candidate["job_id"]
+    assert feedback["count"] == 0

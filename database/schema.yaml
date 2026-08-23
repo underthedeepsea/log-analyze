@@ -1,4 +1,4 @@
-schema_version: 18
+schema_version: 19
 database: logrisk
 description: LOGRISK 双模式运行时数据字典；SQLite 是默认本地实现，PostgreSQL 用于显式配置的外部生产部署。
 authoritative_ddl:
@@ -65,12 +65,13 @@ tables:
     description: 模型或规则产生的待审批特征
     primary_key: candidate_id
     foreign_keys: {job_id: feature_jobs.job_id ON DELETE CASCADE}
+    indexes: ["uq_feature_candidates_candidate_job(candidate_id, job_id)"]
     columns: {candidate_id: 候选特征标识, job_id: 所属任务, entity_id: 来源风险实体, status: 审批状态, candidate_json: 特征内容和 Evidence 引用, created_at: 创建时间, updated_at: 更新时间}
   feature_candidate_feedback:
     description: Feature Candidate 的追加式人工决策反馈；按 Candidate 与幂等键去重且不覆盖历史
     primary_key: feedback_id
-    foreign_keys: {candidate_id: feature_candidates.candidate_id ON DELETE RESTRICT, job_id: feature_jobs.job_id ON DELETE RESTRICT}
-    constraints: outcome 仅允许 approved/rejected；(candidate_id, idempotency_key) 唯一
+    foreign_keys: {candidate_job: "feature_candidates.(candidate_id, job_id) ON DELETE RESTRICT"}
+    constraints: outcome 仅允许 approved/rejected；(candidate_id, job_id) 必须匹配 Candidate 所属 Job；(candidate_id, idempotency_key) 唯一
     indexes: [idx_feature_candidate_feedback_candidate_time(candidate_id, created_at DESC), idx_feature_candidate_feedback_job_time(job_id, created_at DESC)]
     columns: {feedback_id: 反馈标识, candidate_id: 候选特征, job_id: 所属任务, outcome: approved/rejected 决策, reason_code: 有限原因码, note: 有界人工备注, actor: 外部身份操作人, request_id: 请求标识, idempotency_key: 幂等键, created_at: 创建时间, schema_version: 反馈结构标识}
   feature_job_events:

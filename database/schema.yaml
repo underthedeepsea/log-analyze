@@ -1,4 +1,4 @@
-schema_version: 17
+schema_version: 19
 database: logrisk
 description: LOGRISK 双模式运行时数据字典；SQLite 是默认本地实现，PostgreSQL 用于显式配置的外部生产部署。
 authoritative_ddl:
@@ -65,7 +65,15 @@ tables:
     description: 模型或规则产生的待审批特征
     primary_key: candidate_id
     foreign_keys: {job_id: feature_jobs.job_id ON DELETE CASCADE}
+    indexes: ["uq_feature_candidates_candidate_job(candidate_id, job_id)"]
     columns: {candidate_id: 候选特征标识, job_id: 所属任务, entity_id: 来源风险实体, status: 审批状态, candidate_json: 特征内容和 Evidence 引用, created_at: 创建时间, updated_at: 更新时间}
+  feature_candidate_feedback:
+    description: Feature Candidate 的追加式人工决策反馈；按 Candidate 与幂等键去重且不覆盖历史
+    primary_key: feedback_id
+    foreign_keys: {candidate_job: "feature_candidates.(candidate_id, job_id) ON DELETE RESTRICT"}
+    constraints: outcome 仅允许 approved/rejected；(candidate_id, job_id) 必须匹配 Candidate 所属 Job；(candidate_id, idempotency_key) 唯一
+    indexes: [idx_feature_candidate_feedback_candidate_time(candidate_id, created_at DESC), idx_feature_candidate_feedback_job_time(job_id, created_at DESC)]
+    columns: {feedback_id: 反馈标识, candidate_id: 候选特征, job_id: 所属任务, outcome: approved/rejected 决策, reason_code: 有限原因码, note: 有界人工备注, actor: 外部身份操作人, request_id: 请求标识, idempotency_key: 幂等键, created_at: 创建时间, schema_version: 反馈结构标识}
   feature_job_events:
     description: 特征任务顺序事件流
     primary_key: [job_id, sequence]
@@ -262,17 +270,20 @@ tables:
     primary_key: event_id
     columns: {event_id: 自增事件标识, config_id: 配置族标识, version: 目标版本, event_type: 保存/校验/发布/回滚动作, event_json: 操作详情, created_at: 发生时间}
   drain_datasets:
-    description: Drain3 Gold Dataset 及记录
+    description: Drain3 Gold Dataset 的不可变 family/revision 元数据及记录
     primary_key: dataset_id
-    columns: {dataset_id: 数据集标识, name: 数据集名称, version: 数据集版本, dataset_json: 脱敏样本和元数据, created_at: 创建时间, updated_at: 更新时间}
+    indexes: [uq_drain_datasets_family_revision(dataset_family_id, revision_number), idx_drain_datasets_family_revision(dataset_family_id, revision_number DESC), idx_drain_datasets_status_updated(lifecycle_status, updated_at DESC)]
+    columns: {dataset_id: 数据集标识, name: 数据集名称, version: 数据集版本, dataset_json: 脱敏样本和元数据, dataset_family_id: 数据集 family 标识, revision_number: family 内不可变递增版本, content_sha256: 规范记录摘要, parent_dataset_id: 父 Dataset 标识, lifecycle_status: candidate/approved/retired, source_type: 来源类型, source_id: 来源标识, source_version: 来源版本, description: 数据集说明, split: validation/train 等分片, record_count: 记录数, actor: 创建或最近转换操作者, request_id: 请求标识, approved_by: 批准操作者, approved_at: 批准时间, schema_version: Dataset 结构版本, created_at: 创建时间, updated_at: 更新时间}
   drain_annotations:
     description: Drain3 人工簇标注
     primary_key: annotation_id
-    columns: {annotation_id: 标注标识, dataset_id: 所属数据集, annotation_json: 标注内容, created_at: 创建时间, updated_at: 更新时间}
+    indexes: [idx_drain_annotations_dataset_revision(dataset_id, dataset_sha256)]
+    columns: {annotation_id: 标注标识, dataset_id: 所属数据集, dataset_sha256: 锁定的 Dataset 内容摘要, dataset_content_sha256: 内容摘要兼容别名, annotation_json: 标注内容, created_at: 创建时间, updated_at: 更新时间}
   drain_reviews:
     description: Drain3 标注复核记录
     primary_key: review_id
-    columns: {review_id: 复核标识, annotation_id: 被复核标注, review_json: 复核结论, created_at: 创建时间}
+    indexes: [idx_drain_reviews_dataset_revision(dataset_id, dataset_sha256)]
+    columns: {review_id: 复核标识, annotation_id: 被复核标注, dataset_id: 所属数据集, dataset_sha256: 锁定的 Dataset 内容摘要, dataset_content_sha256: 内容摘要兼容别名, review_json: 复核结论, created_at: 创建时间}
   drain_eval_runs:
     description: Drain3 配置质量评测结果
     primary_key: evaluation_id

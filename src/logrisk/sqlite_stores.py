@@ -54,16 +54,40 @@ class SQLiteFeatureJobStore:
                 ),
             )
             connection.execute("DELETE FROM feature_job_entities WHERE job_id=?", (job["job_id"],))
-            connection.execute("DELETE FROM feature_candidates WHERE job_id=?", (job["job_id"],))
             connection.execute("DELETE FROM feature_job_events WHERE job_id=?", (job["job_id"],))
+            candidate_ids = [str(candidate_id) for candidate_id in (job.get("features") or {})]
+            if candidate_ids:
+                placeholders = ",".join("?" for _ in candidate_ids)
+                connection.execute(
+                    "DELETE FROM feature_candidates WHERE job_id=? AND candidate_id NOT IN (" + placeholders + ") "
+                    "AND candidate_id NOT IN (SELECT candidate_id FROM feature_candidate_feedback)",
+                    [job["job_id"], *candidate_ids],
+                )
+            else:
+                connection.execute(
+                    "DELETE FROM feature_candidates WHERE job_id=? "
+                    "AND candidate_id NOT IN (SELECT candidate_id FROM feature_candidate_feedback)",
+                    (job["job_id"],),
+                )
             for entity in job.get("entities", []):
                 connection.execute(
                     "INSERT INTO feature_job_entities(job_id, entity_id, status, risk_score, entity_json, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
                     (job["job_id"], entity["entity_id"], entity.get("status", "unknown"), entity.get("risk_score"), _json(entity), now),
                 )
             for candidate_id, candidate in (job.get("features") or {}).items():
+                existing = connection.execute(
+                    "SELECT job_id FROM feature_candidates WHERE candidate_id=?", (candidate_id,)
+                ).fetchone()
+                if existing is not None and str(existing["job_id"]) != str(job["job_id"]):
+                    feedback = connection.execute(
+                        "SELECT 1 FROM feature_candidate_feedback WHERE candidate_id=? LIMIT 1", (candidate_id,)
+                    ).fetchone()
+                    if feedback is not None:
+                        raise ValueError("cannot re-parent candidate with feedback history")
                 connection.execute(
-                    "INSERT INTO feature_candidates(candidate_id, job_id, entity_id, status, candidate_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO feature_candidates(candidate_id, job_id, entity_id, status, candidate_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) "
+                    "ON CONFLICT(candidate_id) DO UPDATE SET job_id=excluded.job_id, entity_id=excluded.entity_id, "
+                    "status=excluded.status, candidate_json=excluded.candidate_json, updated_at=excluded.updated_at",
                     (
                         candidate_id,
                         job["job_id"],

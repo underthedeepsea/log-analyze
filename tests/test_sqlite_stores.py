@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from datetime import date
 
+import pytest
+
 from logrisk.database import SQLiteDatabase
 from logrisk.sqlite_stores import (
     SQLiteAICache,
@@ -35,6 +37,86 @@ def test_sqlite_feature_jobs_round_trip_entities_candidates_and_events(tmp_path)
     assert loaded["entities"][0]["entity_id"] == "node-a"
     assert loaded["features"]["candidate-1"]["status"] == "pending"
     assert loaded["events"][0]["type"] == "job_created"
+
+
+def test_sqlite_feature_job_replace_preserves_continuous_learning_feedback(tmp_path):
+    database = SQLiteDatabase(tmp_path / "logrisk.sqlite3")
+    store = SQLiteFeatureJobStore(database)
+    job = {
+        "job_id": "job-feedback",
+        "status": "completed",
+        "model_profile_id": None,
+        "created_at": "2026-07-16T00:00:00+00:00",
+        "completed_at": "2026-07-16T00:01:00+00:00",
+        "entities": [],
+        "features": {"candidate-feedback": {"candidate_id": "candidate-feedback", "status": "pending"}},
+        "events": [],
+    }
+    store.save(job)
+    from logrisk.continuous_learning import ContinuousLearningRepository
+
+    repository = ContinuousLearningRepository(database)
+    repository.append_feedback(
+        candidate_id="candidate-feedback",
+        job_id="job-feedback",
+        outcome="rejected",
+        reason_code="false_positive",
+        note="kept history",
+        actor="reviewer-a",
+        request_id="request-1",
+        idempotency_key="feedback-1",
+    )
+
+    job["features"]["candidate-feedback"]["status"] = "rejected"
+    store.save(job)
+
+    history = repository.list_feedback(candidate_id="candidate-feedback")
+    assert len(history) == 1
+    assert history[0]["outcome"] == "rejected"
+
+
+def test_sqlite_feature_job_store_rejects_reparenting_feedback_candidate(tmp_path):
+    database = SQLiteDatabase(tmp_path / "logrisk.sqlite3")
+    store = SQLiteFeatureJobStore(database)
+    first_job = {
+        "job_id": "job-lineage-a",
+        "status": "completed",
+        "model_profile_id": None,
+        "created_at": "2026-07-16T00:00:00+00:00",
+        "completed_at": "2026-07-16T00:01:00+00:00",
+        "entities": [],
+        "features": {"candidate-stable": {"candidate_id": "candidate-stable", "status": "pending"}},
+        "events": [],
+    }
+    store.save(first_job)
+
+    from logrisk.continuous_learning import ContinuousLearningRepository
+
+    repository = ContinuousLearningRepository(database)
+    repository.append_feedback(
+        candidate_id="candidate-stable",
+        job_id="job-lineage-a",
+        outcome="rejected",
+        reason_code="false_positive",
+        note="lineage is fixed",
+        actor="reviewer-a",
+        request_id="request-lineage-a",
+        idempotency_key="feedback-lineage-a",
+    )
+
+    second_job = {**first_job, "job_id": "job-lineage-b"}
+    with pytest.raises(ValueError, match="feedback history"):
+        store.save(second_job)
+
+    with database.connect() as connection:
+        candidate = connection.execute(
+            "SELECT job_id FROM feature_candidates WHERE candidate_id=?", ("candidate-stable",)
+        ).fetchone()
+        feedback = connection.execute(
+            "SELECT job_id FROM feature_candidate_feedback WHERE candidate_id=?", ("candidate-stable",)
+        ).fetchone()
+        assert candidate["job_id"] == "job-lineage-a"
+        assert feedback["job_id"] == "job-lineage-a"
 
 
 def test_sqlite_trace_cache_metrics_and_rules_survive_new_store_instances(tmp_path):

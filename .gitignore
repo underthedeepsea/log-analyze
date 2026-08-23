@@ -13,6 +13,7 @@ state/
 *.db-wal
 *.db-shm
 .superpowers/
+.worktrees/
 .DS_Store
 CODEX_WORK_GUIDE_LOG_RISK_ANALYSIS.md
 log_analyze_ai_harness_plans/

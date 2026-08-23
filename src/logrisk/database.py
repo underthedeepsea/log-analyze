@@ -87,6 +87,37 @@ class MigrationManager:
         return self.status()
 
 
+def _backfill_continuous_learning_datasets(connection: Any) -> None:
+    """Finish the provider-neutral 0018 Dataset metadata backfill.
+
+    SQLite and PostgreSQL do not share a built-in SHA256 JSON function.  The
+    migration owns the columns and lifecycle defaults; this hook uses the
+    same canonical JSON encoding as the continuous-learning repository while
+    the migration transaction is still open.
+    """
+
+    rows = connection.execute("SELECT dataset_id, dataset_json, content_sha256, record_count FROM drain_datasets").fetchall()
+    for row in rows:
+        if row["content_sha256"] is not None and row["record_count"] is not None:
+            continue
+        payload = row["dataset_json"]
+        if not isinstance(payload, (dict, list)):
+            try:
+                payload = json.loads(str(payload))
+            except (TypeError, json.JSONDecodeError):
+                payload = {}
+        records = payload.get("records") if isinstance(payload, dict) else []
+        if not isinstance(records, list):
+            records = []
+        digest = hashlib.sha256(
+            json.dumps(records, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
+        ).hexdigest()
+        connection.execute(
+            "UPDATE drain_datasets SET content_sha256=COALESCE(content_sha256, ?), record_count=COALESCE(record_count, ?) WHERE dataset_id=?",
+            (digest, len(records), row["dataset_id"]),
+        )
+
+
 def qmark_to_pyformat(sql: str) -> str:
     """Convert SQLite qmark placeholders without touching SQL literals/comments."""
 
@@ -291,6 +322,8 @@ class SQLiteDatabase:
                         raise RuntimeError(f"数据库迁移文件已被修改: {path.name}")
                     continue
                 connection.executescript(sql)
+                if version == "0018":
+                    _backfill_continuous_learning_datasets(connection)
                 connection.execute(
                     "INSERT INTO schema_migrations(version, name, sha256, applied_at) VALUES (?, ?, ?, ?)",
                     (version, path.name, digest, utc_now()),
@@ -439,6 +472,8 @@ class PostgresDatabase:
                         raise RuntimeError(f"数据库迁移文件已被修改: {path.name}")
                     continue
                 connection.executescript(sql)
+                if version == "0018":
+                    _backfill_continuous_learning_datasets(connection)
                 connection.execute(
                     "INSERT INTO schema_migrations(version, name, sha256, applied_at) VALUES (?, ?, ?, ?)",
                     (version, path.name, digest, utc_now()),

@@ -378,7 +378,7 @@ def build_application_container(
     knowledge_packages = KnowledgePackageService(
         database,
         artifact_store,
-        app_version="1.34.0",
+        app_version="1.35.1",
         adapters=build_domain_adapter_registry(
             prompt_registry=prompts,
             drain_quality=drain_quality,

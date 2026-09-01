@@ -5,6 +5,20 @@ from logrisk.drain_miner import mine_template_events
 from logrisk.normalizer import normalize_record
 
 
+def test_aggregator_assigns_utc_to_naive_source_timestamps():
+    windows = aggregate_template_events([{
+        "timestamp": "2026-08-31 15:00:00.001",
+        "cluster": "default",
+        "entity_type": "node",
+        "entity_id": "node-a",
+        "component": "kubelet",
+        "template_hash": "hash",
+        "template": "failure",
+    }])
+
+    assert windows[0]["window_start"].endswith("+00:00")
+
+
 def test_drain3_and_aggregator_preserve_entity_route_without_mining_entity_values(tmp_path) -> None:
     normalized = normalize_record({
         "raw_log_id": "line-1",

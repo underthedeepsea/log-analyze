@@ -31,11 +31,16 @@ from logrisk.database_config import DatabaseConnectionSettings, resolve_database
 from logrisk.drain_eval.service import DrainQualityService
 from logrisk.feature_extractor_ollama import FEATURE_RESPONSE_SCHEMA, _validate_model_feature
 from logrisk.feature_jobs import FeatureJobError, FeatureJobManager
-from logrisk.incremental_sources import FileIncrementalSource
+from logrisk.incremental_sources import (
+    FileIncrementalSource,
+    KafkaIncrementalSource,
+    register_kafka_consumer_adapter,
+)
 from logrisk.input_jobs import InputJobConfig
 from logrisk.knowledge_packages.service import KnowledgePackageService
 from logrisk.knowledge_packages.asset_adapters import build_domain_adapter_registry
-from logrisk.large_file_pipeline import run_large_file_pipeline
+from logrisk.kafka_adapter import KafkaPythonConsumerAdapter
+from logrisk.large_file_pipeline import MAX_STREAM_BATCH_RECORDS, run_incremental_pipeline, run_large_file_pipeline
 from logrisk.legacy_import import LegacyStateImporter
 from logrisk.multi_source.config import load_multi_source_config
 from logrisk.multi_source.repository import MultiSourceRepository
@@ -67,7 +72,7 @@ from logrisk.sqlite_stores import (
     SQLiteSemanticDictionaryStore,
     SQLiteUploadSessionStore,
 )
-from logrisk.streaming_state import StreamingConflictError, StreamingStateRepository
+from logrisk.streaming_state import StreamingConflictError, StreamingStateRepository, StreamingTaskBusyError
 from logrisk.upload_sessions import UploadConfig
 from pipeline.manual_import_pipeline import analyze_records
 
@@ -97,6 +102,7 @@ class ApplicationConfig:
     migrate_database: bool = True
     agentic_enabled: bool = False
     agent_workflows_enabled: bool = False
+    kafka_enabled: bool = False
 
     @classmethod
     def for_test(cls, *, project_root: str | Path, state_root: str | Path) -> "ApplicationConfig":
@@ -149,6 +155,7 @@ class ApplicationContainer:
     input_analyzer: Callable[..., dict[str, Any]] | None = None
     input_analyzer_accepts_config: bool = True
     run_input_job: Callable[[str], None] | None = None
+    run_kafka_task: Callable[[str, dict[str, str]], None] | None = None
 
     def recover_agent_runs(self, submit: Callable[[str], None] | None = None) -> list[str]:
         """Recover persisted local Agent runs only when the feature is explicitly enabled."""
@@ -384,7 +391,7 @@ def build_application_container(
     knowledge_packages = KnowledgePackageService(
         database,
         artifact_store,
-        app_version="1.35.2",
+        app_version="1.36.0",
         adapters=build_domain_adapter_registry(
             prompt_registry=prompts,
             drain_quality=drain_quality,
@@ -430,6 +437,8 @@ def build_application_container(
         InputJobConfig(output_dir=output_root / "uploads", artifact_store=artifact_store), database
     )
     streaming_state = StreamingStateRepository(database)
+    if config.kafka_enabled:
+        register_kafka_consumer_adapter(KafkaPythonConsumerAdapter())
     if config.interrupt_streaming_tasks:
         streaming_state.interrupt_running_tasks()
     release_readiness = ReleaseReadinessService(
@@ -593,10 +602,37 @@ def build_application_container(
                 "error": str(exc),
             })
 
+    def run_kafka_task(task_id: str, source_configuration: dict[str, str]) -> None:
+        source = KafkaIncrementalSource(source_configuration)
+        try:
+            run_incremental_pipeline(
+                input_job_id=task_id,
+                source=source,
+                source_name=f"kafka://{source_configuration['topic']}",
+                config_path=container.drain_quality.configs.active_snapshot()["path"],
+                rules_path=root / "configs" / "risk_rules.yaml",
+                state_dir=state_root / "dashboard_kafka" / task_id,
+                streaming_repository=container.streaming_state,
+                semantic_snapshot=container.semantic_dictionaries.active_snapshot(),
+                risk_semantics=container.risk_semantics,
+                node_risks=container.node_risks,
+                multi_source=container.multi_source,
+                resume_task_id=task_id,
+                stream_batch_records=MAX_STREAM_BATCH_RECORDS,
+            )
+        except StreamingTaskBusyError:
+            return
+        except Exception:
+            task = container.streaming_state.get_task(task_id)
+            if task.get("status") not in {"failed", "conflict", "completed"}:
+                container.streaming_state.mark_failed(task_id, "Kafka 流式任务执行失败")
+            raise
+
     container.govern_drain_result = govern_drain_result
     container.input_analyzer = input_analyzer or default_input_analyzer
     container.input_analyzer_accepts_config = input_analyzer is None
     container.run_input_job = run_input_job
+    container.run_kafka_task = run_kafka_task
     return container
 
 

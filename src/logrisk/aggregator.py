@@ -8,17 +8,18 @@ from typing import Any, Dict, List, Tuple
 def parse_ts(ts: str | None) -> datetime:
     if not ts:
         return datetime.now(timezone.utc)
-    value = ts.replace("Z", "+00:00")
+    value = str(ts).replace("Z", "+00:00")
     try:
-        return datetime.fromisoformat(value)
-    except ValueError:
+        parsed = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
         return datetime.now(timezone.utc)
+    return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
 
 
 def floor_window(dt: datetime, window_seconds: int) -> datetime:
     epoch = int(dt.timestamp())
     floored = epoch - (epoch % window_seconds)
-    return datetime.fromtimestamp(floored, tz=dt.tzinfo)
+    return datetime.fromtimestamp(floored, tz=dt.tzinfo or timezone.utc)
 
 
 def aggregate_template_events(

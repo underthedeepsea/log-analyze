@@ -9,6 +9,13 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict
 
+from logrisk.approval_dedup import (
+    approval_identity,
+    entity_problem_codes,
+    normalize_feature_type,
+    normalize_problem_code,
+)
+
 
 class ApprovedRuleError(RuntimeError):
     """Raised when the approved-rule state cannot be read or written safely."""
@@ -51,11 +58,18 @@ def _identity_pair(item: Dict[str, Any]) -> tuple[str, str]:
 
 
 def rule_signature(feature_type: str, sources: list[Dict[str, Any]]) -> str:
-    normalized_type = str(feature_type or "").strip().lower()
+    if not str(feature_type or "").strip():
+        raise ApprovedRuleError("批准特征缺少 feature_type 或模板 Hash，无法生成规则")
+    normalized_type = normalize_feature_type(feature_type)
     pairs = _template_pairs(sources)
-    if not normalized_type or not pairs:
+    if not pairs:
         raise ApprovedRuleError("批准特征缺少 feature_type 或模板 Hash，无法生成规则")
     raw = json.dumps([normalized_type, pairs], ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _approval_rule_signature(base_signature: str, approval_key: str) -> str:
+    raw = json.dumps([base_signature, approval_key], ensure_ascii=False, separators=(",", ":"))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
@@ -84,6 +98,11 @@ def _versioned_fields(rule: Dict[str, Any]) -> Dict[str, Any]:
         "selection_reason",
         "components",
         "template_signatures",
+        "problem_code",
+        "approval_key",
+        "anchor_signatures",
+        "supporting_signatures",
+        "match_mode",
         "lineage",
     )
     return {field: copy.deepcopy(rule.get(field)) for field in fields}
@@ -134,6 +153,7 @@ class ApprovedRuleStore:
     def upsert_feature(self, feature: Dict[str, Any]) -> Dict[str, Any]:
         if not isinstance(feature, dict):
             raise ApprovedRuleError("批准特征必须是 object")
+        identity = approval_identity(feature)
         signature = rule_signature(
             str(feature.get("feature_type") or ""),
             feature.get("source_templates") or [],
@@ -141,18 +161,43 @@ class ApprovedRuleStore:
         now = self.clock()
         with _PROCESS_LOCK:
             rules = self._read_locked()
-            existing = next((rule for rule in rules if rule.get("signature") == signature), None)
+            existing = next(
+                (
+                    rule for rule in rules
+                    if identity["approval_key"] and rule.get("approval_key") == identity["approval_key"]
+                ),
+                None,
+            )
+            if existing is None:
+                existing = next(
+                    (
+                        rule for rule in rules
+                        if not rule.get("approval_key") and rule.get("signature") == signature
+                    ),
+                    None,
+                )
+            if any(
+                rule.get("signature") == signature
+                and rule.get("approval_key") not in {None, identity["approval_key"]}
+                for rule in rules
+            ):
+                signature = _approval_rule_signature(signature, identity["approval_key"])
             rule = {
-                "rule_id": existing.get("rule_id") if existing else f"rule-{signature[:20]}",
+                "rule_id": existing.get("rule_id") if existing else f"rule-{identity['approval_key'][5:25]}",
                 "signature": signature,
-                "feature_type": str(feature.get("feature_type") or "").strip(),
+                "feature_type": normalize_feature_type(feature.get("feature_type")),
                 "title": str(feature.get("title") or "").strip(),
                 "summary": str(feature.get("summary") or "").strip(),
                 "importance": str(feature.get("importance") or "medium").strip(),
                 "tags": [str(tag).strip() for tag in (feature.get("tags") or []) if str(tag).strip()],
                 "selection_reason": str(feature.get("selection_reason") or "").strip(),
-                "components": sorted({str(item) for item in (feature.get("components") or []) if item}),
+                "components": identity["component_scope"],
                 "template_signatures": _template_pairs(feature.get("source_templates") or []),
+                "problem_code": identity["problem_code"],
+                "approval_key": identity["approval_key"],
+                "anchor_signatures": identity["anchor_signatures"],
+                "supporting_signatures": copy.deepcopy(feature.get("supporting_signatures") or []),
+                "match_mode": identity["match_mode"],
                 "approved_at": existing.get("approved_at") if existing else now,
                 "created_at": existing.get("created_at") or existing.get("approved_at") if existing else now,
                 "updated_at": now,
@@ -184,16 +229,68 @@ class ApprovedRuleStore:
             _identity_pair(item)
             for item in _template_pairs(entity.get("top_templates") or [])
         }
+        entity_codes = entity_problem_codes(entity)
+        entity_components = {
+            str(item.get("component") or "").strip().lower()
+            for item in (entity.get("top_templates") or [])
+            if isinstance(item, dict) and str(item.get("component") or "").strip()
+        }
+        entity_anchors = {
+            f"{str(item.get('template_fingerprint') or item.get('template_hash') or '').strip()}|{str(item.get('category') or '').strip()}".rstrip("|")
+            for item in (entity.get("top_templates") or [])
+            if isinstance(item, dict) and (item.get("template_fingerprint") or item.get("template_hash"))
+        }
         with _PROCESS_LOCK:
             matches = []
             for rule in self._read_locked():
                 if str(rule.get("status") or "active") != "active":
                     continue
+                problem_code = normalize_problem_code(rule.get("problem_code"))
+                semantic_rule = rule.get("match_mode") == "semantic" or (
+                    rule.get("match_mode") is None and bool(rule.get("approval_key"))
+                )
+                if problem_code and entity_codes and semantic_rule:
+                    if problem_code not in entity_codes:
+                        continue
+                    required_components = {
+                        str(item).strip().lower()
+                        for item in (rule.get("components") or [])
+                        if str(item).strip()
+                    }
+                    if required_components and entity_components and not required_components.issubset(entity_components):
+                        continue
+                    required_anchors = {
+                        str(item).strip()
+                        for item in (rule.get("anchor_signatures") or [])
+                        if str(item).strip()
+                    }
+                    if required_anchors and not all(
+                        any(required == actual or actual.startswith(required + "|") for actual in entity_anchors)
+                        for required in required_anchors
+                    ):
+                        continue
                 required = {
                     _identity_pair(item)
                     for item in (rule.get("template_signatures") or [])
                 }
-                if required and required.issubset(entity_pairs):
+                if problem_code and entity_codes and semantic_rule:
+                    matches.append(copy.deepcopy(rule))
+                elif required and required.issubset(entity_pairs):
+                    matches.append(copy.deepcopy(rule))
+            return matches
+
+    def match_feature(
+        self,
+        feature: Dict[str, Any],
+        entity: Dict[str, Any] | None = None,
+    ) -> list[Dict[str, Any]]:
+        identity = approval_identity(feature, entity)
+        with _PROCESS_LOCK:
+            matches = []
+            for rule in self._read_locked():
+                if str(rule.get("status") or "active") != "active":
+                    continue
+                if rule.get("approval_key") == identity["approval_key"]:
                     matches.append(copy.deepcopy(rule))
             return matches
 

@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from logrisk.ai_harness.trace_logger import AITraceLogger
+from logrisk.approval_dedup import group_id_for_key
 from logrisk.approved_rules import ApprovedRuleStore
 from logrisk.database import SQLiteDatabase, utc_now
 from logrisk.input_jobs import InputJobConfig, InputJobStore
@@ -85,14 +86,23 @@ class SQLiteFeatureJobStore:
                     if feedback is not None:
                         raise ValueError("cannot re-parent candidate with feedback history")
                 connection.execute(
-                    "INSERT INTO feature_candidates(candidate_id, job_id, entity_id, status, candidate_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) "
+                    "INSERT INTO feature_candidates(candidate_id, job_id, entity_id, status, approval_key, problem_code, "
+                    "approval_group_id, resolved_rule_id, resolution_type, candidate_json, created_at, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                     "ON CONFLICT(candidate_id) DO UPDATE SET job_id=excluded.job_id, entity_id=excluded.entity_id, "
-                    "status=excluded.status, candidate_json=excluded.candidate_json, updated_at=excluded.updated_at",
+                    "status=excluded.status, approval_key=excluded.approval_key, problem_code=excluded.problem_code, "
+                    "approval_group_id=excluded.approval_group_id, resolved_rule_id=excluded.resolved_rule_id, "
+                    "resolution_type=excluded.resolution_type, candidate_json=excluded.candidate_json, updated_at=excluded.updated_at",
                     (
                         candidate_id,
                         job["job_id"],
                         (candidate.get("entity") or {}).get("id") or candidate.get("entity_id"),
                         candidate.get("status"),
+                        candidate.get("approval_key"),
+                        candidate.get("problem_code"),
+                        candidate.get("approval_group_id"),
+                        candidate.get("resolved_rule_id"),
+                        candidate.get("resolution_type"),
                         _json(candidate),
                         candidate.get("created_at") or now,
                         now,
@@ -116,8 +126,18 @@ class SQLiteFeatureJobStore:
                     )
                 ]
                 job["features"] = {
-                    item[0]: json.loads(item[1]) for item in connection.execute(
-                        "SELECT candidate_id, candidate_json FROM feature_candidates WHERE job_id=? ORDER BY created_at, candidate_id", (row["job_id"],)
+                    item["candidate_id"]: {
+                        **json.loads(item["candidate_json"]),
+                        **{
+                            field: item[field]
+                            for field in ("approval_key", "problem_code", "approval_group_id", "resolved_rule_id", "resolution_type")
+                            if item[field] is not None
+                        },
+                    }
+                    for item in connection.execute(
+                        "SELECT candidate_id, candidate_json, approval_key, problem_code, approval_group_id, "
+                        "resolved_rule_id, resolution_type FROM feature_candidates WHERE job_id=? ORDER BY created_at, candidate_id",
+                        (row["job_id"],),
                     )
                 }
                 job["events"] = [
@@ -137,7 +157,8 @@ class SQLiteApprovedRuleStore(ApprovedRuleStore):
     def _read_locked(self) -> list[dict[str, Any]]:
         with self.database.connect() as connection:
             rows = connection.execute(
-                "SELECT rule_json, status, current_version, next_review_at, schema_version, approved_at, updated_at "
+                "SELECT rule_id, rule_json, status, current_version, next_review_at, schema_version, approved_at, updated_at, "
+                "problem_code, approval_key "
                 "FROM approved_rules ORDER BY rule_id"
             )
             rules = []
@@ -151,6 +172,8 @@ class SQLiteApprovedRuleStore(ApprovedRuleStore):
                     "approved_at": row["approved_at"],
                     "created_at": rule.get("created_at") or row["approved_at"],
                     "updated_at": row["updated_at"],
+                    "problem_code": row["problem_code"] or rule.get("problem_code"),
+                    "approval_key": row["approval_key"] or rule.get("approval_key"),
                 })
                 rules.append(rule)
             return rules
@@ -160,16 +183,17 @@ class SQLiteApprovedRuleStore(ApprovedRuleStore):
             for rule in rules:
                 connection.execute(
                     "INSERT INTO approved_rules(rule_id, signature, feature_type, rule_json, approved_at, updated_at, "
-                    "status, current_version, next_review_at, schema_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                    "status, current_version, next_review_at, schema_version, problem_code, approval_key) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                     "ON CONFLICT(rule_id) DO UPDATE SET signature=excluded.signature, feature_type=excluded.feature_type, "
                     "rule_json=excluded.rule_json, updated_at=excluded.updated_at, status=excluded.status, "
                     "current_version=excluded.current_version, next_review_at=excluded.next_review_at, "
-                    "schema_version=excluded.schema_version",
+                    "schema_version=excluded.schema_version, problem_code=excluded.problem_code, approval_key=excluded.approval_key",
                     (
                         rule["rule_id"], rule["signature"], rule["feature_type"], _json(rule),
                         rule["approved_at"], rule["updated_at"], rule.get("status", "active"),
                         int(rule.get("current_version") or 1), rule.get("next_review_at"),
-                        rule.get("schema_version", "approved_rule_v2"),
+                        rule.get("schema_version", "approved_rule_v2"), rule.get("problem_code"), rule.get("approval_key"),
                     ),
                 )
                 version = int(rule.get("current_version") or 1)
@@ -212,6 +236,134 @@ class SQLiteApprovedRuleStore(ApprovedRuleStore):
                 (rule_id, job_id, entity_id, rule["last_reused_at"], cluster, "rule_reuse_event_v2"),
             )
         return rule
+
+
+class SQLiteApprovalGroupStore:
+    """Durable Approval Group metadata for both supported database providers."""
+
+    def __init__(self, database: Any, clock: Callable[[], str] = utc_now) -> None:
+        self.database = database
+        self.clock = clock
+
+    @staticmethod
+    def _row_to_group(row: Any) -> dict[str, Any]:
+        group = json.loads(row["group_json"])
+        group.update({
+            "approval_group_id": row["approval_group_id"],
+            "approval_key": row["approval_key"],
+            "problem_code": row["problem_code"] or group.get("problem_code"),
+            "feature_type": row["feature_type"],
+            "title": row["title"],
+            "summary": row["summary"],
+            "importance": row["importance"],
+            "status": row["status"],
+            "rule_id": row["rule_id"],
+            "first_seen": row["first_seen"],
+            "last_seen": row["last_seen"],
+            "occurrence_count": int(row["occurrence_count"]),
+            "affected_entity_count": int(row["affected_entity_count"]),
+            "candidate_count": int(row["candidate_count"]),
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
+            "schema_version": row["schema_version"],
+        })
+        return group
+
+    def get_by_key(self, approval_key: str) -> dict[str, Any] | None:
+        with self.database.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM approval_groups WHERE approval_key=?", (str(approval_key),)
+            ).fetchone()
+        return self._row_to_group(row) if row else None
+
+    def list_groups(self, status: str | None = None) -> list[dict[str, Any]]:
+        query = "SELECT * FROM approval_groups"
+        parameters: tuple[Any, ...] = ()
+        if status:
+            query += " WHERE status=?"
+            parameters = (status,)
+        query += " ORDER BY created_at, approval_group_id"
+        with self.database.connect() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+        return [self._row_to_group(row) for row in rows]
+
+    def save(self, group: dict[str, Any]) -> dict[str, Any]:
+        value = copy.deepcopy(group)
+        value.setdefault("approval_group_id", group_id_for_key(str(value["approval_key"])))
+        value.setdefault("created_at", self.clock())
+        value["updated_at"] = value.get("updated_at") or self.clock()
+        with self.database.transaction() as connection:
+            existing = connection.execute(
+                "SELECT * FROM approval_groups WHERE approval_key=?", (value["approval_key"],)
+            ).fetchone()
+            if existing:
+                previous = self._row_to_group(existing)
+                value["approval_group_id"] = previous["approval_group_id"]
+                value["created_at"] = previous["created_at"]
+                value["candidate_ids"] = sorted(set(previous.get("candidate_ids") or []) | set(value.get("candidate_ids") or []))
+                value["entity_keys"] = sorted(set(previous.get("entity_keys") or []) | set(value.get("entity_keys") or []))
+                value["candidate_count"] = max(int(previous.get("candidate_count") or 0), int(value.get("candidate_count") or 0), len(value["candidate_ids"]))
+                value["affected_entity_count"] = max(int(previous.get("affected_entity_count") or 0), int(value.get("affected_entity_count") or 0), len(value["entity_keys"]))
+                value["occurrence_count"] = max(int(previous.get("occurrence_count") or 0), int(value.get("occurrence_count") or 0))
+                if previous.get("status") in {"approved", "auto_resolved"} and value.get("status") != "approved":
+                    value["status"] = previous["status"]
+                value["rule_id"] = value.get("rule_id") or previous.get("rule_id")
+            connection.execute(
+                "INSERT INTO approval_groups(approval_group_id, approval_key, problem_code, feature_type, title, summary, "
+                "importance, status, rule_id, first_seen, last_seen, occurrence_count, affected_entity_count, candidate_count, "
+                "group_json, created_at, updated_at, schema_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(approval_key) DO UPDATE SET problem_code=excluded.problem_code, feature_type=excluded.feature_type, "
+                "title=excluded.title, summary=excluded.summary, importance=excluded.importance, "
+                "status=CASE WHEN approval_groups.status IN ('approved', 'auto_resolved') "
+                "AND excluded.status <> 'approved' THEN approval_groups.status ELSE excluded.status END, "
+                "rule_id=excluded.rule_id, first_seen=excluded.first_seen, last_seen=excluded.last_seen, "
+                "occurrence_count=excluded.occurrence_count, affected_entity_count=excluded.affected_entity_count, "
+                "candidate_count=excluded.candidate_count, group_json=excluded.group_json, updated_at=excluded.updated_at, "
+                "schema_version=excluded.schema_version",
+                (
+                    value["approval_group_id"], value["approval_key"], value.get("problem_code"), value.get("feature_type") or "unknown_feature",
+                    value.get("title") or "", value.get("summary") or "", value.get("importance") or "medium",
+                    value.get("status") or "pending", value.get("rule_id"), value.get("first_seen"), value.get("last_seen"),
+                    int(value.get("occurrence_count") or 0), int(value.get("affected_entity_count") or 0), int(value.get("candidate_count") or 0),
+                    _json(value), value["created_at"], value["updated_at"], value.get("schema_version", "approval_group_v1"),
+                ),
+            )
+            row = connection.execute("SELECT * FROM approval_groups WHERE approval_key=?", (value["approval_key"],)).fetchone()
+        return self._row_to_group(row)
+
+    def has_candidate(self, candidate_id: str) -> bool:
+        with self.database.connect() as connection:
+            row = connection.execute(
+                "SELECT 1 FROM approval_group_candidates WHERE candidate_id=?", (str(candidate_id),)
+            ).fetchone()
+        return row is not None
+
+    def attach_candidate(self, approval_group_id: str, candidate_id: str, **metadata: Any) -> None:
+        now = self.clock()
+        with self.database.transaction() as connection:
+            row = connection.execute(
+                "SELECT approval_group_id FROM approval_group_candidates WHERE candidate_id=?", (str(candidate_id),)
+            ).fetchone()
+            if row and str(row["approval_group_id"]) != str(approval_group_id):
+                raise ValueError("Candidate 只能归属于一个 Approval Group")
+            connection.execute(
+                "INSERT INTO approval_group_candidates(approval_group_id, candidate_id, job_id, entity_id, created_at) "
+                "VALUES (?, ?, ?, ?, ?) ON CONFLICT(candidate_id) DO NOTHING",
+                (str(approval_group_id), str(candidate_id), metadata.get("job_id"), metadata.get("entity_id"), now),
+            )
+            connection.execute(
+                "UPDATE approval_groups SET candidate_count=(SELECT COUNT(*) FROM approval_group_candidates WHERE approval_group_id=?), "
+                "affected_entity_count=(SELECT COUNT(DISTINCT entity_id) FROM approval_group_candidates WHERE approval_group_id=? AND entity_id IS NOT NULL) "
+                "WHERE approval_group_id=?",
+                (str(approval_group_id), str(approval_group_id), str(approval_group_id)),
+            )
+
+    def candidate_group_id(self, candidate_id: str) -> str | None:
+        with self.database.connect() as connection:
+            row = connection.execute(
+                "SELECT approval_group_id FROM approval_group_candidates WHERE candidate_id=?", (str(candidate_id),)
+            ).fetchone()
+        return str(row["approval_group_id"]) if row else None
 
 
 class SQLiteAITraceLogger(AITraceLogger):

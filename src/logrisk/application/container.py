@@ -11,6 +11,7 @@ from typing import Any, Callable
 
 import yaml
 
+from logrisk.approval_dedup import InMemoryApprovalGroupStore
 from logrisk.ai_eval.runner import load_cases
 from logrisk.agentic import (
     AgentRepository, AgentRuntime, AgentService, ModelAgentPlanner, WorkflowLimits,
@@ -57,6 +58,7 @@ from logrisk.semantic.store import SemanticDictionaryStore
 from logrisk.sqlite_stores import (
     SQLiteAICache,
     SQLiteAITraceLogger,
+    SQLiteApprovalGroupStore,
     SQLiteApprovedRuleStore,
     SQLiteDrainQualityService,
     SQLiteFeatureJobStore,
@@ -359,11 +361,15 @@ def build_application_container(
         repository=runtime_repository,
     )
     rule_store = SQLiteApprovedRuleStore(database)
+    approval_group_store = SQLiteApprovalGroupStore(database)
     if manager is not None and manager.rule_store is None:
         manager.rule_store = rule_store
+    if manager is not None and isinstance(getattr(manager, "approval_group_store", None), InMemoryApprovalGroupStore):
+        manager.approval_group_store = approval_group_store
     feature_jobs = manager or FeatureJobManager(
         extractor=configured_extractor,
         rule_store=rule_store,
+        approval_group_store=approval_group_store,
         metrics_store=SQLiteProcessingMetricsStore(database),
         persistence=SQLiteFeatureJobStore(database),
         observability=span_recorder,
@@ -378,7 +384,7 @@ def build_application_container(
     knowledge_packages = KnowledgePackageService(
         database,
         artifact_store,
-        app_version="1.35.1",
+        app_version="1.35.2",
         adapters=build_domain_adapter_registry(
             prompt_registry=prompts,
             drain_quality=drain_quality,

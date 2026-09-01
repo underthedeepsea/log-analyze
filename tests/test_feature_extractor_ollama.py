@@ -102,6 +102,8 @@ def test_generate_features_sanitizes_evidence_and_owns_source_facts(monkeypatch)
     assert "samples" not in feature["source_templates"][0]
     assert feature["status"] == "pending"
     assert feature["model"] == "qwen3:1.7b"
+    assert feature["problem_code"] == "linux.memory.oom"
+    assert feature["approval_key"].startswith("appr_")
 
 
 def test_generate_features_uses_prompt_registry_and_writes_trace(monkeypatch, tmp_path):

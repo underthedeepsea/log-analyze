@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Dict
 
 from logrisk.ai_harness.cache import AICache, cache_signature
+from logrisk.approval_dedup import approval_identity
 from logrisk.ai_harness.evidence_builder import (
     build_feature_evidence,
     evidence_hash,
@@ -214,7 +215,7 @@ def _attach_source_facts(
     sources = [source_by_hash[template_hash] for template_hash in feature["template_hashes"]]
     first_seen = [source.get("first_seen") for source in sources if source.get("first_seen")]
     last_seen = [source.get("last_seen") for source in sources if source.get("last_seen")]
-    return {
+    attached = {
         "candidate_id": _candidate_id(entity, feature),
         "status": "pending",
         "reviewer_note": "",
@@ -236,6 +237,8 @@ def _attach_source_facts(
         "provider": provider,
         "model": model,
     }
+    attached.update(approval_identity(attached, entity))
+    return attached
 
 
 def _request_features(

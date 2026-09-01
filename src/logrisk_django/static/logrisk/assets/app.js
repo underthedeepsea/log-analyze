@@ -230,8 +230,8 @@
   };
 
   const NAV_GROUPS = [
-    { id: "analysis", label: "分析工作台", items: [["overview", "特征总览"], ["queue", "识别队列"], ["review", "人工审批"], ["export", "导出记录"]] },
-    { id: "ai", label: "AI 工程", items: [["observability", "AI 分析观测"], ["traces", "AI 调用追踪"], ["agentRuns", "Agent 运行"], ["agentWorkflows", "工作流编排"], ["prompts", "Prompt 管理"], ["modelProfiles", "模型画像"]] },
+    { id: "analysis", label: "识别工作台", items: [["overview", "特征总览"], ["queue", "识别队列"], ["review", "人工审批"], ["export", "导出记录"]] },
+    { id: "ai", label: "AI 工程", items: [["observability", "分析观测"], ["traces", "调用追踪"], ["agentRuns", "Agent 运行"], ["agentWorkflows", "工作流编排"], ["prompts", "Prompt 管理"], ["modelProfiles", "模型画像"]] },
     { id: "risk", label: "规则与风险", items: [["rules", "规则治理"], ["nodeRisks", "服务器风险"], ["multiSource", "多来源关联"], ["semanticLibrary", "风险语义库"]] },
     { id: "governance", label: "数据治理", items: [["streaming", "流式处理"], ["drainQuality", "评测中心 · 模板质量"], ["benchmarkCenter", "评测与基准"], ["knowledgePackages", "知识包中心"]] },
     { id: "system", label: "系统", items: [["runtime", "运行中心"], ["releaseReadiness", "发布就绪"], ["settings", "系统设置"]] },
@@ -302,9 +302,8 @@
       });
     }
     return h("aside", { className: "sidebar", id: "primary-navigation" },
-      h("div", { className: "nav-label" }, "功能导航"),
       h("div", { className: "sidebar-frame" },
-        h("nav", { className: "sidebar-scroll", ref: scrollRef }, NAV_GROUPS.map(function (group) {
+        h("nav", { className: "sidebar-scroll", "aria-label": "主导航", ref: scrollRef }, NAV_GROUPS.map(function (group) {
           const isOpen = expandedGroups.includes(group.id);
           return h("section", { className: "nav-group " + (isOpen ? "is-open" : ""), key: group.id },
             h("button", { type: "button", className: "nav-group-toggle", "aria-expanded": isOpen, onClick: function () { toggleGroup(group.id); } }, h("span", null, group.label), h("i", { "aria-hidden": "true" }, "⌄")),
@@ -2219,7 +2218,7 @@
     const traceRule = drawer.item && rules.find(function (rule) { return rule.lineage && rule.lineage.trace_id === drawer.item.trace_id; });
     const drawerContent = !drawer.item ? null : (drawer.type === "prompt" ? h(PromptDrawer, { item: drawer.item, onSave: savePrompt, onOpenTrace: openTrace }) : h(TraceDrawer, { item: drawer.item, rule: traceRule, onOpenRule: openRule }));
     return h("div", { className: "app-shell" + (sidebarCollapsed ? " sidebar-collapsed" : "") + (mobileMenuOpen ? " mobile-menu-open" : "") },
-      h("header", { className: "topbar" }, h("div", { className: "topbar-left" }, h("button", { className: "sidebar-toggle", type: "button", "aria-label": narrowSidebar ? (mobileMenuOpen ? "关闭菜单" : "打开菜单") : (sidebarCollapsed ? "展开菜单" : "折叠菜单"), "aria-controls": "primary-navigation", "aria-expanded": narrowSidebar ? mobileMenuOpen : !sidebarCollapsed, onClick: toggleSidebar }, h("i"), h("i"), h("i")), h("div", { className: "brand" }, h("img", { className: "brand-logo", src: "/assets/logrisk-app-icon-orange-v2.png", alt: "LOGRISK" }), h("div", null, h("b", null, "LOGRISK")))), h("div", { className: "topbar-actions" }, h("a", { className: "help-button", href: apiUrl("/help"), target: "_blank", rel: "noreferrer" }, "? 帮助"), h("div", { className: "system-status" }, h("span", { className: ollama.online ? "online" : "offline" }, "● Ollama " + (ollama.online ? "在线" : "离线")), h("span", null, model), h("button", { className: "prompt-pill", onClick: function () { changeView("prompts"); } }, "Prompt " + (harness.current_prompt_id || promptId)), h("span", { className: harness.trace_enabled ? "trace-on" : "trace-off" }, "● Trace " + (harness.trace_enabled ? "ON" : "OFF"))))),
+      h("header", { className: "topbar" }, h("div", { className: "topbar-left" }, h("button", { className: "sidebar-toggle", type: "button", "aria-label": narrowSidebar ? (mobileMenuOpen ? "关闭菜单" : "打开菜单") : (sidebarCollapsed ? "展开菜单" : "折叠菜单"), "aria-controls": "primary-navigation", "aria-expanded": narrowSidebar ? mobileMenuOpen : !sidebarCollapsed, onClick: toggleSidebar }, h("i"), h("i"), h("i")), h("div", { className: "brand" }, h("img", { className: "brand-logo", src: "/assets/logrisk-app-icon-orange-v2.png", alt: "LOGRISK" }), h("div", null, h("b", null, "LOGRISK"), h("span", null, "Feature review console")))), h("div", { className: "topbar-actions" }, h("a", { className: "help-button", href: apiUrl("/help"), target: "_blank", rel: "noreferrer" }, "? 帮助"), h("div", { className: "system-status" }, h("span", { className: ollama.online ? "online" : "offline" }, "● Ollama " + (ollama.online ? "在线" : "离线")), h("span", null, model), h("button", { className: "prompt-pill", onClick: function () { changeView("prompts"); } }, "Prompt " + (harness.current_prompt_id || promptId)), h("span", { className: harness.trace_enabled ? "trace-on" : "trace-off" }, "● Trace " + (harness.trace_enabled ? "ON" : "OFF"))))),
       h(Sidebar, { active: view, onChange: changeView }),
       h("button", { className: "sidebar-overlay", type: "button", "aria-label": "关闭菜单", onClick: function () { setMobileMenuOpen(false); } }),
       h("main", null,

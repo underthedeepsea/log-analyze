@@ -166,6 +166,7 @@
     traces: function (query) { return jsonRequest("/api/ai-harness/traces" + (query || "")); },
     trace: function (id) { return jsonRequest("/api/ai-harness/traces/" + encodeURIComponent(id)); },
     job: function (id) { return jsonRequest("/api/jobs/" + id); },
+    featureApprovals: function () { return jsonRequest("/api/feature-approvals?status=pending&page_size=100"); },
     createJob: function (result, model, minScore, promptId, modelProfileId, retryCount) {
       return jsonRequest("/api/jobs", { method: "POST", body: JSON.stringify({ result: result, model: model, min_score: Number(minScore), prompt_id: promptId, model_profile_id: modelProfileId, retry_count: Number(retryCount), cache_enabled: true }) });
     },
@@ -322,6 +323,9 @@
   function shortHash(value) { return value ? String(value).slice(0, 10) : "—"; }
   function timeText(value) { return value ? new Date(value).toLocaleString() : "—"; }
   function pathToView(path) {
+    if (path === "/review") return "review";
+    if (path === "/queue") return "queue";
+    if (path === "/export") return "export";
     if (path === "/benchmark-center") return "benchmarkCenter";
     if (path === "/knowledge-packages") return "knowledgePackages";
     if (path === "/agent-runs") return "agentRuns";
@@ -343,6 +347,7 @@
   }
   function routeForView(view) {
     return {
+      review: "/review", queue: "/queue", export: "/export",
       benchmarkCenter: "/benchmark-center", runtime: "/runtime", releaseReadiness: "/release-readiness", streaming: "/streaming", prompts: "/prompts", modelProfiles: "/model-profiles", agentRuns: "/agent-runs", agentWorkflows: "/agent-workflows",
       traces: "/ai-traces", observability: "/ai-observability", drainQuality: "/drain-quality", rules: "/rules",
       nodeRisks: "/node-risks", multiSource: "/multi-source", semanticLibrary: "/semantic-library", settings: "/settings",
@@ -448,6 +453,30 @@
     );
   }
 
+  function ReviewGroupList(props) {
+    const groups = props.groups || [];
+    return h("section", { className: "surface approval-feature-list" },
+      h("div", { className: "surface-head" }, h("b", null, "待审批 Review Group"), h("span", null, (props.totalCandidates || 0) + " 个候选")),
+      h("div", { className: "feature-list" },
+        props.loading && h("div", { className: "empty-state" }, "正在加载持久化审批队列…"),
+        !props.loading && groups.length === 0 && h("div", { className: "empty-state" }, "暂无待审批特征"),
+        groups.map(function (group) {
+          const active = props.selectedKey === group.review_key;
+          return h("button", {
+            className: "feature-row " + (active ? "active" : ""),
+            key: group.review_key,
+            onClick: function () { props.onSelect(group.review_key); },
+          }, h("div", null,
+            h("b", null, group.title || group.problem_code || "未命名问题"),
+            h("span", null, group.problem_code || "未知问题"),
+            h("small", null, "候选 " + group.candidate_count + " · 实体 " + group.affected_entity_count + " · 出现 " + group.occurrence_count + " 次"),
+            h("small", null, timeText(group.first_seen) + " — " + timeText(group.last_seen))),
+          h("span", { className: "status-chip pending" }, group.importance || "待审批"));
+        })
+      )
+    );
+  }
+
   function evidenceSemanticLabel(template, index) {
     const riskSemantic = template && template.risk_semantic || {};
     const semanticFields = riskSemantic.semantic_fields || {};
@@ -528,7 +557,7 @@
       return h("label", null, label, type === "textarea" ? h("textarea", controlProps) : h("input", controlProps));
     }
     function save(status) { props.onSave(Object.assign({}, draft, { tags: draft.tags.split(",").map(function (tag) { return tag.trim(); }).filter(Boolean), status: status })); }
-    return h("section", { className: "surface review-editor" }, h("div", { className: "surface-head" }, h("b", null, "人工审批"), h("span", null, props.feature.origin === "approved_rule" ? "来自批准规则库" : "来自模型 + Drain3")), h("div", { className: "editor-body" }, field("特征标题（来自模型）", "title"), field("特征摘要（模型语义 + 当前 Drain3 模板）", "summary", "textarea"), field("标签（来自模型，逗号分隔）", "tags"), field("审批备注", "reviewer_note", "textarea"), h("div", { className: "fact-box" }, "当前证据模板：", selectedTemplate.template_hash || "—", h("br"), "组件 " + (selectedTemplate.component || "—") + " · 类别 " + (selectedTemplate.category || "—") + " · 次数 " + (selectedTemplate.count || 0), h("br"), selectedTemplate.template || "暂无模板文本"), h("div", { className: "fact-box" }, "质量门禁：已通过", h("br"), "Evaluator Score：" + (props.feature.evaluator_result && props.feature.evaluator_result.score != null ? props.feature.evaluator_result.score : "—"), h("br"), "实体 " + (props.feature.entity && props.feature.entity.id || "") + " · 风险分 " + props.feature.risk_score + " · 出现 " + props.feature.occurrence_count + " 次", h("br"), props.feature.trace_id ? "来源 " + (props.feature.prompt_id || "feature_extract_v3_compact_strict_json_en") + " · " + (props.feature.model || "—") + " · " + props.feature.trace_id : "来源：历史数据 / 未记录 Trace"), props.feature.trace_id && h("button", { className: "text-button trace-link", onClick: function () { props.onOpenTrace(props.feature.trace_id); } }, "查看 AI Trace"), h("div", { className: "editor-actions" }, h("button", { className: "reject-button", onClick: function () { save("rejected"); } }, "驳回"), h("button", { className: "primary-button", onClick: function () { save("approved"); } }, "批准并写入规则库"))));
+    return h("section", { className: "surface review-editor" }, h("div", { className: "surface-head" }, h("b", null, "人工审批"), h("span", null, props.feature.origin === "approved_rule" ? "来自批准规则库" : "来自模型 + Drain3")), h("div", { className: "editor-body" }, field("特征标题（来自模型）", "title"), field("特征摘要（模型语义 + 当前 Drain3 模板）", "summary", "textarea"), field("标签（来自模型，逗号分隔）", "tags"), field("审批备注", "reviewer_note", "textarea"), h("div", { className: "fact-box" }, "执行模型：", props.feature.model || "—", h("br"), "Provider：", props.feature.provider || "—", h("br"), "Model Profile：", props.feature.model_profile_id || "—", h("br"), "Prompt：", props.feature.prompt_id || "—", h("br"), "Job：", props.feature.job_id || "—", h("br"), "Trace：", props.feature.trace_id || "—"), h("div", { className: "fact-box" }, "当前证据模板：", selectedTemplate.template_hash || "—", h("br"), "组件 " + (selectedTemplate.component || "—") + " · 类别 " + (selectedTemplate.category || "—") + " · 次数 " + (selectedTemplate.count || 0), h("br"), selectedTemplate.template || "暂无模板文本"), h("div", { className: "fact-box" }, "质量门禁：已通过", h("br"), "Evaluator Score：" + (props.feature.evaluator_result && props.feature.evaluator_result.score != null ? props.feature.evaluator_result.score : "—"), h("br"), "实体 " + (props.feature.entity && props.feature.entity.id || "") + " · 风险分 " + props.feature.risk_score + " · 出现 " + props.feature.occurrence_count + " 次", h("br"), props.feature.trace_id ? "来源 " + (props.feature.prompt_id || "feature_extract_v3_compact_strict_json_en") + " · " + (props.feature.model || "—") + " · " + props.feature.trace_id : "来源：历史数据 / 未记录 Trace"), props.feature.trace_id && h("button", { className: "text-button trace-link", onClick: function () { props.onOpenTrace(props.feature.trace_id); } }, "查看 AI Trace"), h("div", { className: "editor-actions" }, h("button", { className: "reject-button", onClick: function () { save("rejected"); } }, "驳回"), h("button", { className: "primary-button", onClick: function () { save("approved"); } }, "批准并写入规则库"))));
   }
 
   function PromptManagement(props) {
@@ -1977,6 +2006,7 @@
     const [ollama, setOllama] = useState({ online: false }), [result, setResult] = useState(null), [fileName, setFileName] = useState("");
     const [snapshot, setSnapshot] = useState(null), [jobId, setJobId] = useState(null), [rules, setRules] = useState([]);
     const [ruleLoading, setRuleLoading] = useState(false), [ruleReviewQueue, setRuleReviewQueue] = useState({ items: [], total: 0 });
+    const [approvalQueue, setApprovalQueue] = useState({ items: [], total_groups: 0, total_candidates: 0 }), [approvalLoading, setApprovalLoading] = useState(false), [selectedReviewKey, setSelectedReviewKey] = useState(function () { return new URLSearchParams(window.location.search).get("review_key") || ""; });
     const [systemMetrics, setSystemMetrics] = useState({ today_llm_logs: 0 });
     const [harness, setHarness] = useState({ trace_enabled: true, current_prompt_id: "feature_extract_v3_compact_strict_json_en" }), [prompts, setPrompts] = useState([]), [traces, setTraces] = useState([]);
     const [modelProfiles, setModelProfiles] = useState({ default_profile_id: "", profiles: [] }), [modelProfileId, setModelProfileId] = useState("");
@@ -2002,6 +2032,7 @@
     const [narrowSidebar, setNarrowSidebar] = useState(function () { return window.matchMedia("(max-width: 900px)").matches; });
     const events = useRef(null);
     const selected = useMemo(function () { return snapshot && snapshot.features && snapshot.features.find(function (feature) { return feature.candidate_id === selectedId; }) || null; }, [snapshot, selectedId]);
+    const selectedReview = useMemo(function () { return (approvalQueue.items || []).find(function (group) { return group.review_key === selectedReviewKey; }) || null; }, [approvalQueue, selectedReviewKey]);
     useEffect(function () {
       const features = snapshot && snapshot.features || [];
       setSelectedId(function (current) {
@@ -2009,6 +2040,13 @@
         return features.length ? features[0].candidate_id : null;
       });
     }, [snapshot]);
+    useEffect(function () {
+      const items = approvalQueue.items || [];
+      setSelectedReviewKey(function (current) {
+        if (current && items.some(function (group) { return group.review_key === current; })) return current;
+        return items.length ? items[0].review_key : "";
+      });
+    }, [approvalQueue]);
     useEffect(function () {
       const media = window.matchMedia("(max-width: 900px)");
       function updateSidebarMode(event) { setNarrowSidebar(event.matches); setMobileMenuOpen(false); }
@@ -2019,6 +2057,7 @@
       setView(next);
       setMobileMenuOpen(false);
       history.pushState({}, "", routeForView(next));
+      if (next === "review") loadApprovalQueue().catch(function (reason) { setError(reason.message); });
       if (next === "drainQuality") loadDrainQuality().catch(function (reason) { setError(reason.message); });
       if (next === "rules") loadRules().catch(function (reason) { setError(reason.message); });
       if (next === "nodeRisks") loadNodeRisks().catch(function (reason) { setError(reason.message); });
@@ -2042,6 +2081,26 @@
       loadHarness(query).catch(function (reason) { setError(reason.message); });
     }
     async function loadHarness(query) { const values = await Promise.all([api.harnessStatus(), api.prompts(), api.traces(query || "?limit=50"), api.modelProfiles()]); setHarness(values[0]); setPrompts(values[1].items || []); setPromptId(values[1].current_prompt_id || "feature_extract_v3_compact_strict_json_en"); setTraces(values[2].items || []); setModelProfiles(values[3]); setModelProfileId(function (current) { return current || values[3].default_profile_id || ""; }); }
+    async function loadApprovalQueue() {
+      setApprovalLoading(true);
+      try {
+        const value = await api.featureApprovals();
+        const items = value.items || [];
+        const requested = new URLSearchParams(window.location.search).get("review_key") || "";
+        setApprovalQueue(Object.assign({ items: [], total_groups: 0, total_candidates: 0 }, value));
+        setSelectedReviewKey(function (current) {
+          if (requested && items.some(function (group) { return group.review_key === requested; })) return requested;
+          if (current && items.some(function (group) { return group.review_key === current; })) return current;
+          return items.length ? items[0].review_key : "";
+        });
+        return value;
+      } catch (reason) {
+        setError(reason.message);
+        throw reason;
+      } finally {
+        setApprovalLoading(false);
+      }
+    }
     async function loadAgentRuns(selectedId) {
       setAgentRunData(function (current) { return Object.assign({}, current, { loading: true, failure: "" }); });
       try {
@@ -2161,8 +2220,8 @@
     async function refresh(id) { const next = await api.job(id || jobId); setSnapshot(next); if (["completed", "completed_with_errors"].includes(next.status) && events.current) events.current.close(); loadHarness().catch(function () {}); }
     useEffect(function () {
       const query = window.location.pathname === "/ai-traces" ? traceFilterQuery(traceFiltersFromSearch(window.location.search)) : "?limit=50";
-      Promise.all([api.config(), api.status(), Promise.all([api.governedRules("?page_size=100"), api.ruleReviewQueue()]), api.metrics(), api.harnessStatus(), api.prompts(), api.traces(query), api.modelProfiles()]).then(function (values) { setModel(values[0].default_model); setOllama(values[1]); setRules(values[2][0].items || []); setRuleReviewQueue(values[2][1]); setSystemMetrics(values[3]); setHarness(values[4]); setPrompts(values[5].items || []); setPromptId(values[5].current_prompt_id || values[4].current_prompt_id || "feature_extract_v3_compact_strict_json_en"); setTraces(values[6].items || []); setModelProfiles(values[7]); setModelProfileId(values[7].default_profile_id || ""); if (window.location.pathname === "/ai-observability") loadObservability().catch(function (reason) { setError(reason.message); }); if (window.location.pathname === "/agent-runs") loadAgentRuns(); if (window.location.pathname === "/agent-workflows") loadAgentWorkflows().catch(function () {}); if (window.location.pathname === "/drain-quality") loadDrainQuality().catch(function (reason) { setError(reason.message); }); if (window.location.pathname.startsWith("/node-risks")) loadNodeRisks().catch(function (reason) { setError(reason.message); }); if (window.location.pathname === "/multi-source") loadMultiSource().catch(function () {}); if (window.location.pathname === "/semantic-library") loadRiskSemantics().catch(function (reason) { setError(reason.message); }); if (window.location.pathname === "/streaming") loadStreaming().catch(function (reason) { setError(reason.message); }); if (window.location.pathname === "/benchmark-center") loadBenchmark().catch(function () {}); if (window.location.pathname === "/runtime") loadRuntime().catch(function () {}); if (window.location.pathname === "/release-readiness") loadReleaseReadiness().catch(function () {}); }).catch(function (reason) { setError(reason.message); });
-      function onPop() { const filters = traceFiltersFromSearch(window.location.search); setView(pathToView(window.location.pathname)); setTraceFilters(filters); if (window.location.pathname === "/ai-traces") loadHarness(traceFilterQuery(filters)).catch(function () {}); if (window.location.pathname === "/ai-observability") loadObservability().catch(function () {}); if (window.location.pathname === "/agent-runs") loadAgentRuns(); if (window.location.pathname === "/agent-workflows") loadAgentWorkflows().catch(function () {}); if (window.location.pathname === "/drain-quality") loadDrainQuality().catch(function () {}); if (window.location.pathname === "/rules") loadRules().catch(function () {}); if (window.location.pathname.startsWith("/node-risks")) loadNodeRisks().catch(function () {}); if (window.location.pathname === "/multi-source") loadMultiSource().catch(function () {}); if (window.location.pathname === "/semantic-library") loadRiskSemantics().catch(function () {}); if (window.location.pathname === "/streaming") loadStreaming().catch(function () {}); if (window.location.pathname === "/benchmark-center") loadBenchmark().catch(function () {}); if (window.location.pathname === "/runtime") loadRuntime().catch(function () {}); if (window.location.pathname === "/release-readiness") loadReleaseReadiness().catch(function () {}); if (window.location.pathname === "/knowledge-packages") { /* page owns its refresh */ } }
+      Promise.all([api.config(), api.status(), Promise.all([api.governedRules("?page_size=100"), api.ruleReviewQueue()]), api.metrics(), api.harnessStatus(), api.prompts(), api.traces(query), api.modelProfiles()]).then(function (values) { setModel(values[0].default_model); setOllama(values[1]); setRules(values[2][0].items || []); setRuleReviewQueue(values[2][1]); setSystemMetrics(values[3]); setHarness(values[4]); setPrompts(values[5].items || []); setPromptId(values[5].current_prompt_id || values[4].current_prompt_id || "feature_extract_v3_compact_strict_json_en"); setTraces(values[6].items || []); setModelProfiles(values[7]); setModelProfileId(values[7].default_profile_id || ""); if (window.location.pathname === "/ai-observability") loadObservability().catch(function (reason) { setError(reason.message); }); if (window.location.pathname === "/agent-runs") loadAgentRuns(); if (window.location.pathname === "/agent-workflows") loadAgentWorkflows().catch(function () {}); if (window.location.pathname === "/drain-quality") loadDrainQuality().catch(function (reason) { setError(reason.message); }); if (window.location.pathname.startsWith("/node-risks")) loadNodeRisks().catch(function (reason) { setError(reason.message); }); if (window.location.pathname === "/multi-source") loadMultiSource().catch(function () {}); if (window.location.pathname === "/semantic-library") loadRiskSemantics().catch(function (reason) { setError(reason.message); }); if (window.location.pathname === "/streaming") loadStreaming().catch(function (reason) { setError(reason.message); }); if (window.location.pathname === "/benchmark-center") loadBenchmark().catch(function () {}); if (window.location.pathname === "/runtime") loadRuntime().catch(function () {}); if (window.location.pathname === "/release-readiness") loadReleaseReadiness().catch(function () {}); if (window.location.pathname === "/review") loadApprovalQueue().catch(function () {}); }).catch(function (reason) { setError(reason.message); });
+      function onPop() { const filters = traceFiltersFromSearch(window.location.search); setView(pathToView(window.location.pathname)); setTraceFilters(filters); if (window.location.pathname === "/ai-traces") loadHarness(traceFilterQuery(filters)).catch(function () {}); if (window.location.pathname === "/ai-observability") loadObservability().catch(function () {}); if (window.location.pathname === "/agent-runs") loadAgentRuns(); if (window.location.pathname === "/agent-workflows") loadAgentWorkflows().catch(function () {}); if (window.location.pathname === "/drain-quality") loadDrainQuality().catch(function () {}); if (window.location.pathname === "/rules") loadRules().catch(function () {}); if (window.location.pathname.startsWith("/node-risks")) loadNodeRisks().catch(function () {}); if (window.location.pathname === "/multi-source") loadMultiSource().catch(function () {}); if (window.location.pathname === "/semantic-library") loadRiskSemantics().catch(function () {}); if (window.location.pathname === "/streaming") loadStreaming().catch(function () {}); if (window.location.pathname === "/benchmark-center") loadBenchmark().catch(function () {}); if (window.location.pathname === "/runtime") loadRuntime().catch(function () {}); if (window.location.pathname === "/release-readiness") loadReleaseReadiness().catch(function () {}); if (window.location.pathname === "/review") loadApprovalQueue().catch(function () {}); if (window.location.pathname === "/knowledge-packages") { /* page owns its refresh */ } }
       window.addEventListener("popstate", onPop);
       return function () { window.removeEventListener("popstate", onPop); if (events.current) events.current.close(); };
     }, []);
@@ -2183,9 +2242,30 @@
       const timer = setInterval(function () { if (!document.hidden) loadStreaming().catch(function () {}); }, 1500);
       return function () { clearInterval(timer); };
     }, [view, (streamingData.tasks || []).map(function (task) { return task.task_id + ":" + task.status + ":" + task.updated_at; }).join("|")]);
+    useEffect(function () {
+      if (view !== "review") return;
+      const timer = setInterval(function () { if (!document.hidden) loadApprovalQueue().catch(function () {}); }, 3000);
+      return function () { clearInterval(timer); };
+    }, [view]);
     async function loadFile(file) { if (!file) return; setBusy(true); setError(""); setUploadProgress(null); setPreprocessProgress(null); try { const next = await api.analyzeFile(file, { onUploadProgress: setUploadProgress, onPreprocessProgress: setPreprocessProgress }); setResult(next); setFileName(file.name); setSnapshot(null); setJobId(null); changeView("overview"); } catch (reason) { setError(reason.message); } finally { setBusy(false); } }
     async function start() { if (!result) return; setBusy(true); setError(""); try { const created = await api.createJob(result, model, threshold, promptId, modelProfileId, retryCount); setJobId(created.job_id); changeView("queue"); await refresh(created.job_id); if (events.current) events.current.close(); events.current = api.subscribe(created.job_id, function () { refresh(created.job_id).catch(function (reason) { setError(reason.message); }); }); } catch (reason) { setError(reason.message); } finally { setBusy(false); } }
     async function save(changes) { try { await api.update(jobId, selectedId, changes); await refresh(); await loadRules(); } catch (reason) { setError(reason.message); } }
+    function selectReviewGroup(reviewKey) { setSelectedReviewKey(reviewKey); history.pushState({}, "", "/review?review_key=" + encodeURIComponent(reviewKey)); }
+    async function saveReview(changes) {
+      const representative = selectedReview && selectedReview.representative;
+      if (!representative) return;
+      try {
+        await api.update(
+          representative.job_id,
+          representative.candidate_id,
+          Object.assign({}, changes, { review_scope: "approval_identity" }),
+        );
+        await loadApprovalQueue();
+        await loadRules();
+      } catch (reason) {
+        setError(reason.message);
+      }
+    }
     function retry(entityId) { api.retry(jobId, entityId).then(function () { return refresh(); }).catch(function (reason) { setError(reason.message); }); }
     function openTrace(traceId) { api.trace(traceId).then(function (item) { setDrawer({ type: "trace", item: item }); applyTraceFilters({ job_id: "", trace_id: traceId, status: "", prompt_id: "" }); }).catch(function (reason) { setError(reason.message); }); }
     function openPrompt(id) { api.prompt(id).then(function (item) { setDrawer({ type: "prompt", item: item }); setView("prompts"); history.pushState({}, "", "/prompts?prompt_id=" + encodeURIComponent(id)); }).catch(function (reason) { setError(reason.message); }); }
@@ -2220,10 +2300,12 @@
     const activePrompts = prompts.filter(function (prompt) { return prompt.analysis_type === "feature_extract" && prompt.status === "active"; });
     const activeProfiles = modelProfiles.profiles || [];
     const selectedModelProfile = activeProfiles.find(function (profile) { return profile.profile_id === modelProfileId; }) || {};
+    const selectedRepresentative = selectedReview && selectedReview.representative || null;
+    const topbarModel = view === "review" ? (selectedRepresentative && selectedRepresentative.model || "—") : model;
     const traceRule = drawer.item && rules.find(function (rule) { return rule.lineage && rule.lineage.trace_id === drawer.item.trace_id; });
     const drawerContent = !drawer.item ? null : (drawer.type === "prompt" ? h(PromptDrawer, { item: drawer.item, onSave: savePrompt, onOpenTrace: openTrace }) : h(TraceDrawer, { item: drawer.item, rule: traceRule, onOpenRule: openRule }));
     return h("div", { className: "app-shell" + (sidebarCollapsed ? " sidebar-collapsed" : "") + (mobileMenuOpen ? " mobile-menu-open" : "") },
-      h("header", { className: "topbar" }, h("div", { className: "topbar-left" }, h("button", { className: "sidebar-toggle", type: "button", "aria-label": narrowSidebar ? (mobileMenuOpen ? "关闭菜单" : "打开菜单") : (sidebarCollapsed ? "展开菜单" : "折叠菜单"), "aria-controls": "primary-navigation", "aria-expanded": narrowSidebar ? mobileMenuOpen : !sidebarCollapsed, onClick: toggleSidebar }, h("i"), h("i"), h("i")), h("div", { className: "brand" }, h("img", { className: "brand-logo", src: "/assets/logrisk-app-icon-orange-v2.png", alt: "LOGRISK" }), h("div", null, h("b", null, "LOGRISK"), h("span", null, "Feature review console")))), h("div", { className: "topbar-actions" }, h("a", { className: "help-button", href: apiUrl("/help"), target: "_blank", rel: "noreferrer" }, "? 帮助"), h("div", { className: "system-status" }, h("span", { className: ollama.online ? "online" : "offline" }, "● Ollama " + (ollama.online ? "在线" : "离线")), h("span", null, model), h("button", { className: "prompt-pill", onClick: function () { changeView("prompts"); } }, "Prompt " + (harness.current_prompt_id || promptId)), h("span", { className: harness.trace_enabled ? "trace-on" : "trace-off" }, "● Trace " + (harness.trace_enabled ? "ON" : "OFF"))))),
+      h("header", { className: "topbar" }, h("div", { className: "topbar-left" }, h("button", { className: "sidebar-toggle", type: "button", "aria-label": narrowSidebar ? (mobileMenuOpen ? "关闭菜单" : "打开菜单") : (sidebarCollapsed ? "展开菜单" : "折叠菜单"), "aria-controls": "primary-navigation", "aria-expanded": narrowSidebar ? mobileMenuOpen : !sidebarCollapsed, onClick: toggleSidebar }, h("i"), h("i"), h("i")), h("div", { className: "brand" }, h("img", { className: "brand-logo", src: "/assets/logrisk-app-icon-orange-v2.png", alt: "LOGRISK" }), h("div", null, h("b", null, "LOGRISK"), h("span", null, "Feature review console")))), h("div", { className: "topbar-actions" }, h("a", { className: "help-button", href: apiUrl("/help"), target: "_blank", rel: "noreferrer" }, "? 帮助"), h("div", { className: "system-status" }, h("span", { className: ollama.online ? "online" : "offline" }, "● Ollama " + (ollama.online ? "在线" : "离线")), h("span", null, topbarModel), h("button", { className: "prompt-pill", onClick: function () { changeView("prompts"); } }, "Prompt " + (harness.current_prompt_id || promptId)), h("span", { className: harness.trace_enabled ? "trace-on" : "trace-off" }, "● Trace " + (harness.trace_enabled ? "ON" : "OFF"))))),
       h(Sidebar, { active: view, onChange: changeView }),
       h("button", { className: "sidebar-overlay", type: "button", "aria-label": "关闭菜单", onClick: function () { setMobileMenuOpen(false); } }),
       h("main", null,
@@ -2239,9 +2321,9 @@
         view === "agentRuns" && h(AgentRunsPage, { data: agentRunData, profiles: activeProfiles, prompts: prompts.filter(function (prompt) { return prompt.analysis_type === "agent_plan" && prompt.status === "active"; }), onRefresh: loadAgentRuns, onSelect: loadAgentRuns, onReview: function () { changeView("review"); }, onCreate: function (payload) { return api.createAgentRun(payload).then(function (created) { return loadAgentRuns(created.run_id); }).catch(function (reason) { setError(reason.message); throw reason; }); }, onAction: function (runId, action) { return changeAgentRun(runId, action).catch(function (reason) { setError(reason.message); throw reason; }); } }),
         view === "agentWorkflows" && h(AgentWorkflowsPage, { data: agentWorkflowData, profiles: activeProfiles, onRefresh: loadAgentWorkflows, onSelect: loadAgentWorkflows, onReview: function () { changeView("review"); }, onCreateWorkflow: function (definition) { return api.createAgentWorkflow(definition).then(function () { return loadAgentWorkflows(); }); }, onCreateRun: function (workflowId, payload) { return api.createAgentWorkflowRun(workflowId, payload).then(function (created) { return loadAgentWorkflows(created.workflow_run_id); }); }, onAction: changeAgentWorkflow, onRetryNode: function (runId, nodeId) { return api.retryNode(runId, nodeId).then(function () { return loadAgentWorkflows(runId); }); } }),
         view === "review" && h("section", { className: "approval-workspace" },
-          h(FeatureList, { features: snapshot && snapshot.features || [], selectedId: selectedId, onSelect: setSelectedId }),
-          h(FeatureEvidence, { feature: selected, onSelectTemplate: setSelectedTemplate }),
-          h(ReviewEditor, { feature: selected, selectedTemplate: selectedTemplate, onSave: save, onOpenTrace: openTrace })),
+          h(ReviewGroupList, { groups: approvalQueue.items, totalCandidates: approvalQueue.total_candidates, loading: approvalLoading, selectedKey: selectedReviewKey, onSelect: selectReviewGroup }),
+          h(FeatureEvidence, { feature: selectedRepresentative, onSelectTemplate: setSelectedTemplate }),
+          h(ReviewEditor, { feature: selectedRepresentative, selectedTemplate: selectedTemplate, onSave: saveReview, onOpenTrace: openTrace })),
         view === "rules" && h(RuleLibrary, { rules: rules, reviewQueue: ruleReviewQueue, loading: ruleLoading, focusRuleId: ruleFocus, onOpenTrace: openTrace, onChanged: loadRules }),
         view === "nodeRisks" && h(NodeRiskPage, { catalog: nodeRiskCatalog, selected: selectedNodeRisk, onRefresh: loadNodeRisks, onSelect: function (item) { selectNodeRisk(item).catch(function (reason) { setError(reason.message); }); }, onEvent: function (eventId, action) { changeNodeEvent(eventId, action).catch(function (reason) { setError(reason.message); }); } }),
         view === "multiSource" && h(MultiSourcePage, { data: multiSourceData, onRefresh: function () { loadMultiSource().catch(function () {}); }, onSelect: function (entity) { selectMultiSourceEntity(entity).catch(function (reason) { setError(reason.message); }); }, onRule: function (rule, enabled) { changeMultiSourceRule(rule, enabled).catch(function (reason) { setError(reason.message); }); } }),

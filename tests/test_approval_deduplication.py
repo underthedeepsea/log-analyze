@@ -2,7 +2,13 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 
-from logrisk.approval_dedup import approval_identity, build_approval_key, normalize_problem_code
+from logrisk.approval_dedup import (
+    approval_identity,
+    build_approval_key,
+    derive_problem_code,
+    normalize_problem_code,
+    same_approval_identity,
+)
 from logrisk.approved_rules import ApprovedRuleStore
 from logrisk.database import SQLiteDatabase
 from logrisk.feature_jobs import FeatureJobManager
@@ -53,6 +59,88 @@ def test_model_candidates_without_explicit_anchor_ignore_wrapper_fingerprint():
     second["source_templates"][0]["template_fingerprint"] = "different-wrapper-fingerprint"
 
     assert approval_identity(first)["approval_key"] == approval_identity(second)["approval_key"]
+
+
+def test_cni_wrappers_choose_the_same_concrete_root_cause():
+    candidates = [
+        {
+            "candidate_id": "candidate-a",
+            "job_id": "job-a",
+            "feature_type": "cni_network_failure",
+            "problem_code": "runtime_cni_setup_failed",
+            "components": ["kubelet"],
+            "source_templates": [
+                {"component": "kubelet", "template": "NetworkPlugin cni failed: no enough ips"},
+            ],
+        },
+        {
+            "candidate_id": "candidate-b",
+            "job_id": "job-b",
+            "feature_type": "pod_sandbox_network_failure",
+            "problem_code": "runtime_sandbox_create_failed",
+            "components": ["containerd"],
+            "source_templates": [
+                {"component": "containerd", "template": "CreatePodSandbox failed: cni no enough ips"},
+            ],
+        },
+    ]
+
+    assert [derive_problem_code(candidate) for candidate in candidates] == [
+        "kubernetes.cni.ip_exhaustion",
+        "kubernetes.cni.ip_exhaustion",
+    ]
+    assert approval_identity(candidates[0])["approval_key"] == approval_identity(candidates[1])["approval_key"]
+
+
+def test_canonical_approval_identity_ignores_wrapper_shape():
+    first = {
+        "feature_type": "cni_network_failure",
+        "problem_code": "kubernetes.cni.ip_exhaustion",
+        "components": ["kubelet"],
+        "anchor_signatures": ["wrapper-a"],
+    }
+    second = {
+        "feature_type": "pod_sandbox_network_failure",
+        "problem_code": "CNI no enough IP",
+        "components": ["containerd"],
+        "anchor_signatures": ["wrapper-b"],
+    }
+
+    assert approval_identity(first)["approval_key"] == approval_identity(second)["approval_key"]
+
+
+def test_conflicting_concrete_cni_causes_use_strict_fallback():
+    feature = {
+        "feature_type": "cni_network_failure",
+        "problem_code": "runtime_cni_setup_failed",
+        "semantic_fields": {
+            "risk_type": "kubernetes.cni.config_error",
+        },
+        "source_templates": [
+            {"template": "CNI config syntax error and no enough ips"},
+        ],
+    }
+
+    assert derive_problem_code(feature).startswith("logrisk.cni_network_failure.")
+
+
+def test_same_approval_identity_supports_legacy_and_v2_semantic_candidates():
+    legacy = {
+        "feature_type": "cni_network_failure",
+        "problem_code": "runtime_cni_setup_failed",
+        "approval_key": "appr-legacy-wrapper",
+        "components": ["kubelet"],
+        "source_templates": [{"template": "NetworkPlugin cni failed: no enough ips"}],
+    }
+    current = {
+        "feature_type": "pod_sandbox_network_failure",
+        "problem_code": "runtime_sandbox_create_failed",
+        "approval_key": approval_identity({"problem_code": "kubernetes.cni.ip_exhaustion"})["approval_key"],
+        "components": ["containerd"],
+        "source_templates": [{"template": "CreatePodSandbox failed: cni no enough ips"}],
+    }
+
+    assert same_approval_identity(legacy, current)
 
 
 def test_distinct_problem_codes_do_not_merge_on_same_template_signature(tmp_path):

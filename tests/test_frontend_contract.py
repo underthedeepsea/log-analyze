@@ -553,8 +553,8 @@ def test_release_docs_describe_current_feature_version():
     assert "## 1.31.0 - 2026-08-03" in release
     assert "## 1.32.0 - 2026-08-10" in release
     assert "## 1.34.0 - 2026-08-13" in release
-    assert "## 1.36.0 - 2026-09-01" in release
-    assert "当前版本：`1.36.0`" in readme
+    assert "## 1.36.1 - 2026-09-01" in release
+    assert "当前版本：`1.36.1`" in readme
     assert "## 1.24.0 - 2026-07-22" in release
     assert "## 1.24.1 - 2026-07-22" in release
     assert "## 1.24.2 - 2026-07-22" in release
@@ -671,3 +671,15 @@ def test_agent_run_ui_exposes_governed_runtime_controls():
     assert '"/" + action' in source
     for action in ("pause", "resume", "cancel", "retry"):
         assert '"' + action + '"' in source
+
+
+def test_feature_approval_workspace_uses_persistent_queue_and_recoverable_route():
+    source = source_text()
+
+    assert 'if (path === "/review") return "review";' in source
+    assert 'review: "/review"' in source
+    assert '/api/feature-approvals?status=pending&page_size=100' in source
+    assert 'representative.job_id' in source
+    assert 'representative.candidate_id' in source
+    assert 'review_scope' in source
+    assert 'h(FeatureList, { features: snapshot && snapshot.features || []' not in source

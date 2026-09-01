@@ -40,6 +40,69 @@ def test_sqlite_feature_jobs_round_trip_entities_candidates_and_events(tmp_path)
     assert loaded["events"][0]["type"] == "job_created"
 
 
+def test_sqlite_feature_job_store_lists_persisted_candidates_with_job_lineage(tmp_path):
+    database = SQLiteDatabase(tmp_path / "logrisk.sqlite3")
+    with database.transaction() as connection:
+        connection.execute(
+            "INSERT INTO provider_connections(connection_id, display_name, provider, base_url, created_at, updated_at) "
+            "VALUES ('connection-fast', 'Fast', 'ollama', 'http://127.0.0.1:11434', 'now', 'now')"
+        )
+        connection.execute(
+            "INSERT INTO model_profiles(profile_id, connection_id, model, display_name, profile_json, created_at, updated_at) "
+            "VALUES ('profile-fast', 'connection-fast', 'qwen3.5:4b-mlx', 'Fast', '{}', 'now', 'now')"
+        )
+    store = SQLiteFeatureJobStore(database)
+    store.save({
+        "job_id": "job-queue",
+        "status": "completed",
+        "model": "qwen3.5:4b-mlx",
+        "provider": "ollama",
+        "prompt_id": "feature-prompt-v3",
+        "model_profile_id": "profile-fast",
+        "created_at": "2026-07-16T00:00:00+00:00",
+        "completed_at": "2026-07-16T00:01:00+00:00",
+        "entities": [],
+        "features": {
+            "candidate-queue": {
+                "candidate_id": "candidate-queue",
+                "status": "pending",
+                "problem_code": "kubernetes.cni.ip_exhaustion",
+                "approval_key": "appr-v2",
+                "source_templates": [],
+            },
+        },
+        "events": [],
+    })
+
+    candidates = store.list_candidates(status="pending")
+
+    assert len(candidates) == 1
+    assert candidates[0]["candidate_id"] == "candidate-queue"
+    assert candidates[0]["job_id"] == "job-queue"
+    assert candidates[0]["model"] == "qwen3.5:4b-mlx"
+    assert candidates[0]["provider"] == "ollama"
+    assert candidates[0]["model_profile_id"] == "profile-fast"
+    assert candidates[0]["prompt_id"] == "feature-prompt-v3"
+
+
+def test_sqlite_feature_job_store_loads_one_job(tmp_path):
+    store = SQLiteFeatureJobStore(SQLiteDatabase(tmp_path / "logrisk.sqlite3"))
+    job = {
+        "job_id": "job-single",
+        "status": "queued",
+        "model_profile_id": None,
+        "created_at": "2026-07-16T00:00:00+00:00",
+        "completed_at": None,
+        "entities": [],
+        "features": {},
+        "events": [],
+    }
+    store.save(job)
+
+    assert store.load_job("job-single")["job_id"] == "job-single"
+    assert store.load_job("missing") is None
+
+
 def test_sqlite_feature_job_replace_preserves_continuous_learning_feedback(tmp_path):
     database = SQLiteDatabase(tmp_path / "logrisk.sqlite3")
     store = SQLiteFeatureJobStore(database)

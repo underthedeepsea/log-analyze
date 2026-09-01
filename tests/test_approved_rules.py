@@ -42,6 +42,26 @@ def entity(cluster="prod-a", entity_id="node-a"):
     }
 
 
+def cni_feature(feature_type="cni_network_failure", problem_code="kubernetes.cni.ip_exhaustion", component="kubelet"):
+    return {
+        "feature_type": feature_type,
+        "problem_code": problem_code,
+        "title": "CNI IP 地址耗尽",
+        "summary": "CNI 地址池没有可用 IP。",
+        "importance": "high",
+        "tags": ["cni"],
+        "selection_reason": "CNI 模板命中地址耗尽语义。",
+        "source_templates": [{
+            "template_hash": "hash-cni-" + component,
+            "template_fingerprint": "fingerprint-cni",
+            "category": "network",
+            "component": component,
+            "template": "CNI failed: no enough ips",
+            "count": 2,
+        }],
+    }
+
+
 def test_approved_rule_persists_and_matches_globally(tmp_path):
     path = tmp_path / "approved_rules.json"
     stored = ApprovedRuleStore(path).upsert_feature(feature())
@@ -165,3 +185,57 @@ def test_record_reuse_increments_usage_metadata(tmp_path):
 
     assert updated["reuse_count"] == 1
     assert updated["last_reused_at"]
+
+
+def test_semantic_rule_matches_new_wrapper_without_template_identity(tmp_path):
+    store = ApprovedRuleStore(tmp_path / "rules.json")
+    stored = store.upsert_feature(cni_feature())
+    target = cni_feature(
+        feature_type="pod_sandbox_network_failure",
+        problem_code="runtime_sandbox_create_failed",
+        component="containerd",
+    )
+
+    matches = store.match_feature(target)
+
+    assert [item["rule_id"] for item in matches] == [stored["rule_id"]]
+
+
+def test_v1_wrapper_rule_is_reused_by_new_semantic_identity(tmp_path):
+    store = ApprovedRuleStore(tmp_path / "rules.json")
+    stored = store.upsert_feature(cni_feature())
+    legacy = store.list_rules()[0]
+    legacy["approval_key"] = "appr-v1-wrapper"
+    legacy["problem_code"] = "kubernetes.cni.plugin_failure"
+    store._write_locked([legacy])
+
+    reused = store.upsert_feature(cni_feature(
+        feature_type="pod_sandbox_network_failure",
+        problem_code="runtime_sandbox_create_failed",
+        component="containerd",
+    ))
+
+    assert reused["rule_id"] == stored["rule_id"]
+    assert len(store.list_rules()) == 1
+
+
+def test_semantic_entity_matching_does_not_require_original_component(tmp_path):
+    store = ApprovedRuleStore(tmp_path / "rules.json")
+    stored = store.upsert_feature(cni_feature(component="kubelet"))
+    target = {
+        "entity_type": "node",
+        "entity_id": "node-b",
+        "cluster": "prod-b",
+        "top_templates": [{
+            "template_hash": "hash-cni-containerd",
+            "template_fingerprint": "another-wrapper",
+            "category": "network",
+            "component": "containerd",
+            "template": "CreatePodSandbox failed: cni no enough ips",
+            "count": 3,
+        }],
+    }
+
+    matches = store.match_entity(target)
+
+    assert [item["rule_id"] for item in matches] == [stored["rule_id"]]

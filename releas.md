@@ -6,6 +6,17 @@
 - 仅修复 Bug 时提升最后一位，例如 `1.2.0 → 1.2.1`；
 - 每次代码更新必须同步更新本文件。
 
+## 1.36.1 - 2026-09-01
+
+### Fixed
+
+- 修复同一 Drain3 根因因 feature_type、组件 wrapper 或模板集合差异被拆成多个待审批组的问题。
+- CNI IP 耗尽现在优先于 generic CNI/PodSandbox wrapper 语义，并兼容历史 V1 审批规则。
+- 修复人工审批页面依赖当前浏览器 Job Snapshot，刷新或重新进入后看不到数据库 pending Candidate 的问题。
+- 人工审批页改为从持久化全局审批队列加载，并按 canonical problem_code 聚合。
+- 修复 `/review` 路由刷新后丢失，以及审批页显示默认模型而不是实际 Candidate 执行模型的问题。
+- 批准或驳回一个语义审批组后，同组 pending Candidate 自动收敛。
+
 ## 1.36.0 - 2026-09-01
 
 ### Added
@@ -16,6 +27,10 @@
 ### Changed
 
 - 将 Kafka 来源从预留契约接入本地 Dashboard 和流式任务状态，默认仍关闭，避免未显式配置时建立 Broker 连接。
+
+### Fixed
+
+- 修复跨时间窗的同一风险实体重复写入特征任务表导致 SQLite `UNIQUE constraint` 和 HTTP 500；创建特征任务前会合并实体窗口、模板计数和时间范围。
 
 ## 1.35.2 - 2026-09-01
 

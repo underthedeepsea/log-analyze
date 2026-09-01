@@ -6,6 +6,7 @@ from typing import Any, Callable, Mapping
 
 from logrisk.ai_harness.connection_check import check_model_connection
 from logrisk.application.container import ApplicationContainer
+from logrisk.approval_queue import build_review_groups
 from logrisk.database import DatabaseError, PostgresDatabase
 from logrisk.database_config import database_url_from_candidate
 from logrisk.feature_extractor_ollama import FEATURE_PROMPT_ID
@@ -106,6 +107,8 @@ class ApiFacade:
             return self.rule_governance_rules(query or {})
         if path == "/api/rule-governance/review-queue":
             return self.rule_review_queue()
+        if path == "/api/feature-approvals":
+            return self.feature_approvals(query or {})
         if path.startswith("/api/rule-governance/rules/"):
             rule_id = path.rsplit("/", 1)[-1]
             if rule_id:
@@ -810,6 +813,22 @@ class ApiFacade:
         manager = self._service("feature_jobs", self.container.feature_jobs)
         manager.refresh_from_persistence(str(job_id))
         return manager.wait_for_events(str(job_id), max(0, int(cursor)), timeout=0)
+
+    def feature_approvals(self, query: Mapping[str, Any]) -> ApiResult:
+        status = self._query(query, "status") or "pending"
+        page_size = max(1, min(self._integer(query, "page_size", 100), 500))
+        candidates = self._service("feature_jobs", self.container.feature_jobs).list_persisted_candidates(
+            status=status,
+            limit=page_size,
+        )
+        groups = build_review_groups(candidates)
+        return ApiResult(200, {
+            "schema_version": "feature_approval_queue_v1",
+            "status": status,
+            "total_groups": len(groups),
+            "total_candidates": sum(int(group.get("candidate_count") or 0) for group in groups),
+            "items": groups[:page_size],
+        })
 
     def orchestration_detail(self, orchestration_run_id: str) -> ApiResult:
         return ApiResult(200, self.container.orchestration.get(str(orchestration_run_id)))

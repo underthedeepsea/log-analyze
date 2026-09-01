@@ -8,7 +8,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "logrisk"
-version = "1.31.0"
+version = "1.35.2"
 description = "Sanitized log feature review and export service"
 requires-python = ">=3.10"
 dependencies = []

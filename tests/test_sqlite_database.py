@@ -26,6 +26,8 @@ def test_database_applies_migrations_and_enables_safety_pragmas(tmp_path):
         "prompt_templates",
         "feature_jobs",
         "approved_rules",
+        "approval_groups",
+        "approval_group_candidates",
         "rule_versions",
         "rule_feedback",
         "rule_audit_events",
@@ -60,7 +62,7 @@ def test_database_migration_is_idempotent(tmp_path):
     with sqlite3.connect(path) as connection:
         count = connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0]
 
-    assert count == 19
+    assert count == 20
 
 
 def test_extension_provider_migration_upgrades_existing_connection_and_profile(tmp_path):
@@ -169,7 +171,7 @@ def test_qwen_9b_profile_migration_seeds_existing_database_without_changing_defa
 def test_schema_dictionary_describes_rule_lifecycle_tables():
     schema = Path("database/schema.yaml").read_text(encoding="utf-8")
 
-    assert "schema_version: 19" in schema
+    assert "schema_version: 20" in schema
     assert 'candidate_job: "feature_candidates.(candidate_id, job_id) ON DELETE RESTRICT"' in schema
     assert "uq_feature_candidates_candidate_job(candidate_id, job_id)" in schema
     assert "rule_versions:" in schema

@@ -8,6 +8,7 @@ from logrisk.database import SQLiteDatabase
 from logrisk.sqlite_stores import (
     SQLiteAICache,
     SQLiteAITraceLogger,
+    SQLiteApprovalGroupStore,
     SQLiteApprovedRuleStore,
     SQLiteFeatureJobStore,
     SQLiteProcessingMetricsStore,
@@ -185,6 +186,38 @@ def test_sqlite_rule_store_only_matches_active_rules(tmp_path):
         )
 
     assert rules.match_entity(entity) == []
+
+
+def test_sqlite_approval_group_round_trip_and_candidate_uniqueness(tmp_path):
+    database = SQLiteDatabase(tmp_path / "logrisk.sqlite3")
+    groups = SQLiteApprovalGroupStore(database)
+    group = groups.save({
+        "approval_group_id": "group-1",
+        "approval_key": "appr-1",
+        "problem_code": "kubernetes.cni.ip_exhaustion",
+        "feature_type": "network_failure",
+        "title": "CNI 网络配置失败",
+        "summary": "摘要",
+        "importance": "high",
+        "status": "pending",
+        "rule_id": None,
+        "first_seen": "2026-07-16T00:00:00+00:00",
+        "last_seen": "2026-07-16T00:05:00+00:00",
+        "occurrence_count": 3,
+        "affected_entity_count": 1,
+        "candidate_count": 1,
+        "candidate_ids": ["candidate-1"],
+        "created_at": "2026-07-16T00:00:00+00:00",
+        "updated_at": "2026-07-16T00:00:00+00:00",
+    })
+    groups.attach_candidate(group["approval_group_id"], "candidate-1", job_id="job-1", entity_id="node-a")
+
+    restored = SQLiteApprovalGroupStore(database).get_by_key("appr-1")
+
+    assert restored["approval_group_id"] == "group-1"
+    assert restored["problem_code"] == "kubernetes.cni.ip_exhaustion"
+    assert SQLiteApprovalGroupStore(database).has_candidate("candidate-1")
+    assert SQLiteApprovalGroupStore(database).candidate_group_id("candidate-1") == "group-1"
 
 
 def test_sqlite_upload_and_input_job_keep_metadata_in_database(tmp_path):

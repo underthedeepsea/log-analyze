@@ -93,10 +93,11 @@ class RuleGovernanceRepository:
             })
             connection.execute(
                 "UPDATE approved_rules SET rule_json=?, status=?, current_version=?, next_review_at=?, "
-                "schema_version='approved_rule_v2', updated_at=? WHERE rule_id=?",
+                "problem_code=?, approval_key=?, schema_version='approved_rule_v2', updated_at=? WHERE rule_id=?",
                 (
                     json.dumps(snapshot, ensure_ascii=False, separators=(",", ":")),
-                    snapshot["status"], version, snapshot.get("next_review_at"), created_at,
+                    snapshot["status"], version, snapshot.get("next_review_at"),
+                    snapshot.get("problem_code"), snapshot.get("approval_key"), created_at,
                     snapshot["rule_id"],
                 ),
             )

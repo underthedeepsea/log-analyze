@@ -11,6 +11,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict
 
+from logrisk.approval_dedup import (
+    InMemoryApprovalGroupStore,
+    approval_identity,
+    group_id_for_key,
+)
 from logrisk.approved_rules import ApprovedRuleStore
 from logrisk.feature_extractor_ollama import (
     DEFAULT_OLLAMA_URL,
@@ -123,6 +128,12 @@ def _sanitized_templates(entity: Dict[str, Any]) -> list[Dict[str, Any]]:
         "first_seen",
         "last_seen",
         "feature_hint",
+        "semantic_fields",
+        "semantic_tags",
+        "typed_parameters",
+        "semantic_dictionary_versions",
+        "semantic_extractor_version",
+        "risk_semantic",
     )
     return [
         {key: template.get(key) for key in allowed}
@@ -132,18 +143,58 @@ def _sanitized_templates(entity: Dict[str, Any]) -> list[Dict[str, Any]]:
 
 
 def _feature_from_rule(rule: Dict[str, Any], entity: Dict[str, Any]) -> Dict[str, Any]:
-    required = {
-        (str(item.get("template_fingerprint") or item.get("template_hash") or ""), str(item.get("category") or ""))
-        for item in (rule.get("template_signatures") or [])
-    }
+    templates = _sanitized_templates(entity)
+
+    def matches_signature(signature: Any, template: Dict[str, Any]) -> bool:
+        expected = str(signature or "").strip()
+        if not expected:
+            return False
+        expected_identity, separator, expected_category = expected.partition("|")
+        actual_identity = str(
+            template.get("template_fingerprint") or template.get("template_hash") or ""
+        ).strip()
+        actual_category = str(template.get("category") or "").strip()
+        return bool(
+            actual_identity
+            and actual_identity == expected_identity
+            and (not separator or actual_category == expected_category)
+        )
+
+    anchors = [str(item).strip() for item in (rule.get("anchor_signatures") or []) if str(item).strip()]
     sources = [
         template
-        for template in _sanitized_templates(entity)
-        if (
-            str(template.get("template_fingerprint") or template.get("template_hash") or ""),
-            str(template.get("category") or ""),
-        ) in required
+        for template in templates
+        if any(matches_signature(anchor, template) for anchor in anchors)
     ]
+    if not sources:
+        required = [
+            "|".join(
+                part for part in (
+                    str(item.get("template_fingerprint") or item.get("template_hash") or "").strip(),
+                    str(item.get("category") or "").strip(),
+                )
+                if part
+            )
+            for item in (rule.get("template_signatures") or [])
+            if isinstance(item, dict)
+        ]
+        sources = [
+            template
+            for template in templates
+            if any(matches_signature(signature, template) for signature in required)
+        ]
+    if not sources:
+        required_components = {
+            str(item).strip().lower()
+            for item in (rule.get("components") or [])
+            if str(item).strip()
+        }
+        sources = [
+            template
+            for template in templates
+            if not required_components
+            or str(template.get("component") or "").strip().lower() in required_components
+        ] or templates[:1]
     material = "|".join([
         str(rule.get("rule_id") or ""),
         str(entity.get("cluster") or ""),
@@ -170,7 +221,7 @@ def _feature_from_rule(rule: Dict[str, Any], entity: Dict[str, Any]) -> Dict[str
         "summary": rule.get("summary"),
         "importance": rule.get("importance"),
         "template_hashes": [item.get("template_hash") for item in sources],
-        "components": sorted({str(item.get("component")) for item in sources if item.get("component")}),
+        "components": sorted({str(item.get("component")) for item in sources if item.get("component")}) or copy.deepcopy(rule.get("components") or []),
         "tags": copy.deepcopy(rule.get("tags") or []),
         "selection_reason": rule.get("selection_reason") or "命中历史人工批准规则",
         "occurrence_count": sum(int(item.get("count") or 0) for item in sources),
@@ -183,6 +234,13 @@ def _feature_from_rule(rule: Dict[str, Any], entity: Dict[str, Any]) -> Dict[str
         "model": None,
         "origin": "approved_rule",
         "rule_id": rule.get("rule_id"),
+        "problem_code": rule.get("problem_code"),
+        "approval_key": rule.get("approval_key"),
+        "anchor_signatures": copy.deepcopy(rule.get("anchor_signatures") or []),
+        "supporting_signatures": copy.deepcopy(rule.get("supporting_signatures") or []),
+        "match_mode": rule.get("match_mode"),
+        "resolution_type": "rule_matched",
+        "resolved_rule_id": rule.get("rule_id"),
     }
 
 
@@ -197,6 +255,7 @@ class FeatureJobManager:
         persistence: FeatureJobFileStore | None = None,
         observability: Any | None = None,
         interrupt_on_restore: bool = True,
+        approval_group_store: Any | None = None,
     ) -> None:
         self.extractor = extractor
         self.rule_store = rule_store
@@ -206,6 +265,7 @@ class FeatureJobManager:
         self.persistence = persistence
         self.observability = observability
         self.interrupt_on_restore = bool(interrupt_on_restore)
+        self.approval_group_store = approval_group_store if approval_group_store is not None else InMemoryApprovalGroupStore()
         self._jobs: Dict[str, Dict[str, Any]] = {}
         self._lock = threading.RLock()
         self._restore_jobs()
@@ -238,6 +298,34 @@ class FeatureJobManager:
             self._jobs[str(job["job_id"])] = job
             if interrupted:
                 self.persistence.save(job)
+        with self._lock:
+            changed_jobs: set[str] = set()
+            for job in self._jobs.values():
+                if self._rebuild_approval_groups_locked(job):
+                    changed_jobs.add(str(job["job_id"]))
+            for job in self._jobs.values():
+                for record in job.get("entities") or []:
+                    source = record.get("source") or {}
+                    for candidate_id in list(record.get("feature_ids") or []):
+                        feature = job.get("features", {}).get(candidate_id)
+                        if not isinstance(feature, dict) or feature.get("status") != "pending":
+                            continue
+                        matches = []
+                        if self.rule_store:
+                            match_feature = getattr(self.rule_store, "match_feature", None)
+                            if callable(match_feature):
+                                matches = match_feature(feature, source)
+                            if not matches:
+                                matches = self.rule_store.match_entity(source)
+                        for rule in matches[:1]:
+                            resolved_rule = copy.deepcopy(rule)
+                            if not resolved_rule.get("approval_key"):
+                                resolved_rule.update(approval_identity(resolved_rule, source))
+                            self._reconcile_pending_candidates_locked(resolved_rule)
+                            break
+            for job in self._jobs.values():
+                if str(job["job_id"]) in changed_jobs:
+                    self.persistence.save(job)
 
     def create_job(
         self,
@@ -268,7 +356,7 @@ class FeatureJobManager:
 
         job_id = uuid.uuid4().hex
         records = []
-        initial_features: Dict[str, Dict[str, Any]] = {}
+        initial_matches: list[tuple[Dict[str, Any], list[Dict[str, Any]]]] = []
         started_monotonic = self.monotonic()
         processed_samples: list[tuple[float, int]] = []
         for source in sorted(
@@ -296,17 +384,8 @@ class FeatureJobManager:
                 "cache_hit": False,
                 "source": copy.deepcopy(source),
             }
-            for rule in matches:
-                feature = _feature_from_rule(rule, source)
-                initial_features[feature["candidate_id"]] = feature
-                record["feature_ids"].append(feature["candidate_id"])
-                self.rule_store.record_reuse(
-                    str(rule["rule_id"]),
-                    job_id=job_id,
-                    entity_id=record["entity_id"],
-                    cluster=record.get("cluster"),
-                )
             if matches:
+                initial_matches.append((record, matches))
                 processed_samples.append((started_monotonic, record["log_count"]))
             records.append(record)
 
@@ -330,13 +409,15 @@ class FeatureJobManager:
                 "min_score": float(min_score),
                 "source_summary": copy.deepcopy(document.get("summary") or {}),
                 "entities": records,
-                "features": initial_features,
+                "features": {},
                 "events": [],
                 "started_monotonic": started_monotonic,
                 "processed_samples": processed_samples,
                 "condition": condition,
             }
             self._emit_locked(self._jobs[job_id], "job_created")
+            for record, matches in initial_matches:
+                self._apply_rule_matches_locked(self._jobs[job_id], record, matches)
             for record in records:
                 if record["status"] == "rule_matched":
                     self._emit_locked(
@@ -349,6 +430,252 @@ class FeatureJobManager:
         if self.auto_start:
             threading.Thread(target=self.run_job, args=(job_id,), daemon=True).start()
         return job_id
+
+    @staticmethod
+    def _feature_times(feature: Dict[str, Any], record: Dict[str, Any]) -> tuple[str | None, str | None]:
+        time_range = feature.get("time_range") if isinstance(feature.get("time_range"), dict) else {}
+        first_seen = time_range.get("first_seen") or feature.get("window_start") or record.get("window_start")
+        last_seen = time_range.get("last_seen") or feature.get("window_end") or record.get("window_end")
+        return (str(first_seen) if first_seen else None, str(last_seen) if last_seen else None)
+
+    @staticmethod
+    def _entity_key(feature: Dict[str, Any], record: Dict[str, Any]) -> str:
+        entity = feature.get("entity") if isinstance(feature.get("entity"), dict) else {}
+        return "|".join((
+            str(feature.get("cluster") or record.get("cluster") or ""),
+            str(entity.get("type") or record.get("entity_type") or ""),
+            str(entity.get("id") or record.get("entity_id") or ""),
+        ))
+
+    def _prepare_feature(
+        self,
+        feature: Dict[str, Any],
+        record: Dict[str, Any],
+        *,
+        job_id: str,
+    ) -> Dict[str, Any]:
+        prepared = copy.deepcopy(feature)
+        identity = approval_identity(prepared, record.get("source") or {})
+        prepared.update({
+            "problem_code": identity["problem_code"],
+            "approval_key": identity["approval_key"],
+            "anchor_signatures": identity["anchor_signatures"],
+            "component_scope": identity["component_scope"],
+            "match_mode": identity["match_mode"],
+        })
+        prepared.setdefault("job_id", job_id)
+        if prepared.get("status") == "pending":
+            prepared.setdefault("resolution_type", "manual")
+        return prepared
+
+    def _register_feature_group_locked(
+        self,
+        job: Dict[str, Any],
+        record: Dict[str, Any],
+        feature: Dict[str, Any],
+    ) -> tuple[Dict[str, Any], Dict[str, Any]]:
+        feature = self._prepare_feature(feature, record, job_id=str(job["job_id"]))
+        candidate_id = str(feature.get("candidate_id") or "")
+        if not candidate_id:
+            raise FeatureJobError("候选特征缺少 candidate_id")
+        approval_key = str(feature["approval_key"])
+        existing = self.approval_group_store.get_by_key(approval_key)
+        first_seen, last_seen = self._feature_times(feature, record)
+        entity_key = self._entity_key(feature, record)
+        is_new_candidate = not self.approval_group_store.has_candidate(candidate_id)
+        was_pending = feature.get("status") == "pending"
+        resolved_rule = None
+        if was_pending and self.rule_store:
+            match_feature = getattr(self.rule_store, "match_feature", None)
+            if callable(match_feature):
+                matches = match_feature(feature, record.get("source") or {})
+                if matches:
+                    resolved_rule = matches[0]
+                    feature.update({
+                        "status": "approved",
+                        "resolution_type": "group_matched",
+                        "resolved_rule_id": resolved_rule.get("rule_id"),
+                        "rule_id": resolved_rule.get("rule_id"),
+                        "approved_at": resolved_rule.get("approved_at") or _now(),
+                    })
+        if existing is None:
+            now = _now()
+            group = {
+                "approval_group_id": group_id_for_key(approval_key),
+                "approval_key": approval_key,
+                "problem_code": feature["problem_code"],
+                "feature_type": feature.get("feature_type"),
+                "title": feature.get("title") or "",
+                "summary": feature.get("summary") or "",
+                "importance": feature.get("importance") or "medium",
+                "status": "approved" if feature.get("status") == "approved" else "pending",
+                "rule_id": feature.get("resolved_rule_id") or feature.get("rule_id"),
+                "first_seen": first_seen or now,
+                "last_seen": last_seen or first_seen or now,
+                "occurrence_count": int(feature.get("occurrence_count") or 0),
+                "affected_entity_count": 1,
+                "candidate_count": 1,
+                "primary_candidate_id": candidate_id,
+                "candidate_ids": [candidate_id],
+                "entity_keys": [entity_key],
+                "created_at": now,
+                "updated_at": now,
+                "schema_version": "approval_group_v1",
+            }
+        else:
+            group = copy.deepcopy(existing)
+            if is_new_candidate:
+                group["candidate_count"] = int(group.get("candidate_count") or 0) + 1
+                group["occurrence_count"] = int(group.get("occurrence_count") or 0) + int(feature.get("occurrence_count") or 0)
+                group.setdefault("candidate_ids", []).append(candidate_id)
+            group.setdefault("entity_keys", [])
+            if entity_key not in group["entity_keys"]:
+                group["entity_keys"].append(entity_key)
+            group["affected_entity_count"] = len(group["entity_keys"])
+            if first_seen and (not group.get("first_seen") or first_seen < group["first_seen"]):
+                group["first_seen"] = first_seen
+            if last_seen and (not group.get("last_seen") or last_seen > group["last_seen"]):
+                group["last_seen"] = last_seen
+            group["updated_at"] = _now()
+
+        if feature.get("status") == "approved" and (feature.get("resolved_rule_id") or feature.get("rule_id")):
+            group["status"] = "approved"
+            group["rule_id"] = feature.get("resolved_rule_id") or feature.get("rule_id")
+        group.setdefault("candidate_ids", [])
+        if candidate_id not in group["candidate_ids"]:
+            group["candidate_ids"].append(candidate_id)
+
+        if group.get("status") in {"approved", "auto_resolved"} and group.get("rule_id"):
+            feature.update({
+                "status": "approved",
+                "resolution_type": "group_matched",
+                "resolved_rule_id": group["rule_id"],
+                "rule_id": group["rule_id"],
+                "approved_at": feature.get("approved_at") or group.get("updated_at") or _now(),
+            })
+        if was_pending:
+            feature["resolution_type"] = "manual" if resolved_rule is None and is_new_candidate and existing is None else "group_matched"
+        primary = str(group.get("primary_candidate_id") or "")
+        if primary and primary != candidate_id:
+            feature["duplicate_of"] = primary
+        feature["approval_group_id"] = group["approval_group_id"]
+        self.approval_group_store.save(group)
+        self.approval_group_store.attach_candidate(
+            group["approval_group_id"],
+            candidate_id,
+            job_id=str(job["job_id"]),
+            entity_id=str(record.get("entity_id") or ""),
+        )
+        if resolved_rule and self.rule_store:
+            self.rule_store.record_reuse(
+                str(resolved_rule["rule_id"]),
+                job_id=str(job["job_id"]),
+                entity_id=str(record.get("entity_id") or ""),
+                cluster=record.get("cluster"),
+            )
+        return feature, group
+
+    def _apply_rule_matches_locked(
+        self,
+        job: Dict[str, Any],
+        record: Dict[str, Any],
+        matches: list[Dict[str, Any]],
+    ) -> None:
+        record["status"] = "rule_matched"
+        record["matched_rule_ids"] = [str(rule.get("rule_id")) for rule in matches]
+        record["feature_ids"] = []
+        for rule in matches:
+            feature = _feature_from_rule(rule, record["source"])
+            feature, _ = self._register_feature_group_locked(job, record, feature)
+            candidate_id = str(feature["candidate_id"])
+            job["features"][candidate_id] = copy.deepcopy(feature)
+            record["feature_ids"].append(candidate_id)
+            if self.rule_store:
+                self.rule_store.record_reuse(
+                    str(rule["rule_id"]),
+                    job_id=str(job["job_id"]),
+                    entity_id=record["entity_id"],
+                    cluster=record.get("cluster"),
+                )
+                self._reconcile_pending_candidates_locked(rule)
+
+    def _rebuild_approval_groups_locked(self, job: Dict[str, Any]) -> bool:
+        changed = False
+        for candidate_id, raw_feature in list((job.get("features") or {}).items()):
+            feature = copy.deepcopy(raw_feature)
+            entity_id = str((feature.get("entity") or {}).get("id") or "")
+            record = next((item for item in job.get("entities") or [] if str(item.get("entity_id")) == entity_id), None)
+            if record is None:
+                record = {
+                    "entity_id": entity_id,
+                    "entity_type": (feature.get("entity") or {}).get("type"),
+                    "cluster": feature.get("cluster"),
+                    "window_start": feature.get("window_start"),
+                    "window_end": feature.get("window_end"),
+                    "source": {},
+                }
+            feature["candidate_id"] = str(feature.get("candidate_id") or candidate_id)
+            prepared, _ = self._register_feature_group_locked(job, record, feature)
+            job.setdefault("features", {})[candidate_id] = prepared
+            changed = changed or prepared != raw_feature
+        return changed
+
+    def reconcile_pending_candidates(self, rule: Dict[str, Any]) -> Dict[str, int]:
+        with self._lock:
+            return self._reconcile_pending_candidates_locked(rule)
+
+    def _reconcile_pending_candidates_locked(self, rule: Dict[str, Any]) -> Dict[str, int]:
+        approval_key = str(rule.get("approval_key") or "")
+        if not approval_key:
+            return {"auto_resolved_candidates": 0, "auto_resolved_groups": 0}
+        resolved = 0
+        groups: set[str] = set()
+        for job in self._jobs.values():
+            for record in job.get("entities") or []:
+                for candidate_id in list(record.get("feature_ids") or []):
+                    feature = job.get("features", {}).get(candidate_id)
+                    if not isinstance(feature, dict) or feature.get("status") != "pending":
+                        continue
+                    if str(feature.get("approval_key") or "") != approval_key:
+                        continue
+                    feature.update({
+                        "status": "approved",
+                        "approved_at": feature.get("approved_at") or rule.get("approved_at") or _now(),
+                        "resolution_type": "group_matched",
+                        "resolved_rule_id": rule.get("rule_id"),
+                        "rule_id": rule.get("rule_id"),
+                    })
+                    job["features"][candidate_id] = feature
+                    group = self.approval_group_store.get_by_key(approval_key)
+                    if group:
+                        group["rule_id"] = rule.get("rule_id")
+                        if group.get("status") == "pending":
+                            group["status"] = "auto_resolved"
+                            groups.add(str(group.get("approval_group_id")))
+                        group["updated_at"] = _now()
+                        self.approval_group_store.save(group)
+                    if self.rule_store:
+                        self.rule_store.record_reuse(
+                            str(rule["rule_id"]),
+                            job_id=str(job["job_id"]),
+                            entity_id=str(record.get("entity_id") or ""),
+                            cluster=record.get("cluster"),
+                        )
+                    resolved += 1
+                    self._emit_locked(
+                        job,
+                        "candidate_auto_resolved",
+                        candidate_id=str(candidate_id),
+                        entity_id=str(record.get("entity_id") or ""),
+                        approval_group_id=feature.get("approval_group_id"),
+                        approval_key=approval_key,
+                        rule_id=rule.get("rule_id"),
+                    )
+        return {"auto_resolved_candidates": resolved, "auto_resolved_groups": len(groups)}
+
+    def list_approval_groups(self, status: str | None = None) -> list[Dict[str, Any]]:
+        with self._lock:
+            return self.approval_group_store.list_groups(status=status)
 
     def _job(self, job_id: str) -> Dict[str, Any]:
         try:
@@ -387,6 +714,7 @@ class FeatureJobManager:
             ],
             "job_started": [("aggregate", "feature-job", "success")],
             "entity_rule_matched": [("rule_cache", "approved-rule", "skipped")],
+            "candidate_auto_resolved": [("approval", "duplicate-candidate-resolved", "success")],
             "entity_started": [
                 ("rule_cache", "rule-cache-checked", "success"),
                 ("evidence", "evidence-built", "success"),
@@ -460,6 +788,17 @@ class FeatureJobManager:
 
         for record in records:
             with self._lock:
+                matches = self.rule_store.match_entity(record["source"]) if self.rule_store else []
+                if matches:
+                    self._apply_rule_matches_locked(job, record, matches)
+                    job["processed_samples"].append((self.monotonic(), record["log_count"]))
+                    self._emit_locked(
+                        job,
+                        "entity_rule_matched",
+                        entity_id=record["entity_id"],
+                        rule_ids=record["matched_rule_ids"],
+                    )
+                    continue
                 record["status"] = "running"
                 self._emit_locked(job, "entity_started", entity_id=record["entity_id"])
             try:
@@ -502,9 +841,11 @@ class FeatureJobManager:
                             self.metrics_store.add_llm_logs(record["log_count"])
                         record["llm_counted"] = True
                     record["feature_ids"] = []
-                    for feature in features:
+                    for raw_feature in features:
+                        feature = copy.deepcopy(raw_feature)
                         feature.setdefault("origin", job.get("provider", "ollama"))
-                        candidate_id = feature["candidate_id"]
+                        feature, _ = self._register_feature_group_locked(job, record, feature)
+                        candidate_id = str(feature["candidate_id"])
                         job["features"][candidate_id] = copy.deepcopy(feature)
                         record["feature_ids"].append(candidate_id)
                     record["status"] = "completed"
@@ -739,6 +1080,7 @@ class FeatureJobManager:
             if record is None:
                 raise FeatureJobError("风险实体不存在")
             if candidate["candidate_id"] not in job["features"]:
+                candidate, _ = self._register_feature_group_locked(job, record, candidate)
                 job["features"][candidate["candidate_id"]] = copy.deepcopy(candidate)
                 if candidate["candidate_id"] not in record["feature_ids"]:
                     record["feature_ids"].append(candidate["candidate_id"])
@@ -820,6 +1162,18 @@ class FeatureJobManager:
                 feature = copy.deepcopy(job["features"][candidate_id])
             except KeyError as exc:
                 raise FeatureJobError("候选特征不存在") from exc
+            record = next(
+                (item for item in job.get("entities") or [] if candidate_id in (item.get("feature_ids") or [])),
+                {
+                    "entity_id": (feature.get("entity") or {}).get("id"),
+                    "entity_type": (feature.get("entity") or {}).get("type"),
+                    "cluster": feature.get("cluster"),
+                    "window_start": feature.get("window_start"),
+                    "window_end": feature.get("window_end"),
+                    "source": {},
+                },
+            )
+            feature, group = self._register_feature_group_locked(job, record, feature)
 
             for field in ("title", "summary", "reviewer_note"):
                 if field in changes:
@@ -844,10 +1198,35 @@ class FeatureJobManager:
                     feature["job_id"] = job["job_id"]
                     rule = self.rule_store.upsert_feature(feature)
                     feature["rule_id"] = rule["rule_id"]
+                    feature["resolved_rule_id"] = rule["rule_id"]
+                    feature["resolution_type"] = "manual"
                     if rule.get("lineage"):
                         feature["lineage"] = copy.deepcopy(rule["lineage"])
+                    group["status"] = "approved"
+                    group["rule_id"] = rule["rule_id"]
+                    group["updated_at"] = _now()
+                    self.approval_group_store.save(group)
+                    job["features"][candidate_id] = feature
+                    reconcile = self._reconcile_pending_candidates_locked(rule)
+                    feature["auto_resolved_count"] = reconcile["auto_resolved_candidates"]
+                elif changes.get("status") == "approved":
+                    group["status"] = "approved"
+                    group["updated_at"] = _now()
+                    self.approval_group_store.save(group)
+                    feature["resolution_type"] = "manual"
+                elif changes.get("status") == "rejected" and group.get("status") == "pending":
+                    group["status"] = "rejected"
+                    group["updated_at"] = _now()
+                    self.approval_group_store.save(group)
             job["features"][candidate_id] = feature
-            self._emit_locked(job, "feature_updated", candidate_id=candidate_id, status=feature["status"])
+            self._emit_locked(
+                job,
+                "feature_updated",
+                candidate_id=candidate_id,
+                status=feature["status"],
+                approval_group_id=feature.get("approval_group_id"),
+                auto_resolved_count=int(feature.get("auto_resolved_count") or 0),
+            )
             return copy.deepcopy(feature)
 
     def list_rules(self) -> list[Dict[str, Any]]:

@@ -1,4 +1,4 @@
-schema_version: 19
+schema_version: 20
 database: logrisk
 description: LOGRISK 双模式运行时数据字典；SQLite 是默认本地实现，PostgreSQL 用于显式配置的外部生产部署。
 authoritative_ddl:
@@ -66,7 +66,7 @@ tables:
     primary_key: candidate_id
     foreign_keys: {job_id: feature_jobs.job_id ON DELETE CASCADE}
     indexes: ["uq_feature_candidates_candidate_job(candidate_id, job_id)"]
-    columns: {candidate_id: 候选特征标识, job_id: 所属任务, entity_id: 来源风险实体, status: 审批状态, candidate_json: 特征内容和 Evidence 引用, created_at: 创建时间, updated_at: 更新时间}
+    columns: {candidate_id: 候选特征标识, job_id: 所属任务, entity_id: 来源风险实体, status: 审批状态, approval_key: 稳定审批身份, problem_code: 规范化问题编码, approval_group_id: 审批分组, resolved_rule_id: 收敛到的规则, resolution_type: manual/rule_matched/group_matched, candidate_json: 特征内容和 Evidence 引用, created_at: 创建时间, updated_at: 更新时间}
   feature_candidate_feedback:
     description: Feature Candidate 的追加式人工决策反馈；按 Candidate 与幂等键去重且不覆盖历史
     primary_key: feedback_id
@@ -74,6 +74,19 @@ tables:
     constraints: outcome 仅允许 approved/rejected；(candidate_id, job_id) 必须匹配 Candidate 所属 Job；(candidate_id, idempotency_key) 唯一
     indexes: [idx_feature_candidate_feedback_candidate_time(candidate_id, created_at DESC), idx_feature_candidate_feedback_job_time(job_id, created_at DESC)]
     columns: {feedback_id: 反馈标识, candidate_id: 候选特征, job_id: 所属任务, outcome: approved/rejected 决策, reason_code: 有限原因码, note: 有界人工备注, actor: 外部身份操作人, request_id: 请求标识, idempotency_key: 幂等键, created_at: 创建时间, schema_version: 反馈结构标识}
+  approval_groups:
+    description: 按稳定问题身份聚合的审批对象；不删除 Candidate 级发生记录
+    primary_key: approval_group_id
+    foreign_keys: {rule_id: approved_rules.rule_id ON DELETE SET NULL}
+    constraints: approval_key 唯一；status 为 pending/approved/rejected/auto_resolved/superseded
+    indexes: [idx_approval_groups_status_updated(status, updated_at DESC), idx_approval_groups_problem_code(problem_code)]
+    columns: {approval_group_id: 审批分组标识, approval_key: 稳定审批身份, problem_code: 规范化问题编码, feature_type: 特征类别, title: 分组标题, summary: 分组摘要, importance: 重要性, status: 分组状态, rule_id: 关联规则, first_seen: 首次发生时间, last_seen: 最近发生时间, occurrence_count: 发生次数, affected_entity_count: 受影响实体数, candidate_count: 候选数, group_json: 分组聚合快照, created_at: 创建时间, updated_at: 更新时间, schema_version: 分组结构版本}
+  approval_group_candidates:
+    description: Approval Group 与 Candidate 的一对多关系；每个 Candidate 只能归属一个分组
+    primary_key: [approval_group_id, candidate_id]
+    foreign_keys: {approval_group_id: approval_groups.approval_group_id ON DELETE CASCADE}
+    constraints: candidate_id 唯一
+    columns: {approval_group_id: 审批分组, candidate_id: 候选特征, job_id: 所属任务, entity_id: 来源风险实体, created_at: 入组时间}
   feature_job_events:
     description: 特征任务顺序事件流
     primary_key: [job_id, sequence]
@@ -82,9 +95,9 @@ tables:
   approved_rules:
     description: 人工批准且可复用的版本化规则资产；仅 active 状态参与匹配
     primary_key: rule_id
-    constraints: signature 唯一；status 为 active/disabled/under_review/deprecated/archived；current_version 大于 0
-    indexes: [idx_approved_rules_status(status)]
-    columns: {rule_id: 规则标识, signature: 去重和匹配签名, feature_type: 特征类别, rule_json: 当前规则、Evidence 和 Lineage 快照, approved_at: 首次批准时间, updated_at: 更新时间, status: 生命周期状态, current_version: 当前规则版本, next_review_at: 下次复审时间, schema_version: 规则资产结构版本}
+    constraints: signature 唯一；非空 approval_key 唯一；status 为 active/disabled/under_review/deprecated/archived；current_version 大于 0
+    indexes: [idx_approved_rules_status(status), idx_approved_rules_approval_key(approval_key)]
+    columns: {rule_id: 规则标识, signature: 去重和匹配签名, feature_type: 特征类别, problem_code: 规范化问题编码, approval_key: 稳定审批身份, rule_json: 当前规则、Evidence 和 Lineage 快照, approved_at: 首次批准时间, updated_at: 更新时间, status: 生命周期状态, current_version: 当前规则版本, next_review_at: 下次复审时间, schema_version: 规则资产结构版本}
   rule_versions:
     description: 不可变的批准规则版本快照；状态变更、审批更新和回滚均追加新版本
     primary_key: [rule_id, version]

@@ -60,6 +60,9 @@ class IncrementalSource(Protocol):
     def read(self, cursor: SourceCursor) -> Iterator[SourceRecord]:
         raise NotImplementedError
 
+    def commit(self, cursor: SourceCursor) -> None:
+        raise NotImplementedError
+
 
 class KafkaConsumerAdapter(Protocol):
     """Internal-only adapter contract; implementations own Broker communication."""
@@ -71,6 +74,13 @@ class KafkaConsumerAdapter(Protocol):
         configuration: Mapping[str, str],
         cursor: SourceCursor,
     ) -> Iterator[SourceRecord]:
+        raise NotImplementedError
+
+    def commit(
+        self,
+        configuration: Mapping[str, str],
+        cursor: SourceCursor,
+    ) -> None:
         raise NotImplementedError
 
 
@@ -85,6 +95,8 @@ def register_kafka_consumer_adapter(adapter: KafkaConsumerAdapter) -> None:
         raise IncrementalSourceError("Kafka 适配器缺少 adapter_id")
     if not callable(getattr(adapter, "read", None)):
         raise IncrementalSourceError("Kafka 适配器缺少 read 方法")
+    if not callable(getattr(adapter, "commit", None)):
+        raise IncrementalSourceError("Kafka 适配器缺少 commit 方法")
     _KAFKA_ADAPTERS[adapter_id] = adapter
 
 
@@ -169,6 +181,10 @@ class FileIncrementalSource:
         except ValueError as exc:
             raise IncrementalSourceError(str(exc)) from exc
 
+    def commit(self, cursor: SourceCursor) -> None:
+        if cursor.kind not in {"", "file"}:
+            raise IncrementalSourceError("文件来源不能提交其他来源的 Checkpoint")
+
     def _identity(self) -> dict[str, Any]:
         try:
             stat = self.path.stat()
@@ -193,7 +209,7 @@ class FileIncrementalSource:
 
 
 class KafkaIncrementalSource:
-    """Static contract for an internal Kafka adapter; it never opens a Broker connection."""
+    """Incremental Kafka source backed by an explicitly registered adapter."""
 
     def __init__(self, configuration: Mapping[str, Any]) -> None:
         self.configuration = {
@@ -220,6 +236,18 @@ class KafkaIncrementalSource:
         if cursor.kind not in {"", "kafka"}:
             raise IncrementalSourceError("Kafka 来源不能使用其他来源的 Checkpoint")
         return iter(adapter.read(self.configuration, cursor))
+
+    def commit(self, cursor: SourceCursor) -> None:
+        adapter_id = self.configuration["adapter_id"]
+        adapter = _KAFKA_ADAPTERS.get(adapter_id)
+        if adapter is None:
+            raise IncrementalSourceError("Kafka 消费适配器未注册，无法提交消费位点")
+        if cursor.kind not in {"", "kafka"}:
+            raise IncrementalSourceError("Kafka 来源不能提交其他来源的 Checkpoint")
+        commit = getattr(adapter, "commit", None)
+        if not callable(commit):
+            raise IncrementalSourceError("Kafka 消费适配器缺少 commit 方法")
+        commit(self.configuration, cursor)
 
 
 def source_capabilities() -> dict[str, dict[str, Any]]:

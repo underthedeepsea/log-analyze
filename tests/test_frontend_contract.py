@@ -405,6 +405,8 @@ def test_frontend_exposes_streaming_workspace_contract():
     assert '"streaming"' in source
     assert "/api/streaming/tasks" in source
     assert "未知模板队列" in source
+    assert "cursorText" in source
+    assert "每批最多 10,000 条" in source
 
 
 def test_react_uses_text_rendering_without_raw_html_injection():
@@ -551,8 +553,8 @@ def test_release_docs_describe_current_feature_version():
     assert "## 1.31.0 - 2026-08-03" in release
     assert "## 1.32.0 - 2026-08-10" in release
     assert "## 1.34.0 - 2026-08-13" in release
-    assert "## 1.35.2 - 2026-09-01" in release
-    assert "当前版本：`1.35.2`" in readme
+    assert "## 1.36.0 - 2026-09-01" in release
+    assert "当前版本：`1.36.0`" in readme
     assert "## 1.24.0 - 2026-07-22" in release
     assert "## 1.24.1 - 2026-07-22" in release
     assert "## 1.24.2 - 2026-07-22" in release
@@ -572,8 +574,8 @@ def test_release_docs_describe_current_feature_version():
         assert text in readme
     assert "普通启动不需要 Node.js" in readme
     assert "Vite" not in readme
-    assert "Kafka 目前不是可用数据源" in readme
-    assert "可恢复处理与 Kafka 预留接口" in readme
+    assert "Kafka 是默认关闭的可选数据源" in readme
+    assert "可恢复处理与 Kafka 来源" in readme
 
 
 def test_node_risk_and_editable_semantic_ui_contract():

@@ -71,6 +71,9 @@ def test_kafka_source_delegates_only_to_an_explicitly_registered_adapter():
             assert cursor.kind == ""
             yield SourceRecord({"message": "sanitized event"}, SourceCursor("kafka", {"partition": 0, "offset": 1}))
 
+        def commit(self, configuration, cursor):
+            return None
+
     register_kafka_consumer_adapter(FakeAdapter())
     try:
         source = KafkaIncrementalSource({
@@ -84,3 +87,31 @@ def test_kafka_source_delegates_only_to_an_explicitly_registered_adapter():
         unregister_kafka_consumer_adapter("fake-kafka")
 
     assert records[0].next_cursor.value == {"partition": 0, "offset": 1}
+
+
+def test_kafka_source_commits_only_through_registered_adapter():
+    commits = []
+
+    class CommitAdapter:
+        adapter_id = "commit-kafka"
+
+        def read(self, configuration, cursor):
+            yield SourceRecord({"message": "sanitized event"}, SourceCursor("kafka", {"partition": 0, "offset": 1}))
+
+        def commit(self, configuration, cursor):
+            commits.append((configuration["topic"], cursor.to_dict()))
+
+    register_kafka_consumer_adapter(CommitAdapter())
+    try:
+        source = KafkaIncrementalSource({
+            "adapter_id": "commit-kafka",
+            "topic": "logs",
+            "consumer_group": "logrisk",
+            "bootstrap_env": "LOGRISK_KAFKA_BOOTSTRAP",
+        })
+        cursor = next(source.read(SourceCursor.empty())).next_cursor
+        source.commit(cursor)
+    finally:
+        unregister_kafka_consumer_adapter("commit-kafka")
+
+    assert commits == [("logs", {"kind": "kafka", "value": {"partition": 0, "offset": 1}})]

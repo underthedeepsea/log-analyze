@@ -1406,6 +1406,11 @@
       const value = task.status || "queued";
       return { queued: "等待处理", running: "处理中", failed: "处理失败", interrupted: "服务中断", completed: "已完成", conflict: "恢复冲突" }[value] || value;
     }
+    function cursorText(cursor) {
+      const partitions = cursor && cursor.partitions;
+      if (partitions && typeof partitions === "object") return Object.keys(partitions).sort(function (a, b) { return Number(a) - Number(b); }).map(function (partition) { return partition + ":" + partitions[partition]; }).join(", ") || "—";
+      return String((cursor && cursor.offset) || 0);
+    }
     return h("section", { className: "streaming-page" },
       h("section", { className: "streaming-hero" }, h("div", null,
         h("span", { className: "eyebrow" }, "STREAMING & INCREMENTAL PIPELINE"),
@@ -1414,10 +1419,10 @@
         h("button", { className: "secondary-button", onClick: props.onRefresh }, "刷新状态")),
       h("section", { className: "streaming-source-grid" },
         h("article", { className: "surface" }, h("span", { className: "eyebrow" }, "FILE SOURCE"), h("h3", null, "文件增量来源"), h("p", null, "按文件身份、字节 Offset 和锁定的 Drain3 配置恢复；文件被替换或配置变化时停止恢复。"), h("span", { className: "status-chip active" }, sources.file && sources.file.resume_supported ? "支持恢复" : "加载中")),
-        h("article", { className: "surface kafka-source-card" }, h("span", { className: "eyebrow" }, "KAFKA CONTRACT"), h("h3", null, "Kafka 消费接口"), h("p", null, "已预留 Topic、Consumer Group、Partition Offset 与环境变量名契约；当前不连接 Broker。"), h("span", { className: "status-chip " + (sources.kafka && sources.kafka.enabled ? "active" : "disabled") }, sources.kafka && sources.kafka.enabled ? "适配器已注册" : "等待内部适配器启用"))),
+        h("article", { className: "surface kafka-source-card" }, h("span", { className: "eyebrow" }, "KAFKA SOURCE"), h("h3", null, "Kafka 消费接口"), h("p", null, "Kafka 默认关闭；启用内置适配器后按 Topic、Consumer Group 和分区 Offset 流式消费，每批最多 10,000 条。"), h("span", { className: "status-chip " + (sources.kafka && sources.kafka.enabled ? "active" : "disabled") }, sources.kafka && sources.kafka.enabled ? "适配器已注册" : "默认关闭"))),
       h("section", { className: "surface streaming-task-table" }, h("div", { className: "surface-head" }, h("div", null, h("b", null, "流水线任务时间线"), h("span", null, "恢复只从最后一次成功提交的 Checkpoint 开始")), h("span", null, tasks.length + " 条")),
         !tasks.length && h("div", { className: "empty-state compact" }, "暂无流式任务。上传超过 10MB 的日志后会自动创建任务。"),
-        tasks.map(function (task) { const cursor = task.cursor && task.cursor.value || {}; return h("article", { key: task.task_id }, h("div", null, h("b", null, task.task_id), h("small", null, (task.source && task.source.kind || "file") + " · " + timeText(task.updated_at))), h("span", { className: "status-chip " + task.status }, statusText(task)), h("div", { className: "streaming-task-progress" }, h("span", null, "窗口 " + (task.windows_committed || 0)), h("span", null, "Offset " + (cursor.offset || 0))), h("div", { className: "streaming-task-actions" }, task.error && h("small", null, task.error), ["failed", "interrupted"].includes(task.status) && h("button", { className: "secondary-button", disabled: working === task.task_id, onClick: function () { resume(task.task_id); } }, working === task.task_id ? "恢复中…" : "从 Checkpoint 恢复"))); })),
+        tasks.map(function (task) { const cursor = task.cursor && task.cursor.value || {}; return h("article", { key: task.task_id }, h("div", null, h("b", null, task.task_id), h("small", null, (task.source && task.source.kind || "file") + " · " + timeText(task.updated_at))), h("span", { className: "status-chip " + task.status }, statusText(task)), h("div", { className: "streaming-task-progress" }, h("span", null, "窗口 " + (task.windows_committed || 0)), h("span", null, "Offset " + cursorText(cursor))), h("div", { className: "streaming-task-actions" }, task.error && h("small", null, task.error), ["failed", "interrupted"].includes(task.status) && h("button", { className: "secondary-button", disabled: working === task.task_id, onClick: function () { resume(task.task_id); } }, working === task.task_id ? "恢复中…" : "从 Checkpoint 恢复"))); })),
       h("section", { className: "surface unknown-template-table" }, h("div", { className: "surface-head" }, h("div", null, h("b", null, "未知模板队列"), h("span", null, "未命中风险语义或风险规则的脱敏模板，供人工进入治理流程")), h("span", null, templates.length + " 条")),
         !templates.length && h("div", { className: "empty-state compact" }, "当前没有待治理的未知模板"),
         templates.map(function (item) { return h("article", { key: item.task_id + ":" + item.template_hash + ":" + item.window_start }, h("div", null, h("b", null, item.component || "unknown"), h("small", null, item.template_hash + " · " + item.window_start)), h("code", null, item.template && item.template.template || "—"), h("span", null, item.occurrence_count + " 次"), h("span", { className: "status-chip " + item.status }, item.status)); })))

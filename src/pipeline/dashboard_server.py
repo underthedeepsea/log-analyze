@@ -52,11 +52,15 @@ from logrisk.ai_harness.evaluator import evaluate_feature_output
 from logrisk.feature_jobs import FeatureJobError, FeatureJobFileStore, FeatureJobManager, _cache_enabled_default
 from logrisk.input_jobs import InputJobConfig, InputJobStore
 from logrisk.input_parser import parse_log_content
-from logrisk.incremental_sources import FileIncrementalSource, source_capabilities
+from logrisk.incremental_sources import (
+    FileIncrementalSource,
+    KafkaIncrementalSource,
+    source_capabilities,
+)
 from logrisk.knowledge_packages import build_archive
 from logrisk.knowledge_packages.errors import KnowledgePackageError
 from logrisk.agentic import AgentRunRequest, AgenticError
-from logrisk.large_file_pipeline import run_large_file_pipeline
+from logrisk.large_file_pipeline import MAX_STREAM_BATCH_RECORDS, run_large_file_pipeline
 from logrisk.processing_metrics import ProcessingMetricsError, ProcessingMetricsStore
 from logrisk.rule_governance import RuleGovernanceError, RuleGovernanceRepository, RuleGovernanceService
 from logrisk.node_risk import NodeRiskError, NodeRiskService
@@ -93,7 +97,7 @@ from pipeline.manual_import_pipeline import analyze_records
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 MAX_LARGE_UPLOAD_BYTES = 500 * 1024 * 1024
 DEFAULT_MODEL = "qwen3:1.7b"
-APP_VERSION = "1.35.2"
+APP_VERSION = "1.36.0"
 
 
 class DashboardHTTPServer(ThreadingHTTPServer):
@@ -121,11 +125,17 @@ def build_server(
     runtime_config_path: str | Path | None = None,
     agentic_enabled: bool = False,
     agent_workflows_enabled: bool = False,
+    kafka_enabled: bool | None = None,
 ) -> DashboardHTTPServer:
     """Create the local development HTTP shell around shared application services."""
     root = Path(__file__).resolve().parents[2]
     selected_state_root = Path(state_root) if state_root else (
         Path(database_path).parent if database_path else root / "state"
+    )
+    selected_kafka_enabled = (
+        bool(kafka_enabled)
+        if kafka_enabled is not None
+        else os.getenv("LOGRISK_KAFKA_ENABLED", "0").lower() in {"1", "true", "yes"}
     )
     container = build_application_container(
         ApplicationConfig(
@@ -146,6 +156,7 @@ def build_server(
             interrupt_streaming_tasks=True,
             agentic_enabled=agentic_enabled,
             agent_workflows_enabled=agent_workflows_enabled,
+            kafka_enabled=selected_kafka_enabled,
         ),
         manager=manager,
         input_analyzer=input_analyzer,
@@ -198,6 +209,7 @@ def build_server(
     server.input_analyzer = container.input_analyzer  # type: ignore[attr-defined]
     server.input_analyzer_accepts_config = container.input_analyzer_accepts_config  # type: ignore[attr-defined]
     server.run_input_job = container.run_input_job  # type: ignore[attr-defined]
+    server.run_kafka_task = container.run_kafka_task  # type: ignore[attr-defined]
     server.api_facade = ApiFacade(  # type: ignore[attr-defined]
         container,
         version=APP_VERSION,
@@ -223,6 +235,13 @@ def _now() -> str:
     from datetime import datetime, timezone
 
     return datetime.now(timezone.utc).isoformat()
+
+
+def _kafka_task_id(configuration: dict[str, str]) -> str:
+    digest = hashlib.sha256(
+        json.dumps(configuration, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    ).hexdigest()[:32]
+    return "stream_kafka_" + digest
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
@@ -1378,6 +1397,26 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 task = self.server.streaming_state.get_task(match.group(1))  # type: ignore[attr-defined]
                 if task.get("status") not in {"failed", "interrupted"}:
                     raise FeatureJobError("仅失败或中断的流式任务可以恢复")
+                if (task.get("source") or {}).get("kind") == "kafka":
+                    configuration = dict((task.get("source") or {}).get("configuration") or {})
+                    adapter_id = str(configuration.get("adapter_id") or "")
+                    if adapter_id not in source_capabilities()["kafka"]["registered_adapter_ids"]:
+                        self._json(HTTPStatus.UNPROCESSABLE_ENTITY, {
+                            "error": "Kafka 消费适配器未启用，请设置 LOGRISK_KAFKA_ENABLED=1 后重启 Dashboard",
+                            "code": "kafka_adapter_unavailable",
+                        })
+                        return
+                    threading.Thread(
+                        target=self.server.run_kafka_task,  # type: ignore[attr-defined]
+                        args=(task["task_id"], configuration),
+                        daemon=True,
+                    ).start()
+                    self._json(HTTPStatus.ACCEPTED, {
+                        "task_id": task["task_id"],
+                        "status": "queued",
+                        "batch_records": MAX_STREAM_BATCH_RECORDS,
+                    })
+                    return
                 input_job_id = str(task.get("input_job_id") or "")
                 if not input_job_id:
                     raise FeatureJobError("流式任务缺少关联输入任务，无法恢复")
@@ -1388,9 +1427,42 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 self._json(HTTPStatus.ACCEPTED, {"task_id": task["task_id"], "input_job_id": input_job_id, "status": "queued"})
                 return
             if path == "/api/streaming/kafka/start":
-                self._json(HTTPStatus.UNPROCESSABLE_ENTITY, {
-                    "error": "Kafka 消费接口仅预留给内部适配器，当前 Dashboard 不启动 Kafka 消费任务",
-                    "code": "kafka_adapter_unavailable",
+                if not isinstance(payload, dict):
+                    raise FeatureJobError("Kafka 启动请求必须是 JSON object")
+                configuration = {
+                    "adapter_id": str(payload.get("adapter_id") or "kafka-python").strip(),
+                    "topic": str(payload.get("topic") or "").strip(),
+                    "consumer_group": str(payload.get("consumer_group") or "").strip(),
+                    "bootstrap_env": str(payload.get("bootstrap_env") or "LOGRISK_KAFKA_BOOTSTRAP").strip(),
+                }
+                registered = source_capabilities()["kafka"]["registered_adapter_ids"]
+                if configuration["adapter_id"] not in registered:
+                    self._json(HTTPStatus.UNPROCESSABLE_ENTITY, {
+                        "error": "Kafka 消费适配器未启用，请设置 LOGRISK_KAFKA_ENABLED=1 后重启 Dashboard",
+                        "code": "kafka_adapter_unavailable",
+                    })
+                    return
+                missing = [key for key in ("topic", "consumer_group") if not configuration[key]]
+                if missing:
+                    raise FeatureJobError("Kafka 配置缺少: " + ", ".join(missing))
+                source = KafkaIncrementalSource(configuration)
+                config_path = self.server.drain_quality.configs.active_snapshot()["path"]  # type: ignore[attr-defined]
+                config_hash = hashlib.sha256(Path(config_path).read_bytes()).hexdigest()
+                task = self.server.streaming_state.create_or_load(  # type: ignore[attr-defined]
+                    descriptor=source.descriptor(),
+                    config_hash=config_hash,
+                    task_id=_kafka_task_id(configuration),
+                )
+                threading.Thread(
+                    target=self.server.run_kafka_task,  # type: ignore[attr-defined]
+                    args=(task["task_id"], configuration),
+                    daemon=True,
+                ).start()
+                self._json(HTTPStatus.ACCEPTED, {
+                    "task_id": task["task_id"],
+                    "status": "queued",
+                    "batch_records": MAX_STREAM_BATCH_RECORDS,
+                    "source": source.descriptor().to_dict(),
                 })
                 return
             if path == "/api/ai-harness/model-profiles":

@@ -12,6 +12,7 @@ from logrisk.ai_harness.prompt_registry import PromptRegistry
 from logrisk.ai_harness.model_profile import ModelProfileRegistry
 from logrisk.ai_harness.trace_logger import AITraceLogger
 from logrisk.feature_jobs import FeatureJobManager
+from logrisk.incremental_sources import SourceCursor, SourceRecord, register_kafka_consumer_adapter, unregister_kafka_consumer_adapter
 from pipeline.dashboard_server import build_server, parse_args
 
 
@@ -146,7 +147,7 @@ def test_database_status_and_restart_candidate_configuration_are_available(dashb
     assert saved["candidate"]["provider"] == "postgres"
     assert saved["candidate"]["password_configured"] is False
     assert saved["restart_required"] is True
-    assert health["version"] == "1.35.2"
+    assert health["version"] == "1.36.0"
     assert health["storage"] == "sqlite"
 
 
@@ -373,6 +374,61 @@ def test_streaming_routes_expose_disabled_kafka_capability(dashboard):
     assert sources["sources"]["kafka"]["reason"] == "Kafka 消费适配器未注册"
     assert unavailable.value.code == 422
     assert json.load(unavailable.value)["code"] == "kafka_adapter_unavailable"
+
+
+def test_kafka_start_route_runs_registered_adapter_to_completion(dashboard):
+    base_url, _ = dashboard
+
+    class FakeKafkaAdapter:
+        adapter_id = "dashboard-kafka"
+
+        def read(self, configuration, cursor):
+            yield SourceRecord(
+                {"timestamp": "2026-09-01T00:00:00+00:00", "node": "node-a", "component": "kernel", "message": "error one"},
+                SourceCursor("kafka", {"partition": 0, "offset": 1}),
+            )
+
+        def commit(self, configuration, cursor):
+            return None
+
+    register_kafka_consumer_adapter(FakeKafkaAdapter())
+    try:
+        status, started, _ = request_json(base_url + "/api/streaming/kafka/start", "POST", {
+            "adapter_id": "dashboard-kafka",
+            "topic": "logs",
+            "consumer_group": "logrisk-test",
+            "bootstrap_env": "LOGRISK_KAFKA_BOOTSTRAP",
+        })
+        for _ in range(50):
+            _, tasks, _ = request_json(base_url + "/api/streaming/tasks")
+            if tasks["tasks"] and tasks["tasks"][0]["status"] == "completed":
+                break
+            time.sleep(0.02)
+        first_updated_at = tasks["tasks"][0]["updated_at"]
+        duplicate_status, duplicate, _ = request_json(base_url + "/api/streaming/kafka/start", "POST", {
+            "adapter_id": "dashboard-kafka",
+            "topic": "logs",
+            "consumer_group": "logrisk-test",
+            "bootstrap_env": "LOGRISK_KAFKA_BOOTSTRAP",
+        })
+        for _ in range(50):
+            _, tasks, _ = request_json(base_url + "/api/streaming/tasks")
+            if tasks["tasks"] and tasks["tasks"][0]["status"] == "completed" and tasks["tasks"][0]["updated_at"] != first_updated_at:
+                break
+            time.sleep(0.02)
+    finally:
+        unregister_kafka_consumer_adapter("dashboard-kafka")
+
+    assert status == 202
+    assert started["task_id"]
+    assert started["batch_records"] == 10000
+    assert tasks["tasks"][0]["task_id"] == started["task_id"]
+    assert tasks["tasks"][0]["source"]["kind"] == "kafka"
+    assert tasks["tasks"][0]["status"] == "completed"
+    assert tasks["tasks"][0]["records_processed"] == 1
+    assert duplicate_status == 202
+    assert duplicate["task_id"] == started["task_id"]
+    assert len(tasks["tasks"]) == 1
 
 
 def test_rule_list_route(dashboard):

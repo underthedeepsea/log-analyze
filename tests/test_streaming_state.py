@@ -30,17 +30,20 @@ def test_commit_window_is_idempotent_and_advances_checkpoint(tmp_path):
         window_id="node-a:1",
         cursor=cursor,
         templates=[template],
+        summary={"record_count": 1},
     )
     second = repository.commit_window(
         task["task_id"],
         window_id="node-a:1",
         cursor=cursor,
         templates=[template],
+        summary={"record_count": 1},
     )
 
     assert first is True
     assert second is False
     assert repository.get_task(task["task_id"])["cursor"] == cursor.to_dict()
+    assert repository.get_task(task["task_id"])["records_processed"] == 1
     assert repository.list_unknown_templates(task_id=task["task_id"])[0]["occurrence_count"] == 1
 
 

@@ -17,6 +17,10 @@ class StreamingConflictError(StreamingStateError):
     """A persisted source or configuration no longer matches the task snapshot."""
 
 
+class StreamingTaskBusyError(StreamingStateError):
+    """A streaming task is already claimed by another worker."""
+
+
 _RAW_LOG_KEYS = {"raw_sample", "samples", "message", "content", "raw_log", "log_line"}
 
 
@@ -49,6 +53,9 @@ class StreamingStateRepository:
             "stage": "READING",
             "cursor": SourceCursor.empty().to_dict(),
             "windows_committed": 0,
+            "records_processed": 0,
+            "pending_external_commit": None,
+            "result": None,
             "error": None,
             "created_at": now,
             "updated_at": now,
@@ -89,6 +96,23 @@ class StreamingStateRepository:
 
     def mark_running(self, task_id: str) -> dict[str, Any]:
         return self._update_task(task_id, status="running", stage="READING", event_type="task_started")
+
+    def claim_task(self, task_id: str) -> dict[str, Any]:
+        now = utc_now()
+        with self.database.transaction() as connection:
+            row = connection.execute("SELECT task_json FROM streaming_tasks WHERE task_id=?", (task_id,)).fetchone()
+            if row is None:
+                raise KeyError(f"Streaming task not found: {task_id}")
+            task = _decode_json(row[0])
+            if task.get("status") == "running":
+                raise StreamingTaskBusyError("流式任务已被其他 Worker 占用")
+            task.update({"status": "running", "stage": "READING", "error": None, "updated_at": now})
+            connection.execute(
+                "UPDATE streaming_tasks SET status='running', stage='READING', task_json=?, updated_at=? WHERE task_id=?",
+                (_json(task), now, task_id),
+            )
+            self._append_event(connection, task_id, "task_claimed", {}, now)
+        return task
 
     def mark_stage(self, task_id: str, stage: str) -> dict[str, Any]:
         allowed = {"READING", "SPOOLING", "MINING", "AGGREGATING"}
@@ -137,6 +161,42 @@ class StreamingStateRepository:
                 count += 1
         return count
 
+    def clear_pending_external_commit(self, task_id: str, cursor: SourceCursor | Mapping[str, Any]) -> dict[str, Any]:
+        cursor_value = cursor.to_dict() if isinstance(cursor, SourceCursor) else SourceCursor.from_dict(cursor).to_dict()
+        now = utc_now()
+        with self.database.transaction() as connection:
+            row = connection.execute("SELECT task_json FROM streaming_tasks WHERE task_id=?", (task_id,)).fetchone()
+            if row is None:
+                raise KeyError(f"Streaming task not found: {task_id}")
+            task = _decode_json(row[0])
+            if task.get("pending_external_commit") == cursor_value:
+                task["pending_external_commit"] = None
+                task["updated_at"] = now
+                connection.execute(
+                    "UPDATE streaming_tasks SET task_json=?, updated_at=? WHERE task_id=?",
+                    (_json(task), now, task_id),
+                )
+                self._append_event(connection, task_id, "external_commit_completed", {}, now)
+        return task
+
+    def save_result(self, task_id: str, result: Mapping[str, Any]) -> dict[str, Any]:
+        safe_result = dict(result)
+        _reject_raw_fields(safe_result)
+        now = utc_now()
+        with self.database.transaction() as connection:
+            row = connection.execute("SELECT task_json FROM streaming_tasks WHERE task_id=?", (task_id,)).fetchone()
+            if row is None:
+                raise KeyError(f"Streaming task not found: {task_id}")
+            task = _decode_json(row[0])
+            task["result"] = safe_result
+            task["updated_at"] = now
+            connection.execute(
+                "UPDATE streaming_tasks SET task_json=?, updated_at=? WHERE task_id=?",
+                (_json(task), now, task_id),
+            )
+            self._append_event(connection, task_id, "result_saved", {}, now)
+        return task
+
     def commit_window(
         self,
         task_id: str,
@@ -150,6 +210,7 @@ class StreamingStateRepository:
             raise StreamingStateError("窗口标识不能为空")
         cursor_value = cursor.to_dict() if isinstance(cursor, SourceCursor) else SourceCursor.from_dict(cursor).to_dict()
         sanitized_templates = [_safe_template(item) for item in templates]
+        commit_summary = dict(summary or {})
         now = utc_now()
         with self.database.transaction() as connection:
             task_row = connection.execute("SELECT task_json, config_hash FROM streaming_tasks WHERE task_id=?", (task_id,)).fetchone()
@@ -169,7 +230,7 @@ class StreamingStateRepository:
                 return False
             connection.execute(
                 "INSERT INTO streaming_window_commits(task_id, window_id, cursor_json, summary_json, committed_at) VALUES (?, ?, ?, ?, ?)",
-                (task_id, window_id, _json(cursor_value), _json(dict(summary or {})), now),
+                (task_id, window_id, _json(cursor_value), _json(commit_summary), now),
             )
             config_hash = str(task_row[1])
             for template in sanitized_templates:
@@ -197,6 +258,8 @@ class StreamingStateRepository:
                     "stage": "AGGREGATING",
                     "cursor": cursor_value,
                     "windows_committed": int(task.get("windows_committed") or 0) + 1,
+                    "records_processed": int(task.get("records_processed") or 0) + int(commit_summary.get("record_count") or 0),
+                    "pending_external_commit": cursor_value,
                     "updated_at": now,
                 }
             )

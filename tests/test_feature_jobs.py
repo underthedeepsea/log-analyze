@@ -1,8 +1,10 @@
 import pytest
 
 from logrisk.approved_rules import ApprovedRuleStore
+from logrisk.database import SQLiteDatabase
 from logrisk.feature_jobs import FeatureJobError, FeatureJobFileStore, FeatureJobManager, validate_result_document
 from logrisk.processing_metrics import ProcessingMetricsStore
+from logrisk.sqlite_stores import SQLiteApprovalGroupStore, SQLiteApprovedRuleStore, SQLiteFeatureJobStore
 
 
 def entity(entity_id, score, log_count=2, entity_type="node"):
@@ -484,6 +486,189 @@ def test_file_store_restores_completed_job_for_review(tmp_path):
     assert restored.get_job(job_id)["features"][0]["status"] == "pending"
     assert (tmp_path / "feature_jobs" / job_id / "snapshot.json").exists()
     assert (tmp_path / "feature_jobs" / job_id / "events.jsonl").exists()
+
+
+def test_sqlite_store_collapses_duplicate_entity_windows_before_persistence(tmp_path):
+    first = entity("node-a", 90, log_count=5)
+    second = entity("node-a", 70, log_count=3)
+    second.update({
+        "window_start": "2026-06-22T11:00:00+08:00",
+        "window_end": "2026-06-22T11:05:00+08:00",
+        "top_templates": [{"template_hash": "hash-node-a-later", "count": 3}],
+    })
+    store = SQLiteFeatureJobStore(SQLiteDatabase(tmp_path / "state.sqlite3"))
+    manager = FeatureJobManager(persistence=store, auto_start=False)
+
+    job_id = manager.create_job(
+        {"summary": {}, "risk_entities": [first, second]},
+        model="qwen3.5:4b-mlx",
+    )
+
+    snapshot = manager.get_job(job_id)
+    assert len(snapshot["entities"]) == 1
+    assert snapshot["entities"][0]["entity_id"] == "node-a"
+    with manager._lock:
+        source = manager._job(job_id)["entities"][0]["source"]
+    assert source["window_start"] == first["window_start"]
+    assert source["window_end"] == second["window_end"]
+    assert {item["template_hash"] for item in source["top_templates"]} == {
+        "hash-node-a",
+        "hash-node-a-later",
+    }
+    assert sum(item["count"] for item in source["top_templates"]) == 8
+
+
+def test_group_scope_reject_marks_all_pending_semantic_candidates_without_rule(tmp_path):
+    rules = ApprovedRuleStore(tmp_path / "rules.json")
+    manager = FeatureJobManager(
+        extractor=lambda source, **kwargs: [candidate(source, f"candidate-{source['entity_id']}")],
+        rule_store=rules,
+        auto_start=False,
+    )
+    first = manager.create_job(
+        {"summary": {}, "risk_entities": [entity("node-a", 90)]},
+        model="qwen3:1.7b",
+    )
+    second = manager.create_job(
+        {"summary": {}, "risk_entities": [entity("node-b", 80)]},
+        model="qwen3:1.7b",
+    )
+    manager.run_job(first)
+    manager.run_job(second)
+
+    rejected = manager.update_feature(
+        first,
+        "feature-node-a",
+        {"status": "rejected", "review_scope": "approval_identity"},
+    )
+
+    assert rejected["status"] == "rejected"
+    assert rejected["resolution_type"] == "group_rejected"
+    assert manager.get_job(second)["features"][0]["status"] == "rejected"
+    assert manager.get_job(second)["features"][0]["resolution_type"] == "group_rejected"
+    assert manager.list_approval_groups()[0]["status"] == "rejected"
+    assert rules.list_rules() == []
+
+
+def _cni_entity(entity_id, component, template):
+    value = entity(entity_id, 90)
+    value["top_templates"] = [{
+        "template_hash": f"hash-{entity_id}",
+        "template_fingerprint": f"fingerprint-{entity_id}",
+        "category": "network",
+        "component": component,
+        "template": template,
+        "count": 3,
+        "first_seen": value["window_start"],
+        "last_seen": value["window_end"],
+    }]
+    return value
+
+
+def _cni_candidate(source, candidate_id, problem_code, feature_type):
+    value = candidate(source, "CNI 网络风险")
+    value.update({
+        "candidate_id": candidate_id,
+        "feature_type": feature_type,
+        "problem_code": problem_code,
+        "components": [source["top_templates"][0]["component"]],
+        "template_hashes": [source["top_templates"][0]["template_hash"]],
+        "source_templates": [dict(source["top_templates"][0])],
+    })
+    return value
+
+
+def test_cross_job_cni_wrappers_share_review_group_and_reuse_rule(tmp_path):
+    rules = ApprovedRuleStore(tmp_path / "rules.json")
+    calls = []
+    specs = [
+        ("node-a", "kubelet", "NetworkPlugin cni failed: no enough ips", "runtime_cni_setup_failed", "cni_network_failure"),
+        ("node-b", "containerd", "CreatePodSandbox failed: cni no enough ips", "runtime_sandbox_create_failed", "pod_sandbox_network_failure"),
+        ("node-c", "kubelet", "RunPodSandbox failed: cni no enough ips", "runtime_cni_setup_failed", "runtime_network_failure"),
+        ("node-d", "kubelet", "CNI config syntax error", "CNI config syntax error", "cni_config_failure"),
+    ]
+
+    def extractor(source, **kwargs):
+        calls.append(source["entity_id"])
+        spec = next(item for item in specs if item[0] == source["entity_id"])
+        return [_cni_candidate(source, f"candidate-{spec[0]}", spec[3], spec[4])]
+
+    manager = FeatureJobManager(extractor=extractor, rule_store=rules, auto_start=False)
+    job_ids = []
+    for entity_id, component, template, problem_code, feature_type in specs:
+        job_id = manager.create_job(
+            {"summary": {}, "risk_entities": [_cni_entity(entity_id, component, template)]},
+            model="qwen3.5:4b-mlx",
+        )
+        manager.run_job(job_id)
+        job_ids.append(job_id)
+
+    from logrisk.approval_queue import build_review_groups
+
+    groups = build_review_groups(manager.list_persisted_candidates(status="pending"))
+    ip_group = next(item for item in groups if item["problem_code"] == "kubernetes.cni.ip_exhaustion")
+    config_group = next(item for item in groups if item["problem_code"] == "kubernetes.cni.config_error")
+    assert len(groups) == 2
+    assert ip_group["candidate_count"] == 3
+    assert config_group["candidate_count"] == 1
+
+    approved = manager.update_feature(
+        job_ids[0],
+        "candidate-node-a",
+        {"status": "approved", "review_scope": "approval_identity"},
+    )
+
+    assert len(rules.list_rules()) == 1
+    assert approved["problem_code"] == "kubernetes.cni.ip_exhaustion"
+    assert all(
+        manager.get_job(job_id)["features"][0]["status"] == "approved"
+        for job_id in job_ids[:3]
+    )
+    assert manager.get_job(job_ids[3])["features"][0]["status"] == "pending"
+    assert build_review_groups(manager.list_persisted_candidates(status="pending"))[0]["problem_code"] == "kubernetes.cni.config_error"
+
+    follow_up = _cni_entity("node-e", "containerd", "CreatePodSandbox failed: cni no enough ips")
+    follow_up_job = manager.create_job({"summary": {}, "risk_entities": [follow_up]}, model="qwen3.5:4b-mlx")
+    manager.run_job(follow_up_job)
+
+    assert calls == ["node-a", "node-b", "node-c", "node-d"]
+    assert manager.get_job(follow_up_job)["entities"][0]["status"] == "rule_matched"
+
+
+def test_feature_job_manager_lazy_loads_job_for_persisted_approval(tmp_path):
+    database = SQLiteDatabase(tmp_path / "state.sqlite3")
+    persistence = SQLiteFeatureJobStore(database)
+    groups = SQLiteApprovalGroupStore(database)
+    rules = SQLiteApprovedRuleStore(database)
+    writer = FeatureJobManager(
+        extractor=lambda source, **kwargs: [candidate(source, "candidate-node-a")],
+        rule_store=rules,
+        approval_group_store=groups,
+        persistence=persistence,
+        auto_start=False,
+        interrupt_on_restore=False,
+    )
+    reader = FeatureJobManager(
+        extractor=lambda source, **kwargs: [],
+        rule_store=rules,
+        approval_group_store=groups,
+        persistence=persistence,
+        auto_start=False,
+        interrupt_on_restore=False,
+    )
+    job_id = writer.create_job(
+        {"summary": {}, "risk_entities": [entity("node-a", 90)]},
+        model="qwen3:1.7b",
+    )
+    writer.run_job(job_id)
+
+    updated = reader.update_feature(
+        job_id,
+        "feature-node-a",
+        {"status": "rejected", "review_scope": "approval_identity"},
+    )
+
+    assert updated["status"] == "rejected"
 
 
 def test_file_store_marks_running_job_interrupted_without_model_retry(tmp_path):

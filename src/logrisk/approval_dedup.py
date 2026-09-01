@@ -55,6 +55,11 @@ _PROBLEM_CODE_ALIASES = {
     "linux_oom": "linux.memory.oom",
 }
 
+_CNI_CONCRETE_PROBLEM_CODES = frozenset({
+    "kubernetes.cni.ip_exhaustion",
+    "kubernetes.cni.config_error",
+})
+
 
 def normalize_problem_code(value: Any) -> str | None:
     """Normalize a problem code without accepting node, pod, or time identity."""
@@ -143,6 +148,14 @@ def _nested_semantic_values(value: Any) -> Iterable[str]:
     return values
 
 
+def _append_problem_code(codes: list[str], value: Any) -> None:
+    normalized = normalize_problem_code(value)
+    if normalized:
+        normalized = _PROBLEM_CODE_ALIASES.get(_alias_key(normalized), normalized)
+        if normalized not in codes:
+            codes.append(normalized)
+
+
 def _keyword_problem_code(text: str) -> str | None:
     lowered = text.lower()
     is_cni = bool(re.search(r"\bcni\b|网络配置|网络插件", lowered))
@@ -189,26 +202,90 @@ def _has_semantic_identity(feature: Mapping[str, Any], sources: Iterable[Mapping
     )
 
 
-def derive_problem_code(feature: Mapping[str, Any], entity: Mapping[str, Any] | None = None) -> str:
-    sources = _source_templates(feature, entity)
-    for value in (feature.get("problem_code"), feature.get("problemCode"), feature.get("risk_type")):
-        normalized = normalize_problem_code(value)
-        if normalized:
-            return _PROBLEM_CODE_ALIASES.get(_alias_key(normalized), normalized)
+def collect_problem_codes(
+    feature: Mapping[str, Any], entity: Mapping[str, Any] | None = None
+) -> list[str]:
+    """Collect every available semantic signal before choosing a primary cause."""
 
-    for value in (feature.get("semantic_fields"), feature.get("risk_semantic"), entity.get("risk_semantic") if entity else None):
+    sources = _source_templates(feature, entity)
+    codes: list[str] = []
+    for value in (feature.get("problem_code"), feature.get("problemCode"), feature.get("risk_type")):
+        _append_problem_code(codes, value)
+    for value in (feature.get("semantic_fields"), feature.get("risk_semantic")):
         for normalized in _nested_semantic_values(value):
-            if normalized:
-                return _PROBLEM_CODE_ALIASES.get(_alias_key(normalized), normalized)
+            _append_problem_code(codes, normalized)
+    if entity:
+        for value in (
+            entity.get("problem_code"),
+            entity.get("problemCode"),
+            entity.get("risk_type"),
+            entity.get("risk_semantic"),
+        ):
+            _append_problem_code(codes, value)
+            for normalized in _nested_semantic_values(value):
+                _append_problem_code(codes, normalized)
+        for normalized in _nested_semantic_values(entity.get("semantic_fields")):
+            _append_problem_code(codes, normalized)
 
     keyword = _keyword_problem_code(_feature_text(feature, sources))
     if keyword:
-        return keyword
+        _append_problem_code(codes, keyword)
+    if entity:
+        entity_sources = _source_templates(entity, entity)
+        entity_keyword = _keyword_problem_code(_feature_text(entity, entity_sources))
+        if entity_keyword:
+            _append_problem_code(codes, entity_keyword)
 
     for source in sources:
-        for normalized in _nested_semantic_values(source.get("risk_semantic")):
-            if normalized:
-                return _PROBLEM_CODE_ALIASES.get(_alias_key(normalized), normalized)
+        for value in (
+            source.get("problem_code"),
+            source.get("problemCode"),
+            source.get("risk_type"),
+            source.get("risk_semantic"),
+            source.get("semantic_fields"),
+        ):
+            _append_problem_code(codes, value)
+            for normalized in _nested_semantic_values(value):
+                _append_problem_code(codes, normalized)
+    return codes
+
+
+def select_primary_problem_code(
+    codes: Iterable[Any], explicit_code: Any = None
+) -> str | None:
+    """Prefer a concrete CNI cause while preserving strict ambiguity fallback."""
+
+    normalized_codes: list[str] = []
+    for value in codes:
+        _append_problem_code(normalized_codes, value)
+    explicit = normalize_problem_code(explicit_code)
+    if explicit:
+        explicit = _PROBLEM_CODE_ALIASES.get(_alias_key(explicit), explicit)
+    concrete = {code for code in normalized_codes if code in _CNI_CONCRETE_PROBLEM_CODES}
+    if explicit in _CNI_CONCRETE_PROBLEM_CODES:
+        return explicit
+    if len(concrete) > 1:
+        return None
+    if concrete:
+        return sorted(concrete)[0]
+    if explicit and explicit != "unknown.problem":
+        return explicit
+    return next((code for code in normalized_codes if code != "unknown.problem"), None)
+
+
+def derive_problem_code(feature: Mapping[str, Any], entity: Mapping[str, Any] | None = None) -> str:
+    sources = _source_templates(feature, entity)
+    explicit_code = next(
+        (
+            normalize_problem_code(feature.get(field))
+            for field in ("problem_code", "problemCode", "risk_type")
+            if normalize_problem_code(feature.get(field))
+        ),
+        None,
+    )
+    selected = select_primary_problem_code(collect_problem_codes(feature, entity), explicit_code)
+    if selected:
+        return selected
 
     anchors = _canonical_signatures(feature.get("anchor_signatures"))
     if not anchors:
@@ -218,19 +295,7 @@ def derive_problem_code(feature: Mapping[str, Any], entity: Mapping[str, Any] | 
 
 
 def entity_problem_codes(entity: Mapping[str, Any]) -> set[str]:
-    codes: set[str] = set()
-    for value in (entity.get("problem_code"), entity.get("problemCode"), entity.get("risk_type"), entity.get("risk_semantic")):
-        codes.update(_nested_semantic_values(value))
-        normalized = normalize_problem_code(value)
-        if normalized:
-            codes.add(_PROBLEM_CODE_ALIASES.get(_alias_key(normalized), normalized))
-    templates = [item for item in entity.get("top_templates") or [] if isinstance(item, Mapping)]
-    for template in templates:
-        codes.update(_nested_semantic_values(template.get("risk_semantic")))
-    keyword = _keyword_problem_code(_feature_text(entity, templates))
-    if keyword:
-        codes.add(keyword)
-    return codes
+    return set(collect_problem_codes(entity, entity))
 
 
 def component_scope(feature: Mapping[str, Any], entity: Mapping[str, Any] | None = None) -> list[str]:
@@ -254,6 +319,12 @@ def anchor_signatures(feature: Mapping[str, Any], entity: Mapping[str, Any] | No
     if not anchors:
         return []
 
+    concrete_codes = {
+        code for code in collect_problem_codes(feature, entity)
+        if code in _CNI_CONCRETE_PROBLEM_CODES
+    }
+    if len(concrete_codes) > 1:
+        return anchors[:1]
     if _has_semantic_identity(feature, sources) or _keyword_problem_code(_feature_text(feature, sources)):
         return []
     return anchors[:1]
@@ -271,16 +342,20 @@ def build_approval_key(
 
     if anchor_template_fingerprints is not None and not anchor_signatures:
         anchor_signatures = anchor_template_fingerprints
-    payload = {
-        "feature_type": normalize_feature_type(feature_type),
-        "problem_code": normalize_problem_code(problem_code) or "unknown.problem",
-        "component_scope": sorted({
-            _remove_ip_literals(str(item).strip().lower())
-            for item in _iter_values(component_scope)
-            if str(item).strip()
-        }),
-        "anchor_signatures": _canonical_signatures(anchor_signatures),
-    }
+    normalized_problem_code = normalize_problem_code(problem_code) or "unknown.problem"
+    if is_canonical_problem_code(normalized_problem_code):
+        payload = {"problem_code": normalized_problem_code}
+    else:
+        payload = {
+            "feature_type": normalize_feature_type(feature_type),
+            "problem_code": normalized_problem_code,
+            "component_scope": sorted({
+                _remove_ip_literals(str(item).strip().lower())
+                for item in _iter_values(component_scope)
+                if str(item).strip()
+            }),
+            "anchor_signatures": _canonical_signatures(anchor_signatures),
+        }
     digest = hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
     return f"appr_{digest}"
 
@@ -297,6 +372,24 @@ def approval_identity(feature: Mapping[str, Any], entity: Mapping[str, Any] | No
         "anchor_signatures": anchors,
         "match_mode": "semantic" if _has_semantic_identity(feature, sources) else "template_set",
     }
+
+
+def is_canonical_problem_code(code: str | None) -> bool:
+    normalized = normalize_problem_code(code)
+    return bool(normalized) and normalized != "unknown.problem" and not normalized.startswith("logrisk.")
+
+
+def same_approval_identity(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
+    left_code = derive_problem_code(left)
+    right_code = derive_problem_code(right)
+    left_canonical = is_canonical_problem_code(left_code)
+    right_canonical = is_canonical_problem_code(right_code)
+    if left_canonical and right_canonical:
+        return left_code == right_code
+
+    left_key = str(left.get("approval_key") or approval_identity(left)["approval_key"])
+    right_key = str(right.get("approval_key") or approval_identity(right)["approval_key"])
+    return bool(left_key) and left_key == right_key
 
 
 def group_id_for_key(approval_key: str) -> str:
@@ -317,6 +410,10 @@ class InMemoryApprovalGroupStore:
         with self._lock:
             group_id = self._by_key.get(str(approval_key))
             return copy.deepcopy(self._groups[group_id]) if group_id else None
+
+    def get_by_id(self, approval_group_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            return copy.deepcopy(self._groups.get(str(approval_group_id)))
 
     def list_groups(self, status: str | None = None) -> list[dict[str, Any]]:
         with self._lock:

@@ -38,9 +38,12 @@ def test_django_core_read_apis_use_the_shared_api_facade(tmp_path) -> None:
             "/api/rule-governance/rules",
             "/api/release-readiness",
         )]
+        approvals = client.get("/api/feature-approvals?status=pending&page_size=100")
         clear_cached_container()
 
     assert all(response.status_code in {200, 503} for response in responses)
+    assert approvals.status_code == 200
+    assert approvals.json()["schema_version"] == "feature_approval_queue_v1"
     assert responses[0].json()["service"] == "logrisk-dashboard"
     assert "profiles" in responses[2].json()
     assert "items" in responses[3].json()

@@ -114,39 +114,103 @@ class SQLiteFeatureJobStore:
                     (job["job_id"], int(event.get("sequence", 0)), str(event.get("type") or "event"), _json(event), event.get("timestamp") or now),
                 )
 
+    @staticmethod
+    def _decode_json(value: Any, default: Any) -> Any:
+        if isinstance(value, (dict, list)):
+            return copy.deepcopy(value)
+        try:
+            return json.loads(value) if value is not None else copy.deepcopy(default)
+        except (TypeError, json.JSONDecodeError):
+            return copy.deepcopy(default)
+
+    @classmethod
+    def _load_job_row(cls, connection: Any, row: Any) -> dict[str, Any]:
+        job = cls._decode_json(row["job_json"], {})
+        if not isinstance(job, dict):
+            job = {}
+        job["job_id"] = str(row["job_id"])
+        job["entities"] = [
+            cls._decode_json(item[0], {})
+            for item in connection.execute(
+                "SELECT entity_json FROM feature_job_entities WHERE job_id=? ORDER BY updated_at, entity_id",
+                (row["job_id"],),
+            )
+        ]
+        features: dict[str, dict[str, Any]] = {}
+        for item in connection.execute(
+            "SELECT candidate_id, candidate_json, approval_key, problem_code, approval_group_id, "
+            "resolved_rule_id, resolution_type FROM feature_candidates WHERE job_id=? ORDER BY created_at, candidate_id",
+            (row["job_id"],),
+        ):
+            candidate = cls._decode_json(item["candidate_json"], {})
+            if not isinstance(candidate, dict):
+                continue
+            candidate["candidate_id"] = str(item["candidate_id"])
+            for field in ("approval_key", "problem_code", "approval_group_id", "resolved_rule_id", "resolution_type"):
+                if item[field] is not None:
+                    candidate[field] = item[field]
+            features[candidate["candidate_id"]] = candidate
+        job["features"] = features
+        job["events"] = [
+            cls._decode_json(item[0], {})
+            for item in connection.execute(
+                "SELECT event_json FROM feature_job_events WHERE job_id=? ORDER BY sequence", (row["job_id"],)
+            )
+        ]
+        return job
+
     def load(self) -> list[dict[str, Any]]:
         with self.database.connect() as connection:
             rows = connection.execute("SELECT job_id, job_json FROM feature_jobs ORDER BY created_at").fetchall()
-            jobs = []
-            for row in rows:
-                job = json.loads(row["job_json"])
-                job["entities"] = [
-                    json.loads(item[0]) for item in connection.execute(
-                        "SELECT entity_json FROM feature_job_entities WHERE job_id=? ORDER BY updated_at, entity_id", (row["job_id"],)
-                    )
-                ]
-                job["features"] = {
-                    item["candidate_id"]: {
-                        **json.loads(item["candidate_json"]),
-                        **{
-                            field: item[field]
-                            for field in ("approval_key", "problem_code", "approval_group_id", "resolved_rule_id", "resolution_type")
-                            if item[field] is not None
-                        },
-                    }
-                    for item in connection.execute(
-                        "SELECT candidate_id, candidate_json, approval_key, problem_code, approval_group_id, "
-                        "resolved_rule_id, resolution_type FROM feature_candidates WHERE job_id=? ORDER BY created_at, candidate_id",
-                        (row["job_id"],),
-                    )
-                }
-                job["events"] = [
-                    json.loads(item[0]) for item in connection.execute(
-                        "SELECT event_json FROM feature_job_events WHERE job_id=? ORDER BY sequence", (row["job_id"],)
-                    )
-                ]
-                jobs.append(job)
-        return jobs
+            return [self._load_job_row(connection, row) for row in rows]
+
+    def load_job(self, job_id: str) -> dict[str, Any] | None:
+        with self.database.connect() as connection:
+            row = connection.execute(
+                "SELECT job_id, job_json FROM feature_jobs WHERE job_id=?", (str(job_id),)
+            ).fetchone()
+            return self._load_job_row(connection, row) if row else None
+
+    def list_candidates(
+        self, status: str | None = None, limit: int = 100
+    ) -> list[dict[str, Any]]:
+        page_size = max(1, min(int(limit), 100000))
+        query = (
+            "SELECT c.candidate_id, c.job_id, c.status, c.approval_key, c.problem_code, c.approval_group_id, "
+            "c.resolved_rule_id, c.resolution_type, c.candidate_json, c.created_at, c.updated_at, "
+            "j.job_json FROM feature_candidates c JOIN feature_jobs j ON j.job_id=c.job_id"
+        )
+        parameters: list[Any] = []
+        if status is not None:
+            query += " WHERE c.status=?"
+            parameters.append(str(status))
+        query += " ORDER BY c.created_at, c.candidate_id LIMIT ?"
+        parameters.append(page_size)
+        with self.database.connect() as connection:
+            rows = connection.execute(query, parameters).fetchall()
+        candidates: list[dict[str, Any]] = []
+        for row in rows:
+            candidate = self._decode_json(row["candidate_json"], {})
+            job = self._decode_json(row["job_json"], {})
+            if not isinstance(candidate, dict):
+                continue
+            if not isinstance(job, dict):
+                job = {}
+            candidate["candidate_id"] = str(row["candidate_id"])
+            candidate["job_id"] = str(row["job_id"])
+            candidate["status"] = row["status"]
+            for field in ("approval_key", "problem_code", "approval_group_id", "resolved_rule_id", "resolution_type"):
+                if row[field] is not None:
+                    candidate[field] = row[field]
+            candidate.setdefault("created_at", row["created_at"])
+            candidate.setdefault("updated_at", row["updated_at"])
+            for field in ("model", "provider", "prompt_id", "model_profile_id"):
+                if candidate.get(field) is None and job.get(field) is not None:
+                    candidate[field] = copy.deepcopy(job[field])
+            candidate.setdefault("job_created_at", job.get("created_at"))
+            candidate.setdefault("job_status", job.get("status"))
+            candidates.append(candidate)
+        return candidates
 
 
 class SQLiteApprovedRuleStore(ApprovedRuleStore):
@@ -273,6 +337,13 @@ class SQLiteApprovalGroupStore:
         with self.database.connect() as connection:
             row = connection.execute(
                 "SELECT * FROM approval_groups WHERE approval_key=?", (str(approval_key),)
+            ).fetchone()
+        return self._row_to_group(row) if row else None
+
+    def get_by_id(self, approval_group_id: str) -> dict[str, Any] | None:
+        with self.database.connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM approval_groups WHERE approval_group_id=?", (str(approval_group_id),)
             ).fetchone()
         return self._row_to_group(row) if row else None
 

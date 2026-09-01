@@ -11,9 +11,10 @@ from typing import Any, Callable, Dict
 
 from logrisk.approval_dedup import (
     approval_identity,
-    entity_problem_codes,
+    derive_problem_code,
+    is_canonical_problem_code,
     normalize_feature_type,
-    normalize_problem_code,
+    same_approval_identity,
 )
 
 
@@ -108,6 +109,16 @@ def _versioned_fields(rule: Dict[str, Any]) -> Dict[str, Any]:
     return {field: copy.deepcopy(rule.get(field)) for field in fields}
 
 
+def _preferred_rule(rules: list[Dict[str, Any]]) -> Dict[str, Any] | None:
+    if not rules:
+        return None
+    latest = max(str(rule.get("updated_at") or "") for rule in rules)
+    return min(
+        (rule for rule in rules if str(rule.get("updated_at") or "") == latest),
+        key=lambda rule: str(rule.get("rule_id") or ""),
+    )
+
+
 class ApprovedRuleStore:
     def __init__(self, path: str | Path, clock: Callable[[], str] = _now) -> None:
         self.path = Path(path)
@@ -161,21 +172,23 @@ class ApprovedRuleStore:
         now = self.clock()
         with _PROCESS_LOCK:
             rules = self._read_locked()
-            existing = next(
-                (
+            exact = [
+                rule for rule in rules
+                if identity["approval_key"] and rule.get("approval_key") == identity["approval_key"]
+            ]
+            existing = _preferred_rule(exact)
+            if existing is None and is_canonical_problem_code(identity["problem_code"]):
+                semantic = [
                     rule for rule in rules
-                    if identity["approval_key"] and rule.get("approval_key") == identity["approval_key"]
-                ),
-                None,
-            )
+                    if str(rule.get("status") or "active") == "active"
+                    and same_approval_identity(rule, feature)
+                ]
+                existing = _preferred_rule(semantic)
             if existing is None:
-                existing = next(
-                    (
-                        rule for rule in rules
-                        if not rule.get("approval_key") and rule.get("signature") == signature
-                    ),
-                    None,
-                )
+                existing = _preferred_rule([
+                    rule for rule in rules
+                    if not rule.get("approval_key") and rule.get("signature") == signature
+                ])
             if any(
                 rule.get("signature") == signature
                 and rule.get("approval_key") not in {None, identity["approval_key"]}
@@ -229,54 +242,33 @@ class ApprovedRuleStore:
             _identity_pair(item)
             for item in _template_pairs(entity.get("top_templates") or [])
         }
-        entity_codes = entity_problem_codes(entity)
-        entity_components = {
-            str(item.get("component") or "").strip().lower()
-            for item in (entity.get("top_templates") or [])
-            if isinstance(item, dict) and str(item.get("component") or "").strip()
-        }
-        entity_anchors = {
-            f"{str(item.get('template_fingerprint') or item.get('template_hash') or '').strip()}|{str(item.get('category') or '').strip()}".rstrip("|")
-            for item in (entity.get("top_templates") or [])
-            if isinstance(item, dict) and (item.get("template_fingerprint") or item.get("template_hash"))
-        }
+        entity_problem_code = derive_problem_code(entity, entity)
         with _PROCESS_LOCK:
             matches = []
+            semantic_matches: dict[str, list[Dict[str, Any]]] = {}
             for rule in self._read_locked():
                 if str(rule.get("status") or "active") != "active":
                     continue
-                problem_code = normalize_problem_code(rule.get("problem_code"))
-                semantic_rule = rule.get("match_mode") == "semantic" or (
-                    rule.get("match_mode") is None and bool(rule.get("approval_key"))
+                problem_code = derive_problem_code(rule)
+                semantic_rule = bool(problem_code and is_canonical_problem_code(problem_code)) and (
+                    rule.get("match_mode") == "semantic"
+                    or (rule.get("match_mode") is None and bool(rule.get("approval_key")))
                 )
-                if problem_code and entity_codes and semantic_rule:
-                    if problem_code not in entity_codes:
+                if semantic_rule:
+                    if problem_code != entity_problem_code:
                         continue
-                    required_components = {
-                        str(item).strip().lower()
-                        for item in (rule.get("components") or [])
-                        if str(item).strip()
-                    }
-                    if required_components and entity_components and not required_components.issubset(entity_components):
-                        continue
-                    required_anchors = {
-                        str(item).strip()
-                        for item in (rule.get("anchor_signatures") or [])
-                        if str(item).strip()
-                    }
-                    if required_anchors and not all(
-                        any(required == actual or actual.startswith(required + "|") for actual in entity_anchors)
-                        for required in required_anchors
-                    ):
-                        continue
+                    semantic_matches.setdefault(problem_code, []).append(rule)
+                    continue
                 required = {
                     _identity_pair(item)
                     for item in (rule.get("template_signatures") or [])
                 }
-                if problem_code and entity_codes and semantic_rule:
+                if required and required.issubset(entity_pairs):
                     matches.append(copy.deepcopy(rule))
-                elif required and required.issubset(entity_pairs):
-                    matches.append(copy.deepcopy(rule))
+            for code in sorted(semantic_matches):
+                preferred = _preferred_rule(semantic_matches[code])
+                if preferred is not None:
+                    matches.append(copy.deepcopy(preferred))
             return matches
 
     def match_feature(
@@ -286,13 +278,25 @@ class ApprovedRuleStore:
     ) -> list[Dict[str, Any]]:
         identity = approval_identity(feature, entity)
         with _PROCESS_LOCK:
-            matches = []
-            for rule in self._read_locked():
-                if str(rule.get("status") or "active") != "active":
-                    continue
-                if rule.get("approval_key") == identity["approval_key"]:
-                    matches.append(copy.deepcopy(rule))
-            return matches
+            rules = [
+                rule for rule in self._read_locked()
+                if str(rule.get("status") or "active") == "active"
+            ]
+            exact = _preferred_rule([
+                rule for rule in rules
+                if rule.get("approval_key") == identity["approval_key"]
+            ])
+            if exact is not None:
+                return [copy.deepcopy(exact)]
+            if is_canonical_problem_code(identity["problem_code"]):
+                semantic = _preferred_rule([
+                    rule for rule in rules
+                    if same_approval_identity(rule, feature)
+                    and is_canonical_problem_code(derive_problem_code(rule))
+                ])
+                if semantic is not None:
+                    return [copy.deepcopy(semantic)]
+            return []
 
     def record_reuse(
         self,

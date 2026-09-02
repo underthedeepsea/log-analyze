@@ -24,6 +24,7 @@
 - 修复代表 Candidate CAS 失败后仍写入规则、同身份 Candidate 或 Approval Group，并在规则写入失败时回滚审批状态。
 - 修复过期的幂等批准绕过 Candidate 版本校验，并避免重复编辑已复用规则的 Candidate 时重复累计复用次数。
 - 修复批准规则 V1/V2 匹配与停用规则替换：仅复用 active 规则，保留 V1 物理身份；停用前身生成可追溯的独立 active replacement，并将规则复用统计限定为模型调用前命中。
+- 收紧 V2 语义匹配的 `match_mode` 门禁，并让 template-set 的 feature_type、组件、模板锚点证据缺失或不兼容时拒绝实体复用；canonical template-set 规则使用确定性的严格存储键，避免覆盖语义规则。
 
 ## 1.36.0 - 2026-09-01
 

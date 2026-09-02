@@ -30,6 +30,7 @@ def entity(cluster="prod-a", entity_id="node-a"):
         "cluster": cluster,
         "entity_type": "node",
         "entity_id": entity_id,
+        "feature_type": "resource_pressure",
         "top_templates": [
             {
                 "template_hash": "hash-oom",
@@ -201,6 +202,58 @@ def test_semantic_rule_matches_new_wrapper_without_template_identity(tmp_path):
     assert [item["rule_id"] for item in matches] == [stored["rule_id"]]
 
 
+def test_template_set_candidate_does_not_reuse_canonical_semantic_rule(tmp_path):
+    store = ApprovedRuleStore(tmp_path / "rules.json")
+    semantic = store.upsert_feature(cni_feature(component="kubelet"))
+    ambiguous = cni_feature(component="containerd")
+    ambiguous.pop("problem_code")
+
+    assert store.match_feature(ambiguous) == []
+
+    replacement = store.upsert_feature(ambiguous)
+    rules = {item["rule_id"]: item for item in store.list_rules()}
+
+    assert replacement["rule_id"] != semantic["rule_id"]
+    assert len(rules) == 2
+    assert rules[semantic["rule_id"]]["components"] == ["kubelet"]
+
+
+def test_template_set_entity_rejects_missing_component_evidence(tmp_path):
+    store = ApprovedRuleStore(tmp_path / "rules.json")
+    stored = store.upsert_feature(feature())
+    target = entity()
+    target["feature_type"] = "resource_pressure"
+    target["top_templates"][0].pop("component")
+
+    assert stored["match_mode"] == "template_set"
+    assert store.match_entity(target) == []
+
+
+def test_template_set_entity_rejects_missing_feature_type_evidence(tmp_path):
+    store = ApprovedRuleStore(tmp_path / "rules.json")
+    store.upsert_feature(feature())
+    target = entity()
+    target.pop("feature_type")
+
+    assert store.match_entity(target) == []
+
+
+@pytest.mark.parametrize("missing_field", ["feature_type", "components", "anchor_signatures"])
+def test_template_set_entity_rejects_incomplete_rule_identity(tmp_path, missing_field):
+    store = ApprovedRuleStore(tmp_path / "rules.json")
+    store.upsert_feature(feature())
+    malformed = store.list_rules()[0]
+    if missing_field == "components":
+        malformed.pop("components")
+    else:
+        malformed.pop(missing_field)
+    store._write_locked([malformed])
+    target = entity()
+    target["feature_type"] = "resource_pressure"
+
+    assert store.match_entity(target) == []
+
+
 def test_v1_wrapper_rule_stays_strict_against_new_semantic_identity(tmp_path):
     store = ApprovedRuleStore(tmp_path / "rules.json")
     stored = store.upsert_feature(cni_feature())
@@ -324,12 +377,22 @@ def test_v1_rule_matching_stays_on_strict_legacy_identity(tmp_path):
     assert [item["rule_id"] for item in store.match_entity({
         "entity_type": "node",
         "entity_id": "node-a",
+        "feature_type": "cni_network_failure",
         "top_templates": [{
             "template_hash": "legacy-hash",
             "category": "network",
             "component": "kubelet",
         }],
     })] == [legacy["rule_id"]]
+    assert store.match_entity({
+        "entity_type": "node",
+        "entity_id": "node-a",
+        "top_templates": [{
+            "template_hash": "legacy-hash",
+            "category": "network",
+            "component": "kubelet",
+        }],
+    }) == []
 
 
 def test_inactive_rule_gets_distinct_active_replacement_with_lineage(tmp_path):

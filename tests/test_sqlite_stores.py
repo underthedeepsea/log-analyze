@@ -506,7 +506,8 @@ def test_sqlite_rule_store_only_matches_active_rules(tmp_path):
     entity = {
         "entity_id": "node-a",
         "cluster": "prod-a",
-        "top_templates": [{"template_hash": "hash-1", "category": "kernel"}],
+        "feature_type": "kernel_error",
+        "top_templates": [{"template_hash": "hash-1", "category": "kernel", "component": "kernel"}],
     }
 
     assert rules.match_entity(entity)[0]["rule_id"] == saved["rule_id"]
@@ -555,6 +556,46 @@ def test_sqlite_inactive_rule_approval_creates_distinct_active_replacement(tmp_p
     assert replacement["status"] == "active"
     assert replacement["lineage"]["predecessor_rule_id"] == predecessor["rule_id"]
     assert persisted[predecessor["rule_id"]]["status"] == "disabled"
+
+
+def test_sqlite_template_set_candidate_does_not_overwrite_semantic_rule(tmp_path):
+    database = SQLiteDatabase(tmp_path / "logrisk.sqlite3")
+    rules = SQLiteApprovedRuleStore(database)
+    semantic = {
+        "feature_type": "cni_network_failure",
+        "problem_code": "kubernetes.cni.ip_exhaustion",
+        "title": "CNI 地址耗尽",
+        "summary": "CNI 地址池没有可用 IP。",
+        "importance": "high",
+        "components": ["kubelet"],
+        "source_templates": [{
+            "template_hash": "hash-kubelet",
+            "template_fingerprint": "fingerprint-cni",
+            "category": "network",
+            "component": "kubelet",
+            "template": "CNI failed: no enough ips",
+        }],
+    }
+    ambiguous = {
+        **semantic,
+        "components": ["containerd"],
+        "source_templates": [{
+            **semantic["source_templates"][0],
+            "template_hash": "hash-containerd",
+            "component": "containerd",
+        }],
+    }
+    ambiguous.pop("problem_code")
+
+    predecessor = rules.upsert_feature(semantic)
+    assert rules.match_feature(ambiguous) == []
+
+    replacement = rules.upsert_feature(ambiguous)
+    persisted = {item["rule_id"]: item for item in rules.list_rules()}
+
+    assert replacement["rule_id"] != predecessor["rule_id"]
+    assert len(persisted) == 2
+    assert persisted[predecessor["rule_id"]]["components"] == ["kubelet"]
 
 
 def test_sqlite_approval_group_round_trip_and_candidate_uniqueness(tmp_path):

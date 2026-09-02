@@ -320,6 +320,7 @@ def reusable_entity(entity_id="node-a", cluster="prod-a"):
 def reusable_candidate(source):
     value = candidate(source, title="已批准的 OOM 特征")
     value["feature_type"] = "resource_pressure"
+    value["problem_code"] = "linux.memory.oom"
     value["template_hashes"] = ["hash-oom"]
     value["source_templates"] = [dict(source["top_templates"][0])]
     value["status"] = "approved"

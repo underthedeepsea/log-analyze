@@ -1,13 +1,17 @@
 from __future__ import annotations
 
+import hashlib
 from concurrent.futures import ThreadPoolExecutor
 
 from logrisk.approval_dedup import (
     approval_identity,
     build_approval_key,
+    collect_problem_codes,
     derive_problem_code,
+    is_canonical_problem_code,
     normalize_problem_code,
     same_approval_identity,
+    select_primary_problem_code,
 )
 from logrisk.approved_rules import ApprovedRuleStore
 from logrisk.database import SQLiteDatabase
@@ -141,6 +145,229 @@ def test_same_approval_identity_supports_legacy_and_v2_semantic_candidates():
     }
 
     assert same_approval_identity(legacy, current)
+
+
+def test_collect_problem_codes_keeps_concrete_and_wrapper_evidence():
+    feature = {
+        "feature_type": "cni_network_failure",
+        "problem_code": "runtime_cni_setup_failed",
+        "semantic_fields": {"risk_type": "kubernetes.cni.config_error"},
+        "source_templates": [{
+            "template_fingerprint": "fingerprint-cni",
+            "template": "NetworkPlugin cni failed: no enough ips",
+        }],
+    }
+
+    assert set(collect_problem_codes(feature)) == {
+        "kubernetes.cni.plugin_failure",
+        "kubernetes.cni.config_error",
+        "kubernetes.cni.ip_exhaustion",
+    }
+
+
+def test_generic_semantic_code_precedes_runtime_wrapper_code():
+    assert select_primary_problem_code([
+        "runtime_sandbox_create_failed",
+        "kubernetes.cni.network_failure",
+    ]) == "kubernetes.cni.network_failure"
+
+
+def test_conflicting_concrete_codes_use_the_strict_fallback_even_with_explicit_code():
+    codes = [
+        "kubernetes.cni.ip_exhaustion",
+        "kubernetes.cni.config_error",
+    ]
+    left = {
+        "feature_type": "cni_network_failure",
+        "problem_code": "kubernetes.cni.ip_exhaustion",
+        "semantic_fields": {"risk_type": "kubernetes.cni.config_error"},
+        "components": ["kubelet"],
+        "anchor_signatures": ["shared-anchor"],
+        "source_templates": [{
+            "template_fingerprint": "shared-anchor",
+            "category": "network",
+            "template": "CNI config syntax error",
+        }],
+    }
+    right = {
+        "feature_type": "cni_network_failure",
+        "problem_code": "kubernetes.cni.config_error",
+        "semantic_fields": {"risk_type": "kubernetes.cni.ip_exhaustion"},
+        "components": ["kubelet"],
+        "anchor_signatures": ["shared-anchor"],
+        "source_templates": [{
+            "template_fingerprint": "shared-anchor",
+            "category": "network",
+            "template": "CNI no enough ips",
+        }],
+    }
+
+    assert select_primary_problem_code(codes, explicit_code=codes[0]) is None
+    assert derive_problem_code(left).startswith("logrisk.cni_network_failure.")
+    assert derive_problem_code(right).startswith("logrisk.cni_network_failure.")
+    assert approval_identity(left)["approval_key"] == approval_identity(right)["approval_key"]
+
+
+def test_unknown_and_unclassified_codes_use_strict_fallback_identity():
+    assert not is_canonical_problem_code("unknown")
+    assert not is_canonical_problem_code("unknown.cause")
+    assert not is_canonical_problem_code("unclassified")
+    assert not is_canonical_problem_code("unclassified.cause")
+    assert not is_canonical_problem_code("logrisk.cni_network_failure.deadbeef")
+
+    left = {
+        "feature_type": "network_failure",
+        "problem_code": "unknown",
+        "components": ["kubelet"],
+        "anchor_signatures": ["anchor-a"],
+    }
+    right = {
+        "feature_type": "pod_sandbox_failure",
+        "problem_code": "unknown",
+        "components": ["containerd"],
+        "anchor_signatures": ["anchor-b"],
+    }
+
+    assert approval_identity(left)["approval_key"] != approval_identity(right)["approval_key"]
+    assert not same_approval_identity(left, right)
+
+
+def test_all_cni_ip_exhaustion_wrappers_share_one_v2_identity():
+    candidates = [
+        {
+            "feature_type": "kubelet_network_signal",
+            "title": "kubelet title",
+            "summary": "kubelet summary",
+            "components": ["kubelet"],
+            "source_templates": [{
+                "template_fingerprint": "wrapper-kubelet",
+                "template_hash": "hash-kubelet",
+                "template": "NetworkPlugin cni failed: no enough ips",
+            }],
+        },
+        {
+            "feature_type": "containerd_sandbox_signal",
+            "title": "containerd title",
+            "summary": "containerd summary",
+            "components": ["containerd"],
+            "source_templates": [{
+                "template_fingerprint": "wrapper-containerd",
+                "template_hash": "hash-containerd",
+                "template": "CreatePodSandbox failed: cni no enough ips",
+            }],
+        },
+        {
+            "feature_type": "runtime_cni_setup_failure",
+            "title": "runtime setup title",
+            "summary": "runtime setup summary",
+            "problem_code": "runtime_cni_setup_failed",
+            "components": ["runtime-wrapper"],
+            "source_templates": [{
+                "template_fingerprint": "wrapper-setup",
+                "template_hash": "hash-setup",
+                "template": "runtime CNI setup failed: no enough ips",
+            }],
+        },
+        {
+            "feature_type": "runtime_sandbox_create_failure",
+            "title": "sandbox title",
+            "summary": "sandbox summary",
+            "problem_code": "runtime_sandbox_create_failed",
+            "components": ["sandbox-wrapper"],
+            "source_templates": [{
+                "template_fingerprint": "wrapper-sandbox",
+                "template_hash": "hash-sandbox",
+                "template": "runtime sandbox create failed: cni no enough ips",
+            }],
+        },
+    ]
+
+    assert {derive_problem_code(candidate) for candidate in candidates} == {
+        "kubernetes.cni.ip_exhaustion",
+    }
+    assert len({approval_identity(candidate)["approval_key"] for candidate in candidates}) == 1
+
+
+def test_runtime_sandbox_wrapper_without_cni_token_finds_ip_exhaustion():
+    feature = {
+        "feature_type": "runtime_network_failure",
+        "problem_code": "runtime_sandbox_create_failed",
+        "summary": "failed to setup network for sandbox: no enough ips",
+    }
+
+    assert derive_problem_code(feature) == "kubernetes.cni.ip_exhaustion"
+
+
+def test_canonical_identity_ignores_presentation_and_operational_fields():
+    left = {
+        "job_id": "job-a",
+        "feature_type": "network_failure",
+        "title": "Old title",
+        "summary": "Old summary",
+        "problem_code": "kubernetes.cni.ip_exhaustion",
+        "components": ["kubelet"],
+        "cluster": "prod-a",
+        "entity": {"type": "node", "id": "node-a"},
+        "window_start": "2026-09-01T10:00:00+00:00",
+        "window_end": "2026-09-01T10:05:00+00:00",
+        "source_templates": [{
+            "template_hash": "hash-a",
+            "template_fingerprint": "fingerprint-a",
+            "category": "network",
+            "component": "kubelet",
+        }],
+    }
+    right = {
+        "job_id": "job-b",
+        "feature_type": "pod_sandbox_network_failure",
+        "title": "New title",
+        "summary": "New summary",
+        "problem_code": "CNI no enough ips",
+        "components": ["containerd"],
+        "cluster": "prod-b",
+        "entity": {"type": "node", "id": "node-b"},
+        "window_start": "2026-09-02T11:00:00+00:00",
+        "window_end": "2026-09-02T11:05:00+00:00",
+        "source_templates": [{
+            "template_hash": "hash-b",
+            "template_fingerprint": "fingerprint-b",
+            "category": "runtime",
+            "component": "containerd",
+        }],
+    }
+
+    assert same_approval_identity(left, right)
+    assert approval_identity(left)["approval_key"] == approval_identity(right)["approval_key"]
+
+
+def test_historical_v1_keys_still_compare_by_their_physical_key():
+    left = {
+        "feature_type": "cni_network_failure",
+        "problem_code": "kubernetes.cni.ip_exhaustion",
+        "components": ["kubelet"],
+        "anchor_signatures": ["legacy-anchor"],
+        "approval_key": "appr-v1-left",
+    }
+    right = dict(left)
+    right["approval_key"] = "appr-v1-right"
+
+    assert not same_approval_identity(left, right)
+    right["approval_key"] = left["approval_key"]
+    assert same_approval_identity(left, right)
+
+
+def test_empty_fallback_keeps_the_historical_v1_digest_material():
+    feature = {"feature_type": "network_failure"}
+    expected_digest = hashlib.sha256(b"[]").hexdigest()[:16]
+
+    assert derive_problem_code(feature) == f"logrisk.network_failure.{expected_digest}"
+
+
+def test_explicit_unknown_code_remains_a_strict_fallback_code():
+    assert derive_problem_code({
+        "feature_type": "network_failure",
+        "problem_code": "unknown",
+    }) == "unknown"
 
 
 def test_distinct_problem_codes_do_not_merge_on_same_template_signature(tmp_path):

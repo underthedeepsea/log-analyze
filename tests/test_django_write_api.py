@@ -108,6 +108,37 @@ def test_django_feature_approval_and_export_share_governed_services(tmp_path) ->
     assert all("reviewer_note" not in item["attributes"] for item in audits)
 
 
+def test_django_feature_update_distinguishes_missing_and_state_conflict(tmp_path) -> None:
+    from logrisk_django.service_factory import clear_cached_container
+
+    with override_settings(LOGRISK=_config(tmp_path, "tests.django_test_project.resolver.OperatorIdentityResolver")):
+        clear_cached_container()
+        call_command("logrisk_migrate", "--json")
+        _container, job_id = _completed_job()
+        missing = Client().patch(
+            f"/api/jobs/{job_id}/features/missing-candidate",
+            data=json.dumps({"status": "approved"}),
+            content_type="application/json",
+        )
+        approved = Client().patch(
+            f"/api/jobs/{job_id}/features/candidate-node-1",
+            data=json.dumps({"status": "approved"}),
+            content_type="application/json",
+        )
+        conflict = Client().patch(
+            f"/api/jobs/{job_id}/features/candidate-node-1",
+            data=json.dumps({"status": "rejected"}),
+            content_type="application/json",
+        )
+        clear_cached_container()
+
+    assert missing.status_code == 404
+    assert missing.json()["code"] == "candidate_not_found"
+    assert approved.status_code == 200
+    assert conflict.status_code == 409
+    assert conflict.json()["code"] == "candidate_state_conflict"
+
+
 def test_django_governed_write_fails_closed_and_audits_denial(tmp_path) -> None:
     from logrisk_django.service_factory import clear_cached_container, get_container
 

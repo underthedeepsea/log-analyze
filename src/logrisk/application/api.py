@@ -819,7 +819,7 @@ class ApiFacade:
         page_size = max(1, min(self._integer(query, "page_size", 100), 500))
         candidates = self._service("feature_jobs", self.container.feature_jobs).list_persisted_candidates(
             status=status,
-            limit=page_size,
+            limit=None,
         )
         groups = build_review_groups(candidates)
         return ApiResult(200, {

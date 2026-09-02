@@ -671,6 +671,29 @@ def test_feature_job_manager_lazy_loads_job_for_persisted_approval(tmp_path):
     assert updated["status"] == "rejected"
 
 
+def test_refresh_does_not_replace_live_job_with_older_persisted_snapshot(tmp_path):
+    store = FeatureJobFileStore(tmp_path / "feature_jobs")
+    manager = FeatureJobManager(
+        extractor=lambda source, **kwargs: [],
+        persistence=store,
+        auto_start=False,
+        interrupt_on_restore=False,
+    )
+    job_id = manager.create_job(
+        {"summary": {}, "risk_entities": [entity("node-a", 90)]},
+        model="qwen3:1.7b",
+    )
+    with manager._lock:
+        manager._job(job_id)["status"] = "running"
+    persisted = store.load_job(job_id)
+    persisted["status"] = "queued"
+    store.save(persisted)
+
+    manager.refresh_from_persistence(job_id)
+
+    assert manager.get_job(job_id)["status"] == "running"
+
+
 def test_file_store_marks_running_job_interrupted_without_model_retry(tmp_path):
     calls = []
     store = FeatureJobFileStore(tmp_path / "feature_jobs")

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
-from datetime import date
+import threading
+from concurrent.futures import ThreadPoolExecutor
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
 from logrisk.database import SQLiteDatabase
+from logrisk.feature_jobs import FeatureJobError, FeatureJobFileStore
 from logrisk.sqlite_stores import (
     SQLiteAICache,
     SQLiteAITraceLogger,
@@ -17,6 +20,45 @@ from logrisk.sqlite_stores import (
 )
 from logrisk.input_jobs import InputJobConfig
 from logrisk.upload_sessions import UploadConfig
+
+
+def _candidate_job(candidate_id="candidate-1", *, status="pending"):
+    return {
+        "job_id": "job-candidates",
+        "status": "completed",
+        "model": "worker-model",
+        "provider": "ollama",
+        "prompt_id": "prompt-worker",
+        "model_profile_id": None,
+        "created_at": "2026-07-16T00:00:00+00:00",
+        "completed_at": "2026-07-16T00:01:00+00:00",
+        "entities": [],
+        "features": {
+            candidate_id: {
+                "candidate_id": candidate_id,
+                "status": status,
+                "reviewer_note": "",
+                "approved_at": None,
+                "entity": {"type": "node", "id": "node-a"},
+                "feature_type": "memory_pressure",
+                "title": "Worker title",
+                "summary": "Worker summary",
+                "tags": ["worker"],
+                "model": "worker-model",
+                "provider": "ollama",
+                "prompt_id": "prompt-worker",
+                "trace_id": "trace-worker",
+                "evidence": {"template_hashes": ["hash-1"]},
+            },
+        },
+        "events": [],
+    }
+
+
+def _candidate_store(tmp_path, kind):
+    if kind == "sqlite":
+        return SQLiteFeatureJobStore(SQLiteDatabase(tmp_path / "state.sqlite3"))
+    return FeatureJobFileStore(tmp_path / "feature_jobs")
 
 
 def test_sqlite_feature_jobs_round_trip_entities_candidates_and_events(tmp_path):
@@ -101,6 +143,129 @@ def test_sqlite_feature_job_store_loads_one_job(tmp_path):
 
     assert store.load_job("job-single")["job_id"] == "job-single"
     assert store.load_job("missing") is None
+
+
+@pytest.mark.parametrize("kind", ["sqlite", "file"])
+@pytest.mark.parametrize("review_status", ["approved", "rejected"])
+def test_generated_candidate_save_preserves_review_owned_fields(tmp_path, kind, review_status):
+    store = _candidate_store(tmp_path, kind)
+    full_stale = _candidate_job()
+    full_stale["model"] = "new-worker-model"
+    full_stale["provider"] = "new-provider"
+    full_stale["prompt_id"] = "prompt-new"
+    full_stale["features"]["candidate-1"].update({
+        "model": "new-worker-model",
+        "provider": "new-provider",
+        "prompt_id": "prompt-new",
+        "trace_id": "trace-new",
+        "evidence": {"template_hashes": ["hash-2"]},
+    })
+    store.save(full_stale)
+
+    review = {
+        "status": review_status,
+        "reviewer_note": "人工复核完成",
+        "approved_at": "2026-07-16T00:02:00+00:00" if review_status == "approved" else None,
+        "resolved_rule_id": "rule-1" if review_status == "approved" else None,
+        "rule_id": "rule-1" if review_status == "approved" else None,
+        "resolution_type": "manual",
+        "review_scope": "approval_identity",
+        "title": "人工标题",
+        "summary": "人工摘要",
+        "tags": ["人工"],
+    }
+    store.update_candidate_review_state("candidate-1", review, expected_status="pending")
+
+    store.save_generated_candidate("job-candidates", {
+        "candidate_id": "candidate-1",
+        "status": "pending",
+        "reviewer_note": "",
+        "approved_at": None,
+        "title": "Stale worker title",
+        "summary": "Stale worker summary",
+        "tags": ["stale-worker"],
+        "model": "new-worker-model",
+        "provider": "new-provider",
+        "prompt_id": "prompt-new",
+        "trace_id": "trace-new",
+        "evidence": {"template_hashes": ["hash-2"]},
+    })
+    store.save(full_stale)
+
+    loaded = store.load_candidate("candidate-1")
+    assert loaded["status"] == review_status
+    assert loaded["reviewer_note"] == "人工复核完成"
+    assert loaded["title"] == "人工标题"
+    assert loaded["summary"] == "人工摘要"
+    assert loaded["tags"] == ["人工"]
+    assert loaded["review_scope"] == "approval_identity"
+    assert loaded["model"] == "new-worker-model"
+    assert loaded["provider"] == "new-provider"
+    assert loaded["prompt_id"] == "prompt-new"
+    assert loaded["trace_id"] == "trace-new"
+
+
+def test_sqlite_candidate_review_cas_has_one_winner_and_a_conflict(tmp_path):
+    database = SQLiteDatabase(tmp_path / "state.sqlite3")
+    SQLiteFeatureJobStore(database).save(_candidate_job())
+    barrier = threading.Barrier(2)
+
+    def review(status):
+        store = SQLiteFeatureJobStore(database)
+        barrier.wait()
+        try:
+            result = store.update_candidate_review_state(
+                "candidate-1", {"status": status}, expected_status="pending"
+            )
+            return "success", result
+        except FeatureJobError as exc:
+            return "error", (exc.code, exc.status_code)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(review, ["approved", "rejected"]))
+
+    assert [result[0] for result in results].count("success") == 1
+    errors = [result[1] for result in results if result[0] == "error"]
+    assert errors == [("candidate_state_conflict", 409)]
+    assert SQLiteFeatureJobStore(database).load_candidate("candidate-1")["status"] in {"approved", "rejected"}
+
+
+def test_sqlite_candidate_review_distinguishes_missing_from_status_conflict(tmp_path):
+    store = _candidate_store(tmp_path, "sqlite")
+    store.save(_candidate_job())
+
+    with pytest.raises(FeatureJobError) as missing:
+        store.update_candidate_review_state(
+            "missing-candidate", {"status": "approved"}, expected_status="pending"
+        )
+    with pytest.raises(FeatureJobError) as conflict:
+        store.update_candidate_review_state(
+            "candidate-1", {"status": "approved"}, expected_status="approved"
+        )
+
+    assert (missing.value.code, missing.value.status_code) == ("candidate_not_found", 404)
+    assert (conflict.value.code, conflict.value.status_code) == ("candidate_state_conflict", 409)
+
+
+@pytest.mark.parametrize("kind", ["sqlite", "file"])
+def test_candidate_listing_is_not_silently_limited_to_one_hundred(tmp_path, kind):
+    store = _candidate_store(tmp_path, kind)
+    job = _candidate_job()
+    base_created_at = datetime(2026, 7, 16, tzinfo=timezone.utc)
+    job["features"] = {
+        f"candidate-{index:03d}": {
+            "candidate_id": f"candidate-{index:03d}",
+            "status": "pending",
+            "created_at": (base_created_at + timedelta(seconds=index)).isoformat(),
+        }
+        for index in range(101)
+    }
+    store.save(job)
+
+    candidates = store.list_candidates(status="pending")
+
+    assert len(candidates) == 101
+    assert candidates[-1]["candidate_id"] == "candidate-100"
 
 
 def test_sqlite_feature_job_replace_preserves_continuous_learning_feedback(tmp_path):

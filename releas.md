@@ -19,6 +19,7 @@
 - 人工审批页改为从持久化全局审批队列加载，并按 canonical problem_code 聚合。
 - 修复 `/review` 路由刷新后丢失，以及审批页显示默认模型而不是实际 Candidate 执行模型的问题。
 - 批准或驳回一个语义审批组后，同组 pending Candidate 自动收敛。
+- 修复 Worker 旧 Candidate 快照覆盖人工审核状态，并为审核更新增加 SQLite/PostgreSQL 兼容的原子 CAS、完整队列读取和明确的 404/409 错误。
 
 ## 1.36.0 - 2026-09-01
 

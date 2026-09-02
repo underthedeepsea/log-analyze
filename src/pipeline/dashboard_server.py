@@ -1676,7 +1676,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._json(HTTPStatus.FORBIDDEN, {"error": str(exc), "code": exc.code, "error_code": exc.code, "request_id": self._runtime_request_identity().request_id})
         except MultiSourceConflictError as exc:
             self._json(HTTPStatus.CONFLICT, {"error": str(exc), "code": exc.code, "error_code": exc.code, "request_id": self._runtime_request_identity().request_id})
-        except (FeatureJobError, ApprovedRuleError, ProcessingMetricsError, DrainQualityError, KeyError, ValueError) as exc:
+        except FeatureJobError as exc:
+            code = getattr(exc, "code", "invalid_request")
+            self._json(
+                HTTPStatus(getattr(exc, "status_code", HTTPStatus.BAD_REQUEST)),
+                {"error": str(exc), "code": code, "error_code": code, "request_id": self._runtime_request_identity().request_id},
+            )
+        except (ApprovedRuleError, ProcessingMetricsError, DrainQualityError, KeyError, ValueError) as exc:
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc), "code": "invalid_request", "error_code": "invalid_request", "request_id": self._runtime_request_identity().request_id})
 
     def _serve_frontend(self) -> None:

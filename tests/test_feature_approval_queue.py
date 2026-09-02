@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import replace
 import importlib
 from pathlib import Path
+from types import SimpleNamespace
 
 
 def test_persisted_candidates_from_different_jobs_form_one_semantic_review_group():
@@ -44,6 +45,8 @@ def test_persisted_candidates_from_different_jobs_form_one_semantic_review_group
 
     assert len(groups) == 1
     assert groups[0]["candidate_count"] == 2
+    assert groups[0]["occurrence_count"] == 7
+    assert groups[0]["affected_entity_count"] == 2
     assert groups[0]["review_key"] == "semantic:kubernetes.cni.ip_exhaustion"
 
 
@@ -120,3 +123,142 @@ def test_facade_restores_pending_queue_after_application_rebuild(tmp_path):
     assert response.body["total_candidates"] == 2
     assert response.body["items"][0]["review_key"] == "semantic:kubernetes.cni.ip_exhaustion"
     assert response.body["items"][0]["representative"]["model"] == "qwen3.5:4b-mlx"
+
+
+def test_v1_and_fallback_candidates_keep_strict_logical_identity():
+    build_review_groups = importlib.import_module("logrisk.approval_queue").build_review_groups
+    candidates = [
+        {
+            "candidate_id": "legacy-a",
+            "job_id": "job-a",
+            "approval_group_id": "physical-group-a",
+            "approval_key": "legacy-approval-a",
+            "schema_version": "approved_rule_v1",
+            "feature_type": "network_failure",
+            "problem_code": "unknown_problem_code",
+            "components": ["kubelet"],
+            "anchor_signatures": ["network-anchor-a"],
+            "status": "pending",
+            "entity": {"type": "node", "id": "node-a"},
+        },
+        {
+            "candidate_id": "legacy-b",
+            "job_id": "job-b",
+            "approval_group_id": "physical-group-b",
+            "approval_key": "legacy-approval-b",
+            "schema_version": "approved_rule_v1",
+            "feature_type": "network_failure",
+            "problem_code": "unknown_problem_code",
+            "components": ["kubelet"],
+            "anchor_signatures": ["network-anchor-b"],
+            "status": "pending",
+            "entity": {"type": "node", "id": "node-b"},
+        },
+    ]
+
+    groups = build_review_groups(candidates)
+
+    assert [group["candidate_ids"] for group in groups] == [["legacy-a"], ["legacy-b"]]
+    assert {group["representative"]["approval_group_id"] for group in groups} == {
+        "physical-group-a",
+        "physical-group-b",
+    }
+
+
+def test_queue_paginates_groups_after_full_candidate_enumeration():
+    class CandidateSource:
+        def __init__(self, candidates):
+            self.candidates = candidates
+            self.limits = []
+
+        def list_persisted_candidates(self, *, status, limit):
+            self.limits.append(limit)
+            return self.candidates
+
+    candidates = [
+        {
+            "candidate_id": f"candidate-{index:03d}",
+            "job_id": f"job-{index:03d}",
+            "problem_code": f"service.failure.{index:03d}",
+            "feature_type": "service_failure",
+            "status": "pending",
+            "created_at": f"2026-09-01T00:{index // 60:02d}:{index % 60:02d}+00:00",
+            "risk_score": index,
+            "importance": "medium",
+            "entity": {"type": "node", "id": f"node-{index:03d}"},
+        }
+        for index in range(101)
+    ]
+    source = CandidateSource(candidates)
+    from logrisk.application.api import ApiFacade
+
+    facade = ApiFacade(SimpleNamespace(feature_jobs=source), version="1.36.1")
+
+    first = facade.feature_approvals({"status": "pending", "page_size": "2"})
+    second = facade.feature_approvals({"status": "pending", "page_size": "2", "cursor": "2"})
+
+    assert source.limits == [None, None]
+    assert first.body["total_groups"] == 101
+    assert first.body["total_candidates"] == 101
+    assert len(first.body["items"]) == 2
+    assert first.body["next_cursor"] == "2"
+    assert [item["review_key"] for item in first.body["items"]] == [
+        "semantic:service.failure.000",
+        "semantic:service.failure.001",
+    ]
+    assert [item["review_key"] for item in second.body["items"]] == [
+        "semantic:service.failure.002",
+        "semantic:service.failure.003",
+    ]
+    assert second.body["next_cursor"] == "4"
+
+
+def test_queue_rejects_invalid_cursor_and_selects_deterministic_representative():
+    build_review_groups = importlib.import_module("logrisk.approval_queue").build_review_groups
+    candidates = [
+        {
+            "candidate_id": "later-critical",
+            "job_id": "job-2",
+            "problem_code": "service.failure",
+            "feature_type": "service_failure",
+            "status": "pending",
+            "importance": "critical",
+            "risk_score": 99,
+            "created_at": "2026-09-01T00:01:00+00:00",
+            "entity": {"type": "node", "id": "node-2"},
+            "source_templates": [{"template_hash": "hash-2", "count": 2}],
+            "raw_logs": ["secret raw line"],
+        },
+        {
+            "candidate_id": "earlier-high",
+            "job_id": "job-1",
+            "problem_code": "service.failure",
+            "feature_type": "service_failure",
+            "status": "pending",
+            "importance": "high",
+            "risk_score": 80,
+            "created_at": "2026-09-01T00:00:00+00:00",
+            "entity": {"type": "node", "id": "node-1"},
+            "source_templates": [{"template_hash": "hash-1", "count": 3}],
+        },
+    ]
+
+    groups = build_review_groups(candidates)
+
+    assert groups[0]["representative"]["candidate_id"] == "later-critical"
+    assert groups[0]["candidate_count"] == 2
+    assert groups[0]["occurrence_count"] == 5
+    assert "samples" not in groups[0]["representative"]
+    assert "raw_sample" not in groups[0]["representative"]
+    assert "raw_logs" not in groups[0]["representative"]
+
+    from logrisk.application.api import ApiFacade
+
+    facade = ApiFacade(
+        SimpleNamespace(feature_jobs=SimpleNamespace(list_persisted_candidates=lambda **_: candidates)),
+        version="1.36.1",
+    )
+    invalid = facade.feature_approvals({"cursor": "not-a-cursor"})
+
+    assert invalid.status == 422
+    assert invalid.body["code"] == "invalid_cursor"

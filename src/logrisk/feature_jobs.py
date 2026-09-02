@@ -86,6 +86,10 @@ def _candidate_state_conflict() -> FeatureJobError:
     return FeatureJobError("候选特征状态已变化", code="candidate_state_conflict", status_code=409)
 
 
+def _invalid_feature_update(message: str) -> FeatureJobError:
+    return FeatureJobError(message, code="invalid_feature_update", status_code=422)
+
+
 def _validate_candidate_review_changes(changes: Dict[str, Any]) -> None:
     unknown = set(changes) - set(REVIEW_OWNED_FIELDS)
     if unknown:
@@ -1843,28 +1847,28 @@ class FeatureJobManager:
 
     def update_feature(self, job_id: str, candidate_id: str, changes: Dict[str, Any]) -> Dict[str, Any]:
         if not isinstance(changes, dict):
-            raise FeatureJobError("审批内容必须是 JSON object")
+            raise _invalid_feature_update("审批内容必须是 JSON object")
         candidate_id = str(candidate_id)
         allowed = {"title", "summary", "importance", "tags", "reviewer_note", "status", "review_scope"}
         unknown = set(changes) - allowed
         if unknown:
-            raise FeatureJobError(f"不可编辑字段: {sorted(unknown)}")
+            raise _invalid_feature_update(f"不可编辑字段: {sorted(unknown)}")
         if changes.get("review_scope") not in {None, "approval_identity"}:
-            raise FeatureJobError("字段 review_scope 无效")
+            raise _invalid_feature_update("字段 review_scope 无效")
         with self._lock:
             job = self._job(job_id)
             for field in ("title", "summary", "reviewer_note"):
                 if field in changes:
                     if not isinstance(changes[field], str) or (field != "reviewer_note" and not changes[field].strip()):
-                        raise FeatureJobError(f"字段 {field} 无效")
+                        raise _invalid_feature_update(f"字段 {field} 无效")
             if "importance" in changes and changes["importance"] not in IMPORTANCE_LEVELS:
-                raise FeatureJobError("字段 importance 无效")
+                raise _invalid_feature_update("字段 importance 无效")
             if "tags" in changes:
                 tags = changes["tags"]
                 if not isinstance(tags, list) or not all(isinstance(tag, str) and tag.strip() for tag in tags):
-                    raise FeatureJobError("字段 tags 必须是字符串数组")
+                    raise _invalid_feature_update("字段 tags 必须是字符串数组")
             if "status" in changes and changes["status"] not in {"pending", "approved", "rejected"}:
-                raise FeatureJobError("字段 status 无效")
+                raise _invalid_feature_update("字段 status 无效")
 
             persisted_status: str | None = None
             expected_updated_at: Any | None = None

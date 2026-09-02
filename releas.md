@@ -29,6 +29,7 @@
 - 新增 SQLite/PostgreSQL `0021` forward-only classification migration，修复数据库 reader 静默覆盖 `rule_json` identity，以及 legacy import、治理状态变更和 rollback 无条件升级 V1 规则为 V2 的问题。
 - 修复审批批准后的跨任务 pending Candidate 持久化收敛、重启恢复和重复审批幂等；新增 `pending_candidate_reconciled` 事件，区分历史收敛与模型调用前的规则复用统计，并保证 group reject 不修改已结束 Candidate。
 - 修复持久化审批队列在全量 Candidate 聚合后的 logical Group 分页、游标校验、全局统计和代表性证据脱敏。
+- 统一 standalone Dashboard 与 Django facade 的审批校验错误映射，补齐 422 validation 响应，并验证无当前 Job 时的 review/queue/export 路由。
 
 ## 1.36.0 - 2026-09-01
 

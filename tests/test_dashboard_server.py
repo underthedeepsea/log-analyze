@@ -283,6 +283,43 @@ def test_review_and_export_routes(dashboard):
     assert "attachment" in headers["Content-Disposition"]
 
 
+def test_feature_approval_queue_and_spa_review_routes_work_without_selected_job(dashboard):
+    base_url, _ = dashboard
+
+    status, queue, _ = request_json(base_url + "/api/feature-approvals")
+
+    assert status == 200
+    assert queue["schema_version"] == "feature_approval_queue_v1"
+    assert queue["next_cursor"] is None
+    for route in ("/review", "/queue", "/export"):
+        with urlopen(base_url + route, timeout=3) as response:
+            assert response.status == 200
+            assert "Feature Dashboard" in response.read().decode()
+
+
+def test_feature_update_validation_returns_unprocessable_entity(dashboard):
+    base_url, _ = dashboard
+    _, created, _ = request_json(base_url + "/api/jobs", "POST", {
+        "result": {"summary": {}, "risk_entities": [entity()]},
+        "model": "qwen3:1.7b",
+    })
+    job_id = created["job_id"]
+    for _ in range(50):
+        _, snapshot, _ = request_json(base_url + f"/api/jobs/{job_id}")
+        if snapshot["features"]:
+            break
+
+    with pytest.raises(HTTPError) as invalid:
+        request_json(
+            base_url + f"/api/jobs/{job_id}/features/feature-node-a",
+            "PATCH",
+            {"importance": "not-a-level"},
+        )
+
+    assert invalid.value.code == 422
+    assert json.load(invalid.value)["code"] == "invalid_feature_update"
+
+
 def test_invalid_upload_and_unknown_route_return_json_errors(dashboard):
     base_url, _ = dashboard
 

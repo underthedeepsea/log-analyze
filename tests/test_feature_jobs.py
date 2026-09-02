@@ -719,6 +719,36 @@ def test_review_failure_does_not_leave_candidate_approved(tmp_path):
     assert persistence.load_candidate("feature-node-a")["status"] == "pending"
 
 
+def test_rule_failure_rolls_back_status_without_clobbering_concurrent_review(tmp_path):
+    class FailingRuleStore(ApprovedRuleStore):
+        def upsert_feature(self, feature):
+            raise RuntimeError("rule write failed")
+
+    database = SQLiteDatabase(tmp_path / "state.sqlite3")
+    persistence = _InterleavingSQLiteFeatureJobStore(database)
+    manager = FeatureJobManager(
+        extractor=lambda source, **kwargs: [candidate(source)],
+        rule_store=FailingRuleStore(tmp_path / "rules.json"),
+        persistence=persistence,
+        auto_start=False,
+        interrupt_on_restore=False,
+    )
+    job_id = manager.create_job(
+        {"summary": {}, "risk_entities": [entity("node-a", 90)]},
+        model="qwen3:1.7b",
+    )
+    manager.run_job(job_id)
+
+    with pytest.raises(RuntimeError, match="rule write failed"):
+        manager.update_feature(job_id, "feature-node-a", {"status": "approved"})
+
+    persisted = persistence.load_candidate("feature-node-a")
+    assert persisted["status"] == "pending"
+    assert persisted["title"] == "并发审核标题"
+    assert persisted["reviewer_note"] == "并发审核备注"
+    assert persisted["tags"] == ["并发审核"]
+
+
 def test_review_operation_uses_one_cas_without_overwriting_concurrent_review(tmp_path):
     database = SQLiteDatabase(tmp_path / "state.sqlite3")
     persistence = _InterleavingSQLiteFeatureJobStore(database)
@@ -746,6 +776,60 @@ def test_review_operation_uses_one_cas_without_overwriting_concurrent_review(tmp
     assert persisted["title"] == "并发审核标题"
     assert persisted["reviewer_note"] == "并发审核备注"
     assert persisted["tags"] == ["并发审核"]
+
+
+def test_losing_review_cannot_leave_rule_or_sibling_group_side_effect(tmp_path):
+    class LosingReviewStore(SQLiteFeatureJobStore):
+        def __init__(self, database):
+            super().__init__(database)
+            self.interleaved = False
+
+        def update_candidate_review_state(self, candidate_id, changes, **kwargs):
+            if (
+                candidate_id == "feature-node-a"
+                and changes.get("status") == "approved"
+                and not self.interleaved
+            ):
+                self.interleaved = True
+                SQLiteFeatureJobStore(self.database).update_candidate_review_state(
+                    candidate_id,
+                    {"status": "rejected"},
+                    expected_status="pending",
+                )
+            return super().update_candidate_review_state(candidate_id, changes, **kwargs)
+
+    database = SQLiteDatabase(tmp_path / "state.sqlite3")
+    persistence = LosingReviewStore(database)
+    rules = SQLiteApprovedRuleStore(database)
+    groups = SQLiteApprovalGroupStore(database)
+    manager = FeatureJobManager(
+        extractor=lambda source, **kwargs: [candidate(source)],
+        rule_store=rules,
+        approval_group_store=groups,
+        persistence=persistence,
+        auto_start=False,
+        interrupt_on_restore=False,
+    )
+    first = manager.create_job(
+        {"summary": {}, "risk_entities": [entity("node-a", 90)]},
+        model="qwen3:1.7b",
+    )
+    second = manager.create_job(
+        {"summary": {}, "risk_entities": [entity("node-b", 90)]},
+        model="qwen3:1.7b",
+    )
+    manager.run_job(first)
+    manager.run_job(second)
+
+    with pytest.raises(FeatureJobError) as conflict:
+        manager.update_feature(first, "feature-node-a", {"status": "approved"})
+
+    assert (conflict.value.code, conflict.value.status_code) == ("candidate_state_conflict", 409)
+    assert rules.list_rules() == []
+    assert persistence.load_candidate("feature-node-a")["status"] == "rejected"
+    assert persistence.load_candidate("feature-node-b")["status"] == "pending"
+    assert groups.list_groups()[0]["status"] == "pending"
+    assert groups.list_groups()[0]["rule_id"] is None
 
 
 def test_refresh_does_not_replace_live_job_with_older_persisted_snapshot(tmp_path):

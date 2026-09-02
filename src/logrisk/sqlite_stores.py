@@ -313,6 +313,7 @@ class SQLiteFeatureJobStore:
         expected_status: str,
         job_id: str | None = None,
         expected_updated_at: Any | None = None,
+        allow_terminal_rollback: bool = False,
     ) -> dict[str, Any]:
         if not isinstance(changes, dict):
             raise FeatureJobError(
@@ -342,7 +343,8 @@ class SQLiteFeatureJobStore:
             current_status = current.get("status")
             requested_status = changes.get("status")
             if current_status in {"approved", "rejected"} and requested_status is not None and requested_status != current_status:
-                raise self._candidate_state_conflict()
+                if not (allow_terminal_rollback and current_status == expected_status and requested_status == "pending"):
+                    raise self._candidate_state_conflict()
             if current_status != expected_status:
                 if current_status == "approved" and requested_status == "approved":
                     return current
@@ -389,6 +391,24 @@ class SQLiteFeatureJobStore:
             ).fetchone()
             loaded = self._candidate_from_row(updated_row) if updated_row else None
             return loaded if loaded is not None else updated
+
+    def rollback_candidate_review_state(
+        self,
+        candidate_id: str,
+        changes: dict[str, Any],
+        *,
+        expected_status: str,
+        expected_updated_at: Any,
+        job_id: str | None = None,
+    ) -> dict[str, Any]:
+        return self.update_candidate_review_state(
+            candidate_id,
+            changes,
+            expected_status=expected_status,
+            job_id=job_id,
+            expected_updated_at=expected_updated_at,
+            allow_terminal_rollback=True,
+        )
 
     def list_candidates(
         self, status: str | None = None, limit: int | None = None

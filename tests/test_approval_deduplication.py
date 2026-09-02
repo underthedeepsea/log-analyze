@@ -375,6 +375,20 @@ def test_runtime_sandbox_wrapper_without_cni_token_finds_ip_exhaustion():
     assert derive_problem_code(feature) == "kubernetes.cni.ip_exhaustion"
 
 
+def test_generic_network_and_plain_pod_sandbox_text_do_not_become_cni_ip_exhaustion():
+    generic_network = {
+        "feature_type": "network_failure",
+        "summary": "network reports no enough ips",
+    }
+    plain_pod_sandbox = {
+        "feature_type": "pod_sandbox_network_failure",
+        "summary": "CreatePodSandbox failed: no enough ips",
+    }
+
+    assert derive_problem_code(generic_network) != "kubernetes.cni.ip_exhaustion"
+    assert derive_problem_code(plain_pod_sandbox) == "kubernetes.runtime.pod_sandbox_failure"
+
+
 def test_canonical_identity_ignores_presentation_and_operational_fields():
     left = {
         "job_id": "job-a",

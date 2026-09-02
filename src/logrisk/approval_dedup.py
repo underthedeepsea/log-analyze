@@ -209,22 +209,25 @@ def _keyword_problem_codes(text: str) -> list[str]:
     if re.search(r"oom|out\s+of\s+memory|内存.*(?:耗尽|不足)|内存溢出", lowered):
         codes.append("linux.memory.oom")
 
-    is_cni = bool(re.search(r"\bcni\b|\bnetwork\b|网络配置|网络插件|网络", lowered))
-    if is_cni and re.search(
+    cni_context = bool(re.search(
+        r"\bcni(?:\b|_)|network[-\s]+plugin|networkplugin|"
+        r"network\s+(?:config(?:uration)?|setup)|"
+        r"network\s+(?:for|in|on)\s+(?:the\s+)?(?:pod\s+)?sandbox|"
+        r"(?:pod\s+)?sandbox[-\s]+(?:network|cni)|"
+        r"网络配置|网络插件|网络.{0,20}沙箱|沙箱.{0,20}网络",
+        lowered,
+    ))
+    if cni_context and re.search(
         r"no[ _-]*(?:(?:enough|free)\s+)?ips?|ip(?:v4)?\s*(?:address|地址)?\s*(?:exhaust|deplet|耗尽)|地址\s*耗尽",
         lowered,
     ):
         codes.append("kubernetes.cni.ip_exhaustion")
-    if is_cni and re.search(
+    if cni_context and re.search(
         r"syntax|invalid\s+(?:cni|network)|config(?:uration)?\s*(?:syntax\s*)?(?:error|invalid)|语法|配置.*(?:语法|错误)",
         lowered,
     ):
         codes.append("kubernetes.cni.config_error")
-    plugin_context = bool(re.search(
-        r"\bcni\b|network\s+(?:plugin|config(?:uration)?|setup)|network.{0,40}sandbox|网络配置|网络插件|网络.{0,20}沙箱",
-        lowered,
-    ))
-    if plugin_context and re.search(r"failed|failure|error|失败|错误", lowered):
+    if cni_context and re.search(r"failed|failure|error|失败|错误", lowered):
         codes.append("kubernetes.cni.plugin_failure")
     if re.search(r"pod\s+sandbox|podsandbox|沙箱", lowered) and re.search(r"failed|failure|error|失败|错误", lowered):
         codes.append("kubernetes.runtime.pod_sandbox_failure")

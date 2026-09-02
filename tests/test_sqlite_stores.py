@@ -10,6 +10,7 @@ from datetime import date, datetime, timedelta, timezone
 import pytest
 
 from logrisk.database import SQLiteDatabase
+from logrisk.approved_rules import ApprovedRuleError
 from logrisk.feature_jobs import FeatureJobError, FeatureJobFileStore
 from logrisk.sqlite_stores import (
     SQLiteAICache,
@@ -58,6 +59,18 @@ def _file_review_worker(root, status, delay, result_queue):
         result_queue.put(("success", status))
     except FeatureJobError as exc:
         result_queue.put(("error", exc.code, exc.status_code))
+
+
+def _sqlite_reuse_worker(database_path, rule_id, result_queue):
+    try:
+        rule = SQLiteApprovedRuleStore(SQLiteDatabase(database_path)).record_reuse(
+            rule_id,
+            job_id=f"job-{rule_id}",
+            entity_id="node-a",
+        )
+        result_queue.put(("success", rule["reuse_count"]))
+    except Exception as exc:  # pragma: no cover - the assertion reports the failure
+        result_queue.put(("error", type(exc).__name__, str(exc)))
 
 
 def _candidate_job(candidate_id="candidate-1", *, status="pending"):
@@ -183,6 +196,24 @@ def test_sqlite_feature_job_store_loads_one_job(tmp_path):
     assert store.load_job("missing") is None
 
 
+def test_sqlite_feature_job_save_merges_events_from_stale_worker_snapshot(tmp_path):
+    store = SQLiteFeatureJobStore(SQLiteDatabase(tmp_path / "logrisk.sqlite3"))
+    base = _candidate_job()
+    base["events"] = [{"sequence": 0, "type": "job_created", "timestamp": "2026-07-16T00:00:00+00:00"}]
+    store.save(base)
+
+    first_worker = store.load_job("job-candidates")
+    second_worker = store.load_job("job-candidates")
+    first_worker["events"].append({"sequence": 1, "type": "entity_completed", "timestamp": "2026-07-16T00:01:00+00:00"})
+    second_worker["events"].append({"sequence": 1, "type": "entity_failed", "timestamp": "2026-07-16T00:02:00+00:00"})
+    store.save(first_worker)
+    store.save(second_worker)
+
+    events = store.load_job("job-candidates")["events"]
+
+    assert {event["type"] for event in events} == {"job_created", "entity_completed", "entity_failed"}
+
+
 @pytest.mark.parametrize("kind", ["sqlite", "file"])
 @pytest.mark.parametrize("review_status", ["approved", "rejected"])
 def test_generated_candidate_save_preserves_review_owned_fields(tmp_path, kind, review_status):
@@ -241,6 +272,45 @@ def test_generated_candidate_save_preserves_review_owned_fields(tmp_path, kind, 
     assert loaded["provider"] == "new-provider"
     assert loaded["prompt_id"] == "prompt-new"
     assert loaded["trace_id"] == "trace-new"
+
+
+@pytest.mark.parametrize("kind", ["sqlite", "file"])
+def test_persisted_candidate_removes_raw_logs_and_secrets(tmp_path, kind):
+    store = _candidate_store(tmp_path, kind)
+    job = _candidate_job()
+    job["features"]["candidate-1"].update({
+        "raw_sample": "secret raw line",
+        "raw_logs": ["secret raw line 2"],
+        "nested": {"message": "raw message", "api_key": "secret-token"},
+    })
+
+    store.save(job)
+    loaded = store.load_candidate("candidate-1")
+
+    serialized = json.dumps(loaded, ensure_ascii=False)
+    assert "raw_sample" not in serialized
+    assert "raw_logs" not in serialized
+    assert "raw message" not in serialized
+    assert "secret-token" not in serialized
+
+
+@pytest.mark.parametrize("kind", ["sqlite", "file"])
+def test_persisted_job_events_remove_raw_logs_and_secrets(tmp_path, kind):
+    store = _candidate_store(tmp_path, kind)
+    job = _candidate_job()
+    job["events"] = [{
+        "sequence": 0,
+        "type": "entity_failed",
+        "raw_log": "secret raw line",
+        "credentials": {"token": "secret-token"},
+    }]
+
+    store.save(job)
+    serialized = json.dumps(store.load_job("job-candidates"), ensure_ascii=False)
+
+    assert "secret" not in serialized
+    assert '"raw_log"' not in serialized
+    assert '"token"' not in serialized
 
 
 def test_sqlite_candidate_review_cas_has_one_winner_and_a_conflict(tmp_path):
@@ -331,6 +401,73 @@ def test_sqlite_candidate_review_cas_rejects_stale_idempotent_approval(tmp_path)
     assert (conflict.value.code, conflict.value.status_code) == ("candidate_state_conflict", 409)
     assert store.load_candidate("candidate-1")["updated_at"] == winner["updated_at"]
     assert store.load_candidate("candidate-1")["reviewer_note"] == "并发审核胜者"
+
+
+def test_sqlite_rule_reuse_count_is_atomic_across_processes(tmp_path):
+    if "fork" not in multiprocessing.get_all_start_methods():
+        pytest.skip("cross-process reuse regression requires fork")
+    database_path = tmp_path / "logrisk.sqlite3"
+    database = SQLiteDatabase(database_path)
+    rule = SQLiteApprovedRuleStore(database).upsert_feature(feature())
+    context = multiprocessing.get_context("fork")
+    result_queue = context.Queue()
+    workers = [
+        context.Process(target=_sqlite_reuse_worker, args=(database_path, rule["rule_id"], result_queue))
+        for _ in range(4)
+    ]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(5)
+
+    assert all(worker.exitcode == 0 for worker in workers)
+    results = [result_queue.get(timeout=2) for _ in workers]
+    assert all(result[0] == "success" for result in results), results
+    assert SQLiteApprovedRuleStore(database).list_rules()[0]["reuse_count"] == len(workers)
+
+
+def test_sqlite_rule_reuse_rejects_inactive_rule_without_audit_event(tmp_path):
+    database = SQLiteDatabase(tmp_path / "logrisk.sqlite3")
+    rules = SQLiteApprovedRuleStore(database)
+    saved = rules.upsert_feature(feature())
+    with database.transaction() as connection:
+        connection.execute("UPDATE approved_rules SET status='disabled' WHERE rule_id=?", (saved["rule_id"],))
+
+    with pytest.raises(ApprovedRuleError, match="active"):
+        rules.record_reuse(saved["rule_id"], job_id="job-1", entity_id="node-a")
+
+    with database.connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM rule_reuse_events WHERE rule_id=?", (saved["rule_id"],)
+        ).fetchone()[0] == 0
+
+
+def test_rejected_approval_group_cannot_be_regressed_by_stale_pending_save(tmp_path):
+    database = SQLiteDatabase(tmp_path / "logrisk.sqlite3")
+    groups = SQLiteApprovalGroupStore(database)
+    value = {
+        "approval_group_id": "group-terminal",
+        "approval_key": "appr-terminal",
+        "problem_code": "kubernetes.cni.ip_exhaustion",
+        "feature_type": "network_failure",
+        "title": "CNI",
+        "summary": "摘要",
+        "importance": "high",
+        "status": "pending",
+        "candidate_ids": ["candidate-1"],
+        "entity_keys": ["node-a"],
+        "candidate_count": 1,
+        "affected_entity_count": 1,
+        "occurrence_count": 1,
+        "created_at": "2026-07-16T00:00:00+00:00",
+        "updated_at": "2026-07-16T00:00:00+00:00",
+    }
+    groups.save(value)
+    groups.save({**value, "status": "rejected", "updated_at": "2026-07-16T00:01:00+00:00"})
+
+    groups.save({**value, "status": "pending", "updated_at": "2026-07-16T00:00:01+00:00"})
+
+    assert groups.get_by_key("appr-terminal")["status"] == "rejected"
 
 
 def test_file_candidate_review_cas_is_safe_across_processes(tmp_path):

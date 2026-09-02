@@ -43,6 +43,30 @@ REVIEW_OWNED_FIELDS = (
     "tags",
 )
 
+_FORBIDDEN_FEATURE_PAYLOAD_KEYS = frozenset({
+    "raw",
+    "raw_log",
+    "raw_logs",
+    "raw_record",
+    "raw_records",
+    "raw_sample",
+    "raw_samples",
+    "samples",
+    "log_stream",
+    "raw_stream",
+    "raw_message",
+    "message",
+    "content",
+    "api_key",
+    "authorization",
+    "cookie",
+    "database_url",
+    "dsn",
+    "password",
+    "secret",
+    "token",
+})
+
 
 class FeatureJobError(RuntimeError):
     """Raised for invalid feature extraction job operations."""
@@ -59,6 +83,20 @@ class FeatureJobError(RuntimeError):
             self.code = code
         if status_code is not None:
             self.status_code = status_code
+
+
+def _sanitize_feature_payload(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: _sanitize_feature_payload(item)
+            for key, item in value.items()
+            if str(key).strip().lower() not in _FORBIDDEN_FEATURE_PAYLOAD_KEYS
+        }
+    if isinstance(value, list):
+        return [_sanitize_feature_payload(item) for item in value]
+    if isinstance(value, tuple):
+        return [_sanitize_feature_payload(item) for item in value]
+    return copy.deepcopy(value)
 
 
 def _merge_review_owned_fields(
@@ -140,6 +178,7 @@ class FeatureJobFileStore:
         for candidate_id, candidate in (job.get("features") or {}).items():
             if not isinstance(candidate, dict):
                 continue
+            candidate = _sanitize_feature_payload(candidate)
             key = str(candidate.get("candidate_id") or candidate_id)
             previous = features.get(key)
             merged = (
@@ -163,17 +202,20 @@ class FeatureJobFileStore:
     def _write(
         self, job: Dict[str, Any], features: dict[str, Dict[str, Any]]
     ) -> None:
+        safe_job = _sanitize_feature_payload(
+            {key: value for key, value in job.items() if key != "condition"}
+        )
         snapshot = {
             key: copy.deepcopy(value)
-            for key, value in job.items()
+            for key, value in safe_job.items()
             if key not in {"condition", "events"}
         }
         snapshot["features"] = copy.deepcopy(features)
-        job_dir = self.root / str(job["job_id"])
+        job_dir = self.root / str(safe_job["job_id"])
         self._atomic_json(job_dir / "snapshot.json", snapshot)
         events_text = "".join(
-            json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n"
-            for event in job.get("events", [])
+            json.dumps(_sanitize_feature_payload(event), ensure_ascii=False, separators=(",", ":")) + "\n"
+            for event in safe_job.get("events", [])
         )
         events_path = job_dir / "events.jsonl"
         events_path.parent.mkdir(parents=True, exist_ok=True)
@@ -183,7 +225,7 @@ class FeatureJobFileStore:
 
     @staticmethod
     def _candidate_with_lineage(job: Dict[str, Any], candidate: Dict[str, Any]) -> Dict[str, Any]:
-        value = copy.deepcopy(candidate)
+        value = _sanitize_feature_payload(candidate)
         value["job_id"] = str(job["job_id"])
         for field in ("model", "provider", "prompt_id", "model_profile_id"):
             if value.get(field) is None and job.get(field) is not None:
@@ -198,12 +240,12 @@ class FeatureJobFileStore:
         jobs = []
         for snapshot_path in sorted(self.root.glob("*/snapshot.json")):
             try:
-                job = json.loads(snapshot_path.read_text(encoding="utf-8"))
+                job = _sanitize_feature_payload(json.loads(snapshot_path.read_text(encoding="utf-8")))
                 events_path = snapshot_path.with_name("events.jsonl")
                 events = []
                 if events_path.exists():
                     events = [
-                        json.loads(line)
+                        _sanitize_feature_payload(json.loads(line))
                         for line in events_path.read_text(encoding="utf-8").splitlines()
                         if line.strip()
                     ]
@@ -241,6 +283,7 @@ class FeatureJobFileStore:
         candidate_id = str(candidate.get("candidate_id") or "")
         if not candidate_id:
             raise FeatureJobError("候选特征缺少 candidate_id")
+        candidate = _sanitize_feature_payload(candidate)
         with self._lock, self._process_lock():
             job = self.load_job(str(job_id))
             if job is None:
@@ -791,7 +834,13 @@ class FeatureJobManager:
         initial_matches: list[tuple[Dict[str, Any], list[Dict[str, Any]]]] = []
         started_monotonic = self.monotonic()
         processed_samples: list[tuple[float, int]] = []
-        sources = _collapse_risk_entities(document["risk_entities"])
+        sources = [
+            _sanitize_feature_payload(source)
+            for source in _collapse_risk_entities(document["risk_entities"])
+        ]
+        source_summary = _sanitize_feature_payload(document.get("summary") or {})
+        safe_connection_snapshot = _sanitize_feature_payload(connection_snapshot) if connection_snapshot else None
+        safe_profile_snapshot = _sanitize_feature_payload(profile_snapshot) if profile_snapshot else None
         for source in sorted(
             sources,
             key=lambda item: float(item.get("risk_score") or 0),
@@ -835,13 +884,13 @@ class FeatureJobManager:
                 "timeout": float(timeout),
                 "prompt_id": str(prompt_id or FEATURE_PROMPT_ID),
                 "model_profile_id": model_profile_id,
-                "connection_snapshot": copy.deepcopy(connection_snapshot) if connection_snapshot else None,
-                "profile_snapshot": copy.deepcopy(profile_snapshot) if profile_snapshot else None,
+                "connection_snapshot": safe_connection_snapshot,
+                "profile_snapshot": safe_profile_snapshot,
                 "cache_enabled": _cache_enabled_default() if cache_enabled is None else bool(cache_enabled),
                 "retry_count": normalized_retry_count,
                 "min_score": float(min_score),
                 "source_summary": {
-                    **copy.deepcopy(document.get("summary") or {}),
+                    **source_summary,
                     "feature_job_entity_count": len(sources),
                 },
                 "entities": records,
@@ -890,7 +939,7 @@ class FeatureJobManager:
         *,
         job_id: str,
     ) -> Dict[str, Any]:
-        prepared = copy.deepcopy(feature)
+        prepared = _sanitize_feature_payload(feature)
         identity = approval_identity(prepared, record.get("source") or {})
         prepared.update({
             "problem_code": identity["problem_code"],
@@ -1795,6 +1844,26 @@ class FeatureJobManager:
                 current_events = len(current.get("events") or [])
                 persisted_events = len(persisted.get("events") or [])
                 if persisted_events <= current_events:
+                    current_features = current.get("features") or {}
+                    persisted_features = persisted.get("features") or {}
+                    for candidate_id, persisted_candidate in persisted_features.items():
+                        live_candidate = current_features.get(candidate_id)
+                        if not isinstance(live_candidate, dict) or not isinstance(persisted_candidate, dict):
+                            continue
+                        if not any(
+                            live_candidate.get(field) != persisted_candidate.get(field)
+                            for field in REVIEW_OWNED_FIELDS
+                        ):
+                            continue
+                        live_updated_at = str(live_candidate.get("updated_at") or "")
+                        persisted_updated_at = str(persisted_candidate.get("updated_at") or "")
+                        if not persisted_updated_at or persisted_updated_at <= live_updated_at:
+                            continue
+                        for field in REVIEW_OWNED_FIELDS:
+                            if field in persisted_candidate:
+                                live_candidate[field] = copy.deepcopy(persisted_candidate[field])
+                        if persisted_updated_at:
+                            live_candidate["updated_at"] = persisted_updated_at
                     return
                 persisted = copy.deepcopy(persisted)
                 persisted_features = persisted.setdefault("features", {})
@@ -1803,9 +1872,12 @@ class FeatureJobManager:
                         continue
                     persisted_candidate = persisted_features.get(candidate_id)
                     if isinstance(persisted_candidate, dict):
-                        persisted_features[candidate_id] = _merge_review_owned_fields(
-                            live_candidate, persisted_candidate
-                        )
+                        live_updated_at = str(live_candidate.get("updated_at") or "")
+                        persisted_updated_at = str(persisted_candidate.get("updated_at") or "")
+                        if live_updated_at > persisted_updated_at:
+                            persisted_features[candidate_id] = _merge_review_owned_fields(
+                                live_candidate, persisted_candidate
+                            )
                     else:
                         persisted_features[candidate_id] = copy.deepcopy(live_candidate)
             self._jobs[target] = self._hydrate_persisted_job_locked(persisted)

@@ -31,6 +31,8 @@
 - 修复持久化审批队列在全量 Candidate 聚合后的 logical Group 分页、游标校验、全局统计和代表性证据脱敏。
 - 统一 standalone Dashboard 与 Django facade 的审批校验错误映射，补齐 422 validation 响应，并验证无当前 Job 时的 review/queue/export 路由。
 - 完善持久化人工审批工作台：全量消费队列游标、处理轮询可见性与响应竞态、保留 `review_key` 和脏草稿，并展示真实模型、Provider、Profile、Prompt、Job、Trace 信息及 404/409 提示。
+- 补强 SQLite/PostgreSQL 共享存储的并发复用计数、终态审批组保护和无事件刷新恢复，避免跨进程并发与 Worker/Reviewer 时序造成状态回退。
+- 持久化 Candidate、Job 快照和文件事件写入现在递归剔除原始日志、样例、消息及凭据字段，保持审批、模型和审计边界不泄漏敏感内容。
 
 ## 1.36.0 - 2026-09-01
 

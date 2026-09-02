@@ -12,7 +12,9 @@ from logrisk.ai_harness.trace_logger import AITraceLogger
 from logrisk.approval_dedup import group_id_for_key
 from logrisk.approved_rules import (
     ApprovedRuleStore,
+    ApprovedRuleError,
     RuleFormat,
+    _is_active,
     classify_rule,
     hydrate_persisted_rule,
     public_rule,
@@ -23,6 +25,7 @@ from logrisk.feature_jobs import (
     REVIEW_OWNED_FIELDS,
     _candidate_version_payload,
     _merge_review_owned_fields,
+    _sanitize_feature_payload,
     _validate_candidate_review_changes,
 )
 from logrisk.input_jobs import InputJobConfig, InputJobStore
@@ -47,7 +50,7 @@ class SQLiteFeatureJobStore:
 
     @classmethod
     def _candidate_from_row(cls, row: Any) -> dict[str, Any] | None:
-        candidate = cls._decode_json(row["candidate_json"], {})
+        candidate = _sanitize_feature_payload(cls._decode_json(row["candidate_json"], {}))
         if not isinstance(candidate, dict):
             return None
         candidate["candidate_id"] = str(row["candidate_id"])
@@ -83,7 +86,7 @@ class SQLiteFeatureJobStore:
 
     @classmethod
     def _candidate_for_merge(cls, row: Any) -> dict[str, Any]:
-        candidate = cls._decode_json(row["candidate_json"], {})
+        candidate = _sanitize_feature_payload(cls._decode_json(row["candidate_json"], {}))
         if not isinstance(candidate, dict):
             candidate = {}
         candidate["candidate_id"] = str(row["candidate_id"])
@@ -106,16 +109,21 @@ class SQLiteFeatureJobStore:
         job_id: str,
         candidate: dict[str, Any],
         now: str,
+        *,
+        for_update: bool = False,
     ) -> dict[str, Any]:
         candidate_id = str(candidate.get("candidate_id") or "")
         if not candidate_id:
             raise FeatureJobError("候选特征缺少 candidate_id")
-        existing = connection.execute(
+        candidate = _sanitize_feature_payload(candidate)
+        query = (
             "SELECT candidate_id, job_id, entity_id, status, approval_key, problem_code, approval_group_id, "
             "resolved_rule_id, resolution_type, candidate_json, created_at, updated_at "
-            "FROM feature_candidates WHERE candidate_id=?",
-            (candidate_id,),
-        ).fetchone()
+            "FROM feature_candidates WHERE candidate_id=?"
+        )
+        if for_update:
+            query += " FOR UPDATE"
+        existing = connection.execute(query, (candidate_id,)).fetchone()
         if existing is not None and str(existing["job_id"]) != str(job_id):
             feedback = connection.execute(
                 "SELECT 1 FROM feature_candidate_feedback WHERE candidate_id=? LIMIT 1", (candidate_id,)
@@ -162,7 +170,10 @@ class SQLiteFeatureJobStore:
         return merged
 
     def save(self, job: dict[str, Any]) -> None:
-        snapshot = {key: copy.deepcopy(value) for key, value in job.items() if key not in {"condition", "events"}}
+        safe_job = _sanitize_feature_payload(
+            {key: value for key, value in job.items() if key != "condition"}
+        )
+        snapshot = {key: copy.deepcopy(value) for key, value in safe_job.items() if key not in {"condition", "events"}}
         now = utc_now()
         with self.database.transaction() as connection:
             connection.execute(
@@ -172,44 +183,80 @@ class SQLiteFeatureJobStore:
                 "connection_snapshot_json=excluded.connection_snapshot_json, profile_snapshot_json=excluded.profile_snapshot_json, "
                 "job_json=excluded.job_json, completed_at=excluded.completed_at, updated_at=excluded.updated_at",
                 (
-                    job["job_id"],
-                    job.get("status", "unknown"),
-                    job.get("model_profile_id"),
-                    _json(job.get("connection_snapshot")) if job.get("connection_snapshot") else None,
-                    _json(job.get("profile_snapshot")) if job.get("profile_snapshot") else None,
+                    safe_job["job_id"],
+                    safe_job.get("status", "unknown"),
+                    safe_job.get("model_profile_id"),
+                    _json(safe_job.get("connection_snapshot")) if safe_job.get("connection_snapshot") else None,
+                    _json(safe_job.get("profile_snapshot")) if safe_job.get("profile_snapshot") else None,
                     _json(snapshot),
-                    job.get("created_at") or now,
-                    job.get("completed_at"),
+                    safe_job.get("created_at") or now,
+                    safe_job.get("completed_at"),
                     now,
                 ),
             )
-            connection.execute("DELETE FROM feature_job_entities WHERE job_id=?", (job["job_id"],))
-            connection.execute("DELETE FROM feature_job_events WHERE job_id=?", (job["job_id"],))
-            for entity in job.get("entities", []):
+            connection.execute("DELETE FROM feature_job_entities WHERE job_id=?", (safe_job["job_id"],))
+            for entity in safe_job.get("entities", []):
                 connection.execute(
                     "INSERT INTO feature_job_entities(job_id, entity_id, status, risk_score, entity_json, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
-                    (job["job_id"], entity["entity_id"], entity.get("status", "unknown"), entity.get("risk_score"), _json(entity), now),
+                    (safe_job["job_id"], entity["entity_id"], entity.get("status", "unknown"), entity.get("risk_score"), _json(entity), now),
                 )
             persisted_features: dict[str, dict[str, Any]] = {}
-            for candidate_id, candidate in (job.get("features") or {}).items():
+            for candidate_id, candidate in (safe_job.get("features") or {}).items():
                 if not isinstance(candidate, dict):
                     continue
                 candidate["candidate_id"] = str(candidate.get("candidate_id") or candidate_id)
                 persisted_features[candidate["candidate_id"]] = self._upsert_generated_candidate(
-                    connection, str(job["job_id"]), candidate, now
+                    connection,
+                    str(safe_job["job_id"]),
+                    candidate,
+                    now,
+                    for_update=getattr(self.database, "provider", "sqlite") == "postgres",
                 )
             if persisted_features:
                 snapshot["features"] = persisted_features
                 connection.execute(
                     "UPDATE feature_jobs SET job_json=? WHERE job_id=?",
-                    (_json(snapshot), job["job_id"]),
+                    (_json(snapshot), safe_job["job_id"]),
                 )
-            for event in job.get("events", []):
+            persisted_events = [
+                (int(row["sequence"]), _sanitize_feature_payload(self._decode_json(row["event_json"], {})))
+                for row in connection.execute(
+                    "SELECT sequence, event_json FROM feature_job_events WHERE job_id=? ORDER BY sequence",
+                    (safe_job["job_id"],),
+                )
+            ]
+            merged_events = [copy.deepcopy(event) for _, event in persisted_events if isinstance(event, dict)]
+            used_sequences = {sequence for sequence, _ in persisted_events}
+            fingerprints = {
+                json.dumps(event, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                for event in merged_events
+            }
+            next_sequence = max(used_sequences, default=-1) + 1
+            for incoming in safe_job.get("events", []):
+                if not isinstance(incoming, dict):
+                    continue
+                fingerprint = json.dumps(incoming, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                if fingerprint in fingerprints:
+                    continue
+                event = copy.deepcopy(incoming)
+                sequence = int(event.get("sequence", next_sequence))
+                if sequence in used_sequences:
+                    sequence = next_sequence
+                while sequence in used_sequences:
+                    sequence += 1
+                event["sequence"] = sequence
+                merged_events.append(event)
+                used_sequences.add(sequence)
+                fingerprints.add(fingerprint)
+                next_sequence = max(next_sequence, sequence + 1)
+            for event in merged_events:
                 connection.execute(
-                    "INSERT INTO feature_job_events(job_id, sequence, event_type, event_json, created_at) VALUES (?, ?, ?, ?, ?)",
-                    (job["job_id"], int(event.get("sequence", 0)), str(event.get("type") or "event"), _json(event), event.get("timestamp") or now),
+                    "INSERT INTO feature_job_events(job_id, sequence, event_type, event_json, created_at) VALUES (?, ?, ?, ?, ?) "
+                    "ON CONFLICT(job_id, sequence) DO NOTHING",
+                    (safe_job["job_id"], int(event.get("sequence", 0)), str(event.get("type") or "event"), _json(event), event.get("timestamp") or now),
                 )
         job["features"] = copy.deepcopy(persisted_features)
+        job["events"] = copy.deepcopy(merged_events)
 
     @staticmethod
     def _decode_json(value: Any, default: Any) -> Any:
@@ -222,12 +269,12 @@ class SQLiteFeatureJobStore:
 
     @classmethod
     def _load_job_row(cls, connection: Any, row: Any) -> dict[str, Any]:
-        job = cls._decode_json(row["job_json"], {})
+        job = _sanitize_feature_payload(cls._decode_json(row["job_json"], {}))
         if not isinstance(job, dict):
             job = {}
         job["job_id"] = str(row["job_id"])
         job["entities"] = [
-            cls._decode_json(item[0], {})
+            _sanitize_feature_payload(cls._decode_json(item[0], {}))
             for item in connection.execute(
                 "SELECT entity_json FROM feature_job_entities WHERE job_id=? ORDER BY updated_at, entity_id",
                 (row["job_id"],),
@@ -239,7 +286,7 @@ class SQLiteFeatureJobStore:
             "resolved_rule_id, resolution_type FROM feature_candidates WHERE job_id=? ORDER BY created_at, candidate_id",
             (row["job_id"],),
         ):
-            candidate = cls._decode_json(item["candidate_json"], {})
+            candidate = _sanitize_feature_payload(cls._decode_json(item["candidate_json"], {}))
             if not isinstance(candidate, dict):
                 continue
             candidate["candidate_id"] = str(item["candidate_id"])
@@ -249,7 +296,7 @@ class SQLiteFeatureJobStore:
             features[candidate["candidate_id"]] = candidate
         job["features"] = features
         job["events"] = [
-            cls._decode_json(item[0], {})
+            _sanitize_feature_payload(cls._decode_json(item[0], {}))
             for item in connection.execute(
                 "SELECT event_json FROM feature_job_events WHERE job_id=? ORDER BY sequence", (row["job_id"],)
             )
@@ -300,7 +347,11 @@ class SQLiteFeatureJobStore:
             if job is None:
                 raise self._candidate_not_found()
             merged = self._upsert_generated_candidate(
-                connection, str(job_id), {**copy.deepcopy(candidate), "candidate_id": candidate_id}, utc_now()
+                connection,
+                str(job_id),
+                {**copy.deepcopy(candidate), "candidate_id": candidate_id},
+                utc_now(),
+                for_update=getattr(self.database, "provider", "sqlite") == "postgres",
             )
             row = connection.execute(
                 "SELECT c.candidate_id, c.job_id, c.entity_id, c.status, c.approval_key, c.problem_code, "
@@ -536,14 +587,60 @@ class SQLiteApprovedRuleStore(ApprovedRuleStore):
         entity_id: str | None = None,
         cluster: str | None = None,
     ) -> dict[str, Any]:
-        rule = super().record_reuse(rule_id, job_id=job_id, entity_id=entity_id, cluster=cluster)
+        """Increment reuse metadata and append its audit row atomically.
+
+        SQLite serializes the transaction at begin time. PostgreSQL needs the
+        row lock explicitly because a read-modify-write sequence otherwise
+        loses increments from concurrent workers.
+        """
+        rule_id = str(rule_id)
         with self.database.transaction() as connection:
+            query = (
+                "SELECT rule_id, signature, feature_type, rule_json, status, current_version, next_review_at, "
+                "schema_version, approved_at, updated_at, problem_code, approval_key "
+                "FROM approved_rules WHERE rule_id=?"
+            )
+            if getattr(self.database, "provider", "sqlite") == "postgres":
+                query += " FOR UPDATE"
+            row = connection.execute(query, (rule_id,)).fetchone()
+            if row is None:
+                raise ApprovedRuleError("批准规则不存在")
+            rule = hydrate_persisted_rule(
+                row["rule_json"],
+                persisted_projection={
+                    "rule_id": row["rule_id"],
+                    "signature": row["signature"],
+                    "feature_type": row["feature_type"],
+                    "schema_version": row["schema_version"],
+                    "problem_code": row["problem_code"],
+                    "approval_key": row["approval_key"],
+                },
+                lifecycle={
+                    "status": row["status"],
+                    "current_version": int(row["current_version"]),
+                    "next_review_at": row["next_review_at"],
+                    "approved_at": row["approved_at"],
+                    "updated_at": row["updated_at"],
+                },
+            )
+            classification = classify_rule(rule)
+            if classification.kind == RuleFormat.MALFORMED_V2:
+                raise ApprovedRuleError("批准规则损坏，不能记录复用")
+            if not _is_active(rule):
+                raise ApprovedRuleError("只有 active 批准规则可以记录复用")
+            rule["reuse_count"] = int(rule.get("reuse_count") or 0) + 1
+            rule["last_reused_at"] = self.clock()
+            persisted = public_rule(rule)
+            connection.execute(
+                "UPDATE approved_rules SET rule_json=? WHERE rule_id=?",
+                (_json(persisted), rule_id),
+            )
             connection.execute(
                 "INSERT INTO rule_reuse_events(rule_id, job_id, entity_id, reused_at, cluster, schema_version) "
                 "VALUES (?, ?, ?, ?, ?, ?)",
-                (rule_id, job_id, entity_id, rule["last_reused_at"], cluster, "rule_reuse_event_v2"),
+                (rule_id, job_id, entity_id, persisted["last_reused_at"], cluster, "rule_reuse_event_v2"),
             )
-        return rule
+        return persisted
 
 
 class SQLiteApprovalGroupStore:
@@ -608,9 +705,10 @@ class SQLiteApprovalGroupStore:
         value.setdefault("created_at", self.clock())
         value["updated_at"] = value.get("updated_at") or self.clock()
         with self.database.transaction() as connection:
-            existing = connection.execute(
-                "SELECT * FROM approval_groups WHERE approval_key=?", (value["approval_key"],)
-            ).fetchone()
+            query = "SELECT * FROM approval_groups WHERE approval_key=?"
+            if getattr(self.database, "provider", "sqlite") == "postgres":
+                query += " FOR UPDATE"
+            existing = connection.execute(query, (value["approval_key"],)).fetchone()
             if existing:
                 previous = self._row_to_group(existing)
                 value["approval_group_id"] = previous["approval_group_id"]
@@ -620,7 +718,9 @@ class SQLiteApprovalGroupStore:
                 value["candidate_count"] = len(value["candidate_ids"])
                 value["affected_entity_count"] = len(value["entity_keys"])
                 value["occurrence_count"] = int(value.get("occurrence_count") or 0)
-                if previous.get("status") in {"approved", "auto_resolved"} and value.get("status") != "approved":
+                if previous.get("status") in {"rejected", "superseded"}:
+                    value["status"] = previous["status"]
+                elif previous.get("status") in {"approved", "auto_resolved"} and value.get("status") != "approved":
                     value["status"] = previous["status"]
                 value["rule_id"] = value.get("rule_id") or previous.get("rule_id")
             connection.execute(
@@ -629,7 +729,8 @@ class SQLiteApprovalGroupStore:
                 "group_json, created_at, updated_at, schema_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(approval_key) DO UPDATE SET problem_code=excluded.problem_code, feature_type=excluded.feature_type, "
                 "title=excluded.title, summary=excluded.summary, importance=excluded.importance, "
-                "status=CASE WHEN approval_groups.status IN ('approved', 'auto_resolved') "
+                "status=CASE WHEN approval_groups.status IN ('rejected', 'superseded') THEN approval_groups.status "
+                "WHEN approval_groups.status IN ('approved', 'auto_resolved') "
                 "AND excluded.status <> 'approved' THEN approval_groups.status ELSE excluded.status END, "
                 "rule_id=excluded.rule_id, first_seen=excluded.first_seen, last_seen=excluded.last_seen, "
                 "occurrence_count=excluded.occurrence_count, affected_entity_count=excluded.affected_entity_count, "

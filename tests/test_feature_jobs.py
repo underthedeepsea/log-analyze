@@ -1,3 +1,5 @@
+import json
+
 import pytest
 
 from logrisk.approved_rules import ApprovedRuleStore
@@ -976,6 +978,77 @@ def test_refresh_does_not_replace_live_job_with_older_persisted_snapshot(tmp_pat
     manager.refresh_from_persistence(job_id)
 
     assert manager.get_job(job_id)["status"] == "running"
+
+
+def test_refresh_imports_review_state_when_persistence_has_no_new_job_event(tmp_path):
+    database = SQLiteDatabase(tmp_path / "state.sqlite3")
+    persistence = SQLiteFeatureJobStore(database)
+    groups = SQLiteApprovalGroupStore(database)
+    manager = FeatureJobManager(
+        extractor=lambda source, **kwargs: [candidate(source, "candidate-node-a")],
+        persistence=persistence,
+        approval_group_store=groups,
+        auto_start=False,
+        interrupt_on_restore=False,
+    )
+    job_id = manager.create_job(
+        {"summary": {}, "risk_entities": [entity("node-a", 90)]},
+        model="qwen3:1.7b",
+    )
+    manager.run_job(job_id)
+    before = manager.get_job(job_id)
+    before_events = persistence.load_job(job_id)["events"]
+    persistence.update_candidate_review_state(
+        "feature-node-a",
+        {"status": "approved"},
+        expected_status="pending",
+    )
+
+    assert persistence.load_job(job_id)["events"] == before_events
+    manager.refresh_from_persistence(job_id)
+
+    assert next(item for item in manager.get_job(job_id)["features"] if item["candidate_id"] == "feature-node-a")["status"] == "approved"
+    assert manager.get_job(job_id)["status"] == before["status"]
+
+
+def test_job_state_and_extractor_input_drop_raw_payloads(tmp_path):
+    captured_sources = []
+
+    def extractor(source, **kwargs):
+        captured_sources.append(source)
+        return [candidate(source)]
+
+    persistence = SQLiteFeatureJobStore(SQLiteDatabase(tmp_path / "state.sqlite3"))
+    manager = FeatureJobManager(
+        extractor=extractor,
+        persistence=persistence,
+        auto_start=False,
+        interrupt_on_restore=False,
+    )
+    source = entity("node-a", 90)
+    source.update({
+        "raw_logs": ["secret raw line"],
+        "samples": ["secret sample"],
+        "nested": {"api_key": "secret-key"},
+    })
+    job_id = manager.create_job(
+        {
+            "summary": {"raw_logs": ["secret summary line"]},
+            "risk_entities": [source],
+        },
+        model="qwen3:1.7b",
+        connection_snapshot={"dsn": "postgresql://secret"},
+        profile_snapshot={"token": "secret-token"},
+    )
+
+    manager.run_job(job_id)
+
+    assert captured_sources
+    assert all("secret" not in json.dumps(value, ensure_ascii=False) for value in captured_sources)
+    serialized = json.dumps(persistence.load_job(job_id), ensure_ascii=False)
+    assert "secret" not in serialized
+    assert "raw_logs" not in serialized
+    assert '"samples"' not in serialized
 
 
 def test_refresh_keeps_live_review_fields_for_equal_progress_snapshot(tmp_path):

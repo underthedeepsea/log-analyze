@@ -377,6 +377,39 @@ def test_matching_rule_skips_extractor_and_uses_current_entity_facts(tmp_path):
     assert reused["source_templates"][0]["template_hash"] == "hash-oom"
 
 
+def test_late_rule_match_records_reuse_only_for_pending_transition(tmp_path):
+    reuse_events = []
+
+    class RecordingRuleStore(ApprovedRuleStore):
+        def record_reuse(self, rule_id, **metadata):
+            reuse_events.append({"rule_id": rule_id, **metadata})
+            return super().record_reuse(rule_id, **metadata)
+
+    source = reusable_entity("node-a")
+    store = RecordingRuleStore(tmp_path / "rules.json")
+    manager = FeatureJobManager(
+        extractor=lambda record, **kwargs: [reusable_candidate(record) | {"status": "pending"}],
+        rule_store=store,
+        auto_start=False,
+    )
+    job_id = manager.create_job(
+        {"summary": {}, "risk_entities": [source]},
+        model="qwen3:1.7b",
+    )
+    manager.run_job(job_id)
+    rule = store.upsert_feature(reusable_candidate(source))
+
+    manager.update_feature(job_id, "feature-node-a", {"title": "首次编辑"})
+    manager.update_feature(job_id, "feature-node-a", {"title": "再次编辑"})
+
+    assert reuse_events == [{
+        "rule_id": rule["rule_id"],
+        "job_id": job_id,
+        "entity_id": "node-a",
+        "cluster": "prod-a",
+    }]
+
+
 def test_approving_ollama_feature_persists_reusable_rule(tmp_path):
     store = ApprovedRuleStore(tmp_path / "rules.json")
     source = reusable_entity("node-a")
@@ -828,6 +861,57 @@ def test_losing_review_cannot_leave_rule_or_sibling_group_side_effect(tmp_path):
     assert rules.list_rules() == []
     assert persistence.load_candidate("feature-node-a")["status"] == "rejected"
     assert persistence.load_candidate("feature-node-b")["status"] == "pending"
+    assert groups.list_groups()[0]["status"] == "pending"
+    assert groups.list_groups()[0]["rule_id"] is None
+
+
+def test_stale_idempotent_approval_cannot_run_or_rollback_winner_side_effects(tmp_path):
+    class ConcurrentApprovalStore(SQLiteFeatureJobStore):
+        def __init__(self, database):
+            super().__init__(database)
+            self.interleaved = False
+
+        def update_candidate_review_state(self, candidate_id, changes, **kwargs):
+            if (
+                candidate_id == "feature-node-a"
+                and changes.get("status") == "approved"
+                and not self.interleaved
+            ):
+                self.interleaved = True
+                SQLiteFeatureJobStore(self.database).update_candidate_review_state(
+                    candidate_id,
+                    {"status": "approved", "reviewer_note": "并发审核胜者"},
+                    expected_status="pending",
+                    expected_updated_at=kwargs.get("expected_updated_at"),
+                )
+            return super().update_candidate_review_state(candidate_id, changes, **kwargs)
+
+    database = SQLiteDatabase(tmp_path / "state.sqlite3")
+    persistence = ConcurrentApprovalStore(database)
+    rules = SQLiteApprovedRuleStore(database)
+    groups = SQLiteApprovalGroupStore(database)
+    manager = FeatureJobManager(
+        extractor=lambda source, **kwargs: [candidate(source)],
+        rule_store=rules,
+        approval_group_store=groups,
+        persistence=persistence,
+        auto_start=False,
+        interrupt_on_restore=False,
+    )
+    job_id = manager.create_job(
+        {"summary": {}, "risk_entities": [entity("node-a", 90)]},
+        model="qwen3:1.7b",
+    )
+    manager.run_job(job_id)
+
+    with pytest.raises(FeatureJobError) as conflict:
+        manager.update_feature(job_id, "feature-node-a", {"status": "approved"})
+
+    assert (conflict.value.code, conflict.value.status_code) == ("candidate_state_conflict", 409)
+    assert rules.list_rules() == []
+    persisted = persistence.load_candidate("feature-node-a")
+    assert persisted["status"] == "approved"
+    assert persisted["reviewer_note"] == "并发审核胜者"
     assert groups.list_groups()[0]["status"] == "pending"
     assert groups.list_groups()[0]["rule_id"] is None
 

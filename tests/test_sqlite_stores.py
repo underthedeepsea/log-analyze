@@ -295,6 +295,31 @@ def test_sqlite_candidate_review_cas_rejects_a_stale_updated_at(tmp_path):
     assert store.load_candidate("candidate-1")["reviewer_note"] == "较新的审核"
 
 
+def test_sqlite_candidate_review_cas_rejects_stale_idempotent_approval(tmp_path):
+    store = _candidate_store(tmp_path, "sqlite")
+    store.save(_candidate_job())
+    stale = store.load_candidate("candidate-1")
+
+    winner = store.update_candidate_review_state(
+        "candidate-1",
+        {"status": "approved", "reviewer_note": "并发审核胜者"},
+        expected_status="pending",
+        expected_updated_at=stale["updated_at"],
+    )
+
+    with pytest.raises(FeatureJobError) as conflict:
+        store.update_candidate_review_state(
+            "candidate-1",
+            {"status": "approved", "reviewer_note": "过期审核"},
+            expected_status="pending",
+            expected_updated_at=stale["updated_at"],
+        )
+
+    assert (conflict.value.code, conflict.value.status_code) == ("candidate_state_conflict", 409)
+    assert store.load_candidate("candidate-1")["updated_at"] == winner["updated_at"]
+    assert store.load_candidate("candidate-1")["reviewer_note"] == "并发审核胜者"
+
+
 def test_file_candidate_review_cas_is_safe_across_processes(tmp_path):
     if "fork" not in multiprocessing.get_all_start_methods():
         pytest.skip("cross-process file CAS regression requires fork")

@@ -345,11 +345,11 @@ class SQLiteFeatureJobStore:
             if current_status in {"approved", "rejected"} and requested_status is not None and requested_status != current_status:
                 if not (allow_terminal_rollback and current_status == expected_status and requested_status == "pending"):
                     raise self._candidate_state_conflict()
+            if expected_updated_at is not None and current.get("updated_at") != expected_updated_at:
+                raise self._candidate_state_conflict()
             if current_status != expected_status:
                 if current_status == "approved" and requested_status == "approved":
                     return current
-                raise self._candidate_state_conflict()
-            if expected_updated_at is not None and current.get("updated_at") != expected_updated_at:
                 raise self._candidate_state_conflict()
             updated = copy.deepcopy(current)
             for field, value in changes.items():

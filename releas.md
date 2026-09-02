@@ -22,6 +22,7 @@
 - 修复 Worker 旧 Candidate 快照覆盖人工审核状态，并为审核更新增加 SQLite/PostgreSQL 兼容的原子 CAS、完整队列读取和明确的 404/409 错误。
 - 修复审核操作的二阶段 CAS 覆盖和部分批准，补强文件存储跨进程 CAS，并阻止同进度旧快照覆盖实时审核字段。
 - 修复代表 Candidate CAS 失败后仍写入规则、同身份 Candidate 或 Approval Group，并在规则写入失败时回滚审批状态。
+- 修复过期的幂等批准绕过 Candidate 版本校验，并避免重复编辑已复用规则的 Candidate 时重复累计复用次数。
 
 ## 1.36.0 - 2026-09-01
 

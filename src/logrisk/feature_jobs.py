@@ -278,11 +278,11 @@ class FeatureJobFileStore:
             if current_status in {"approved", "rejected"} and requested_status is not None and requested_status != current_status:
                 if not (allow_terminal_rollback and current_status == expected_status and requested_status == "pending"):
                     raise _candidate_state_conflict()
+            if expected_updated_at is not None and candidate.get("updated_at") != expected_updated_at:
+                raise _candidate_state_conflict()
             if current_status != expected_status:
                 if current_status == "approved" and requested_status == "approved":
                     return candidate
-                raise _candidate_state_conflict()
-            if expected_updated_at is not None and candidate.get("updated_at") != expected_updated_at:
                 raise _candidate_state_conflict()
             job = self.load_job(str(candidate["job_id"]))
             if job is None:
@@ -1973,7 +1973,7 @@ class FeatureJobManager:
             self._persist_feature_group_locked(job, record, group, candidate_id)
 
             if (
-                changes.get("status") is None
+                original_feature.get("status") == "pending"
                 and feature.get("resolution_type") == "group_matched"
                 and feature.get("resolved_rule_id")
                 and self.rule_store

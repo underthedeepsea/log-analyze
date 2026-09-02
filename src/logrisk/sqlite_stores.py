@@ -209,6 +209,7 @@ class SQLiteFeatureJobStore:
                     "INSERT INTO feature_job_events(job_id, sequence, event_type, event_json, created_at) VALUES (?, ?, ?, ?, ?)",
                     (job["job_id"], int(event.get("sequence", 0)), str(event.get("type") or "event"), _json(event), event.get("timestamp") or now),
                 )
+        job["features"] = copy.deepcopy(persisted_features)
 
     @staticmethod
     def _decode_json(value: Any, default: Any) -> Any:
@@ -357,6 +358,8 @@ class SQLiteFeatureJobStore:
                 if current_status == "approved" and requested_status == "approved":
                     return current
                 raise self._candidate_state_conflict()
+            if all(current.get(field) == value for field, value in changes.items()):
+                return current
             updated = copy.deepcopy(current)
             for field, value in changes.items():
                 updated[field] = copy.deepcopy(value)
@@ -614,9 +617,9 @@ class SQLiteApprovalGroupStore:
                 value["created_at"] = previous["created_at"]
                 value["candidate_ids"] = sorted(set(previous.get("candidate_ids") or []) | set(value.get("candidate_ids") or []))
                 value["entity_keys"] = sorted(set(previous.get("entity_keys") or []) | set(value.get("entity_keys") or []))
-                value["candidate_count"] = max(int(previous.get("candidate_count") or 0), int(value.get("candidate_count") or 0), len(value["candidate_ids"]))
-                value["affected_entity_count"] = max(int(previous.get("affected_entity_count") or 0), int(value.get("affected_entity_count") or 0), len(value["entity_keys"]))
-                value["occurrence_count"] = max(int(previous.get("occurrence_count") or 0), int(value.get("occurrence_count") or 0))
+                value["candidate_count"] = len(value["candidate_ids"])
+                value["affected_entity_count"] = len(value["entity_keys"])
+                value["occurrence_count"] = int(value.get("occurrence_count") or 0)
                 if previous.get("status") in {"approved", "auto_resolved"} and value.get("status") != "approved":
                     value["status"] = previous["status"]
                 value["rule_id"] = value.get("rule_id") or previous.get("rule_id")

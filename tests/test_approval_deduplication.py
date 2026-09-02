@@ -15,7 +15,7 @@ from logrisk.approval_dedup import (
 )
 from logrisk.approved_rules import ApprovedRuleStore
 from logrisk.database import SQLiteDatabase
-from logrisk.feature_jobs import FeatureJobManager
+from logrisk.feature_jobs import FeatureJobError, FeatureJobManager
 from logrisk.sqlite_stores import SQLiteApprovalGroupStore, SQLiteApprovedRuleStore, SQLiteFeatureJobStore
 
 
@@ -644,6 +644,218 @@ def test_approval_reconciles_pending_duplicates_across_jobs(tmp_path):
     assert resolved["duplicate_of"] == "candidate-node-a"
 
 
+def test_approval_reconciliation_persists_every_sibling_and_event_after_restart(tmp_path):
+    database = SQLiteDatabase(tmp_path / "logrisk.sqlite3")
+
+    def build_manager():
+        return FeatureJobManager(
+            extractor=lambda source, **kwargs: [candidate(source, f"candidate-{source['entity_id']}")],
+            rule_store=SQLiteApprovedRuleStore(database),
+            approval_group_store=SQLiteApprovalGroupStore(database),
+            persistence=SQLiteFeatureJobStore(database),
+            auto_start=False,
+            interrupt_on_restore=False,
+        )
+
+    manager = build_manager()
+    first = manager.create_job(
+        {"summary": {}, "risk_entities": [entity("node-a", "2026-06-22T10:00:00+08:00")]},
+        model="qwen3:1.7b",
+    )
+    second = manager.create_job(
+        {"summary": {}, "risk_entities": [entity("node-b", "2026-06-22T11:00:00+08:00")]},
+        model="qwen3:1.7b",
+    )
+    manager.run_job(first)
+    manager.run_job(second)
+
+    approved = manager.update_feature(
+        first,
+        "candidate-node-a",
+        {"status": "approved", "review_scope": "approval_identity"},
+    )
+
+    sibling = SQLiteFeatureJobStore(database).load_candidate("candidate-node-b")
+    assert sibling["status"] == "approved"
+    assert sibling["resolution_type"] == "group_matched"
+    assert sibling["resolved_rule_id"] == approved["rule_id"]
+    assert any(
+        event["type"] == "pending_candidate_reconciled"
+        for event in SQLiteFeatureJobStore(database).load_job(second)["events"]
+    )
+
+    restored = build_manager()
+    assert restored.get_job(second)["features"][0]["status"] == "approved"
+    assert restored.list_persisted_candidates(status="pending") == []
+
+
+def test_duplicate_approval_is_idempotent_without_duplicate_events_or_reuse(tmp_path):
+    rules = ApprovedRuleStore(tmp_path / "rules.json")
+    manager = FeatureJobManager(
+        extractor=lambda source, **kwargs: [candidate(source, "candidate-node-a")],
+        rule_store=rules,
+        auto_start=False,
+    )
+    job_id = manager.create_job(
+        {"summary": {}, "risk_entities": [entity("node-a", "2026-06-22T10:00:00+08:00")]},
+        model="qwen3:1.7b",
+    )
+    manager.run_job(job_id)
+
+    first = manager.update_feature(job_id, "candidate-node-a", {"status": "approved"})
+    events_after_first = manager.list_events(job_id)
+    second = manager.update_feature(job_id, "candidate-node-a", {"status": "approved"})
+
+    assert second["rule_id"] == first["rule_id"]
+    assert len(rules.list_rules()) == 1
+    assert rules.list_rules()[0]["reuse_count"] == 0
+    assert len(manager.list_events(job_id)) == len(events_after_first)
+    assert sum(event["type"] == "feature_updated" for event in manager.list_events(job_id)) == 1
+
+
+def test_group_reject_leaves_terminal_candidate_unchanged_and_creates_no_rule(tmp_path):
+    database = SQLiteDatabase(tmp_path / "logrisk.sqlite3")
+    persistence = SQLiteFeatureJobStore(database)
+    manager = FeatureJobManager(
+        extractor=lambda source, **kwargs: [candidate(source, f"candidate-{source['entity_id']}")],
+        rule_store=SQLiteApprovedRuleStore(database),
+        approval_group_store=SQLiteApprovalGroupStore(database),
+        persistence=persistence,
+        auto_start=False,
+        interrupt_on_restore=False,
+    )
+    job_ids = [
+        manager.create_job(
+            {"summary": {}, "risk_entities": [entity(entity_id, window)]},
+            model="qwen3:1.7b",
+        )
+        for entity_id, window in (
+            ("node-a", "2026-06-22T10:00:00+08:00"),
+            ("node-b", "2026-06-22T11:00:00+08:00"),
+            ("node-c", "2026-06-22T12:00:00+08:00"),
+        )
+    ]
+    for job_id in job_ids:
+        manager.run_job(job_id)
+
+    terminal = manager.update_feature(
+        job_ids[0], "candidate-node-a", {"status": "rejected", "reviewer_note": "已确认误报"}
+    )
+    terminal_updated_at = persistence.load_candidate("candidate-node-a")["updated_at"]
+
+    manager.update_feature(
+        job_ids[1],
+        "candidate-node-b",
+        {"status": "rejected", "review_scope": "approval_identity"},
+    )
+
+    assert persistence.load_candidate("candidate-node-a")["status"] == "rejected"
+    assert persistence.load_candidate("candidate-node-a")["reviewer_note"] == terminal["reviewer_note"]
+    assert persistence.load_candidate("candidate-node-a")["updated_at"] == terminal_updated_at
+    assert all(
+        persistence.load_candidate(f"candidate-node-{node}")["status"] == "rejected"
+        for node in ("a", "b", "c")
+    )
+    assert SQLiteApprovedRuleStore(database).list_rules() == []
+
+
+def test_candidate_level_reject_keeps_other_pending_candidates_reviewable(tmp_path):
+    manager = FeatureJobManager(
+        extractor=lambda source, **kwargs: [candidate(source, f"candidate-{source['entity_id']}")],
+        rule_store=ApprovedRuleStore(tmp_path / "rules.json"),
+        auto_start=False,
+    )
+    first = manager.create_job(
+        {"summary": {}, "risk_entities": [entity("node-a", "2026-06-22T10:00:00+08:00")]},
+        model="qwen3:1.7b",
+    )
+    second = manager.create_job(
+        {"summary": {}, "risk_entities": [entity("node-b", "2026-06-22T11:00:00+08:00")]},
+        model="qwen3:1.7b",
+    )
+    manager.run_job(first)
+    manager.run_job(second)
+
+    manager.update_feature(first, "candidate-node-a", {"status": "rejected"})
+
+    assert manager.get_job(second)["features"][0]["status"] == "pending"
+    assert manager.list_approval_groups()[0]["status"] == "pending"
+
+
+def test_concurrent_duplicate_approvals_create_one_rule_and_one_event(tmp_path):
+    database = SQLiteDatabase(tmp_path / "logrisk.sqlite3")
+    persistence = SQLiteFeatureJobStore(database)
+    setup = FeatureJobManager(
+        extractor=lambda source, **kwargs: [candidate(source, "candidate-node-a")],
+        rule_store=SQLiteApprovedRuleStore(database),
+        approval_group_store=SQLiteApprovalGroupStore(database),
+        persistence=SQLiteFeatureJobStore(database),
+        auto_start=False,
+        interrupt_on_restore=False,
+    )
+    job_id = setup.create_job(
+        {"summary": {}, "risk_entities": [entity("node-a", "2026-06-22T10:00:00+08:00")]},
+        model="qwen3:1.7b",
+    )
+    setup.run_job(job_id)
+    managers = [
+        FeatureJobManager(
+            extractor=lambda source, **kwargs: [],
+            rule_store=SQLiteApprovedRuleStore(database),
+            approval_group_store=SQLiteApprovalGroupStore(database),
+            persistence=SQLiteFeatureJobStore(database),
+            auto_start=False,
+            interrupt_on_restore=False,
+        )
+        for _ in range(2)
+    ]
+
+    def approve(manager):
+        try:
+            return manager.update_feature(job_id, "candidate-node-a", {"status": "approved"})
+        except FeatureJobError as exc:
+            return exc
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(approve, managers))
+
+    assert all(
+        not isinstance(result, FeatureJobError)
+        or (result.code, result.status_code) == ("candidate_state_conflict", 409)
+        for result in results
+    )
+    assert SQLiteApprovedRuleStore(database).list_rules()[0]["reuse_count"] == 0
+    assert len(SQLiteApprovedRuleStore(database).list_rules()) == 1
+    assert persistence.load_candidate("candidate-node-a")["status"] == "approved"
+    assert sum(
+        event["type"] == "feature_updated"
+        for event in persistence.load_job(job_id)["events"]
+    ) == 1
+
+
+def test_candidate_and_group_statistics_are_separate_and_aggregate_members():
+    from logrisk.approval_queue import build_review_groups
+
+    first = candidate(entity("node-a", "2026-06-22T10:00:00+08:00"), "candidate-a")
+    second = candidate(entity("node-b", "2026-06-22T11:00:00+08:00"), "candidate-b")
+    second["occurrence_count"] = 4
+    other = candidate(entity("node-c", "2026-06-22T12:00:00+08:00"), "candidate-c")
+    other["problem_code"] = "OOM"
+    other["feature_type"] = "memory_pressure"
+    other["anchor_signatures"] = ["oom-anchor"]
+    other["template_hashes"] = ["hash-oom"]
+    other["source_templates"] = [{"template_hash": "hash-oom", "category": "memory", "template": "Out of memory", "count": 5}]
+    groups = build_review_groups([first, second, other])
+
+    cni_group = next(item for item in groups if item["problem_code"] == "kubernetes.cni.ip_exhaustion")
+    assert sum(item["candidate_count"] for item in groups) == 3
+    assert cni_group["candidate_count"] == 2
+    assert cni_group["occurrence_count"] == 7
+    assert cni_group["affected_entity_count"] == 2
+    assert cni_group["first_seen"] == "2026-06-22T10:00:00+08:00"
+    assert cni_group["last_seen"] == "2026-06-22T11:05:00+08:00"
+
+
 def test_approval_groups_and_candidate_identity_survive_sqlite_restart(tmp_path):
     database = SQLiteDatabase(tmp_path / "logrisk.sqlite3")
     persistence = SQLiteFeatureJobStore(database)
@@ -692,6 +904,9 @@ def test_restart_backfills_pending_candidate_against_existing_rule(tmp_path):
     job_id = manager.create_job({"summary": {}, "risk_entities": [source]}, model="qwen3:1.7b")
     manager.run_job(job_id)
 
+    crashed_snapshot = persistence.load_job(job_id)
+    crashed_snapshot["entities"][0]["feature_ids"] = []
+    persistence.save(crashed_snapshot)
     SQLiteApprovedRuleStore(database).upsert_feature(candidate(source, "approved-seed"))
 
     restored = FeatureJobManager(

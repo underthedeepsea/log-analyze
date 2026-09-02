@@ -27,6 +27,7 @@
 - 收紧 V2 语义匹配的 `match_mode` 门禁，并让 template-set 的 feature_type、组件、模板锚点证据缺失或不兼容时拒绝实体复用；canonical template-set 规则使用确定性的严格存储键，避免覆盖语义规则。
 - 修复损坏的 `approved_rule_v2` 回退到 V1 匹配路径的问题，新增 `LEGACY_V1`、`VALID_V2`、`MALFORMED_V2` 三态规则分类和损坏 identity 冲突的 409 错误。
 - 新增 SQLite/PostgreSQL `0021` forward-only classification migration，修复数据库 reader 静默覆盖 `rule_json` identity，以及 legacy import、治理状态变更和 rollback 无条件升级 V1 规则为 V2 的问题。
+- 修复审批批准后的跨任务 pending Candidate 持久化收敛、重启恢复和重复审批幂等；新增 `pending_candidate_reconciled` 事件，区分历史收敛与模型调用前的规则复用统计，并保证 group reject 不修改已结束 Candidate。
 
 ## 1.36.0 - 2026-09-01
 

@@ -892,7 +892,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._json(exc.status_code, {"error": str(exc), "code": exc.code, "request_id": f"request-{uuid.uuid4().hex}"})
         except AgenticError as exc:
             self._json(exc.status_code, {"error": str(exc), "code": exc.code})
-        except (FeatureJobError, ApprovedRuleError, ProcessingMetricsError, DrainQualityError, SemanticValidationError) as exc:
+        except ApprovedRuleError as exc:
+            code = getattr(exc, "code", "invalid_request")
+            self._json(
+                HTTPStatus(getattr(exc, "status_code", HTTPStatus.BAD_REQUEST)),
+                {"error": str(exc), "code": code, "error_code": code},
+            )
+        except (FeatureJobError, ProcessingMetricsError, DrainQualityError, SemanticValidationError) as exc:
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
         except (TypeError, ValueError) as exc:
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc)})
@@ -1557,7 +1563,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 HTTPStatus.REQUEST_ENTITY_TOO_LARGE if exc.code in {"package_too_large", "package_too_many_files", "package_expanded_too_large"} else HTTPStatus.UNPROCESSABLE_ENTITY
             )
             self._json(status, {"error": str(exc), "code": exc.code, "error_code": exc.code, "request_id": self._runtime_request_identity().request_id})
-        except (FeatureJobError, ApprovedRuleError, ProcessingMetricsError, DrainQualityError, SemanticValidationError) as exc:
+        except ApprovedRuleError as exc:
+            code = getattr(exc, "code", "invalid_request")
+            self._json(
+                HTTPStatus(getattr(exc, "status_code", HTTPStatus.BAD_REQUEST)),
+                {"error": str(exc), "code": code, "error_code": code, "request_id": self._runtime_request_identity().request_id},
+            )
+        except (FeatureJobError, ProcessingMetricsError, DrainQualityError, SemanticValidationError) as exc:
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc), "code": "invalid_request", "error_code": "invalid_request", "request_id": self._runtime_request_identity().request_id})
         except (TypeError, ValueError) as exc:
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc), "code": "invalid_request", "error_code": "invalid_request", "request_id": self._runtime_request_identity().request_id})
@@ -1682,7 +1694,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 HTTPStatus(getattr(exc, "status_code", HTTPStatus.BAD_REQUEST)),
                 {"error": str(exc), "code": code, "error_code": code, "request_id": self._runtime_request_identity().request_id},
             )
-        except (ApprovedRuleError, ProcessingMetricsError, DrainQualityError, KeyError, ValueError) as exc:
+        except ApprovedRuleError as exc:
+            code = getattr(exc, "code", "invalid_request")
+            self._json(
+                HTTPStatus(getattr(exc, "status_code", HTTPStatus.BAD_REQUEST)),
+                {"error": str(exc), "code": code, "error_code": code, "request_id": self._runtime_request_identity().request_id},
+            )
+        except (ProcessingMetricsError, DrainQualityError, KeyError, ValueError) as exc:
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc), "code": "invalid_request", "error_code": "invalid_request", "request_id": self._runtime_request_identity().request_id})
 
     def _serve_frontend(self) -> None:

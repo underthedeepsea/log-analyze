@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-import pytest
+import json
 
+import pytest
 from logrisk.database import SQLiteDatabase
 from logrisk.sqlite_stores import SQLiteApprovedRuleStore
 
@@ -62,6 +63,94 @@ def test_status_change_is_versioned_and_disabled_rule_stops_matching(tmp_path):
             (rule["rule_id"],),
         ).fetchall()
     assert [tuple(item) for item in versions] == [(1, "rule_created"), (2, "status_changed")]
+
+
+def test_v1_status_changes_preserve_rule_format_and_null_projection(tmp_path):
+    database, store, service, rule = governed_rule(tmp_path)
+    legacy = store.list_rules()[0]
+    legacy["schema_version"] = "approved_rule_v1"
+    store._write_locked([legacy])
+
+    disabled = service.change_status(rule["rule_id"], "disabled", 1, "reviewer-a", "停用")
+    enabled = service.change_status(rule["rule_id"], "active", 2, "reviewer-a", "恢复")
+
+    assert disabled["rule"]["schema_version"] == "approved_rule_v1"
+    assert enabled["rule"]["schema_version"] == "approved_rule_v1"
+    with database.connect() as connection:
+        row = connection.execute(
+            "SELECT schema_version, problem_code, approval_key FROM approved_rules WHERE rule_id=?",
+            (rule["rule_id"],),
+        ).fetchone()
+    assert tuple(row) == ("approved_rule_v1", None, None)
+
+
+def test_rollback_to_v1_snapshot_preserves_v1_format(tmp_path):
+    database, store, service, rule = governed_rule(tmp_path)
+    v1_snapshot = dict(rule, schema_version="approved_rule_v1")
+    current_v2 = dict(rule, current_version=2, updated_at=NOW)
+    with database.transaction() as connection:
+        connection.execute(
+            "UPDATE rule_versions SET rule_json=? WHERE rule_id=? AND version=1",
+            (json.dumps(v1_snapshot, ensure_ascii=False, separators=(",", ":")), rule["rule_id"]),
+        )
+        connection.execute(
+            "UPDATE approved_rules SET rule_json=?, current_version=2, schema_version='approved_rule_v2', problem_code=?, approval_key=? WHERE rule_id=?",
+            (json.dumps(current_v2, ensure_ascii=False, separators=(",", ":")), current_v2["problem_code"], current_v2["approval_key"], rule["rule_id"]),
+        )
+
+    result = service.rollback(
+        rule["rule_id"], target_version=1, expected_version=2, confirmed=True,
+        operator="reviewer-a", reason="恢复历史 V1 规则",
+    )
+
+    assert result["rule"]["schema_version"] == "approved_rule_v1"
+    with database.connect() as connection:
+        row = connection.execute(
+            "SELECT schema_version, problem_code, approval_key FROM approved_rules WHERE rule_id=?",
+            (rule["rule_id"],),
+        ).fetchone()
+    assert tuple(row) == ("approved_rule_v1", None, None)
+
+
+def test_rollback_trusted_legacy_snapshot_normalizes_to_v1(tmp_path):
+    database, store, service, rule = governed_rule(tmp_path)
+    legacy_snapshot = {
+        "rule_id": rule["rule_id"],
+        "signature": rule["signature"],
+        "feature_type": rule["feature_type"],
+        "title": rule["title"],
+        "summary": rule["summary"],
+        "components": rule["components"],
+        "template_signatures": rule["template_signatures"],
+        "status": "active",
+        "current_version": 1,
+        "approved_at": rule["approved_at"],
+        "created_at": rule["created_at"],
+        "next_review_at": rule["next_review_at"],
+    }
+    current_v2 = dict(rule, current_version=2, updated_at=NOW)
+    with database.transaction() as connection:
+        connection.execute(
+            "UPDATE rule_versions SET rule_json=? WHERE rule_id=? AND version=1",
+            (json.dumps(legacy_snapshot, ensure_ascii=False, separators=(",", ":")), rule["rule_id"]),
+        )
+        connection.execute(
+            "UPDATE approved_rules SET rule_json=?, current_version=2, schema_version='approved_rule_v2', problem_code=?, approval_key=? WHERE rule_id=?",
+            (json.dumps(current_v2, ensure_ascii=False, separators=(",", ":")), current_v2["problem_code"], current_v2["approval_key"], rule["rule_id"]),
+        )
+
+    result = service.rollback(
+        rule["rule_id"], target_version=1, expected_version=2, confirmed=True,
+        operator="reviewer-a", reason="恢复未版本化历史规则",
+    )
+
+    assert result["rule"]["schema_version"] == "approved_rule_v1"
+    with database.connect() as connection:
+        row = connection.execute(
+            "SELECT schema_version, problem_code, approval_key FROM approved_rules WHERE rule_id=?",
+            (rule["rule_id"],),
+        ).fetchone()
+    assert tuple(row) == ("approved_rule_v1", None, None)
 
 
 def test_status_change_rejects_stale_expected_version(tmp_path):

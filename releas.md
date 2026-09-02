@@ -25,6 +25,8 @@
 - 修复过期的幂等批准绕过 Candidate 版本校验，并避免重复编辑已复用规则的 Candidate 时重复累计复用次数。
 - 修复批准规则 V1/V2 匹配与停用规则替换：仅复用 active 规则，保留 V1 物理身份；停用前身生成可追溯的独立 active replacement，并将规则复用统计限定为模型调用前命中。
 - 收紧 V2 语义匹配的 `match_mode` 门禁，并让 template-set 的 feature_type、组件、模板锚点证据缺失或不兼容时拒绝实体复用；canonical template-set 规则使用确定性的严格存储键，避免覆盖语义规则。
+- 修复损坏的 `approved_rule_v2` 回退到 V1 匹配路径的问题，新增 `LEGACY_V1`、`VALID_V2`、`MALFORMED_V2` 三态规则分类和损坏 identity 冲突的 409 错误。
+- 新增 SQLite/PostgreSQL `0021` forward-only classification migration，修复数据库 reader 静默覆盖 `rule_json` identity，以及 legacy import、治理状态变更和 rollback 无条件升级 V1 规则为 V2 的问题。
 
 ## 1.36.0 - 2026-09-01
 

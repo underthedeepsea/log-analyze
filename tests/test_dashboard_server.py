@@ -526,6 +526,29 @@ def test_rule_governance_api_returns_conflict_for_stale_version(dashboard):
     assert error["request_id"].startswith("request-")
 
 
+def test_feature_approval_returns_conflict_for_malformed_rule_identity(dashboard):
+    base_url, manager = dashboard
+    malformed = manager.rule_store.upsert_feature(candidate(entity()))
+    malformed.pop("match_mode")
+    manager.rule_store._write_locked([malformed])
+    _, created, _ = request_json(base_url + "/api/jobs", "POST", {
+        "result": {"summary": {}, "risk_entities": [entity()]},
+        "model": "qwen3:1.7b",
+    })
+    job_id = created["job_id"]
+    for _ in range(50):
+        _, snapshot, _ = request_json(base_url + f"/api/jobs/{job_id}")
+        if snapshot["features"]:
+            break
+
+    with pytest.raises(HTTPError) as conflict:
+        request_json(base_url + f"/api/jobs/{job_id}/features/feature-node-a", "PATCH", {"status": "approved"})
+
+    assert conflict.value.code == 409
+    error = json.load(conflict.value)
+    assert error["code"] == "malformed_rule_identity_conflict"
+
+
 def test_system_metrics_route_returns_daily_llm_volume(dashboard):
     base_url, _ = dashboard
 

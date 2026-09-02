@@ -5,6 +5,14 @@ import json
 from pathlib import Path
 from typing import Any
 
+from logrisk.approved_rules import (
+    ApprovedRuleError,
+    RuleFormat,
+    RuleNormalizationSource,
+    classify_rule,
+    normalize_legacy_rule_version,
+    public_rule,
+)
 from logrisk.database import SQLiteDatabase, utc_now
 
 
@@ -74,34 +82,51 @@ class LegacyStateImporter:
     def _import_path(self, connection: Any, path: Path) -> int:
         if path.name == "approved_rules.json":
             rules = self._read_json(path).get("rules") or []
+            imported = 0
             for rule in rules:
+                try:
+                    normalized = normalize_legacy_rule_version(
+                        rule,
+                        source=RuleNormalizationSource.LEGACY_IMPORT,
+                    )
+                except ApprovedRuleError:
+                    continue
+                approved_at = normalized.get("approved_at") or normalized.get("created_at") or utc_now()
+                updated_at = normalized.get("updated_at") or approved_at
                 snapshot = {
-                    **rule,
-                    "schema_version": "approved_rule_v2",
-                    "status": str(rule.get("status") or "active"),
-                    "current_version": int(rule.get("current_version") or 1),
-                    "created_at": rule.get("created_at") or rule["approved_at"],
-                    "next_review_at": rule.get("next_review_at"),
+                    **normalized,
+                    "status": str(normalized.get("status") or "active"),
+                    "current_version": int(normalized.get("current_version") or 1),
+                    "created_at": normalized.get("created_at") or approved_at,
+                    "next_review_at": normalized.get("next_review_at"),
                 }
+                classification = classify_rule(snapshot)
+                if classification.kind == RuleFormat.MALFORMED_V2:
+                    continue
+                persisted = public_rule(snapshot)
+                projection = (None, None) if classification.kind == RuleFormat.LEGACY_V1 else (
+                    persisted.get("problem_code"), persisted.get("approval_key")
+                )
                 connection.execute(
                     "INSERT INTO approved_rules(rule_id, signature, feature_type, rule_json, approved_at, "
-                    "updated_at, status, current_version, next_review_at, schema_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
+                    "updated_at, status, current_version, next_review_at, schema_version, problem_code, approval_key) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
                     (
-                        rule["rule_id"], rule["signature"], rule["feature_type"],
-                        json.dumps(snapshot, ensure_ascii=False), rule["approved_at"], rule["updated_at"],
+                        persisted["rule_id"], persisted["signature"], persisted["feature_type"],
+                        json.dumps(persisted, ensure_ascii=False), approved_at, updated_at,
                         snapshot["status"], snapshot["current_version"], snapshot["next_review_at"],
-                        "approved_rule_v2",
+                        persisted["schema_version"], projection[0], projection[1],
                     ),
                 )
                 connection.execute(
                     "INSERT INTO rule_versions(rule_id, version, rule_json, change_type, change_reason, "
                     "operator, created_at, schema_version) VALUES (?, ?, ?, 'legacy_import', ?, 'legacy-importer', ?, 'rule_version_v1') ON CONFLICT DO NOTHING",
                     (
-                        rule["rule_id"], snapshot["current_version"], json.dumps(snapshot, ensure_ascii=False),
-                        "由旧批准规则文件导入", rule["updated_at"],
+                        persisted["rule_id"], snapshot["current_version"], json.dumps(persisted, ensure_ascii=False),
+                        "由旧批准规则文件导入", updated_at,
                     ),
                 )
-            return len(rules)
+                imported += 1
+            return imported
         if path.name == "ai_traces.jsonl":
             traces = self._read_jsonl(path)
             for trace in traces:

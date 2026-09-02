@@ -11,9 +11,12 @@ from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
 import pytest
 
+from logrisk.approval_dedup import build_approval_key
+from logrisk.approved_rules import RuleFormat, classify_rule
 from logrisk.continuous_learning import ContinuousLearningRepository
 from logrisk.database import PostgresDatabase, SQLiteDatabase
 from logrisk.incremental_sources import FileIncrementalSource, SourceCursor
+from logrisk.sqlite_stores import SQLiteApprovedRuleStore
 from logrisk.streaming_state import StreamingStateRepository
 from pipeline.database_migrate import SQLiteToPostgresMigration, _digest_rows, build_migration_preview, parse_args
 
@@ -359,6 +362,139 @@ def test_optional_postgres_streaming_checkpoint_uses_jsonb_and_foreign_keys(tmp_
 
         assert repository.get_task(task["task_id"])["cursor"]["value"]["offset"] == 10
         assert repository.list_unknown_templates(task_id=task["task_id"])[0]["template"]["template_hash"] == "abc"
+    finally:
+        with psycopg.connect(base_url, autocommit=True) as connection:
+            connection.execute('DROP SCHEMA IF EXISTS "' + schema + '" CASCADE')
+
+
+@pytest.mark.skipif(not os.getenv("LOGRISK_TEST_POSTGRES_URL"), reason="未设置 LOGRISK_TEST_POSTGRES_URL")
+def test_optional_postgres_rule_classification_migration_0001_to_0021(tmp_path):
+    psycopg = pytest.importorskip("psycopg")
+    base_url = os.environ["LOGRISK_TEST_POSTGRES_URL"]
+    schema = "logrisk_rules_" + uuid.uuid4().hex[:12]
+    parts = urlsplit(base_url)
+    query = parse_qsl(parts.query, keep_blank_values=True) + [("options", "-c search_path=" + schema)]
+    target_url = urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query, quote_via=quote), parts.fragment))
+    with psycopg.connect(base_url, autocommit=True) as connection:
+        connection.execute('CREATE SCHEMA "' + schema + '"')
+
+    try:
+        migrations = tmp_path / "postgres-migrations"
+        migrations.mkdir()
+        source_dir = Path("database/postgres/migrations")
+        shutil.copy(source_dir / "0001_initial.sql", migrations / "0001_initial.sql")
+        database = PostgresDatabase(target_url, state_root=tmp_path / "state", migrations_dir=migrations)
+        legacy = {
+            "rule_id": "legacy-a",
+            "signature": "sig-a",
+            "feature_type": "kernel_error",
+            "components": ["kernel"],
+            "template_signatures": [{"template_hash": "hash-a", "category": "kernel"}],
+        }
+        with database.transaction() as connection:
+            connection.execute(
+                "INSERT INTO approved_rules(rule_id, signature, feature_type, rule_json, approved_at, updated_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    legacy["rule_id"], legacy["signature"], legacy["feature_type"], json.dumps(legacy),
+                    "2026-07-01T00:00:00+00:00", "2026-07-01T00:00:00+00:00",
+                ),
+            )
+
+        for source in sorted(source_dir.glob("*.sql")):
+            if source.name not in {"0001_initial.sql", "0021_approved_rule_classification.sql"}:
+                shutil.copy(source, migrations / source.name)
+        database = PostgresDatabase(target_url, state_root=tmp_path / "state", migrations_dir=migrations)
+
+        approval_key = build_approval_key("kernel_error", "linux.memory.oom", ["kernel"], [])
+        valid_v2 = {
+            "rule_id": "valid-b",
+            "signature": "sig-b",
+            "feature_type": "kernel_error",
+            "components": ["kernel"],
+            "template_signatures": [{"template_hash": "hash-b", "category": "kernel"}],
+            "problem_code": "linux.memory.oom",
+            "approval_key": approval_key,
+            "match_mode": "semantic",
+            "status": "active",
+            "current_version": 1,
+            "schema_version": "approved_rule_v2",
+        }
+        malformed_v2 = {
+            **valid_v2,
+            "rule_id": "malformed-c",
+            "signature": "sig-c",
+            "approval_key": "appr-c",
+            "match_mode": "unsupported",
+        }
+        mismatch_v2 = {
+            **valid_v2,
+            "rule_id": "mismatch-d",
+            "signature": "sig-d",
+        }
+        with database.transaction() as connection:
+            for rule, projection_key in (
+                (valid_v2, approval_key),
+                (malformed_v2, "appr-c"),
+                (mismatch_v2, "db-mismatch"),
+            ):
+                connection.execute(
+                    "INSERT INTO approved_rules(rule_id, signature, feature_type, rule_json, approved_at, updated_at, "
+                    "status, current_version, next_review_at, schema_version, problem_code, approval_key) "
+                    "VALUES (?, ?, ?, ?, ?, ?, 'active', 1, NULL, 'approved_rule_v2', ?, ?)",
+                    (
+                        rule["rule_id"], rule["signature"], rule["feature_type"], json.dumps(rule),
+                        "2026-07-01T00:00:00+00:00", "2026-07-01T00:00:00+00:00",
+                        rule.get("problem_code"), projection_key,
+                    ),
+                )
+            snapshot_before = connection.execute(
+                "SELECT rule_json FROM rule_versions WHERE rule_id=? AND version=1",
+                (legacy["rule_id"],),
+            ).fetchone()["rule_json"]
+
+        shutil.copy(source_dir / "0021_approved_rule_classification.sql", migrations / "0021_approved_rule_classification.sql")
+        upgraded = PostgresDatabase(target_url, state_root=tmp_path / "state", migrations_dir=migrations)
+
+        with upgraded.connect() as connection:
+            rows = connection.execute(
+                "SELECT rule_id, schema_version, problem_code, approval_key, rule_json "
+                "FROM approved_rules ORDER BY rule_id"
+            ).fetchall()
+            snapshot_after = connection.execute(
+                "SELECT rule_json FROM rule_versions WHERE rule_id=? AND version=1",
+                (legacy["rule_id"],),
+            ).fetchone()["rule_json"]
+        values = {row["rule_id"]: row for row in rows}
+        assert tuple(values["legacy-a"][field] for field in ("schema_version", "problem_code", "approval_key")) == (
+            "approved_rule_v1", None, None,
+        )
+        assert json.loads(values["legacy-a"]["rule_json"])["schema_version"] == "approved_rule_v1"
+        assert sum(row["schema_version"] == "approved_rule_v1" for row in rows) == 1
+        assert sum(row["schema_version"] == "approved_rule_v2" for row in rows) == 3
+        assert json.loads(snapshot_after) == json.loads(snapshot_before)
+        assert values["valid-b"]["approval_key"] == approval_key
+        assert values["malformed-c"]["approval_key"] == "appr-c"
+        assert values["mismatch-d"]["approval_key"] == "db-mismatch"
+
+        store = SQLiteApprovedRuleStore(upgraded)
+        rules = {rule["rule_id"]: rule for rule in store._read_locked()}
+        assert {rule_id: classify_rule(rule).kind for rule_id, rule in rules.items()} == {
+            "legacy-a": RuleFormat.LEGACY_V1,
+            "valid-b": RuleFormat.VALID_V2,
+            "malformed-c": RuleFormat.MALFORMED_V2,
+            "mismatch-d": RuleFormat.MALFORMED_V2,
+        }
+        assert [rule["rule_id"] for rule in store.match_feature({
+            **legacy,
+            "schema_version": "approved_rule_v1",
+        })] == ["legacy-a"]
+        assert [rule["rule_id"] for rule in store.match_feature({
+            "feature_type": "kernel_error",
+            "problem_code": "linux.memory.oom",
+            "components": ["kernel"],
+            "source_templates": [{"template_hash": "hash-b", "category": "kernel"}],
+        })] == ["valid-b"]
     finally:
         with psycopg.connect(base_url, autocommit=True) as connection:
             connection.execute('DROP SCHEMA IF EXISTS "' + schema + '" CASCADE')

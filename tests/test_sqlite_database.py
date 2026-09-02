@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import sqlite3
 import shutil
+import json
 from pathlib import Path
 
+from logrisk.approval_dedup import build_approval_key
+from logrisk.approved_rules import RuleFormat, classify_rule
 from logrisk.database import SQLiteDatabase
+from logrisk.sqlite_stores import SQLiteApprovedRuleStore
 
 
 def test_database_applies_migrations_and_enables_safety_pragmas(tmp_path):
@@ -62,7 +66,7 @@ def test_database_migration_is_idempotent(tmp_path):
     with sqlite3.connect(path) as connection:
         count = connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0]
 
-    assert count == 20
+    assert count == 21
 
 
 def test_extension_provider_migration_upgrades_existing_connection_and_profile(tmp_path):
@@ -171,7 +175,7 @@ def test_qwen_9b_profile_migration_seeds_existing_database_without_changing_defa
 def test_schema_dictionary_describes_rule_lifecycle_tables():
     schema = Path("database/schema.yaml").read_text(encoding="utf-8")
 
-    assert "schema_version: 20" in schema
+    assert "schema_version: 21" in schema
     assert 'candidate_job: "feature_candidates.(candidate_id, job_id) ON DELETE RESTRICT"' in schema
     assert "uq_feature_candidates_candidate_job(candidate_id, job_id)" in schema
     assert "rule_versions:" in schema
@@ -218,3 +222,86 @@ def test_rule_governance_migration_versions_existing_rules_with_lifecycle_defaul
     assert version == 1
     assert '"schema_version":"approved_rule_v2"' in snapshot
     assert '"status":"active"' in snapshot
+
+
+def test_approved_rule_classification_migration_normalizes_only_unmarked_legacy_rows(tmp_path):
+    migrations = tmp_path / "migrations"
+    migrations.mkdir()
+    for source in sorted(Path("database/migrations").glob("*.sql")):
+        if source.name != "0021_approved_rule_classification.sql":
+            shutil.copy(source, migrations / source.name)
+    path = tmp_path / "logrisk.sqlite3"
+    database = SQLiteDatabase(path, migrations_dir=migrations)
+    legacy = {
+        "rule_id": "legacy-a",
+        "signature": "sig-a",
+        "feature_type": "kernel_error",
+        "components": ["kernel"],
+        "template_signatures": [{"template_hash": "hash-a", "category": "kernel"}],
+    }
+    valid_v2 = {
+        "rule_id": "valid-b",
+        "signature": "sig-b",
+        "feature_type": "kernel_error",
+        "components": ["kernel"],
+        "template_signatures": [{"template_hash": "hash-b", "category": "kernel"}],
+        "problem_code": "linux.memory.oom",
+        "approval_key": build_approval_key("kernel_error", "linux.memory.oom", ["kernel"], []),
+        "match_mode": "semantic",
+        "status": "active",
+        "current_version": 1,
+        "schema_version": "approved_rule_v2",
+    }
+    malformed_v2 = {
+        **valid_v2,
+        "rule_id": "malformed-c",
+        "signature": "sig-c",
+        "approval_key": "appr-c",
+        "match_mode": "unsupported",
+        "schema_version": "approved_rule_v2",
+    }
+    with database.transaction() as connection:
+        for rule in (legacy, valid_v2, malformed_v2):
+            connection.execute(
+                "INSERT INTO approved_rules(rule_id, signature, feature_type, rule_json, approved_at, updated_at, status, current_version, next_review_at, schema_version, problem_code, approval_key) "
+                "VALUES (?, ?, ?, ?, ?, ?, 'active', 1, NULL, 'approved_rule_v2', ?, ?)",
+                (
+                    rule["rule_id"], rule["signature"], rule["feature_type"], json.dumps(rule),
+                    "2026-07-01T00:00:00+00:00", "2026-07-01T00:00:00+00:00",
+                    rule.get("problem_code"), rule.get("approval_key"),
+                ),
+            )
+    shutil.copy("database/migrations/0021_approved_rule_classification.sql", migrations / "0021_approved_rule_classification.sql")
+
+    upgraded = SQLiteDatabase(path, migrations_dir=migrations)
+
+    with upgraded.connect() as connection:
+        rows = connection.execute(
+            "SELECT rule_id, schema_version, problem_code, approval_key, rule_json FROM approved_rules ORDER BY rule_id"
+        ).fetchall()
+    values = {row[0]: row for row in rows}
+    assert tuple(values["legacy-a"][1:4]) == ("approved_rule_v1", None, None)
+    assert json.loads(values["legacy-a"][4])["schema_version"] == "approved_rule_v1"
+    assert tuple(values["valid-b"][1:4]) == ("approved_rule_v2", "linux.memory.oom", valid_v2["approval_key"])
+    assert tuple(values["malformed-c"][1:4]) == ("approved_rule_v2", "linux.memory.oom", "appr-c")
+
+    store = SQLiteApprovedRuleStore(upgraded)
+    assert [item["rule_id"] for item in store.match_feature({
+        **legacy,
+        "schema_version": "approved_rule_v1",
+    })] == ["legacy-a"]
+    assert [item["rule_id"] for item in store.match_feature({
+        "feature_type": "kernel_error",
+        "problem_code": "linux.memory.oom",
+        "components": ["kernel"],
+        "source_templates": [{"template_hash": "hash-b", "category": "kernel"}],
+    })] == ["valid-b"]
+    classifications = {
+        rule["rule_id"]: classify_rule(rule).kind
+        for rule in store._read_locked()
+    }
+    assert classifications == {
+        "legacy-a": RuleFormat.LEGACY_V1,
+        "valid-b": RuleFormat.VALID_V2,
+        "malformed-c": RuleFormat.MALFORMED_V2,
+    }

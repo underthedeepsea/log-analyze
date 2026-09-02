@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import multiprocessing
+import json
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -22,6 +23,18 @@ from logrisk.sqlite_stores import (
 )
 from logrisk.input_jobs import InputJobConfig
 from logrisk.upload_sessions import UploadConfig
+
+
+def feature() -> dict[str, object]:
+    return {
+        "feature_type": "kernel_error",
+        "title": "内核错误",
+        "summary": "检测到内核错误",
+        "importance": "high",
+        "tags": ["内核"],
+        "components": ["kernel"],
+        "source_templates": [{"template_hash": "hash-1", "category": "kernel"}],
+    }
 
 
 class _DelayedFileFeatureJobStore(FeatureJobFileStore):
@@ -488,6 +501,68 @@ def test_sqlite_trace_cache_metrics_and_rules_survive_new_store_instances(tmp_pa
             (saved["rule_id"],),
         ).fetchone()
     assert tuple(version) == (1, "rule_created")
+
+
+def test_sqlite_rule_store_projects_v1_identity_columns_as_null(tmp_path):
+    database = SQLiteDatabase(tmp_path / "logrisk.sqlite3")
+    store = SQLiteApprovedRuleStore(database)
+    saved = store.upsert_feature(feature())
+    saved["schema_version"] = "approved_rule_v1"
+    store._write_locked([saved])
+
+    with database.connect() as connection:
+        projection = connection.execute(
+            "SELECT schema_version, problem_code, approval_key FROM approved_rules WHERE rule_id=?",
+            (saved["rule_id"],),
+        ).fetchone()
+    assert tuple(projection) == ("approved_rule_v1", None, None)
+
+
+@pytest.mark.parametrize("conflict", ["schema", "approval_key", "signature", "v1_projection"])
+def test_sqlite_rule_reader_fail_closes_db_json_identity_conflicts(tmp_path, conflict):
+    database = SQLiteDatabase(tmp_path / "logrisk.sqlite3")
+    store = SQLiteApprovedRuleStore(database)
+    saved = store.upsert_feature(feature())
+    with database.connect() as connection:
+        payload = json.loads(connection.execute(
+            "SELECT rule_json FROM approved_rules WHERE rule_id=?", (saved["rule_id"],)
+        ).fetchone()[0])
+    if conflict == "schema":
+        payload["schema_version"] = "approved_rule_v1"
+        input_feature = feature()
+    elif conflict == "approval_key":
+        payload["approval_key"] = "appr-json-corrupt"
+        input_feature = feature()
+    elif conflict == "signature":
+        payload["signature"] = "sig-json-corrupt"
+        input_feature = feature()
+    else:
+        payload["schema_version"] = "approved_rule_v1"
+        input_feature = {**feature(), "schema_version": "approved_rule_v1", "approval_key": saved["approval_key"]}
+
+    with database.transaction() as connection:
+        if conflict == "schema":
+            connection.execute(
+                "UPDATE approved_rules SET rule_json=? WHERE rule_id=?",
+                (json.dumps(payload, ensure_ascii=False), saved["rule_id"]),
+            )
+        elif conflict == "approval_key":
+            connection.execute(
+                "UPDATE approved_rules SET rule_json=? WHERE rule_id=?",
+                (json.dumps(payload, ensure_ascii=False), saved["rule_id"]),
+            )
+        elif conflict == "signature":
+            connection.execute(
+                "UPDATE approved_rules SET rule_json=? WHERE rule_id=?",
+                (json.dumps(payload, ensure_ascii=False), saved["rule_id"]),
+            )
+        else:
+            connection.execute(
+                "UPDATE approved_rules SET rule_json=?, schema_version='approved_rule_v1', problem_code=NULL, approval_key=? WHERE rule_id=?",
+                (json.dumps(payload, ensure_ascii=False), saved["approval_key"], saved["rule_id"]),
+            )
+
+    assert store.match_feature(input_feature) == []
 
 
 def test_sqlite_rule_store_only_matches_active_rules(tmp_path):

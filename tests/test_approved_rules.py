@@ -2,7 +2,15 @@ import json
 
 import pytest
 
-from logrisk.approved_rules import ApprovedRuleError, ApprovedRuleStore
+from logrisk.approved_rules import (
+    ApprovedRuleError,
+    ApprovedRuleIntegrityError,
+    ApprovedRuleStore,
+    RuleFormat,
+    RuleNormalizationSource,
+    classify_rule,
+    normalize_legacy_rule_version,
+)
 
 
 def feature(title="内存压力"):
@@ -426,3 +434,101 @@ def test_inactive_rule_gets_distinct_active_replacement_with_lineage(tmp_path):
     assert repeated["rule_id"] == replacement["rule_id"]
     assert rules[predecessor["rule_id"]]["status"] == "disabled"
     assert rules[replacement["rule_id"]]["status"] == "active"
+
+
+def test_runtime_classifier_requires_explicit_version_but_trusted_legacy_boundary_normalizes():
+    unversioned = {
+        "rule_id": "legacy-rule",
+        "signature": "legacy-signature",
+        "feature_type": "kernel_error",
+    }
+
+    assert classify_rule(unversioned).kind == RuleFormat.MALFORMED_V2
+
+    normalized = normalize_legacy_rule_version(
+        unversioned,
+        source=RuleNormalizationSource.LEGACY_IMPORT,
+    )
+
+    assert normalized["schema_version"] == "approved_rule_v1"
+    assert classify_rule(normalized).kind == RuleFormat.LEGACY_V1
+
+
+def test_legacy_file_load_normalizes_in_memory_without_rewriting(tmp_path):
+    store = ApprovedRuleStore(tmp_path / "rules.json")
+    legacy = {
+        "rule_id": "legacy-file-rule",
+        "signature": "legacy-file-signature",
+        "feature_type": "kernel_error",
+        "components": ["kernel"],
+        "template_signatures": [{"template_hash": "hash-legacy", "category": "kernel"}],
+    }
+    store._write_locked([legacy])
+
+    loaded = store.load_legacy_file()
+
+    assert loaded[0]["schema_version"] == "approved_rule_v1"
+    assert "schema_version" not in store.list_rules()[0]
+
+
+def test_classifier_accepts_explicit_v1_and_valid_semantic_and_template_set_v2(tmp_path):
+    store = ApprovedRuleStore(tmp_path / "rules.json")
+    semantic = store.upsert_feature(cni_feature())
+    template_set = store.upsert_feature(feature())
+    explicit_v1 = {**template_set, "schema_version": "approved_rule_v1"}
+
+    assert classify_rule(explicit_v1).kind == RuleFormat.LEGACY_V1
+    assert classify_rule(semantic).kind == RuleFormat.VALID_V2
+    assert classify_rule(template_set).kind == RuleFormat.VALID_V2
+
+
+@pytest.mark.parametrize("damage", ["missing_match_mode", "bad_approval_key", "missing_templates", "unknown_schema"])
+def test_classifier_rejects_malformed_v2_without_downgrading(damage, tmp_path):
+    store = ApprovedRuleStore(tmp_path / "rules.json")
+    value = store.upsert_feature(feature())
+    if damage == "missing_match_mode":
+        value.pop("match_mode")
+    elif damage == "bad_approval_key":
+        value["approval_key"] = "appr-corrupt"
+    elif damage == "missing_templates":
+        value.pop("template_signatures")
+    else:
+        value["schema_version"] = "approved_rule_v9"
+
+    classification = classify_rule(value)
+
+    assert classification.kind == RuleFormat.MALFORMED_V2
+    assert classification.integrity_errors
+
+
+def test_malformed_v2_never_enters_legacy_matching(tmp_path):
+    store = ApprovedRuleStore(tmp_path / "rules.json")
+    malformed = store.upsert_feature(feature())
+    malformed.update({
+        "schema_version": "approved_rule_v2",
+        "match_mode": "unsupported",
+        "approval_key": "legacy-key",
+        "signature": "legacy-signature",
+    })
+    store._write_locked([malformed])
+
+    legacy_input = feature()
+    legacy_input.update({"schema_version": "approved_rule_v1", "approval_key": "legacy-key"})
+
+    assert store.match_feature(legacy_input) == []
+    assert store.match_entity(entity()) == []
+
+
+def test_malformed_v2_identity_conflict_blocks_duplicate_approval(tmp_path):
+    store = ApprovedRuleStore(tmp_path / "rules.json")
+    malformed = store.upsert_feature(feature())
+    malformed.pop("match_mode")
+    store._write_locked([malformed])
+
+    with pytest.raises(ApprovedRuleIntegrityError) as error:
+        store.upsert_feature(feature())
+
+    assert error.value.code == "malformed_rule_identity_conflict"
+    assert error.value.status_code == 409
+    assert error.value.rule_id == malformed["rule_id"]
+    assert len(store.list_rules()) == 1

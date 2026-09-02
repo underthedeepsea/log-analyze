@@ -10,7 +10,13 @@ from typing import Any, Callable
 
 from logrisk.ai_harness.trace_logger import AITraceLogger
 from logrisk.approval_dedup import group_id_for_key
-from logrisk.approved_rules import ApprovedRuleStore
+from logrisk.approved_rules import (
+    ApprovedRuleStore,
+    RuleFormat,
+    classify_rule,
+    hydrate_persisted_rule,
+    public_rule,
+)
 from logrisk.database import Database, SQLiteDatabase, utc_now
 from logrisk.feature_jobs import (
     FeatureJobError,
@@ -444,30 +450,42 @@ class SQLiteApprovedRuleStore(ApprovedRuleStore):
     def _read_locked(self) -> list[dict[str, Any]]:
         with self.database.connect() as connection:
             rows = connection.execute(
-                "SELECT rule_id, rule_json, status, current_version, next_review_at, schema_version, approved_at, updated_at, "
+                "SELECT rule_id, signature, feature_type, rule_json, status, current_version, next_review_at, schema_version, approved_at, updated_at, "
                 "problem_code, approval_key "
                 "FROM approved_rules ORDER BY rule_id"
             )
             rules = []
             for row in rows:
-                rule = json.loads(row["rule_json"])
-                rule.update({
-                    "status": row["status"],
-                    "current_version": int(row["current_version"]),
-                    "next_review_at": row["next_review_at"],
-                    "schema_version": row["schema_version"],
-                    "approved_at": row["approved_at"],
-                    "created_at": rule.get("created_at") or row["approved_at"],
-                    "updated_at": row["updated_at"],
-                    "problem_code": row["problem_code"] or rule.get("problem_code"),
-                    "approval_key": row["approval_key"] or rule.get("approval_key"),
-                })
-                rules.append(rule)
+                rules.append(hydrate_persisted_rule(
+                    row["rule_json"],
+                    persisted_projection={
+                        "rule_id": row["rule_id"],
+                        "signature": row["signature"] if "signature" in row.keys() else None,
+                        "feature_type": row["feature_type"] if "feature_type" in row.keys() else None,
+                        "schema_version": row["schema_version"],
+                        "problem_code": row["problem_code"],
+                        "approval_key": row["approval_key"],
+                    },
+                    lifecycle={
+                        "status": row["status"],
+                        "current_version": int(row["current_version"]),
+                        "next_review_at": row["next_review_at"],
+                        "approved_at": row["approved_at"],
+                        "updated_at": row["updated_at"],
+                    },
+                ))
             return rules
 
     def _write_locked(self, rules: list[dict[str, Any]]) -> None:
         with self.database.transaction() as connection:
             for rule in rules:
+                persisted = public_rule(rule)
+                schema_version = str(persisted.get("schema_version") or "").strip()
+                if not schema_version:
+                    raise ValueError("批准规则缺少 schema_version，不能在运行时自动归一化")
+                projection = (None, None) if schema_version == "approved_rule_v1" or classify_rule(persisted).kind == RuleFormat.LEGACY_V1 else (
+                    persisted.get("problem_code"), persisted.get("approval_key")
+                )
                 connection.execute(
                     "INSERT INTO approved_rules(rule_id, signature, feature_type, rule_json, approved_at, updated_at, "
                     "status, current_version, next_review_at, schema_version, problem_code, approval_key) "
@@ -477,22 +495,22 @@ class SQLiteApprovedRuleStore(ApprovedRuleStore):
                     "current_version=excluded.current_version, next_review_at=excluded.next_review_at, "
                     "schema_version=excluded.schema_version, problem_code=excluded.problem_code, approval_key=excluded.approval_key",
                     (
-                        rule["rule_id"], rule["signature"], rule["feature_type"], _json(rule),
-                        rule["approved_at"], rule["updated_at"], rule.get("status", "active"),
-                        int(rule.get("current_version") or 1), rule.get("next_review_at"),
-                        rule.get("schema_version", "approved_rule_v2"), rule.get("problem_code"), rule.get("approval_key"),
+                        persisted["rule_id"], persisted["signature"], persisted["feature_type"], _json(persisted),
+                        persisted["approved_at"], persisted["updated_at"], persisted.get("status", "active"),
+                        int(persisted.get("current_version") or 1), persisted.get("next_review_at"),
+                        schema_version, projection[0], projection[1],
                     ),
                 )
-                version = int(rule.get("current_version") or 1)
+                version = int(persisted.get("current_version") or 1)
                 change_type = "rule_created" if version == 1 else "rule_updated"
                 created = connection.execute(
                     "INSERT INTO rule_versions(rule_id, version, rule_json, change_type, change_reason, "
                     "operator, created_at, schema_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
                     "ON CONFLICT(rule_id, version) DO NOTHING",
                     (
-                        rule["rule_id"], version, _json(rule), change_type,
+                        persisted["rule_id"], version, _json(persisted), change_type,
                         "人工批准特征" if version == 1 else "人工审批更新规则",
-                        "manual-approval", rule["updated_at"], "rule_version_v1",
+                        "manual-approval", persisted["updated_at"], "rule_version_v1",
                     ),
                 )
                 if created.rowcount:
@@ -500,10 +518,10 @@ class SQLiteApprovedRuleStore(ApprovedRuleStore):
                         "INSERT INTO rule_audit_events(event_id, rule_id, event_type, from_version, to_version, "
                         "event_json, operator, created_at, schema_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         (
-                            f"rule-event-{uuid.uuid4().hex}", rule["rule_id"], change_type,
+                            f"rule-event-{uuid.uuid4().hex}", persisted["rule_id"], change_type,
                             version - 1 if version > 1 else None, version,
                             _json({"reason": "人工审批写入规则库"}), "manual-approval",
-                            rule["updated_at"], "rule_audit_event_v1",
+                            persisted["updated_at"], "rule_audit_event_v1",
                         ),
                     )
 

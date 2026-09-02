@@ -5,7 +5,9 @@ import hashlib
 import json
 import os
 import threading
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Dict
 
@@ -23,7 +25,53 @@ class ApprovedRuleError(RuntimeError):
     """Raised when the approved-rule state cannot be read or written safely."""
 
 
+class ApprovedRuleIntegrityError(ApprovedRuleError):
+    """Raised when a malformed rule occupies an approval identity."""
+
+    def __init__(
+        self,
+        message: str = "存在损坏规则占用了当前审批 identity，需先完成规则治理修复",
+        *,
+        rule_id: Any = None,
+        approval_key: Any = None,
+        signature: Any = None,
+        integrity_errors: tuple[str, ...] = (),
+        code: str = "malformed_rule_identity_conflict",
+        status_code: int = 409,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.status_code = status_code
+        self.rule_id = str(rule_id or "") or None
+        self.approval_key = str(approval_key or "") or None
+        self.signature = str(signature or "") or None
+        self.integrity_errors = tuple(integrity_errors)
+
+
+class RuleFormat(str, Enum):
+    LEGACY_V1 = "legacy_v1"
+    VALID_V2 = "valid_v2"
+    MALFORMED_V2 = "malformed_v2"
+
+
+class RuleNormalizationSource(str, Enum):
+    DATABASE_MIGRATION = "database_migration"
+    LEGACY_IMPORT = "legacy_import"
+    LEGACY_FILE = "legacy_file"
+
+
+@dataclass(frozen=True)
+class RuleClassification:
+    kind: RuleFormat
+    integrity_errors: tuple[str, ...] = ()
+
+
 _PROCESS_LOCK = threading.RLock()
+
+_LEGACY_SCHEMA_VERSION = "approved_rule_v1"
+_V2_SCHEMA_VERSION = "approved_rule_v2"
+_RULE_INTEGRITY_ERRORS_KEY = "__logrisk_rule_integrity_errors"
+_RULE_STATUSES = {"active", "disabled", "under_review", "deprecated", "archived"}
 
 
 def _now() -> str:
@@ -136,28 +184,276 @@ def _rule_canonical_approval_key(rule: Dict[str, Any]) -> str:
     )
 
 
-def _is_v2_rule(rule: Dict[str, Any]) -> bool:
-    if str(rule.get("schema_version") or "") != "approved_rule_v2":
-        return False
-    if rule.get("match_mode") not in {None, "semantic", "template_set"}:
-        return False
-    expected = _rule_canonical_approval_key(rule)
-    canonical = str(rule.get("canonical_approval_key") or "").strip()
-    stored = str(rule.get("approval_key") or "").strip()
-    return canonical == expected or (not canonical and stored == expected)
+def _nonempty_text(value: Any) -> bool:
+    return isinstance(value, str) and bool(value.strip())
 
 
-def _is_semantic_v2_rule(rule: Dict[str, Any]) -> bool:
-    return _is_v2_rule(rule) and (
-        rule.get("match_mode") == "semantic"
-        or (rule.get("match_mode") is None and bool(rule.get("approval_key")))
+def _has_value(value: Any) -> bool:
+    if isinstance(value, str):
+        return bool(value.strip())
+    return value is not None and value != [] and value != {} and value != ()
+
+
+def has_v2_identity_markers(rule: dict[str, Any]) -> bool:
+    """Return whether a rule carries any identity field introduced by V2."""
+
+    if not isinstance(rule, dict):
+        return False
+    for field in (
+        "approval_key",
+        "canonical_approval_key",
+        "problem_code",
+        "problemCode",
+        "match_mode",
+        "risk_type",
+        "cause",
+        "template_storage_key",
+        "strict_storage_key",
+    ):
+        if _has_value(rule.get(field)):
+            return True
+    for field in (
+        "anchor_signatures",
+        "supporting_signatures",
+        "component_scope",
+    ):
+        if field in rule and rule[field] is not None:
+            return True
+    for field in ("risk_semantic", "semantic_fields"):
+        if _has_value(rule.get(field)):
+            return True
+    return False
+
+
+def _key_matches_expected(stored: str, expected: str) -> bool:
+    return stored == expected or stored.startswith(f"{expected}:replacement-")
+
+
+def _valid_text_list(value: Any) -> bool:
+    return isinstance(value, list) and all(_nonempty_text(item) for item in value)
+
+
+def _valid_template_list(value: Any) -> bool:
+    return isinstance(value, list) and all(
+        isinstance(item, dict)
+        and _nonempty_text(item.get("template_fingerprint") or item.get("template_hash"))
+        and ("category" not in item or isinstance(item.get("category"), str))
+        for item in value
     )
 
 
+def _rule_identity(rule: Dict[str, Any]) -> Dict[str, Any]:
+    problem_code = normalize_problem_code(rule.get("problem_code"))
+    components = _legacy_components(rule)
+    anchors = {
+        str(item).strip()
+        for item in (rule.get("anchor_signatures") or [])
+        if str(item).strip()
+    }
+    return {
+        "problem_code": problem_code,
+        "approval_key": build_approval_key(
+            rule.get("feature_type"), problem_code,
+            sorted(components), sorted(anchors),
+        ),
+        "component_scope": sorted(components),
+        "anchor_signatures": sorted(anchors),
+        "match_mode": rule.get("match_mode"),
+    }
+
+
+def validate_v2_rule(rule: dict[str, Any]) -> tuple[str, ...]:
+    """Validate the persisted V2 identity without repairing any field."""
+
+    errors: list[str] = []
+    if not isinstance(rule, dict):
+        return ("rule_not_object",)
+    if rule.get("schema_version") != _V2_SCHEMA_VERSION:
+        errors.append("schema_version_invalid")
+    for field in ("rule_id", "signature", "feature_type", "approval_key"):
+        if not _nonempty_text(rule.get(field)):
+            errors.append(f"{field}_missing")
+    if normalize_feature_type(rule.get("feature_type")) == "unknown_feature":
+        errors.append("feature_type_invalid")
+    for field in ("components", "component_scope", "anchor_signatures"):
+        if field in rule and rule[field] is not None and not _valid_text_list(rule[field]):
+            errors.append(f"{field}_invalid")
+    for field in ("source_templates", "template_signatures"):
+        if field in rule and rule[field] is not None and not _valid_template_list(rule[field]):
+            errors.append(f"{field}_invalid")
+    if (
+        "supporting_signatures" in rule
+        and rule["supporting_signatures"] is not None
+        and not isinstance(rule["supporting_signatures"], list)
+    ):
+        errors.append("supporting_signatures_invalid")
+    status = str(rule.get("status") or "")
+    if status not in _RULE_STATUSES:
+        errors.append("status_invalid")
+    current_version = rule.get("current_version")
+    if isinstance(current_version, bool) or not isinstance(current_version, int) or current_version < 1:
+        errors.append("current_version_invalid")
+    match_mode = rule.get("match_mode")
+    if match_mode not in {"semantic", "template_set"}:
+        errors.append("match_mode_missing_or_invalid")
+    problem_code = normalize_problem_code(rule.get("problem_code"))
+    if not problem_code:
+        errors.append("problem_code_missing")
+
+    if match_mode == "semantic":
+        if not is_canonical_problem_code(problem_code):
+            errors.append("semantic_problem_code_invalid")
+        expected = build_approval_key(
+            rule.get("feature_type"), problem_code,
+            rule.get("components") or rule.get("component_scope") or [],
+            rule.get("anchor_signatures") or [],
+        )
+        stored = str(rule.get("approval_key") or "").strip()
+        if not _key_matches_expected(stored, expected):
+            errors.append("approval_key_mismatch")
+        canonical = str(rule.get("canonical_approval_key") or "").strip()
+        if canonical and canonical != expected:
+            errors.append("canonical_approval_key_mismatch")
+    elif match_mode == "template_set":
+        if not _legacy_components(rule):
+            errors.append("template_set_components_missing")
+        if "anchor_signatures" not in rule or not isinstance(rule.get("anchor_signatures"), list):
+            errors.append("template_set_anchors_missing")
+        if not _v2_template_pairs(rule):
+            errors.append("template_set_templates_missing")
+        identity = _rule_identity(rule)
+        expected = _template_set_storage_key(rule, identity)
+        stored = str(rule.get("approval_key") or "").strip()
+        base_expected = identity["approval_key"]
+        if not (_key_matches_expected(stored, expected) or _key_matches_expected(stored, base_expected)):
+            errors.append("approval_key_mismatch")
+        for field in ("template_storage_key", "strict_storage_key"):
+            if field in rule and rule[field] is not None:
+                if (
+                    not _nonempty_text(rule[field])
+                    or not _key_matches_expected(str(rule[field]).strip(), expected)
+                ):
+                    errors.append(f"{field}_mismatch")
+        canonical = str(rule.get("canonical_approval_key") or "").strip()
+        if is_canonical_problem_code(problem_code):
+            if canonical != base_expected:
+                errors.append("canonical_approval_key_mismatch")
+        elif canonical:
+            errors.append("canonical_approval_key_unexpected")
+    return tuple(dict.fromkeys(errors))
+
+
+def _projection_errors(rule: dict[str, Any], projection: dict[str, Any]) -> tuple[str, ...]:
+    errors: list[str] = []
+    json_schema = str(rule.get("schema_version") or "").strip()
+    db_schema = str(projection.get("schema_version") or "").strip()
+    if not json_schema and db_schema == _LEGACY_SCHEMA_VERSION:
+        if has_v2_identity_markers(rule):
+            errors.append("unversioned_v2_identity_markers")
+        json_schema = _LEGACY_SCHEMA_VERSION
+    elif json_schema != db_schema:
+        errors.append("schema_version_projection_mismatch")
+
+    for field in ("rule_id", "signature", "feature_type"):
+        json_value = str(rule.get(field) or "").strip()
+        db_value = str(projection.get(field) or "").strip()
+        if json_value and db_value and json_value != db_value:
+            errors.append(f"{field}_projection_mismatch")
+
+    if db_schema == _LEGACY_SCHEMA_VERSION:
+        for field in ("problem_code", "approval_key"):
+            if projection.get(field) is not None:
+                errors.append(f"v1_{field}_projection_not_null")
+    elif db_schema == _V2_SCHEMA_VERSION:
+        for field in ("problem_code", "approval_key"):
+            json_value = str(rule.get(field) or "").strip()
+            db_value = str(projection.get(field) or "").strip()
+            if json_value != db_value:
+                errors.append(f"{field}_projection_mismatch")
+    return tuple(dict.fromkeys(errors))
+
+
+def classify_rule(
+    rule: dict[str, Any],
+    *,
+    persisted_projection: dict[str, Any] | None = None,
+) -> RuleClassification:
+    """Classify a rule without treating malformed V2 data as legacy V1."""
+
+    if not isinstance(rule, dict):
+        return RuleClassification(RuleFormat.MALFORMED_V2, ("rule_not_object",))
+    errors = list(rule.get(_RULE_INTEGRITY_ERRORS_KEY) or ())
+    candidate = rule
+    if persisted_projection is not None:
+        errors.extend(_projection_errors(rule, persisted_projection))
+        if not str(rule.get("schema_version") or "").strip() and str(persisted_projection.get("schema_version") or "") == _LEGACY_SCHEMA_VERSION:
+            candidate = {**rule, "schema_version": _LEGACY_SCHEMA_VERSION}
+    version = str(candidate.get("schema_version") or "").strip()
+    if version == _LEGACY_SCHEMA_VERSION:
+        if errors:
+            return RuleClassification(RuleFormat.MALFORMED_V2, tuple(dict.fromkeys(errors)))
+        return RuleClassification(RuleFormat.LEGACY_V1)
+    if version == _V2_SCHEMA_VERSION:
+        errors.extend(validate_v2_rule(candidate))
+    else:
+        errors.append("schema_version_missing_or_unknown")
+    if version == _V2_SCHEMA_VERSION and not errors:
+        return RuleClassification(RuleFormat.VALID_V2)
+    return RuleClassification(RuleFormat.MALFORMED_V2, tuple(dict.fromkeys(errors)))
+
+
+def normalize_legacy_rule_version(
+    rule: dict[str, Any],
+    *,
+    source: RuleNormalizationSource,
+) -> dict[str, Any]:
+    """Normalize an unversioned rule only at an explicitly trusted legacy boundary."""
+
+    try:
+        RuleNormalizationSource(source)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("不支持的 legacy 规则归一化来源") from exc
+    if not isinstance(rule, dict):
+        raise ApprovedRuleError("legacy 规则必须是 object")
+    normalized = copy.deepcopy(rule)
+    version = str(normalized.get("schema_version") or "").strip()
+    if version == _LEGACY_SCHEMA_VERSION:
+        return normalized
+    if version == _V2_SCHEMA_VERSION:
+        classification = classify_rule(normalized)
+        if classification.kind == RuleFormat.VALID_V2:
+            return normalized
+        raise ApprovedRuleIntegrityError(
+            "legacy 规则声明为 V2 但内容损坏",
+            rule_id=normalized.get("rule_id"),
+            approval_key=normalized.get("approval_key"),
+            signature=normalized.get("signature"),
+            integrity_errors=classification.integrity_errors,
+            code="malformed_rule_version",
+            status_code=422,
+        )
+    if version or has_v2_identity_markers(normalized):
+        raise ApprovedRuleIntegrityError(
+            "legacy 规则版本或 identity 无法安全归一化",
+            rule_id=normalized.get("rule_id"),
+            approval_key=normalized.get("approval_key"),
+            signature=normalized.get("signature"),
+            integrity_errors=("legacy_normalization_not_safe",),
+            code="malformed_rule_version",
+            status_code=422,
+        )
+    normalized["schema_version"] = _LEGACY_SCHEMA_VERSION
+    return normalized
+
+
 def _is_legacy_feature(feature: Dict[str, Any], identity: Dict[str, Any]) -> bool:
-    version = str(feature.get("schema_version") or "")
-    if version and version != "approved_rule_v2":
+    version = str(feature.get("schema_version") or "").strip()
+    if version == _LEGACY_SCHEMA_VERSION:
         return True
+    if version and version != _V2_SCHEMA_VERSION:
+        return True
+    if version == _V2_SCHEMA_VERSION:
+        return False
     key = str(feature.get("approval_key") or "").strip()
     canonical_key = str(feature.get("canonical_approval_key") or "").strip()
     return bool(key and key != identity["approval_key"] and canonical_key != identity["approval_key"])
@@ -255,6 +551,61 @@ def _v2_template_pairs(value: Dict[str, Any]) -> set[tuple[str, str]]:
     }
 
 
+def _persistable_rule(rule: Dict[str, Any]) -> Dict[str, Any]:
+    value = copy.deepcopy(rule)
+    value.pop(_RULE_INTEGRITY_ERRORS_KEY, None)
+    return value
+
+
+def public_rule(rule: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a rule without internal DB consistency diagnostics."""
+
+    return _persistable_rule(rule)
+
+
+def hydrate_persisted_rule(
+    rule_json: Any,
+    *,
+    persisted_projection: dict[str, Any],
+    lifecycle: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Hydrate lifecycle metadata while keeping JSON identity authoritative for comparison."""
+
+    if isinstance(rule_json, str):
+        try:
+            rule = json.loads(rule_json)
+        except json.JSONDecodeError as exc:
+            raise ApprovedRuleError("批准规则 JSON 无效") from exc
+    else:
+        rule = copy.deepcopy(rule_json)
+    if not isinstance(rule, dict):
+        raise ApprovedRuleError("批准规则 JSON 必须是 object")
+    lifecycle_values = dict(lifecycle or {})
+    if (
+        not str(rule.get("schema_version") or "").strip()
+        and str(persisted_projection.get("schema_version") or "") == _LEGACY_SCHEMA_VERSION
+        and not has_v2_identity_markers(rule)
+    ):
+        rule["schema_version"] = _LEGACY_SCHEMA_VERSION
+    candidate = {**rule, **{
+        field: value
+        for field, value in lifecycle_values.items()
+        if field in {"status", "current_version", "next_review_at", "approved_at", "updated_at"}
+    }}
+    classification = classify_rule(candidate, persisted_projection=persisted_projection)
+    if classification.kind == RuleFormat.MALFORMED_V2:
+        rule[_RULE_INTEGRITY_ERRORS_KEY] = classification.integrity_errors
+    rule.update({
+        field: value
+        for field, value in lifecycle_values.items()
+        if field in {"status", "current_version", "next_review_at", "approved_at", "updated_at"}
+    })
+    if "current_version" in rule and rule["current_version"] is not None:
+        rule["current_version"] = int(rule["current_version"])
+    rule.setdefault("created_at", rule.get("approved_at"))
+    return rule
+
+
 def _template_set_storage_key(feature: Dict[str, Any], identity: Dict[str, Any]) -> str:
     if identity["match_mode"] != "template_set" or not is_canonical_problem_code(identity["problem_code"]):
         return identity["approval_key"]
@@ -282,6 +633,7 @@ def _template_set_rule_complete(rule: Dict[str, Any]) -> bool:
         and normalize_feature_type(rule.get("feature_type")) != "unknown_feature"
         and bool(_legacy_components(rule))
         and "anchor_signatures" in rule
+        and bool(_v2_template_pairs(rule))
     )
 
 
@@ -290,7 +642,7 @@ def _v2_exact_feature_match(
     feature: Dict[str, Any],
     identity: Dict[str, Any],
 ) -> bool:
-    if not _is_v2_rule(rule):
+    if classify_rule(rule).kind != RuleFormat.VALID_V2:
         return False
     strict_key = _template_set_storage_key(feature, identity)
     keys_match = (
@@ -300,7 +652,7 @@ def _v2_exact_feature_match(
     )
     if not keys_match:
         return False
-    if _is_semantic_v2_rule(rule):
+    if rule.get("match_mode") == "semantic":
         return identity["match_mode"] == "semantic"
     if identity["match_mode"] != "template_set" or not _template_set_rule_complete(rule):
         return False
@@ -345,10 +697,11 @@ def _rule_matches_feature(
 ) -> bool:
     if active_only and not _is_active(rule):
         return False
-    if not _is_v2_rule(rule):
-        if str(rule.get("schema_version") or "") == "approved_rule_v2":
-            return False
+    classification = classify_rule(rule)
+    if classification.kind == RuleFormat.LEGACY_V1:
         return _legacy_feature_matches(rule, feature)
+    if classification.kind != RuleFormat.VALID_V2:
+        return False
     identity = approval_identity(feature, entity)
     if _is_legacy_feature(feature, identity):
         return False
@@ -356,7 +709,7 @@ def _rule_matches_feature(
         return True
     code = derive_problem_code(rule)
     return (
-        _is_semantic_v2_rule(rule)
+        rule.get("match_mode") == "semantic"
         and identity["match_mode"] == "semantic"
         and is_canonical_problem_code(identity["problem_code"])
         and is_canonical_problem_code(code)
@@ -367,12 +720,13 @@ def _rule_matches_feature(
 def _rule_matches_entity(rule: Dict[str, Any], entity: Dict[str, Any]) -> bool:
     if not _is_active(rule):
         return False
-    if not _is_v2_rule(rule):
-        if str(rule.get("schema_version") or "") == "approved_rule_v2":
-            return False
+    classification = classify_rule(rule)
+    if classification.kind == RuleFormat.LEGACY_V1:
         return _legacy_entity_matches(rule, entity)
+    if classification.kind != RuleFormat.VALID_V2:
+        return False
     problem_code = derive_problem_code(rule)
-    if _is_semantic_v2_rule(rule) and is_canonical_problem_code(problem_code):
+    if rule.get("match_mode") == "semantic" and is_canonical_problem_code(problem_code):
         return problem_code == derive_problem_code(entity, entity)
     required = {
         _identity_pair(item)
@@ -437,7 +791,7 @@ class ApprovedRuleStore:
     def _write_locked(self, rules: list[Dict[str, Any]]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         temporary = self.path.with_name(f".{self.path.name}.{os.getpid()}.tmp")
-        payload = {"schema_version": "1.0", "rules": rules}
+        payload = {"schema_version": "1.0", "rules": [_persistable_rule(rule) for rule in rules]}
         try:
             temporary.write_text(
                 json.dumps(payload, ensure_ascii=False, indent=2),
@@ -453,7 +807,16 @@ class ApprovedRuleStore:
 
     def list_rules(self) -> list[Dict[str, Any]]:
         with _PROCESS_LOCK:
-            return copy.deepcopy(self._read_locked())
+            return [public_rule(rule) for rule in self._read_locked()]
+
+    def load_legacy_file(self) -> list[Dict[str, Any]]:
+        """Load a known legacy file without implicitly rewriting it."""
+
+        with _PROCESS_LOCK:
+            return [
+                normalize_legacy_rule_version(rule, source=RuleNormalizationSource.LEGACY_FILE)
+                for rule in self._read_locked()
+            ]
 
     def upsert_feature(self, feature: Dict[str, Any]) -> Dict[str, Any]:
         if not isinstance(feature, dict):
@@ -466,12 +829,36 @@ class ApprovedRuleStore:
         now = self.clock()
         with _PROCESS_LOCK:
             rules = self._read_locked()
+            classified = [(rule, classify_rule(rule)) for rule in rules]
+            incoming_keys = {
+                identity["approval_key"],
+                _template_set_storage_key(feature, identity),
+            }
+            for candidate, classification in classified:
+                if classification.kind != RuleFormat.MALFORMED_V2:
+                    continue
+                candidate_key = str(candidate.get("approval_key") or "").strip()
+                candidate_canonical_key = str(candidate.get("canonical_approval_key") or "").strip()
+                if (
+                    candidate_key in incoming_keys
+                    or candidate_canonical_key in incoming_keys
+                    or candidate.get("signature") == base_signature
+                ):
+                    raise ApprovedRuleIntegrityError(
+                        rule_id=candidate.get("rule_id"),
+                        approval_key=candidate.get("approval_key"),
+                        signature=candidate.get("signature"),
+                        integrity_errors=classification.integrity_errors,
+                    )
             legacy_feature = _is_legacy_feature(feature, identity)
-            active = [rule for rule in rules if _is_active(rule)]
+            active = [rule for rule, classification in classified if _is_active(rule) and classification.kind in {
+                RuleFormat.LEGACY_V1, RuleFormat.VALID_V2,
+            }]
             exact = [
                 rule for rule in rules
                 if not legacy_feature
                 and rule in active
+                and classify_rule(rule).kind == RuleFormat.VALID_V2
                 and _v2_exact_feature_match(rule, feature, identity)
             ]
             existing = _preferred_rule(exact)
@@ -483,8 +870,8 @@ class ApprovedRuleStore:
             ):
                 semantic = [
                     rule for rule in active
-                    if _is_v2_rule(rule)
-                    and _is_semantic_v2_rule(rule)
+                    if classify_rule(rule).kind == RuleFormat.VALID_V2
+                    and rule.get("match_mode") == "semantic"
                     and is_canonical_problem_code(derive_problem_code(rule))
                     and derive_problem_code(rule) == identity["problem_code"]
                 ]
@@ -492,16 +879,19 @@ class ApprovedRuleStore:
             if existing is None and legacy_feature:
                 existing = _preferred_rule([
                     rule for rule in active
-                    if not _is_v2_rule(rule) and _legacy_feature_matches(rule, feature)
+                    if classify_rule(rule).kind == RuleFormat.LEGACY_V1
+                    and _legacy_feature_matches(rule, feature)
                 ])
                 if existing is not None:
                     return copy.deepcopy(existing)
 
             predecessor = None
-            if existing is None:
+            if existing is None and not legacy_feature:
                 predecessor = _preferred_rule([
-                    rule for rule in rules
-                    if not _is_active(rule) and _rule_matches_feature(rule, feature, active_only=False)
+                    rule for rule, classification in classified
+                    if classification.kind == RuleFormat.VALID_V2
+                    and not _is_active(rule)
+                    and _rule_matches_feature(rule, feature, active_only=False)
                 ])
 
             approval_key = (
@@ -588,7 +978,7 @@ class ApprovedRuleStore:
                 rules.append(rule)
             rules.sort(key=lambda item: str(item.get("rule_id")))
             self._write_locked(rules)
-            return copy.deepcopy(rule)
+            return public_rule(rule)
 
     def match_entity(self, entity: Dict[str, Any]) -> list[Dict[str, Any]]:
         with _PROCESS_LOCK:
@@ -598,14 +988,14 @@ class ApprovedRuleStore:
                 if not _rule_matches_entity(rule, entity):
                     continue
                 problem_code = derive_problem_code(rule)
-                if _is_semantic_v2_rule(rule) and is_canonical_problem_code(problem_code):
+                if classify_rule(rule).kind == RuleFormat.VALID_V2 and rule.get("match_mode") == "semantic" and is_canonical_problem_code(problem_code):
                     semantic_matches.setdefault(problem_code, []).append(rule)
                 else:
-                    matches.append(copy.deepcopy(rule))
+                    matches.append(public_rule(rule))
             for code in sorted(semantic_matches):
                 preferred = _preferred_rule(semantic_matches[code])
                 if preferred is not None:
-                    matches.append(copy.deepcopy(preferred))
+                    matches.append(public_rule(preferred))
             return matches
 
     def match_feature(
@@ -622,31 +1012,26 @@ class ApprovedRuleStore:
             if _is_legacy_feature(feature, identity):
                 legacy = _preferred_rule([
                     rule for rule in rules
-                    if not _is_v2_rule(rule) and _legacy_feature_matches(rule, feature)
+                    if classify_rule(rule).kind == RuleFormat.LEGACY_V1
+                    and _legacy_feature_matches(rule, feature)
                 ])
-                return [copy.deepcopy(legacy)] if legacy is not None else []
-            legacy = _preferred_rule([
-                rule for rule in rules
-                if not _is_v2_rule(rule) and _legacy_feature_matches(rule, feature)
-            ])
-            if legacy is not None:
-                return [copy.deepcopy(legacy)]
+                return [public_rule(legacy)] if legacy is not None else []
             exact = _preferred_rule([
                 rule for rule in rules
                 if _v2_exact_feature_match(rule, feature, identity)
             ])
             if exact is not None:
-                return [copy.deepcopy(exact)]
+                return [public_rule(exact)]
             if identity["match_mode"] == "semantic" and is_canonical_problem_code(identity["problem_code"]):
                 semantic = _preferred_rule([
                     rule for rule in rules
-                    if _is_v2_rule(rule)
-                    and _is_semantic_v2_rule(rule)
+                    if classify_rule(rule).kind == RuleFormat.VALID_V2
+                    and rule.get("match_mode") == "semantic"
                     and is_canonical_problem_code(derive_problem_code(rule))
                     and derive_problem_code(rule) == identity["problem_code"]
                 ])
                 if semantic is not None:
-                    return [copy.deepcopy(semantic)]
+                    return [public_rule(semantic)]
             return []
 
     def record_reuse(
@@ -662,7 +1047,12 @@ class ApprovedRuleStore:
             rule = next((item for item in rules if item.get("rule_id") == rule_id), None)
             if rule is None:
                 raise ApprovedRuleError("批准规则不存在")
+            classification = classify_rule(rule)
+            if classification.kind == RuleFormat.MALFORMED_V2:
+                raise ApprovedRuleError("批准规则损坏，不能记录复用")
+            if not _is_active(rule):
+                raise ApprovedRuleError("只有 active 批准规则可以记录复用")
             rule["reuse_count"] = int(rule.get("reuse_count") or 0) + 1
             rule["last_reused_at"] = self.clock()
             self._write_locked(rules)
-            return copy.deepcopy(rule)
+            return public_rule(rule)

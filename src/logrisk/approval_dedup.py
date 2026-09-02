@@ -79,7 +79,17 @@ _UNKNOWN_PROBLEM_CODES = frozenset({
 
 
 def _is_unknown_problem_code(code: str) -> bool:
-    return code in _UNKNOWN_PROBLEM_CODES or code.startswith(("unknown.", "unclassified."))
+    segments = code.split(".")
+    has_unknown_segment = any(
+        segment in {"unknown", "unclassified"}
+        or segment.startswith(("unknown_", "unclassified_"))
+        for segment in segments
+    )
+    return (
+        code in _UNKNOWN_PROBLEM_CODES
+        or code.startswith(("unknown.", "unclassified."))
+        or has_unknown_segment
+    )
 
 
 def normalize_problem_code(value: Any) -> str | None:
@@ -103,7 +113,13 @@ def _iter_values(value: Any) -> list[Any]:
     if isinstance(value, str):
         return [value]
     if isinstance(value, (list, tuple, set)):
-        return list(value)
+        values: list[Any] = []
+        for item in value:
+            if isinstance(item, (list, tuple, set)):
+                values.extend(_iter_values(item))
+            else:
+                values.append(item)
+        return values
     return []
 
 
@@ -159,16 +175,23 @@ def _nested_semantic_values(value: Any) -> Iterable[str]:
     if isinstance(value, str):
         normalized = normalize_problem_code(value)
         return (normalized,) if normalized else ()
+    if isinstance(value, (list, tuple, set)):
+        values: list[str] = []
+        for item in value:
+            values.extend(_nested_semantic_values(item))
+        return values
     if not isinstance(value, Mapping):
         return ()
     values = []
-    for key in ("problem_code", "risk_type", "cause"):
-        item = normalize_problem_code(value.get(key))
-        if item:
-            values.append(item)
-    nested = value.get("risk_semantic")
-    if isinstance(nested, Mapping):
-        values.extend(_nested_semantic_values(nested))
+    for key in (
+        "problem_code",
+        "problemCode",
+        "risk_type",
+        "cause",
+        "risk_semantic",
+        "semantic_fields",
+    ):
+        values.extend(_nested_semantic_values(value.get(key)))
     return values
 
 
@@ -180,23 +203,32 @@ def _append_problem_code(codes: list[str], value: Any) -> None:
             codes.append(normalized)
 
 
-def _keyword_problem_code(text: str) -> str | None:
+def _keyword_problem_codes(text: str) -> list[str]:
     lowered = text.lower()
-    is_cni = bool(re.search(r"\bcni\b|\bsandbox\b|网络配置|网络插件|沙箱", lowered))
+    codes: list[str] = []
+    if re.search(r"oom|out\s+of\s+memory|内存.*(?:耗尽|不足)|内存溢出", lowered):
+        codes.append("linux.memory.oom")
+
+    is_cni = bool(re.search(r"\bcni\b|\bnetwork\b|网络配置|网络插件|网络", lowered))
     if is_cni and re.search(
         r"no[ _-]*(?:(?:enough|free)\s+)?ips?|ip(?:v4)?\s*(?:address|地址)?\s*(?:exhaust|deplet|耗尽)|地址\s*耗尽",
         lowered,
     ):
-        return "kubernetes.cni.ip_exhaustion"
-    if is_cni and re.search(r"syntax|invalid\s+(?:cni|network)|config(?:uration)?\s*(?:syntax\s*)?(?:error|invalid)|语法|配置.*(?:语法|错误)", lowered):
-        return "kubernetes.cni.config_error"
-    if is_cni and re.search(r"failed|failure|error|失败|错误", lowered):
-        return "kubernetes.cni.plugin_failure"
-    if re.search(r"oom|out\s+of\s+memory|内存.*(?:耗尽|不足)|内存溢出", lowered):
-        return "linux.memory.oom"
+        codes.append("kubernetes.cni.ip_exhaustion")
+    if is_cni and re.search(
+        r"syntax|invalid\s+(?:cni|network)|config(?:uration)?\s*(?:syntax\s*)?(?:error|invalid)|语法|配置.*(?:语法|错误)",
+        lowered,
+    ):
+        codes.append("kubernetes.cni.config_error")
+    plugin_context = bool(re.search(
+        r"\bcni\b|network\s+(?:plugin|config(?:uration)?|setup)|network.{0,40}sandbox|网络配置|网络插件|网络.{0,20}沙箱",
+        lowered,
+    ))
+    if plugin_context and re.search(r"failed|failure|error|失败|错误", lowered):
+        codes.append("kubernetes.cni.plugin_failure")
     if re.search(r"pod\s+sandbox|podsandbox|沙箱", lowered) and re.search(r"failed|failure|error|失败|错误", lowered):
-        return "kubernetes.runtime.pod_sandbox_failure"
-    return None
+        codes.append("kubernetes.runtime.pod_sandbox_failure")
+    return list(dict.fromkeys(codes))
 
 
 def _feature_text(feature: Mapping[str, Any], sources: Iterable[Mapping[str, Any]]) -> str:
@@ -205,6 +237,10 @@ def _feature_text(feature: Mapping[str, Any], sources: Iterable[Mapping[str, Any
         feature.get("title"),
         feature.get("summary"),
         feature.get("selection_reason"),
+        feature.get("problem_code"),
+        feature.get("problemCode"),
+        feature.get("risk_type"),
+        feature.get("cause"),
         *[str(item) for item in _iter_values(feature.get("tags"))],
     ]
     for source in sources:
@@ -212,16 +248,27 @@ def _feature_text(feature: Mapping[str, Any], sources: Iterable[Mapping[str, Any
         semantic = source.get("risk_semantic")
         if isinstance(semantic, Mapping):
             values.extend((semantic.get("risk_type"), semantic.get("category"), *[str(item) for item in _iter_values(semantic.get("tags"))]))
+        values.append(source.get("cause"))
     return " ".join(str(value) for value in values if value is not None)
 
 
 def _has_semantic_identity(feature: Mapping[str, Any], sources: Iterable[Mapping[str, Any]]) -> bool:
-    if any(normalize_problem_code(feature.get(field)) for field in ("problem_code", "problemCode", "risk_type")):
+    if any(normalize_problem_code(feature.get(field)) for field in ("problem_code", "problemCode", "risk_type", "cause")):
         return True
     if any(_nested_semantic_values(value) for value in (feature.get("semantic_fields"), feature.get("risk_semantic"))):
         return True
     return any(
-        _nested_semantic_values(source.get("risk_semantic")) or source.get("semantic_fields")
+        any(
+            _nested_semantic_values(source.get(field))
+            for field in (
+                "problem_code",
+                "problemCode",
+                "risk_type",
+                "cause",
+                "risk_semantic",
+                "semantic_fields",
+            )
+        )
         for source in sources
     )
 
@@ -234,7 +281,12 @@ def collect_problem_codes(
     sources = _source_templates(feature, entity)
     entity_sources = _source_templates(entity, entity) if entity else []
     codes: list[str] = []
-    for value in (feature.get("problem_code"), feature.get("problemCode"), feature.get("risk_type")):
+    for value in (
+        feature.get("problem_code"),
+        feature.get("problemCode"),
+        feature.get("risk_type"),
+        feature.get("cause"),
+    ):
         _append_problem_code(codes, value)
     for value in (feature.get("semantic_fields"), feature.get("risk_semantic")):
         for normalized in _nested_semantic_values(value):
@@ -244,6 +296,7 @@ def collect_problem_codes(
             entity.get("problem_code"),
             entity.get("problemCode"),
             entity.get("risk_type"),
+            entity.get("cause"),
             entity.get("risk_semantic"),
         ):
             _append_problem_code(codes, value)
@@ -252,19 +305,18 @@ def collect_problem_codes(
         for normalized in _nested_semantic_values(entity.get("semantic_fields")):
             _append_problem_code(codes, normalized)
 
-    keyword = _keyword_problem_code(_feature_text(feature, sources))
-    if keyword:
+    for keyword in _keyword_problem_codes(_feature_text(feature, sources)):
         _append_problem_code(codes, keyword)
     if entity:
-        entity_keyword = _keyword_problem_code(_feature_text(entity, entity_sources))
-        if entity_keyword:
-            _append_problem_code(codes, entity_keyword)
+        for keyword in _keyword_problem_codes(_feature_text(entity, entity_sources)):
+            _append_problem_code(codes, keyword)
 
     for source in [*sources, *entity_sources]:
         for value in (
             source.get("problem_code"),
             source.get("problemCode"),
             source.get("risk_type"),
+            source.get("cause"),
             source.get("risk_semantic"),
             source.get("semantic_fields"),
         ):
@@ -295,12 +347,7 @@ def select_primary_problem_code(
     ]
     if usable:
         return min(usable, key=lambda code: (_problem_code_priority(code), code))
-
-    fallbacks = sorted(
-        code for code in normalized_codes
-        if _is_unknown_problem_code(code) or code.startswith("logrisk.")
-    )
-    return fallbacks[0] if fallbacks else None
+    return None
 
 
 def _problem_code_priority(code: str) -> int:
@@ -360,13 +407,7 @@ def anchor_signatures(feature: Mapping[str, Any], entity: Mapping[str, Any] | No
     if not anchors:
         return []
 
-    concrete_codes = {
-        code for code in collect_problem_codes(feature, entity)
-        if code in _CNI_CONCRETE_PROBLEM_CODES
-    }
-    if len(concrete_codes) > 1:
-        return anchors[:1]
-    if _has_semantic_identity(feature, sources) or _keyword_problem_code(_feature_text(feature, sources)):
+    if is_canonical_problem_code(derive_problem_code(feature, entity)):
         return []
     return anchors[:1]
 

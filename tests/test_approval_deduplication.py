@@ -165,6 +165,37 @@ def test_collect_problem_codes_keeps_concrete_and_wrapper_evidence():
     }
 
 
+def test_collect_problem_codes_keeps_independent_keyword_hits_from_one_text():
+    feature = {
+        "feature_type": "cni_network_failure",
+        "source_templates": [{
+            "template_fingerprint": "fingerprint-conflict",
+            "template": "CNI config syntax error: no enough ips",
+        }],
+    }
+
+    assert set(collect_problem_codes(feature)) >= {
+        "kubernetes.cni.config_error",
+        "kubernetes.cni.ip_exhaustion",
+    }
+    assert derive_problem_code(feature).startswith("logrisk.cni_network_failure.")
+
+
+def test_recursive_semantic_fields_collect_lists_and_top_level_cause():
+    feature = {
+        "feature_type": "cni_network_failure",
+        "cause": "kubernetes.cni.config_error",
+        "semantic_fields": [{
+            "risk_semantic": ["kubernetes.cni.ip_exhaustion"],
+        }],
+    }
+
+    assert set(collect_problem_codes(feature)) >= {
+        "kubernetes.cni.config_error",
+        "kubernetes.cni.ip_exhaustion",
+    }
+
+
 def test_generic_semantic_code_precedes_runtime_wrapper_code():
     assert select_primary_problem_code([
         "runtime_sandbox_create_failed",
@@ -230,6 +261,52 @@ def test_unknown_and_unclassified_codes_use_strict_fallback_identity():
 
     assert approval_identity(left)["approval_key"] != approval_identity(right)["approval_key"]
     assert not same_approval_identity(left, right)
+
+
+def test_unknown_namespaces_are_not_canonical_anywhere_in_the_code():
+    assert not is_canonical_problem_code("vendor.unknown")
+    assert not is_canonical_problem_code("vendor.unknown.cause")
+    assert not is_canonical_problem_code("unknown.vendor.cause")
+    assert not is_canonical_problem_code("vendor.unclassified_problem")
+
+
+def test_unknown_fallback_hashes_all_evidence_and_preserves_source_anchors():
+    base = {
+        "feature_type": "network_failure",
+        "problem_code": "unknown",
+        "cause": "unknown_cause",
+        "source_templates": [{
+            "template_fingerprint": "anchor-a",
+            "category": "network",
+        }],
+    }
+    unknown_only = dict(base)
+    unknown_only.pop("cause")
+    different_anchor = dict(base)
+    different_anchor["source_templates"] = [{
+        "template_fingerprint": "anchor-b",
+        "category": "network",
+    }]
+
+    assert derive_problem_code(base).startswith("logrisk.network_failure.")
+    assert derive_problem_code(unknown_only).startswith("logrisk.network_failure.")
+    assert derive_problem_code(base) != derive_problem_code(unknown_only)
+    assert approval_identity(base)["approval_key"] != approval_identity(different_anchor)["approval_key"]
+
+
+def test_logrisk_fallback_preserves_distinct_source_anchors():
+    left = {
+        "feature_type": "network_failure",
+        "problem_code": "logrisk.network_failure.old",
+        "source_templates": [{"template_fingerprint": "anchor-a"}],
+    }
+    right = {
+        "feature_type": "network_failure",
+        "problem_code": "logrisk.network_failure.old",
+        "source_templates": [{"template_fingerprint": "anchor-b"}],
+    }
+
+    assert approval_identity(left)["approval_key"] != approval_identity(right)["approval_key"]
 
 
 def test_all_cni_ip_exhaustion_wrappers_share_one_v2_identity():
@@ -363,11 +440,20 @@ def test_empty_fallback_keeps_the_historical_v1_digest_material():
     assert derive_problem_code(feature) == f"logrisk.network_failure.{expected_digest}"
 
 
-def test_explicit_unknown_code_remains_a_strict_fallback_code():
+def test_explicit_unknown_code_is_hashed_as_strict_fallback_evidence():
     assert derive_problem_code({
         "feature_type": "network_failure",
         "problem_code": "unknown",
-    }) == "unknown"
+    }).startswith("logrisk.network_failure.")
+
+
+def test_pod_sandbox_oom_is_not_classified_as_cni_plugin_failure():
+    feature = {
+        "feature_type": "runtime_sandbox_failure",
+        "summary": "pod sandbox failed: out of memory",
+    }
+
+    assert derive_problem_code(feature) == "linux.memory.oom"
 
 
 def test_distinct_problem_codes_do_not_merge_on_same_template_signature(tmp_path):

@@ -13,6 +13,7 @@
 - 修复同一 Drain3 根因因 feature_type、组件 wrapper 或模板集合差异被拆成多个待审批组的问题。
 - CNI IP 耗尽现在优先于 generic CNI/PodSandbox wrapper 语义，并兼容历史 V1 审批规则。
 - 修复 Approval Identity V2 对未知或歧义根因的严格回退，并保留历史 V1 `approval_key` 的比较与物理分组兼容。
+- 修正多重具体语义关键字、递归根因字段和未知命名空间的收集与校验；严格回退保留来源锚点，并避免将 PodSandbox OOM 误判为 CNI 插件故障。
 - 修复人工审批页面依赖当前浏览器 Job Snapshot，刷新或重新进入后看不到数据库 pending Candidate 的问题。
 - 人工审批页改为从持久化全局审批队列加载，并按 canonical problem_code 聚合。
 - 修复 `/review` 路由刷新后丢失，以及审批页显示默认模型而不是实际 Candidate 执行模型的问题。

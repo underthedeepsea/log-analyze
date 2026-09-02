@@ -15,6 +15,7 @@ from logrisk.database import Database, SQLiteDatabase, utc_now
 from logrisk.feature_jobs import (
     FeatureJobError,
     REVIEW_OWNED_FIELDS,
+    _candidate_version_payload,
     _merge_review_owned_fields,
     _validate_candidate_review_changes,
 )
@@ -51,8 +52,8 @@ class SQLiteFeatureJobStore:
             if row[field] is not None:
                 candidate[field] = row[field]
         candidate.setdefault("entity_id", row["entity_id"])
-        candidate.setdefault("created_at", row["created_at"])
-        candidate.setdefault("updated_at", row["updated_at"])
+        candidate["created_at"] = row["created_at"]
+        candidate["updated_at"] = row["updated_at"]
         try:
             job = cls._decode_json(row["job_json"], {})
         except (IndexError, KeyError):
@@ -121,6 +122,14 @@ class SQLiteFeatureJobStore:
             else copy.deepcopy(candidate)
         )
         merged["candidate_id"] = candidate_id
+        unchanged = (
+            existing is not None
+            and str(existing["job_id"]) == str(job_id)
+            and _candidate_version_payload(cls._candidate_for_merge(existing))
+            == _candidate_version_payload(merged)
+        )
+        updated_at = existing["updated_at"] if unchanged else now
+        merged["updated_at"] = updated_at
         connection.execute(
             "INSERT INTO feature_candidates(candidate_id, job_id, entity_id, status, approval_key, problem_code, "
             "approval_group_id, resolved_rule_id, resolution_type, candidate_json, created_at, updated_at) "
@@ -141,7 +150,7 @@ class SQLiteFeatureJobStore:
                 merged.get("resolution_type"),
                 _json(merged),
                 existing["created_at"] if existing is not None else (merged.get("created_at") or now),
-                now,
+                updated_at,
             ),
         )
         return merged
@@ -303,6 +312,7 @@ class SQLiteFeatureJobStore:
         *,
         expected_status: str,
         job_id: str | None = None,
+        expected_updated_at: Any | None = None,
     ) -> dict[str, Any]:
         if not isinstance(changes, dict):
             raise FeatureJobError(
@@ -337,24 +347,32 @@ class SQLiteFeatureJobStore:
                 if current_status == "approved" and requested_status == "approved":
                     return current
                 raise self._candidate_state_conflict()
+            if expected_updated_at is not None and current.get("updated_at") != expected_updated_at:
+                raise self._candidate_state_conflict()
             updated = copy.deepcopy(current)
             for field, value in changes.items():
                 updated[field] = copy.deepcopy(value)
             updated["candidate_id"] = candidate_id
             updated["job_id"] = str(row["job_id"])
-            cursor = connection.execute(
+            updated_at = utc_now()
+            updated["updated_at"] = updated_at
+            update_query = (
                 "UPDATE feature_candidates SET status=?, resolved_rule_id=?, resolution_type=?, candidate_json=?, updated_at=? "
-                "WHERE candidate_id=? AND status=?",
-                (
-                    updated.get("status"),
-                    updated.get("resolved_rule_id"),
-                    updated.get("resolution_type"),
-                    _json(updated),
-                    utc_now(),
-                    candidate_id,
-                    expected_status,
-                ),
+                "WHERE candidate_id=? AND status=?"
             )
+            update_parameters: list[Any] = [
+                updated.get("status"),
+                updated.get("resolved_rule_id"),
+                updated.get("resolution_type"),
+                _json(updated),
+                updated_at,
+                candidate_id,
+                expected_status,
+            ]
+            if expected_updated_at is not None:
+                update_query += " AND updated_at=?"
+                update_parameters.append(expected_updated_at)
+            cursor = connection.execute(update_query, update_parameters)
             if cursor.rowcount != 1:
                 latest = connection.execute(
                     "SELECT status FROM feature_candidates WHERE candidate_id=?", (candidate_id,)

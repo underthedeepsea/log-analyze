@@ -69,6 +69,27 @@ def document():
     }
 
 
+class _InterleavingSQLiteFeatureJobStore(SQLiteFeatureJobStore):
+    def __init__(self, database):
+        super().__init__(database)
+        self.review_calls = 0
+
+    def update_candidate_review_state(self, *args, **kwargs):
+        self.review_calls += 1
+        result = super().update_candidate_review_state(*args, **kwargs)
+        if self.review_calls == 1:
+            SQLiteFeatureJobStore(self.database).update_candidate_review_state(
+                args[0],
+                {
+                    "title": "并发审核标题",
+                    "reviewer_note": "并发审核备注",
+                    "tags": ["并发审核"],
+                },
+                expected_status=str(result.get("status") or kwargs["expected_status"]),
+            )
+        return result
+
+
 def test_validate_result_document_requires_risk_entities():
     with pytest.raises(FeatureJobError, match="risk_entities"):
         validate_result_document({"summary": {}})
@@ -671,6 +692,62 @@ def test_feature_job_manager_lazy_loads_job_for_persisted_approval(tmp_path):
     assert updated["status"] == "rejected"
 
 
+def test_review_failure_does_not_leave_candidate_approved(tmp_path):
+    class FailingRuleStore(ApprovedRuleStore):
+        def upsert_feature(self, feature):
+            raise RuntimeError("rule write failed")
+
+    database = SQLiteDatabase(tmp_path / "state.sqlite3")
+    persistence = SQLiteFeatureJobStore(database)
+    rules = FailingRuleStore(tmp_path / "rules.json")
+    manager = FeatureJobManager(
+        extractor=lambda source, **kwargs: [candidate(source)],
+        rule_store=rules,
+        persistence=persistence,
+        auto_start=False,
+        interrupt_on_restore=False,
+    )
+    job_id = manager.create_job(
+        {"summary": {}, "risk_entities": [entity("node-a", 90)]},
+        model="qwen3:1.7b",
+    )
+    manager.run_job(job_id)
+
+    with pytest.raises(RuntimeError, match="rule write failed"):
+        manager.update_feature(job_id, "feature-node-a", {"status": "approved"})
+
+    assert persistence.load_candidate("feature-node-a")["status"] == "pending"
+
+
+def test_review_operation_uses_one_cas_without_overwriting_concurrent_review(tmp_path):
+    database = SQLiteDatabase(tmp_path / "state.sqlite3")
+    persistence = _InterleavingSQLiteFeatureJobStore(database)
+    manager = FeatureJobManager(
+        extractor=lambda source, **kwargs: [candidate(source)],
+        persistence=persistence,
+        auto_start=False,
+        interrupt_on_restore=False,
+    )
+    job_id = manager.create_job(
+        {"summary": {}, "risk_entities": [entity("node-a", 90)]},
+        model="qwen3:1.7b",
+    )
+    manager.run_job(job_id)
+
+    manager.update_feature(
+        job_id,
+        "feature-node-a",
+        {"status": "approved", "title": "管理器标题"},
+    )
+
+    persisted = persistence.load_candidate("feature-node-a")
+    assert persistence.review_calls == 1
+    assert persisted["status"] == "approved"
+    assert persisted["title"] == "并发审核标题"
+    assert persisted["reviewer_note"] == "并发审核备注"
+    assert persisted["tags"] == ["并发审核"]
+
+
 def test_refresh_does_not_replace_live_job_with_older_persisted_snapshot(tmp_path):
     store = FeatureJobFileStore(tmp_path / "feature_jobs")
     manager = FeatureJobManager(
@@ -692,6 +769,35 @@ def test_refresh_does_not_replace_live_job_with_older_persisted_snapshot(tmp_pat
     manager.refresh_from_persistence(job_id)
 
     assert manager.get_job(job_id)["status"] == "running"
+
+
+def test_refresh_keeps_live_review_fields_for_equal_progress_snapshot(tmp_path):
+    store = FeatureJobFileStore(tmp_path / "feature_jobs")
+    manager = FeatureJobManager(
+        extractor=lambda source, **kwargs: [candidate(source)],
+        persistence=store,
+        auto_start=False,
+        interrupt_on_restore=False,
+    )
+    job_id = manager.create_job(
+        {"summary": {}, "risk_entities": [entity("node-a", 90)]},
+        model="qwen3:1.7b",
+    )
+    manager.run_job(job_id)
+    with manager._lock:
+        live = manager._job(job_id)["features"]["feature-node-a"]
+        live["title"] = "实时审核标题"
+        live["reviewer_note"] = "实时审核备注"
+        live["tags"] = ["实时审核"]
+
+    persisted = store.load_job(job_id)
+    store.save(persisted)
+    manager.refresh_from_persistence(job_id)
+
+    live = manager.get_job(job_id)["features"][0]
+    assert live["title"] == "实时审核标题"
+    assert live["reviewer_note"] == "实时审核备注"
+    assert live["tags"] == ["实时审核"]
 
 
 def test_file_store_marks_running_job_interrupted_without_model_retry(tmp_path):

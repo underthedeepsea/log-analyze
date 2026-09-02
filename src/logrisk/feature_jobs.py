@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import copy
+import fcntl
 import hashlib
 import json
 import os
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict
@@ -69,6 +71,13 @@ def _merge_review_owned_fields(
     return merged
 
 
+def _candidate_version_payload(candidate: Dict[str, Any]) -> Dict[str, Any]:
+    value = copy.deepcopy(candidate)
+    for field in ("job_id", "job_created_at", "job_status", "updated_at", "entity_id", "created_at"):
+        value.pop(field, None)
+    return value
+
+
 def _candidate_not_found() -> FeatureJobError:
     return FeatureJobError("候选特征不存在", code="candidate_not_found", status_code=404)
 
@@ -97,31 +106,55 @@ class FeatureJobFileStore:
     def __init__(self, root: str | Path) -> None:
         self.root = Path(root)
 
+    @contextmanager
+    def _process_lock(self):
+        # ponytail: one root-wide lock keeps file CAS cross-process safe; use per-job locks if throughput requires it.
+        self.root.mkdir(parents=True, exist_ok=True)
+        with (self.root / ".feature_jobs.lock").open("a+", encoding="utf-8") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
     @staticmethod
     def _atomic_json(path: Path, payload: Any) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
         temporary.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         os.replace(temporary, path)
 
     def save(self, job: Dict[str, Any]) -> None:
-        with self._lock:
-            existing = self.load_job(str(job["job_id"]))
-            features: dict[str, Dict[str, Any]] = {}
-            if existing:
-                features.update(copy.deepcopy(existing.get("features") or {}))
-            for candidate_id, candidate in (job.get("features") or {}).items():
-                if not isinstance(candidate, dict):
-                    continue
-                key = str(candidate.get("candidate_id") or candidate_id)
-                previous = features.get(key)
-                features[key] = (
-                    _merge_review_owned_fields(previous, candidate)
-                    if isinstance(previous, dict)
-                    else copy.deepcopy(candidate)
-                )
-                features[key]["candidate_id"] = key
-            self._write(job, features)
+        with self._lock, self._process_lock():
+            self._save_locked(job)
+
+    def _save_locked(self, job: Dict[str, Any]) -> dict[str, Dict[str, Any]]:
+        existing = self.load_job(str(job["job_id"]))
+        features: dict[str, Dict[str, Any]] = {}
+        if existing:
+            features.update(copy.deepcopy(existing.get("features") or {}))
+        for candidate_id, candidate in (job.get("features") or {}).items():
+            if not isinstance(candidate, dict):
+                continue
+            key = str(candidate.get("candidate_id") or candidate_id)
+            previous = features.get(key)
+            merged = (
+                _merge_review_owned_fields(previous, candidate)
+                if isinstance(previous, dict)
+                else copy.deepcopy(candidate)
+            )
+            merged["candidate_id"] = key
+            if (
+                isinstance(previous, dict)
+                and _candidate_version_payload(previous) == _candidate_version_payload(merged)
+                and previous.get("updated_at") is not None
+            ):
+                merged["updated_at"] = copy.deepcopy(previous["updated_at"])
+            else:
+                merged["updated_at"] = _now()
+            features[key] = merged
+        self._write(job, features)
+        return features
 
     def _write(
         self, job: Dict[str, Any], features: dict[str, Dict[str, Any]]
@@ -140,7 +173,7 @@ class FeatureJobFileStore:
         )
         events_path = job_dir / "events.jsonl"
         events_path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = events_path.with_name(f".{events_path.name}.{os.getpid()}.tmp")
+        temporary = events_path.with_name(f".{events_path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
         temporary.write_text(events_text, encoding="utf-8")
         os.replace(temporary, events_path)
 
@@ -204,7 +237,7 @@ class FeatureJobFileStore:
         candidate_id = str(candidate.get("candidate_id") or "")
         if not candidate_id:
             raise FeatureJobError("候选特征缺少 candidate_id")
-        with self._lock:
+        with self._lock, self._process_lock():
             job = self.load_job(str(job_id))
             if job is None:
                 raise _candidate_not_found()
@@ -216,8 +249,8 @@ class FeatureJobFileStore:
                 else copy.deepcopy(candidate)
             )
             features[candidate_id]["candidate_id"] = candidate_id
-            self.save(job)
-            return self._candidate_with_lineage(job, features[candidate_id])
+            saved_features = self._save_locked(job)
+            return self._candidate_with_lineage(job, saved_features[candidate_id])
 
     def update_candidate_review_state(
         self,
@@ -226,6 +259,7 @@ class FeatureJobFileStore:
         *,
         expected_status: str,
         job_id: str | None = None,
+        expected_updated_at: Any | None = None,
     ) -> Dict[str, Any]:
         if not isinstance(changes, dict):
             raise FeatureJobError(
@@ -234,7 +268,7 @@ class FeatureJobFileStore:
                 status_code=422,
             )
         _validate_candidate_review_changes(changes)
-        with self._lock:
+        with self._lock, self._process_lock():
             candidate = self.load_candidate(candidate_id, job_id=job_id)
             if candidate is None:
                 raise _candidate_not_found()
@@ -245,6 +279,8 @@ class FeatureJobFileStore:
             if current_status != expected_status:
                 if current_status == "approved" and requested_status == "approved":
                     return candidate
+                raise _candidate_state_conflict()
+            if expected_updated_at is not None and candidate.get("updated_at") != expected_updated_at:
                 raise _candidate_state_conflict()
             job = self.load_job(str(candidate["job_id"]))
             if job is None:
@@ -257,6 +293,10 @@ class FeatureJobFileStore:
             for field, value in changes.items():
                 updated[field] = copy.deepcopy(value)
             updated["candidate_id"] = str(candidate_id)
+            if _candidate_version_payload(current) != _candidate_version_payload(updated):
+                updated["updated_at"] = _now()
+            else:
+                updated["updated_at"] = current.get("updated_at") or _now()
             features[str(candidate_id)] = updated
             job["features"] = features
             self._write(job, features)
@@ -657,16 +697,20 @@ class FeatureJobManager:
         changes: Dict[str, Any],
         *,
         expected_status: str,
+        expected_updated_at: Any | None = None,
     ) -> Dict[str, Any] | None:
         if not self.persistence:
             return None
         updater = getattr(self.persistence, "update_candidate_review_state", None)
         if not callable(updater):
             return None
+        parameters: Dict[str, Any] = {"expected_status": expected_status}
+        if expected_updated_at is not None:
+            parameters["expected_updated_at"] = expected_updated_at
         updated = updater(
             str(candidate_id),
             copy.deepcopy(changes),
-            expected_status=expected_status,
+            **parameters,
         )
         return copy.deepcopy(updated) if isinstance(updated, dict) else None
 
@@ -1024,6 +1068,7 @@ class FeatureJobManager:
                         continue
                     if not same_approval_identity(feature, rule):
                         continue
+                    expected_updated_at = feature.get("updated_at")
                     feature.update({
                         "status": "approved",
                         "approved_at": feature.get("approved_at") or rule.get("approved_at") or _now(),
@@ -1041,6 +1086,7 @@ class FeatureJobManager:
                             "rule_id": rule.get("rule_id"),
                         },
                         expected_status="pending",
+                        expected_updated_at=expected_updated_at,
                     )
                     if persisted is not None:
                         feature = persisted
@@ -1084,6 +1130,7 @@ class FeatureJobManager:
                     if not same_approval_identity(feature, selected):
                         continue
                     expected_status = str(feature.get("status") or "pending")
+                    expected_updated_at = feature.get("updated_at")
                     feature.update({
                         "status": "rejected",
                         "approved_at": None,
@@ -1099,6 +1146,7 @@ class FeatureJobManager:
                             "review_scope": "approval_identity",
                         },
                         expected_status=expected_status,
+                        expected_updated_at=expected_updated_at,
                     )
                     if persisted is not None:
                         feature = persisted
@@ -1606,21 +1654,20 @@ class FeatureJobManager:
             if current is not None:
                 current_events = len(current.get("events") or [])
                 persisted_events = len(persisted.get("events") or [])
-                if persisted_events < current_events:
+                if persisted_events <= current_events:
                     return
-                status_rank = {
-                    "queued": 0,
-                    "running": 1,
-                    "interrupted": 1,
-                    "completed_with_errors": 2,
-                    "completed": 2,
-                }
-                if (
-                    persisted_events == current_events
-                    and status_rank.get(str(persisted.get("status")), 0)
-                    < status_rank.get(str(current.get("status")), 0)
-                ):
-                    return
+                persisted = copy.deepcopy(persisted)
+                persisted_features = persisted.setdefault("features", {})
+                for candidate_id, live_candidate in (current.get("features") or {}).items():
+                    if not isinstance(live_candidate, dict):
+                        continue
+                    persisted_candidate = persisted_features.get(candidate_id)
+                    if isinstance(persisted_candidate, dict):
+                        persisted_features[candidate_id] = _merge_review_owned_fields(
+                            live_candidate, persisted_candidate
+                        )
+                    else:
+                        persisted_features[candidate_id] = copy.deepcopy(live_candidate)
             self._jobs[target] = self._hydrate_persisted_job_locked(persisted)
 
     def wait_for_events(
@@ -1683,10 +1730,13 @@ class FeatureJobManager:
                 raise FeatureJobError("字段 status 无效")
 
             persisted_status: str | None = None
+            expected_updated_at: Any | None = None
+            review_changes: Dict[str, Any] = {}
             if callable(getattr(self.persistence, "update_candidate_review_state", None)):
                 feature = self._load_review_candidate_locked(job, str(candidate_id))
                 expected_status = str(feature.get("status") or "")
-                review_changes: Dict[str, Any] = {}
+                persisted_status = expected_status
+                expected_updated_at = feature.get("updated_at")
                 for field in ("title", "summary", "reviewer_note", "importance", "review_scope"):
                     if field in changes:
                         value = changes[field]
@@ -1696,12 +1746,6 @@ class FeatureJobManager:
                 if "status" in changes:
                     review_changes["status"] = changes["status"]
                     review_changes["approved_at"] = _now() if changes["status"] == "approved" else None
-                updated = self._persist_review_state_locked(
-                    str(candidate_id), review_changes, expected_status=expected_status
-                )
-                if updated is not None:
-                    feature = updated
-                persisted_status = str(feature.get("status") or "")
             else:
                 try:
                     feature = copy.deepcopy(job["features"][candidate_id])
@@ -1718,6 +1762,8 @@ class FeatureJobManager:
                     "source": {},
                 },
             )
+            resolution_fields_changed: set[str] = set()
+            group_should_persist = False
             feature, group = self._register_feature_group_locked(job, record, feature)
 
             for field in ("title", "summary", "reviewer_note"):
@@ -1728,11 +1774,15 @@ class FeatureJobManager:
             if "tags" in changes:
                 tags = changes["tags"]
                 feature["tags"] = list(dict.fromkeys(tag.strip() for tag in tags))
+            if "review_scope" in changes:
+                feature["review_scope"] = changes["review_scope"]
             if "status" in changes:
                 feature["status"] = changes["status"]
-                feature["approved_at"] = _now() if changes["status"] == "approved" else None
-                if changes.get("review_scope") is not None:
-                    feature["review_scope"] = changes["review_scope"]
+                feature["approved_at"] = (
+                    review_changes["approved_at"]
+                    if "approved_at" in review_changes
+                    else (_now() if changes["status"] == "approved" else None)
+                )
                 if changes["status"] == "approved" and self.rule_store:
                     feature["job_id"] = job["job_id"]
                     rule = self.rule_store.upsert_feature(feature)
@@ -1744,37 +1794,58 @@ class FeatureJobManager:
                     group["status"] = "approved"
                     group["rule_id"] = rule["rule_id"]
                     group["updated_at"] = _now()
-                    self.approval_group_store.save(group)
+                    group_should_persist = True
+                    resolution_fields_changed.update({"rule_id", "resolved_rule_id", "resolution_type"})
                     job["features"][candidate_id] = feature
                     reconcile = self._reconcile_pending_candidates_locked(rule)
                     feature["auto_resolved_count"] = reconcile["auto_resolved_candidates"]
                 elif changes.get("status") == "approved":
                     group["status"] = "approved"
                     group["updated_at"] = _now()
-                    self.approval_group_store.save(group)
+                    group_should_persist = True
                     feature["resolution_type"] = "manual"
+                    resolution_fields_changed.add("resolution_type")
                 elif changes.get("status") == "rejected" and group.get("status") == "pending":
                     if changes.get("review_scope") == "approval_identity":
                         feature["resolution_type"] = "group_rejected"
+                        resolution_fields_changed.add("resolution_type")
                     else:
                         group["status"] = "rejected"
                         group["updated_at"] = _now()
-                        self.approval_group_store.save(group)
+                        group_should_persist = True
                         feature["resolution_type"] = "manual"
+                        resolution_fields_changed.add("resolution_type")
             if persisted_status is not None:
-                review_state = {
-                    field: copy.deepcopy(feature[field])
-                    for field in REVIEW_OWNED_FIELDS
-                    if field in feature
-                }
+                review_state = copy.deepcopy(review_changes)
+                if feature.get("status") != persisted_status:
+                    review_state.update({
+                        "status": feature.get("status"),
+                        "approved_at": feature.get("approved_at"),
+                    })
+                    for field in ("resolved_rule_id", "rule_id", "resolution_type"):
+                        if field in feature:
+                            review_state[field] = copy.deepcopy(feature[field])
+                if "status" in changes:
+                    for field in ("resolved_rule_id", "rule_id", "resolution_type"):
+                        if field in feature:
+                            review_state[field] = copy.deepcopy(feature[field])
+                for field in resolution_fields_changed:
+                    if field in feature:
+                        review_state[field] = copy.deepcopy(feature[field])
                 updated = self._persist_review_state_locked(
                     str(candidate_id),
                     review_state,
-                    expected_status=persisted_status if feature.get("status") != persisted_status else str(feature.get("status") or ""),
+                    expected_status=persisted_status,
+                    expected_updated_at=expected_updated_at,
                 )
                 if updated is not None:
+                    for field, value in feature.items():
+                        if field not in REVIEW_OWNED_FIELDS and field not in updated:
+                            updated[field] = copy.deepcopy(value)
                     feature = updated
             job["features"][candidate_id] = feature
+            if group_should_persist:
+                self.approval_group_store.save(group)
             if changes.get("status") == "rejected" and changes.get("review_scope") == "approval_identity":
                 if group.get("status") == "pending":
                     group["status"] = "rejected"

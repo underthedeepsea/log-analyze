@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import multiprocessing
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timedelta, timezone
 
@@ -20,6 +22,29 @@ from logrisk.sqlite_stores import (
 )
 from logrisk.input_jobs import InputJobConfig
 from logrisk.upload_sessions import UploadConfig
+
+
+class _DelayedFileFeatureJobStore(FeatureJobFileStore):
+    def __init__(self, root, delay):
+        super().__init__(root)
+        self.delay = delay
+
+    def load_candidate(self, *args, **kwargs):
+        candidate = super().load_candidate(*args, **kwargs)
+        if self.delay:
+            time.sleep(self.delay)
+        return candidate
+
+
+def _file_review_worker(root, status, delay, result_queue):
+    store = _DelayedFileFeatureJobStore(root, delay)
+    try:
+        store.update_candidate_review_state(
+            "candidate-1", {"status": status}, expected_status="pending"
+        )
+        result_queue.put(("success", status))
+    except FeatureJobError as exc:
+        result_queue.put(("error", exc.code, exc.status_code))
 
 
 def _candidate_job(candidate_id="candidate-1", *, status="pending"):
@@ -245,6 +270,59 @@ def test_sqlite_candidate_review_distinguishes_missing_from_status_conflict(tmp_
 
     assert (missing.value.code, missing.value.status_code) == ("candidate_not_found", 404)
     assert (conflict.value.code, conflict.value.status_code) == ("candidate_state_conflict", 409)
+
+
+def test_sqlite_candidate_review_cas_rejects_a_stale_updated_at(tmp_path):
+    store = _candidate_store(tmp_path, "sqlite")
+    store.save(_candidate_job())
+    initial = store.load_candidate("candidate-1")
+
+    store.update_candidate_review_state(
+        "candidate-1",
+        {"reviewer_note": "较新的审核"},
+        expected_status="pending",
+    )
+
+    with pytest.raises(FeatureJobError) as conflict:
+        store.update_candidate_review_state(
+            "candidate-1",
+            {"status": "approved"},
+            expected_status="pending",
+            expected_updated_at=initial["updated_at"],
+        )
+
+    assert (conflict.value.code, conflict.value.status_code) == ("candidate_state_conflict", 409)
+    assert store.load_candidate("candidate-1")["reviewer_note"] == "较新的审核"
+
+
+def test_file_candidate_review_cas_is_safe_across_processes(tmp_path):
+    if "fork" not in multiprocessing.get_all_start_methods():
+        pytest.skip("cross-process file CAS regression requires fork")
+    store = FeatureJobFileStore(tmp_path / "feature_jobs")
+    store.save(_candidate_job())
+    context = multiprocessing.get_context("fork")
+    result_queue = context.Queue()
+    first = context.Process(
+        target=_file_review_worker,
+        args=(str(tmp_path / "feature_jobs"), "approved", 1.0, result_queue),
+    )
+    second = context.Process(
+        target=_file_review_worker,
+        args=(str(tmp_path / "feature_jobs"), "rejected", 0.0, result_queue),
+    )
+    first.start()
+    time.sleep(0.1)
+    second.start()
+    first.join(5)
+    second.join(5)
+
+    assert first.exitcode == 0
+    assert second.exitcode == 0
+    results = [result_queue.get(timeout=2), result_queue.get(timeout=2)]
+    assert [item[0] for item in results].count("success") == 1
+    assert [item[1:] for item in results if item[0] == "error"] == [
+        ("candidate_state_conflict", 409)
+    ]
 
 
 @pytest.mark.parametrize("kind", ["sqlite", "file"])

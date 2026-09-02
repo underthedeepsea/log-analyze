@@ -11,10 +11,11 @@ from typing import Any, Callable, Dict
 
 from logrisk.approval_dedup import (
     approval_identity,
+    build_approval_key,
     derive_problem_code,
     is_canonical_problem_code,
+    normalize_problem_code,
     normalize_feature_type,
-    same_approval_identity,
 )
 
 
@@ -104,6 +105,8 @@ def _versioned_fields(rule: Dict[str, Any]) -> Dict[str, Any]:
         "anchor_signatures",
         "supporting_signatures",
         "match_mode",
+        "canonical_approval_key",
+        "predecessor_rule_id",
         "lineage",
     )
     return {field: copy.deepcopy(rule.get(field)) for field in fields}
@@ -117,6 +120,216 @@ def _preferred_rule(rules: list[Dict[str, Any]]) -> Dict[str, Any] | None:
         (rule for rule in rules if str(rule.get("updated_at") or "") == latest),
         key=lambda rule: str(rule.get("rule_id") or ""),
     )
+
+
+def _is_active(rule: Dict[str, Any]) -> bool:
+    return str(rule.get("status") or "active") == "active"
+
+
+def _rule_canonical_approval_key(rule: Dict[str, Any]) -> str:
+    problem_code = normalize_problem_code(rule.get("problem_code")) or derive_problem_code(rule)
+    return build_approval_key(
+        rule.get("feature_type"),
+        problem_code,
+        rule.get("components") or rule.get("component_scope") or [],
+        rule.get("anchor_signatures") or [],
+    )
+
+
+def _is_v2_rule(rule: Dict[str, Any]) -> bool:
+    if str(rule.get("schema_version") or "") != "approved_rule_v2":
+        return False
+    if rule.get("match_mode") not in {None, "semantic", "template_set"}:
+        return False
+    expected = _rule_canonical_approval_key(rule)
+    canonical = str(rule.get("canonical_approval_key") or "").strip()
+    stored = str(rule.get("approval_key") or "").strip()
+    return canonical == expected or (not canonical and stored == expected)
+
+
+def _is_semantic_v2_rule(rule: Dict[str, Any]) -> bool:
+    return _is_v2_rule(rule) and (
+        rule.get("match_mode") == "semantic"
+        or (rule.get("match_mode") is None and bool(rule.get("approval_key")))
+    )
+
+
+def _is_legacy_feature(feature: Dict[str, Any], identity: Dict[str, Any]) -> bool:
+    version = str(feature.get("schema_version") or "")
+    if version and version != "approved_rule_v2":
+        return True
+    key = str(feature.get("approval_key") or "").strip()
+    canonical_key = str(feature.get("canonical_approval_key") or "").strip()
+    return bool(key and key != identity["approval_key"] and canonical_key != identity["approval_key"])
+
+
+def _value_list(value: Any) -> list[Any]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, (list, tuple, set)):
+        return list(value)
+    return []
+
+
+def _legacy_template_pairs(value: Dict[str, Any]) -> set[tuple[str, str]]:
+    items = value.get("source_templates") or value.get("template_signatures") or value.get("top_templates") or []
+    pairs = set()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        identity = str(item.get("template_hash") or item.get("template_fingerprint") or "").strip()
+        if identity:
+            pairs.add((identity, str(item.get("category") or "").strip()))
+    return pairs
+
+
+def _legacy_components(value: Dict[str, Any]) -> set[str]:
+    components = {
+        str(item).strip().lower()
+        for item in _value_list(value.get("components") or value.get("component_scope"))
+        if str(item).strip()
+    }
+    if components:
+        return components
+    items = value.get("source_templates") or value.get("template_signatures") or value.get("top_templates") or []
+    return {
+        str(item.get("component")).strip().lower()
+        for item in items
+        if isinstance(item, dict) and str(item.get("component") or "").strip()
+    }
+
+
+def _legacy_anchors(value: Dict[str, Any]) -> set[str]:
+    anchors = {
+        str(item).strip()
+        for item in _value_list(value.get("anchor_signatures"))
+        if str(item).strip()
+    }
+    if anchors:
+        return anchors
+    return {
+        "|".join(item)
+        for item in sorted(_legacy_template_pairs(value))
+    }
+
+
+def _legacy_feature_matches(rule: Dict[str, Any], feature: Dict[str, Any]) -> bool:
+    rule_key = str(rule.get("approval_key") or "").strip()
+    feature_key = str(feature.get("approval_key") or "").strip()
+    if rule_key or feature_key:
+        return bool(rule_key and feature_key and rule_key == feature_key)
+    if normalize_feature_type(rule.get("feature_type")) != normalize_feature_type(feature.get("feature_type")):
+        return False
+    rule_pairs = _legacy_template_pairs(rule)
+    feature_pairs = _legacy_template_pairs(feature)
+    if not rule_pairs or rule_pairs != feature_pairs:
+        return False
+    if _legacy_components(rule) != _legacy_components(feature):
+        return False
+    return _legacy_anchors(rule) == _legacy_anchors(feature)
+
+
+def _legacy_entity_matches(rule: Dict[str, Any], entity: Dict[str, Any]) -> bool:
+    required = _legacy_template_pairs(rule)
+    actual = _legacy_template_pairs(entity)
+    if not required or not required.issubset(actual):
+        return False
+    required_components = _legacy_components(rule)
+    actual_components = _legacy_components(entity)
+    if required_components and actual_components and not required_components.issubset(actual_components):
+        return False
+    required_anchors = _legacy_anchors(rule)
+    actual_anchors = _legacy_anchors(entity)
+    return not required_anchors or not actual_anchors or required_anchors.issubset(actual_anchors)
+
+
+def _rule_matches_feature(
+    rule: Dict[str, Any],
+    feature: Dict[str, Any],
+    entity: Dict[str, Any] | None = None,
+    *,
+    active_only: bool = True,
+) -> bool:
+    if active_only and not _is_active(rule):
+        return False
+    if not _is_v2_rule(rule):
+        return _legacy_feature_matches(rule, feature)
+    identity = approval_identity(feature, entity)
+    if _is_legacy_feature(feature, identity):
+        return False
+    stored_key = str(rule.get("approval_key") or "").strip()
+    canonical_key = str(rule.get("canonical_approval_key") or "").strip()
+    if stored_key == identity["approval_key"] or canonical_key == identity["approval_key"]:
+        return True
+    code = derive_problem_code(rule)
+    return (
+        _is_semantic_v2_rule(rule)
+        and identity["match_mode"] == "semantic"
+        and is_canonical_problem_code(identity["problem_code"])
+        and is_canonical_problem_code(code)
+        and code == identity["problem_code"]
+    )
+
+
+def _rule_matches_entity(rule: Dict[str, Any], entity: Dict[str, Any]) -> bool:
+    if not _is_active(rule):
+        return False
+    if not _is_v2_rule(rule):
+        return _legacy_entity_matches(rule, entity)
+    problem_code = derive_problem_code(rule)
+    if _is_semantic_v2_rule(rule) and is_canonical_problem_code(problem_code):
+        return problem_code == derive_problem_code(entity, entity)
+    required = {
+        _identity_pair(item)
+        for item in (rule.get("template_signatures") or [])
+        if isinstance(item, dict)
+    }
+    actual = {
+        _identity_pair(item)
+        for item in (entity.get("top_templates") or [])
+        if isinstance(item, dict)
+    }
+    if not required or not required.issubset(actual):
+        return False
+    required_components = _legacy_components(rule)
+    actual_components = _legacy_components(entity)
+    if required_components and actual_components and not required_components.issubset(actual_components):
+        return False
+    required_anchors = {
+        str(item).strip()
+        for item in (rule.get("anchor_signatures") or [])
+        if str(item).strip()
+    }
+    actual_anchors = _legacy_anchors(entity)
+    if required_anchors and actual_anchors and not required_anchors.issubset(actual_anchors):
+        return False
+    rule_type = normalize_feature_type(rule.get("feature_type"))
+    entity_type = str(entity.get("feature_type") or "").strip()
+    return not entity_type or rule_type == normalize_feature_type(entity_type)
+
+
+def _replacement_key(approval_key: str, predecessor_rule_id: str) -> str:
+    digest = hashlib.sha256(
+        f"{approval_key}\x1f{predecessor_rule_id}".encode("utf-8")
+    ).hexdigest()[:20]
+    return f"{approval_key}:replacement-{digest}"
+
+
+def _replacement_rule_id(approval_key: str, predecessor_rule_id: str) -> str:
+    digest = hashlib.sha256(
+        f"replacement\x1f{approval_key}\x1f{predecessor_rule_id}".encode("utf-8")
+    ).hexdigest()[:20]
+    return f"rule-{digest}"
+
+
+def rule_matches_feature(
+    rule: Dict[str, Any],
+    feature: Dict[str, Any],
+    entity: Dict[str, Any] | None = None,
+    *,
+    active_only: bool = True,
+) -> bool:
+    return _rule_matches_feature(rule, feature, entity, active_only=active_only)
 
 
 class ApprovedRuleStore:
@@ -165,38 +378,72 @@ class ApprovedRuleStore:
         if not isinstance(feature, dict):
             raise ApprovedRuleError("批准特征必须是 object")
         identity = approval_identity(feature)
-        signature = rule_signature(
+        base_signature = rule_signature(
             str(feature.get("feature_type") or ""),
             feature.get("source_templates") or [],
         )
         now = self.clock()
         with _PROCESS_LOCK:
             rules = self._read_locked()
+            legacy_feature = _is_legacy_feature(feature, identity)
+            active = [rule for rule in rules if _is_active(rule)]
             exact = [
                 rule for rule in rules
-                if identity["approval_key"] and rule.get("approval_key") == identity["approval_key"]
+                if not legacy_feature
+                and rule in active
+                and _is_v2_rule(rule)
+                and (
+                    rule.get("approval_key") == identity["approval_key"]
+                    or rule.get("canonical_approval_key") == identity["approval_key"]
+                )
             ]
             existing = _preferred_rule(exact)
-            if existing is None and is_canonical_problem_code(identity["problem_code"]):
+            if existing is None and not legacy_feature and is_canonical_problem_code(identity["problem_code"]):
                 semantic = [
-                    rule for rule in rules
-                    if str(rule.get("status") or "active") == "active"
-                    and same_approval_identity(rule, feature)
+                    rule for rule in active
+                    if _is_v2_rule(rule)
+                    and _is_semantic_v2_rule(rule)
+                    and is_canonical_problem_code(derive_problem_code(rule))
+                    and derive_problem_code(rule) == identity["problem_code"]
                 ]
                 existing = _preferred_rule(semantic)
-            if existing is None:
+            if existing is None and legacy_feature:
                 existing = _preferred_rule([
-                    rule for rule in rules
-                    if not rule.get("approval_key") and rule.get("signature") == signature
+                    rule for rule in active
+                    if not _is_v2_rule(rule) and _legacy_feature_matches(rule, feature)
                 ])
+                if existing is not None:
+                    return copy.deepcopy(existing)
+
+            predecessor = None
+            if existing is None:
+                predecessor = _preferred_rule([
+                    rule for rule in rules
+                    if not _is_active(rule) and _rule_matches_feature(rule, feature, active_only=False)
+                ])
+
+            approval_key = str(existing.get("approval_key") or identity["approval_key"]) if existing else identity["approval_key"]
+            canonical_approval_key = None
+            predecessor_rule_id = None
+            if predecessor is not None:
+                predecessor_rule_id = str(predecessor.get("rule_id") or "")
+                canonical_approval_key = identity["approval_key"]
+                if any(rule.get("approval_key") == approval_key for rule in rules):
+                    approval_key = _replacement_key(identity["approval_key"], predecessor_rule_id)
+
+            signature = base_signature
             if any(
                 rule.get("signature") == signature
-                and rule.get("approval_key") not in {None, identity["approval_key"]}
+                and (existing is None or rule.get("rule_id") != existing.get("rule_id"))
                 for rule in rules
             ):
-                signature = _approval_rule_signature(signature, identity["approval_key"])
+                signature = _approval_rule_signature(signature, approval_key)
+
+            rule_id = existing.get("rule_id") if existing else f"rule-{identity['approval_key'][5:25]}"
+            if existing is None and any(rule.get("rule_id") == rule_id for rule in rules):
+                rule_id = _replacement_rule_id(identity["approval_key"], str(predecessor_rule_id or rule_id))
             rule = {
-                "rule_id": existing.get("rule_id") if existing else f"rule-{identity['approval_key'][5:25]}",
+                "rule_id": rule_id,
                 "signature": signature,
                 "feature_type": normalize_feature_type(feature.get("feature_type")),
                 "title": str(feature.get("title") or "").strip(),
@@ -207,17 +454,17 @@ class ApprovedRuleStore:
                 "components": identity["component_scope"],
                 "template_signatures": _template_pairs(feature.get("source_templates") or []),
                 "problem_code": identity["problem_code"],
-                "approval_key": identity["approval_key"],
+                "approval_key": approval_key,
                 "anchor_signatures": identity["anchor_signatures"],
                 "supporting_signatures": copy.deepcopy(feature.get("supporting_signatures") or []),
                 "match_mode": identity["match_mode"],
                 "approved_at": existing.get("approved_at") if existing else now,
-                "created_at": existing.get("created_at") or existing.get("approved_at") if existing else now,
+                "created_at": (existing.get("created_at") or existing.get("approved_at") or now) if existing else now,
                 "updated_at": now,
                 "reuse_count": int(existing.get("reuse_count") or 0) if existing else 0,
                 "last_reused_at": existing.get("last_reused_at") if existing else None,
                 "schema_version": "approved_rule_v2",
-                "status": str(existing.get("status") or "active") if existing else "active",
+                "status": "active",
                 "next_review_at": existing.get("next_review_at") if existing else _next_review(now),
             }
             lineage = _lineage(feature)
@@ -225,10 +472,20 @@ class ApprovedRuleStore:
                 rule["lineage"] = lineage
             elif existing and isinstance(existing.get("lineage"), dict):
                 rule["lineage"] = copy.deepcopy(existing["lineage"])
+            if predecessor_rule_id:
+                rule["predecessor_rule_id"] = predecessor_rule_id
+                rule["lineage"] = copy.deepcopy(rule.get("lineage") or {})
+                rule["lineage"]["predecessor_rule_id"] = predecessor_rule_id
+            elif existing:
+                for field in ("canonical_approval_key", "predecessor_rule_id"):
+                    if existing.get(field) is not None:
+                        rule[field] = copy.deepcopy(existing[field])
             current_version = int(existing.get("current_version") or 1) if existing else 1
             if existing and _versioned_fields(existing) != _versioned_fields(rule):
                 current_version += 1
             rule["current_version"] = current_version
+            if canonical_approval_key:
+                rule["canonical_approval_key"] = canonical_approval_key
             if existing:
                 rules[rules.index(existing)] = rule
             else:
@@ -238,32 +495,16 @@ class ApprovedRuleStore:
             return copy.deepcopy(rule)
 
     def match_entity(self, entity: Dict[str, Any]) -> list[Dict[str, Any]]:
-        entity_pairs = {
-            _identity_pair(item)
-            for item in _template_pairs(entity.get("top_templates") or [])
-        }
-        entity_problem_code = derive_problem_code(entity, entity)
         with _PROCESS_LOCK:
             matches = []
             semantic_matches: dict[str, list[Dict[str, Any]]] = {}
             for rule in self._read_locked():
-                if str(rule.get("status") or "active") != "active":
+                if not _rule_matches_entity(rule, entity):
                     continue
                 problem_code = derive_problem_code(rule)
-                semantic_rule = bool(problem_code and is_canonical_problem_code(problem_code)) and (
-                    rule.get("match_mode") == "semantic"
-                    or (rule.get("match_mode") is None and bool(rule.get("approval_key")))
-                )
-                if semantic_rule:
-                    if problem_code != entity_problem_code:
-                        continue
+                if _is_semantic_v2_rule(rule) and is_canonical_problem_code(problem_code):
                     semantic_matches.setdefault(problem_code, []).append(rule)
-                    continue
-                required = {
-                    _identity_pair(item)
-                    for item in (rule.get("template_signatures") or [])
-                }
-                if required and required.issubset(entity_pairs):
+                else:
                     matches.append(copy.deepcopy(rule))
             for code in sorted(semantic_matches):
                 preferred = _preferred_rule(semantic_matches[code])
@@ -280,19 +521,37 @@ class ApprovedRuleStore:
         with _PROCESS_LOCK:
             rules = [
                 rule for rule in self._read_locked()
-                if str(rule.get("status") or "active") == "active"
+                if _is_active(rule)
             ]
+            if _is_legacy_feature(feature, identity):
+                legacy = _preferred_rule([
+                    rule for rule in rules
+                    if not _is_v2_rule(rule) and _legacy_feature_matches(rule, feature)
+                ])
+                return [copy.deepcopy(legacy)] if legacy is not None else []
+            legacy = _preferred_rule([
+                rule for rule in rules
+                if not _is_v2_rule(rule) and _legacy_feature_matches(rule, feature)
+            ])
+            if legacy is not None:
+                return [copy.deepcopy(legacy)]
             exact = _preferred_rule([
                 rule for rule in rules
-                if rule.get("approval_key") == identity["approval_key"]
+                if _is_v2_rule(rule)
+                and (
+                    rule.get("approval_key") == identity["approval_key"]
+                    or rule.get("canonical_approval_key") == identity["approval_key"]
+                )
             ])
             if exact is not None:
                 return [copy.deepcopy(exact)]
             if is_canonical_problem_code(identity["problem_code"]):
                 semantic = _preferred_rule([
                     rule for rule in rules
-                    if same_approval_identity(rule, feature)
+                    if _is_v2_rule(rule)
+                    and _is_semantic_v2_rule(rule)
                     and is_canonical_problem_code(derive_problem_code(rule))
+                    and derive_problem_code(rule) == identity["problem_code"]
                 ])
                 if semantic is not None:
                     return [copy.deepcopy(semantic)]

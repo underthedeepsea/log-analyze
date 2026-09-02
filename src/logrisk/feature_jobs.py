@@ -577,7 +577,7 @@ def _feature_from_rule(rule: Dict[str, Any], entity: Dict[str, Any]) -> Dict[str
         "origin": "approved_rule",
         "rule_id": rule.get("rule_id"),
         "problem_code": rule.get("problem_code"),
-        "approval_key": rule.get("approval_key"),
+        "approval_key": rule.get("canonical_approval_key") or rule.get("approval_key"),
         "anchor_signatures": copy.deepcopy(rule.get("anchor_signatures") or []),
         "supporting_signatures": copy.deepcopy(rule.get("supporting_signatures") or []),
         "match_mode": rule.get("match_mode"),
@@ -1017,13 +1017,6 @@ class FeatureJobManager:
         feature["approval_group_id"] = group["approval_group_id"]
         if persist:
             self._persist_feature_group_locked(job, record, group, candidate_id)
-            if resolved_rule and self.rule_store:
-                self.rule_store.record_reuse(
-                    str(resolved_rule["rule_id"]),
-                    job_id=str(job["job_id"]),
-                    entity_id=str(record.get("entity_id") or ""),
-                    cluster=record.get("cluster"),
-                )
         return feature, group
 
     def _persist_feature_group_locked(
@@ -1108,7 +1101,7 @@ class FeatureJobManager:
                 self.persistence.save(job)
 
     def _reconcile_pending_candidates_locked(self, rule: Dict[str, Any]) -> Dict[str, int]:
-        if not (rule.get("approval_key") or rule.get("problem_code")):
+        if str(rule.get("status") or "active") != "active" or not (rule.get("approval_key") or rule.get("problem_code")):
             return {"auto_resolved_candidates": 0, "auto_resolved_groups": 0}
         self._load_persisted_candidate_jobs_locked()
         resolved = 0
@@ -1161,13 +1154,6 @@ class FeatureJobManager:
                             groups.add(str(group.get("approval_group_id")))
                         group["updated_at"] = _now()
                         self.approval_group_store.save(group)
-                    if self.rule_store:
-                        self.rule_store.record_reuse(
-                            str(rule["rule_id"]),
-                            job_id=str(job["job_id"]),
-                            entity_id=str(record.get("entity_id") or ""),
-                            cluster=record.get("cluster"),
-                        )
                     resolved += 1
                     self._emit_locked(
                         job,
@@ -1972,18 +1958,6 @@ class FeatureJobManager:
                 group["updated_at"] = _now()
             self._persist_feature_group_locked(job, record, group, candidate_id)
 
-            if (
-                original_feature.get("status") == "pending"
-                and feature.get("resolution_type") == "group_matched"
-                and feature.get("resolved_rule_id")
-                and self.rule_store
-            ):
-                self.rule_store.record_reuse(
-                    str(feature["resolved_rule_id"]),
-                    job_id=str(job["job_id"]),
-                    entity_id=str(record.get("entity_id") or ""),
-                    cluster=record.get("cluster"),
-                )
             if rule is not None:
                 reconcile = self._reconcile_pending_candidates_locked(rule)
                 feature["auto_resolved_count"] = reconcile["auto_resolved_candidates"]

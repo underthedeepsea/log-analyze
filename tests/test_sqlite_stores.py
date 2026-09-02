@@ -519,6 +519,44 @@ def test_sqlite_rule_store_only_matches_active_rules(tmp_path):
     assert rules.match_entity(entity) == []
 
 
+def test_sqlite_inactive_rule_approval_creates_distinct_active_replacement(tmp_path):
+    database = SQLiteDatabase(tmp_path / "logrisk.sqlite3")
+    rules = SQLiteApprovedRuleStore(database)
+    feature = {
+        "candidate_id": "candidate-old",
+        "feature_type": "cni_network_failure",
+        "problem_code": "kubernetes.cni.ip_exhaustion",
+        "title": "CNI 地址耗尽",
+        "summary": "CNI 地址池没有可用 IP。",
+        "importance": "high",
+        "source_templates": [{
+            "template_hash": "hash-cni",
+            "template_fingerprint": "fingerprint-cni",
+            "category": "network",
+            "component": "kubelet",
+        }],
+    }
+    predecessor = rules.upsert_feature(feature)
+    with database.transaction() as connection:
+        connection.execute(
+            "UPDATE approved_rules SET status='disabled' WHERE rule_id=?",
+            (predecessor["rule_id"],),
+        )
+
+    replacement = rules.upsert_feature({
+        **feature,
+        "candidate_id": "candidate-new",
+        "feature_type": "pod_sandbox_network_failure",
+        "problem_code": "runtime_sandbox_create_failed",
+    })
+    persisted = {item["rule_id"]: item for item in rules.list_rules()}
+
+    assert replacement["rule_id"] != predecessor["rule_id"]
+    assert replacement["status"] == "active"
+    assert replacement["lineage"]["predecessor_rule_id"] == predecessor["rule_id"]
+    assert persisted[predecessor["rule_id"]]["status"] == "disabled"
+
+
 def test_sqlite_approval_group_round_trip_and_candidate_uniqueness(tmp_path):
     database = SQLiteDatabase(tmp_path / "logrisk.sqlite3")
     groups = SQLiteApprovalGroupStore(database)

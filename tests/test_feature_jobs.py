@@ -377,7 +377,7 @@ def test_matching_rule_skips_extractor_and_uses_current_entity_facts(tmp_path):
     assert reused["source_templates"][0]["template_hash"] == "hash-oom"
 
 
-def test_late_rule_match_records_reuse_only_for_pending_transition(tmp_path):
+def test_late_rule_match_does_not_count_as_pre_llm_reuse(tmp_path):
     reuse_events = []
 
     class RecordingRuleStore(ApprovedRuleStore):
@@ -397,17 +397,55 @@ def test_late_rule_match_records_reuse_only_for_pending_transition(tmp_path):
         model="qwen3:1.7b",
     )
     manager.run_job(job_id)
-    rule = store.upsert_feature(reusable_candidate(source))
+    store.upsert_feature(reusable_candidate(source))
 
     manager.update_feature(job_id, "feature-node-a", {"title": "首次编辑"})
     manager.update_feature(job_id, "feature-node-a", {"title": "再次编辑"})
 
+    assert reuse_events == []
+
+
+def test_rule_reuse_counts_pre_llm_match_once_but_not_reconciliation(tmp_path):
+    reuse_events = []
+
+    class RecordingRuleStore(ApprovedRuleStore):
+        def record_reuse(self, rule_id, **metadata):
+            reuse_events.append({"rule_id": rule_id, **metadata})
+            return super().record_reuse(rule_id, **metadata)
+
+    rules = RecordingRuleStore(tmp_path / "rules.json")
+    manager = FeatureJobManager(
+        extractor=lambda source, **kwargs: [reusable_candidate(source) | {"status": "pending"}],
+        rule_store=rules,
+        auto_start=False,
+    )
+    first = manager.create_job(
+        {"summary": {}, "risk_entities": [reusable_entity("node-a")]},
+        model="qwen3:1.7b",
+    )
+    second = manager.create_job(
+        {"summary": {}, "risk_entities": [reusable_entity("node-b")]},
+        model="qwen3:1.7b",
+    )
+    manager.run_job(first)
+    manager.run_job(second)
+
+    approved = manager.update_feature(first, "feature-node-a", {"status": "approved"})
+    assert reuse_events == []
+
+    third = manager.create_job(
+        {"summary": {}, "risk_entities": [reusable_entity("node-c")]},
+        model="qwen3:1.7b",
+    )
+    manager.run_job(third)
+
     assert reuse_events == [{
-        "rule_id": rule["rule_id"],
-        "job_id": job_id,
-        "entity_id": "node-a",
+        "rule_id": approved["rule_id"],
+        "job_id": third,
+        "entity_id": "node-c",
         "cluster": "prod-a",
     }]
+    assert rules.list_rules()[0]["reuse_count"] == 1
 
 
 def test_approving_ollama_feature_persists_reusable_rule(tmp_path):

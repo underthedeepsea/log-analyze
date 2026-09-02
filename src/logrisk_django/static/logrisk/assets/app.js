@@ -27,6 +27,7 @@
     if (!response.ok) {
       const error = new Error(payload.error || "请求失败 (" + response.status + ")");
       error.code = payload.code || "http_" + response.status;
+      error.status = response.status;
       error.requestId = payload.request_id || "";
       throw error;
     }
@@ -166,7 +167,7 @@
     traces: function (query) { return jsonRequest("/api/ai-harness/traces" + (query || "")); },
     trace: function (id) { return jsonRequest("/api/ai-harness/traces/" + encodeURIComponent(id)); },
     job: function (id) { return jsonRequest("/api/jobs/" + id); },
-    featureApprovals: function () { return jsonRequest("/api/feature-approvals?status=pending&page_size=100"); },
+    featureApprovals: function (cursor) { return jsonRequest("/api/feature-approvals?status=pending&page_size=100" + (cursor ? "&cursor=" + encodeURIComponent(cursor) : "")); },
     createJob: function (result, model, minScore, promptId, modelProfileId, retryCount) {
       return jsonRequest("/api/jobs", { method: "POST", body: JSON.stringify({ result: result, model: model, min_score: Number(minScore), prompt_id: promptId, model_profile_id: modelProfileId, retry_count: Number(retryCount), cache_enabled: true }) });
     },
@@ -547,17 +548,42 @@
 
   function ReviewEditor(props) {
     const [draft, setDraft] = useState(null);
+    const [dirty, setDirty] = useState(false);
+    const draftIdentity = useRef("");
     const selectedTemplate = props.selectedTemplate || {};
+    const featureIdentity = props.feature && (props.feature.candidate_id || props.feature.approval_key) || "";
     useEffect(function () {
+      if (!featureIdentity) {
+        draftIdentity.current = "";
+        setDraft(null);
+        setDirty(false);
+        props.onDirtyChange && props.onDirtyChange(false);
+        return;
+      }
+      if (draftIdentity.current === featureIdentity) return;
+      draftIdentity.current = featureIdentity;
       setDraft(reviewDraftFromFeature(props.feature, props.selectedTemplate));
-    }, [props.feature, props.selectedTemplate]);
+      setDirty(false);
+      props.onDirtyChange && props.onDirtyChange(false);
+    }, [featureIdentity]);
     if (!props.feature || !draft) return h("section", { className: "surface review-editor empty-state" }, "选择一条特征进行人工审批");
+    function setField(key, value) {
+      setDraft(function (current) { return Object.assign({}, current, { [key]: value }); });
+      setDirty(true);
+      props.onDirtyChange && props.onDirtyChange(true);
+    }
     function field(label, key, type) {
-      const controlProps = { value: draft[key], onChange: function (event) { setDraft(Object.assign({}, draft, { [key]: event.target.value })); } };
+      const controlProps = { value: draft[key], onChange: function (event) { setField(key, event.target.value); } };
       return h("label", null, label, type === "textarea" ? h("textarea", controlProps) : h("input", controlProps));
     }
-    function save(status) { props.onSave(Object.assign({}, draft, { tags: draft.tags.split(",").map(function (tag) { return tag.trim(); }).filter(Boolean), status: status })); }
-    return h("section", { className: "surface review-editor" }, h("div", { className: "surface-head" }, h("b", null, "人工审批"), h("span", null, props.feature.origin === "approved_rule" ? "来自批准规则库" : "来自模型 + Drain3")), h("div", { className: "editor-body" }, field("特征标题（来自模型）", "title"), field("特征摘要（模型语义 + 当前 Drain3 模板）", "summary", "textarea"), field("标签（来自模型，逗号分隔）", "tags"), field("审批备注", "reviewer_note", "textarea"), h("div", { className: "fact-box" }, "执行模型：", props.feature.model || "—", h("br"), "Provider：", props.feature.provider || "—", h("br"), "Model Profile：", props.feature.model_profile_id || "—", h("br"), "Prompt：", props.feature.prompt_id || "—", h("br"), "Job：", props.feature.job_id || "—", h("br"), "Trace：", props.feature.trace_id || "—"), h("div", { className: "fact-box" }, "当前证据模板：", selectedTemplate.template_hash || "—", h("br"), "组件 " + (selectedTemplate.component || "—") + " · 类别 " + (selectedTemplate.category || "—") + " · 次数 " + (selectedTemplate.count || 0), h("br"), selectedTemplate.template || "暂无模板文本"), h("div", { className: "fact-box" }, "质量门禁：已通过", h("br"), "Evaluator Score：" + (props.feature.evaluator_result && props.feature.evaluator_result.score != null ? props.feature.evaluator_result.score : "—"), h("br"), "实体 " + (props.feature.entity && props.feature.entity.id || "") + " · 风险分 " + props.feature.risk_score + " · 出现 " + props.feature.occurrence_count + " 次", h("br"), props.feature.trace_id ? "来源 " + (props.feature.prompt_id || "feature_extract_v3_compact_strict_json_en") + " · " + (props.feature.model || "—") + " · " + props.feature.trace_id : "来源：历史数据 / 未记录 Trace"), props.feature.trace_id && h("button", { className: "text-button trace-link", onClick: function () { props.onOpenTrace(props.feature.trace_id); } }, "查看 AI Trace"), h("div", { className: "editor-actions" }, h("button", { className: "reject-button", onClick: function () { save("rejected"); } }, "驳回"), h("button", { className: "primary-button", onClick: function () { save("approved"); } }, "批准并写入规则库"))));
+    async function save(status) {
+      try {
+        await props.onSave(Object.assign({}, draft, { tags: draft.tags.split(",").map(function (tag) { return tag.trim(); }).filter(Boolean), status: status }));
+        setDirty(false);
+        props.onDirtyChange && props.onDirtyChange(false);
+      } catch (_) {}
+    }
+    return h("section", { className: "surface review-editor" }, h("div", { className: "surface-head" }, h("div", null, h("b", null, "人工审批"), h("span", null, props.feature.origin === "approved_rule" ? "来自批准规则库" : "来自模型 + Drain3")), h("span", { className: "review-dirty-indicator " + (dirty ? "dirty" : "clean") }, dirty ? "有未保存更改" : "草稿已同步")), h("div", { className: "editor-body" }, field("特征标题（来自模型）", "title"), field("特征摘要（模型语义 + 当前 Drain3 模板）", "summary", "textarea"), h("label", null, "重要性", h("select", { value: draft.importance, onChange: function (event) { setField("importance", event.target.value); } }, ["critical", "high", "medium", "low"].map(function (level) { return h("option", { key: level, value: level }, level); }))), field("标签（来自模型，逗号分隔）", "tags"), field("审批备注", "reviewer_note", "textarea"), h("div", { className: "fact-box" }, "执行模型：", props.feature.model || "—", h("br"), "Provider：", props.feature.provider || "—", h("br"), "Model Profile：", props.feature.model_profile_id || "—", h("br"), "Prompt：", props.feature.prompt_id || "—", h("br"), "Job：", props.feature.job_id || "—", h("br"), "Trace：", props.feature.trace_id || "—", h("br"), "审批身份：", props.feature.approval_key || "—"), h("div", { className: "fact-box" }, "当前证据模板：", selectedTemplate.template_hash || "—", h("br"), "组件 " + (selectedTemplate.component || "—") + " · 类别 " + (selectedTemplate.category || "—") + " · 次数 " + (selectedTemplate.count || 0), h("br"), selectedTemplate.template || "暂无模板文本"), h("div", { className: "fact-box" }, "质量门禁：已通过", h("br"), "Evaluator Score：" + (props.feature.evaluator_result && props.feature.evaluator_result.score != null ? props.feature.evaluator_result.score : "—"), h("br"), "实体 " + (props.feature.entity && props.feature.entity.id || "") + " · 风险分 " + props.feature.risk_score + " · 出现 " + props.feature.occurrence_count + " 次", h("br"), props.feature.trace_id ? "来源 " + (props.feature.prompt_id || "feature_extract_v3_compact_strict_json_en") + " · " + (props.feature.model || "—") + " · " + props.feature.trace_id : "来源：历史数据 / 未记录 Trace"), props.feature.trace_id && h("button", { className: "text-button trace-link", onClick: function () { props.onOpenTrace(props.feature.trace_id); } }, "查看 AI Trace"), h("div", { className: "editor-actions" }, h("button", { className: "reject-button", onClick: function () { save("rejected"); } }, "驳回"), h("button", { className: "primary-button", onClick: function () { save("approved"); } }, "批准并写入规则库"))));
   }
 
   function PromptManagement(props) {
@@ -2007,6 +2033,7 @@
     const [snapshot, setSnapshot] = useState(null), [jobId, setJobId] = useState(null), [rules, setRules] = useState([]);
     const [ruleLoading, setRuleLoading] = useState(false), [ruleReviewQueue, setRuleReviewQueue] = useState({ items: [], total: 0 });
     const [approvalQueue, setApprovalQueue] = useState({ items: [], total_groups: 0, total_candidates: 0 }), [approvalLoading, setApprovalLoading] = useState(false), [selectedReviewKey, setSelectedReviewKey] = useState(function () { return new URLSearchParams(window.location.search).get("review_key") || ""; });
+    const [reviewDirty, setReviewDirty] = useState(false), [reviewNotice, setReviewNotice] = useState("");
     const [systemMetrics, setSystemMetrics] = useState({ today_llm_logs: 0 });
     const [harness, setHarness] = useState({ trace_enabled: true, current_prompt_id: "feature_extract_v3_compact_strict_json_en" }), [prompts, setPrompts] = useState([]), [traces, setTraces] = useState([]);
     const [modelProfiles, setModelProfiles] = useState({ default_profile_id: "", profiles: [] }), [modelProfileId, setModelProfileId] = useState("");
@@ -2031,6 +2058,7 @@
     const [sidebarCollapsed, setSidebarCollapsed] = useState(false), [mobileMenuOpen, setMobileMenuOpen] = useState(false);
     const [narrowSidebar, setNarrowSidebar] = useState(function () { return window.matchMedia("(max-width: 900px)").matches; });
     const events = useRef(null);
+    const approvalRequestSequence = useRef(0);
     const selected = useMemo(function () { return snapshot && snapshot.features && snapshot.features.find(function (feature) { return feature.candidate_id === selectedId; }) || null; }, [snapshot, selectedId]);
     const selectedReview = useMemo(function () { return (approvalQueue.items || []).find(function (group) { return group.review_key === selectedReviewKey; }) || null; }, [approvalQueue, selectedReviewKey]);
     useEffect(function () {
@@ -2054,10 +2082,11 @@
       return function () { media.removeEventListener("change", updateSidebarMode); };
     }, []);
     function changeView(next) {
+      if (view === "review" && next !== "review" && reviewDirty && !window.confirm("当前审批草稿尚未保存，确定离开吗？")) return;
       setView(next);
+      if (next !== "review") setReviewDirty(false);
       setMobileMenuOpen(false);
       history.pushState({}, "", routeForView(next));
-      if (next === "review") loadApprovalQueue().catch(function (reason) { setError(reason.message); });
       if (next === "drainQuality") loadDrainQuality().catch(function (reason) { setError(reason.message); });
       if (next === "rules") loadRules().catch(function (reason) { setError(reason.message); });
       if (next === "nodeRisks") loadNodeRisks().catch(function (reason) { setError(reason.message); });
@@ -2082,12 +2111,21 @@
     }
     async function loadHarness(query) { const values = await Promise.all([api.harnessStatus(), api.prompts(), api.traces(query || "?limit=50"), api.modelProfiles()]); setHarness(values[0]); setPrompts(values[1].items || []); setPromptId(values[1].current_prompt_id || "feature_extract_v3_compact_strict_json_en"); setTraces(values[2].items || []); setModelProfiles(values[3]); setModelProfileId(function (current) { return current || values[3].default_profile_id || ""; }); }
     async function loadApprovalQueue() {
+      const requestId = approvalRequestSequence.current + 1;
+      approvalRequestSequence.current = requestId;
       setApprovalLoading(true);
       try {
-        const value = await api.featureApprovals();
-        const items = value.items || [];
+        let cursor = "", value = { items: [], total_groups: 0, total_candidates: 0, next_cursor: null }, items = [];
+        do {
+          const page = await api.featureApprovals(cursor || null);
+          if (requestId !== approvalRequestSequence.current) return page;
+          value = page;
+          items = items.concat(page.items || []);
+          cursor = page.next_cursor || "";
+        } while (cursor);
+        if (requestId !== approvalRequestSequence.current) return value;
         const requested = new URLSearchParams(window.location.search).get("review_key") || "";
-        setApprovalQueue(Object.assign({ items: [], total_groups: 0, total_candidates: 0 }, value));
+        setApprovalQueue(Object.assign({ items: [], total_groups: 0, total_candidates: 0 }, value, { items: items, next_cursor: null }));
         setSelectedReviewKey(function (current) {
           if (requested && items.some(function (group) { return group.review_key === requested; })) return requested;
           if (current && items.some(function (group) { return group.review_key === current; })) return current;
@@ -2095,10 +2133,10 @@
         });
         return value;
       } catch (reason) {
-        setError(reason.message);
+        if (requestId === approvalRequestSequence.current) setError(reason.message);
         throw reason;
       } finally {
-        setApprovalLoading(false);
+        if (requestId === approvalRequestSequence.current) setApprovalLoading(false);
       }
     }
     async function loadAgentRuns(selectedId) {
@@ -2220,8 +2258,8 @@
     async function refresh(id) { const next = await api.job(id || jobId); setSnapshot(next); if (["completed", "completed_with_errors"].includes(next.status) && events.current) events.current.close(); loadHarness().catch(function () {}); }
     useEffect(function () {
       const query = window.location.pathname === "/ai-traces" ? traceFilterQuery(traceFiltersFromSearch(window.location.search)) : "?limit=50";
-      Promise.all([api.config(), api.status(), Promise.all([api.governedRules("?page_size=100"), api.ruleReviewQueue()]), api.metrics(), api.harnessStatus(), api.prompts(), api.traces(query), api.modelProfiles()]).then(function (values) { setModel(values[0].default_model); setOllama(values[1]); setRules(values[2][0].items || []); setRuleReviewQueue(values[2][1]); setSystemMetrics(values[3]); setHarness(values[4]); setPrompts(values[5].items || []); setPromptId(values[5].current_prompt_id || values[4].current_prompt_id || "feature_extract_v3_compact_strict_json_en"); setTraces(values[6].items || []); setModelProfiles(values[7]); setModelProfileId(values[7].default_profile_id || ""); if (window.location.pathname === "/ai-observability") loadObservability().catch(function (reason) { setError(reason.message); }); if (window.location.pathname === "/agent-runs") loadAgentRuns(); if (window.location.pathname === "/agent-workflows") loadAgentWorkflows().catch(function () {}); if (window.location.pathname === "/drain-quality") loadDrainQuality().catch(function (reason) { setError(reason.message); }); if (window.location.pathname.startsWith("/node-risks")) loadNodeRisks().catch(function (reason) { setError(reason.message); }); if (window.location.pathname === "/multi-source") loadMultiSource().catch(function () {}); if (window.location.pathname === "/semantic-library") loadRiskSemantics().catch(function (reason) { setError(reason.message); }); if (window.location.pathname === "/streaming") loadStreaming().catch(function (reason) { setError(reason.message); }); if (window.location.pathname === "/benchmark-center") loadBenchmark().catch(function () {}); if (window.location.pathname === "/runtime") loadRuntime().catch(function () {}); if (window.location.pathname === "/release-readiness") loadReleaseReadiness().catch(function () {}); if (window.location.pathname === "/review") loadApprovalQueue().catch(function () {}); }).catch(function (reason) { setError(reason.message); });
-      function onPop() { const filters = traceFiltersFromSearch(window.location.search); setView(pathToView(window.location.pathname)); setTraceFilters(filters); if (window.location.pathname === "/ai-traces") loadHarness(traceFilterQuery(filters)).catch(function () {}); if (window.location.pathname === "/ai-observability") loadObservability().catch(function () {}); if (window.location.pathname === "/agent-runs") loadAgentRuns(); if (window.location.pathname === "/agent-workflows") loadAgentWorkflows().catch(function () {}); if (window.location.pathname === "/drain-quality") loadDrainQuality().catch(function () {}); if (window.location.pathname === "/rules") loadRules().catch(function () {}); if (window.location.pathname.startsWith("/node-risks")) loadNodeRisks().catch(function () {}); if (window.location.pathname === "/multi-source") loadMultiSource().catch(function () {}); if (window.location.pathname === "/semantic-library") loadRiskSemantics().catch(function () {}); if (window.location.pathname === "/streaming") loadStreaming().catch(function () {}); if (window.location.pathname === "/benchmark-center") loadBenchmark().catch(function () {}); if (window.location.pathname === "/runtime") loadRuntime().catch(function () {}); if (window.location.pathname === "/release-readiness") loadReleaseReadiness().catch(function () {}); if (window.location.pathname === "/review") loadApprovalQueue().catch(function () {}); if (window.location.pathname === "/knowledge-packages") { /* page owns its refresh */ } }
+      Promise.all([api.config(), api.status(), Promise.all([api.governedRules("?page_size=100"), api.ruleReviewQueue()]), api.metrics(), api.harnessStatus(), api.prompts(), api.traces(query), api.modelProfiles()]).then(function (values) { setModel(values[0].default_model); setOllama(values[1]); setRules(values[2][0].items || []); setRuleReviewQueue(values[2][1]); setSystemMetrics(values[3]); setHarness(values[4]); setPrompts(values[5].items || []); setPromptId(values[5].current_prompt_id || values[4].current_prompt_id || "feature_extract_v3_compact_strict_json_en"); setTraces(values[6].items || []); setModelProfiles(values[7]); setModelProfileId(values[7].default_profile_id || ""); if (window.location.pathname === "/ai-observability") loadObservability().catch(function (reason) { setError(reason.message); }); if (window.location.pathname === "/agent-runs") loadAgentRuns(); if (window.location.pathname === "/agent-workflows") loadAgentWorkflows().catch(function () {}); if (window.location.pathname === "/drain-quality") loadDrainQuality().catch(function (reason) { setError(reason.message); }); if (window.location.pathname.startsWith("/node-risks")) loadNodeRisks().catch(function (reason) { setError(reason.message); }); if (window.location.pathname === "/multi-source") loadMultiSource().catch(function () {}); if (window.location.pathname === "/semantic-library") loadRiskSemantics().catch(function (reason) { setError(reason.message); }); if (window.location.pathname === "/streaming") loadStreaming().catch(function (reason) { setError(reason.message); }); if (window.location.pathname === "/benchmark-center") loadBenchmark().catch(function () {}); if (window.location.pathname === "/runtime") loadRuntime().catch(function () {}); if (window.location.pathname === "/release-readiness") loadReleaseReadiness().catch(function () {}); }).catch(function (reason) { setError(reason.message); });
+      function onPop() { const filters = traceFiltersFromSearch(window.location.search); setView(pathToView(window.location.pathname)); setTraceFilters(filters); if (window.location.pathname === "/ai-traces") loadHarness(traceFilterQuery(filters)).catch(function () {}); if (window.location.pathname === "/ai-observability") loadObservability().catch(function () {}); if (window.location.pathname === "/agent-runs") loadAgentRuns(); if (window.location.pathname === "/agent-workflows") loadAgentWorkflows().catch(function () {}); if (window.location.pathname === "/drain-quality") loadDrainQuality().catch(function () {}); if (window.location.pathname === "/rules") loadRules().catch(function () {}); if (window.location.pathname.startsWith("/node-risks")) loadNodeRisks().catch(function () {}); if (window.location.pathname === "/multi-source") loadMultiSource().catch(function () {}); if (window.location.pathname === "/semantic-library") loadRiskSemantics().catch(function () {}); if (window.location.pathname === "/streaming") loadStreaming().catch(function () {}); if (window.location.pathname === "/benchmark-center") loadBenchmark().catch(function () {}); if (window.location.pathname === "/runtime") loadRuntime().catch(function () {}); if (window.location.pathname === "/release-readiness") loadReleaseReadiness().catch(function () {}); if (window.location.pathname === "/knowledge-packages") { /* page owns its refresh */ } }
       window.addEventListener("popstate", onPop);
       return function () { window.removeEventListener("popstate", onPop); if (events.current) events.current.close(); };
     }, []);
@@ -2243,27 +2281,63 @@
       return function () { clearInterval(timer); };
     }, [view, (streamingData.tasks || []).map(function (task) { return task.task_id + ":" + task.status + ":" + task.updated_at; }).join("|")]);
     useEffect(function () {
-      if (view !== "review") return;
-      const timer = setInterval(function () { if (!document.hidden) loadApprovalQueue().catch(function () {}); }, 3000);
-      return function () { clearInterval(timer); };
+      if (view !== "review") return undefined;
+      let timer = null;
+      function stopPolling() {
+        if (timer !== null) {
+          clearInterval(timer);
+          timer = null;
+        }
+      }
+      function refreshApprovalQueue() { loadApprovalQueue().catch(function () {}); }
+      function startPolling() {
+        stopPolling();
+        if (!document.hidden) timer = setInterval(function () { if (!document.hidden) refreshApprovalQueue(); }, 3000);
+      }
+      refreshApprovalQueue();
+      function onVisibilityChange() {
+        if (document.hidden) stopPolling();
+        else { refreshApprovalQueue(); startPolling(); }
+      }
+      document.addEventListener("visibilitychange", onVisibilityChange);
+      startPolling();
+      return function () {
+        approvalRequestSequence.current += 1;
+        stopPolling();
+        document.removeEventListener("visibilitychange", onVisibilityChange);
+      };
     }, [view]);
     async function loadFile(file) { if (!file) return; setBusy(true); setError(""); setUploadProgress(null); setPreprocessProgress(null); try { const next = await api.analyzeFile(file, { onUploadProgress: setUploadProgress, onPreprocessProgress: setPreprocessProgress }); setResult(next); setFileName(file.name); setSnapshot(null); setJobId(null); changeView("overview"); } catch (reason) { setError(reason.message); } finally { setBusy(false); } }
     async function start() { if (!result) return; setBusy(true); setError(""); try { const created = await api.createJob(result, model, threshold, promptId, modelProfileId, retryCount); setJobId(created.job_id); changeView("queue"); await refresh(created.job_id); if (events.current) events.current.close(); events.current = api.subscribe(created.job_id, function () { refresh(created.job_id).catch(function (reason) { setError(reason.message); }); }); } catch (reason) { setError(reason.message); } finally { setBusy(false); } }
     async function save(changes) { try { await api.update(jobId, selectedId, changes); await refresh(); await loadRules(); } catch (reason) { setError(reason.message); } }
-    function selectReviewGroup(reviewKey) { setSelectedReviewKey(reviewKey); history.pushState({}, "", "/review?review_key=" + encodeURIComponent(reviewKey)); }
+    function selectReviewGroup(reviewKey) {
+      if (reviewKey !== selectedReviewKey && reviewDirty && !window.confirm("当前审批草稿尚未保存，确定切换吗？")) return;
+      setReviewDirty(false);
+      setReviewNotice("");
+      setSelectedReviewKey(reviewKey);
+      history.pushState({}, "", "/review?review_key=" + encodeURIComponent(reviewKey));
+    }
+    function reviewFailureMessage(reason) {
+      if (reason && (reason.code === "candidate_state_conflict" || reason.status === 409)) return "该候选已被其他审核者更新，请刷新审批队列后重试。";
+      if (reason && (reason.code === "candidate_not_found" || reason.status === 404)) return "该候选已不存在，请刷新审批队列。";
+      return reason && reason.message || "审批保存失败，请稍后重试。";
+    }
     async function saveReview(changes) {
       const representative = selectedReview && selectedReview.representative;
       if (!representative) return;
       try {
-        await api.update(
+        const updated = await api.update(
           representative.job_id,
           representative.candidate_id,
           Object.assign({}, changes, { review_scope: "approval_identity" }),
         );
-        await loadApprovalQueue();
-        await loadRules();
+        const resolved = Number(updated.auto_resolved_count || 0);
+        setReviewNotice(changes.status === "approved" ? "已批准该 Review Group，已同步收敛 " + resolved + " 个重复候选。" : "已驳回该 Review Group 下仍待审批的候选。");
+        await Promise.all([loadApprovalQueue(), loadRules()]);
+        return updated;
       } catch (reason) {
-        setError(reason.message);
+        setError(reviewFailureMessage(reason));
+        throw reason;
       }
     }
     function retry(entityId) { api.retry(jobId, entityId).then(function () { return refresh(); }).catch(function (reason) { setError(reason.message); }); }
@@ -2321,9 +2395,10 @@
         view === "agentRuns" && h(AgentRunsPage, { data: agentRunData, profiles: activeProfiles, prompts: prompts.filter(function (prompt) { return prompt.analysis_type === "agent_plan" && prompt.status === "active"; }), onRefresh: loadAgentRuns, onSelect: loadAgentRuns, onReview: function () { changeView("review"); }, onCreate: function (payload) { return api.createAgentRun(payload).then(function (created) { return loadAgentRuns(created.run_id); }).catch(function (reason) { setError(reason.message); throw reason; }); }, onAction: function (runId, action) { return changeAgentRun(runId, action).catch(function (reason) { setError(reason.message); throw reason; }); } }),
         view === "agentWorkflows" && h(AgentWorkflowsPage, { data: agentWorkflowData, profiles: activeProfiles, onRefresh: loadAgentWorkflows, onSelect: loadAgentWorkflows, onReview: function () { changeView("review"); }, onCreateWorkflow: function (definition) { return api.createAgentWorkflow(definition).then(function () { return loadAgentWorkflows(); }); }, onCreateRun: function (workflowId, payload) { return api.createAgentWorkflowRun(workflowId, payload).then(function (created) { return loadAgentWorkflows(created.workflow_run_id); }); }, onAction: changeAgentWorkflow, onRetryNode: function (runId, nodeId) { return api.retryNode(runId, nodeId).then(function () { return loadAgentWorkflows(runId); }); } }),
         view === "review" && h("section", { className: "approval-workspace" },
+          reviewNotice && h("div", { className: "review-notice" }, reviewNotice),
           h(ReviewGroupList, { groups: approvalQueue.items, totalCandidates: approvalQueue.total_candidates, loading: approvalLoading, selectedKey: selectedReviewKey, onSelect: selectReviewGroup }),
           h(FeatureEvidence, { feature: selectedRepresentative, onSelectTemplate: setSelectedTemplate }),
-          h(ReviewEditor, { feature: selectedRepresentative, selectedTemplate: selectedTemplate, onSave: saveReview, onOpenTrace: openTrace })),
+          h(ReviewEditor, { feature: selectedRepresentative, selectedTemplate: selectedTemplate, onSave: saveReview, onOpenTrace: openTrace, onDirtyChange: setReviewDirty })),
         view === "rules" && h(RuleLibrary, { rules: rules, reviewQueue: ruleReviewQueue, loading: ruleLoading, focusRuleId: ruleFocus, onOpenTrace: openTrace, onChanged: loadRules }),
         view === "nodeRisks" && h(NodeRiskPage, { catalog: nodeRiskCatalog, selected: selectedNodeRisk, onRefresh: loadNodeRisks, onSelect: function (item) { selectNodeRisk(item).catch(function (reason) { setError(reason.message); }); }, onEvent: function (eventId, action) { changeNodeEvent(eventId, action).catch(function (reason) { setError(reason.message); }); } }),
         view === "multiSource" && h(MultiSourcePage, { data: multiSourceData, onRefresh: function () { loadMultiSource().catch(function () {}); }, onSelect: function (entity) { selectMultiSourceEntity(entity).catch(function (reason) { setError(reason.message); }); }, onRule: function (rule, enabled) { changeMultiSourceRule(rule, enabled).catch(function (reason) { setError(reason.message); }); } }),

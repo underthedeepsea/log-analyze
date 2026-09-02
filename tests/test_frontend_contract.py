@@ -683,3 +683,30 @@ def test_feature_approval_workspace_uses_persistent_queue_and_recoverable_route(
     assert 'representative.candidate_id' in source
     assert 'review_scope' in source
     assert 'h(FeatureList, { features: snapshot && snapshot.features || []' not in source
+
+
+def test_review_workbench_polls_safely_and_preserves_dirty_drafts():
+    source = (FRONTEND / "src" / "app.js").read_text(encoding="utf-8")
+
+    for marker in (
+        'featureApprovals: function (cursor)',
+        'next_cursor',
+        'const approvalRequestSequence = useRef(0);',
+        'visibilitychange',
+        'document.hidden',
+        'clearInterval(timer)',
+        'const draftIdentity = useRef("");',
+        'reviewDirty',
+        '有未保存更改',
+        'h("select", { value: draft.importance',
+        'candidate_state_conflict',
+        'candidate_not_found',
+        'auto_resolved_count',
+    ):
+        assert marker in source
+
+
+def test_review_workbench_bundles_are_identical():
+    source = (FRONTEND / "src" / "app.js").read_bytes()
+    assert source == (FRONTEND / "dist" / "assets" / "app.js").read_bytes()
+    assert source == (Path("src/logrisk_django/static/logrisk/assets/app.js")).read_bytes()

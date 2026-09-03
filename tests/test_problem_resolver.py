@@ -4,6 +4,7 @@ import hashlib
 
 import pytest
 
+import logrisk.problem_resolver as problem_resolver
 from logrisk.approval_dedup import approval_identity, build_approval_key, derive_problem_code
 from logrisk.problem_resolver import ProblemResolution, resolve_problem
 
@@ -83,6 +84,17 @@ def test_standalone_no_such_container_remains_container_not_found():
     assert resolution.problem_code == "kubernetes.runtime.container_not_found"
     assert resolution.subtype is None
     assert resolution.semantic_safe is True
+
+
+def test_resolve_selected_template_preserves_generic_wrapper_safety():
+    resolver = getattr(problem_resolver, "resolve_selected_template", None)
+    assert callable(resolver)
+
+    resolution = resolver(selected("CNI plugin failed", category="network"))
+
+    assert resolution.problem_code == "kubernetes.cni.plugin_failure"
+    assert resolution.semantic_safe is False
+    assert resolution.ambiguity is False
 
 
 def test_t2_selected_ip_evidence_wins_over_summary_pollution():

@@ -105,6 +105,20 @@ _CONCRETE_CODES = frozenset({
     "linux.memory.oom",
 })
 
+_STATS_OPERATION_PATTERN = re.compile(
+    r"failed\s+to\s+get\s+(?:system\s+)?container\s+(?:stats|statistics|info)"
+    r"|system\s+container\s+stats"
+    r"|container\s+stats"
+    r"|recentstats",
+    re.I,
+)
+
+_CONTAINER_NOT_FOUND_PATTERN = re.compile(
+    r"(?:unknown|no such|does not exist|not found)\s+container"
+    r"|container\s+(?:is\s+)?(?:unknown|not found|does not exist)",
+    re.I,
+)
+
 
 @dataclass(frozen=True)
 class _Match:
@@ -321,17 +335,23 @@ def _template_matches(source: Mapping[str, Any]) -> list[_Match]:
             "cni_config_error_v1",
         ))
 
-    if re.search(r"(?:unknown|no such|does not exist|not found)\s+container|"
-                 r"container\s+(?:is\s+)?(?:unknown|not found|does not exist)", text):
+    stats_context = bool(_STATS_OPERATION_PATTERN.search(text))
+    not_found_context = bool(_CONTAINER_NOT_FOUND_PATTERN.search(text))
+
+    if stats_context:
         matches.append(_Match(
-            "kubernetes.runtime.container_not_found", "selected_template_pattern", "high",
-            "container_not_found_v1",
+            "kubernetes.runtime.container_stats_failure",
+            "selected_template_pattern",
+            "high",
+            "container_stats_failure_v2",
+            "container_not_found" if not_found_context else None,
         ))
-    elif re.search(r"failed\s+to\s+get\s+(?:system\s+)?container\s+(?:stats|statistics|info)|"
-                   r"system\s+container\s+stats|container\s+stats|recentstats", text):
+    elif not_found_context:
         matches.append(_Match(
-            "kubernetes.runtime.container_stats_failure", "selected_template_pattern", "high",
-            "container_stats_failure_v1",
+            "kubernetes.runtime.container_not_found",
+            "selected_template_pattern",
+            "high",
+            "container_not_found_v1",
         ))
 
     if re.search(r"(?:unable\s+to\s+find|not found|missing).{0,45}"
@@ -541,6 +561,21 @@ def _resolution(
         tuple(codes),
         match.subtype,
     )
+
+
+def resolve_selected_template(template: Mapping[str, Any]) -> ProblemResolution:
+    matches = _template_matches(template)
+    concrete = [match for match in matches if _is_concrete(match.code)]
+    if not concrete:
+        generic = [match for match in matches if _is_generic(match.code)]
+        return _resolution(generic, semantic_safe=False) if generic else ProblemResolution(
+            None, "low", False, False, "fallback", None, ()
+        )
+
+    codes = {match.code for match in concrete}
+    if len(codes) > 1:
+        return _resolution(concrete, semantic_safe=False, ambiguity=True)
+    return _resolution(concrete, semantic_safe=True)
 
 
 def resolve_problem(

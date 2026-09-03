@@ -52,6 +52,39 @@ def test_t1_same_container_stats_semantics_ignore_wrapper_and_presentation():
     assert approval_identity(left)["approval_key"] == approval_identity(right)["approval_key"]
 
 
+def test_container_stats_operation_keeps_stats_as_primary_and_not_found_as_subtype():
+    feature = {
+        "feature_type": "kubelet_container_stats_error",
+        "source_templates": [selected(
+            "Failed to get system container stats: "
+            "failed to get container info: unknown container"
+        )],
+    }
+
+    resolution = resolve_problem(feature)
+
+    assert resolution.problem_code == "kubernetes.runtime.container_stats_failure"
+    assert resolution.subtype == "container_not_found"
+    assert resolution.semantic_safe is True
+    assert resolution.ambiguity is False
+
+
+def test_standalone_no_such_container_remains_container_not_found():
+    feature = {
+        "feature_type": "kubelet_container_runtime_error",
+        "source_templates": [selected(
+            'ContainerStatus "<id>" from runtime service failed: '
+            "rpc error: code = Unknown desc = No such container"
+        )],
+    }
+
+    resolution = resolve_problem(feature)
+
+    assert resolution.problem_code == "kubernetes.runtime.container_not_found"
+    assert resolution.subtype is None
+    assert resolution.semantic_safe is True
+
+
 def test_t2_selected_ip_evidence_wins_over_summary_pollution():
     feature = {
         "feature_type": "cni_network_failure",

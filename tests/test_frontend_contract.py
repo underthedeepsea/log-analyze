@@ -554,7 +554,7 @@ def test_release_docs_describe_current_feature_version():
     assert "## 1.32.0 - 2026-08-10" in release
     assert "## 1.34.0 - 2026-08-13" in release
     assert "## 1.36.1 - 2026-09-01" in release
-    assert "当前版本：`1.36.1`" in readme
+    assert "当前版本：`1.36.2`" in readme
     assert "## 1.24.0 - 2026-07-22" in release
     assert "## 1.24.1 - 2026-07-22" in release
     assert "## 1.24.2 - 2026-07-22" in release

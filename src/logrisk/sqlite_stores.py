@@ -10,8 +10,24 @@ from typing import Any, Callable
 
 from logrisk.ai_harness.trace_logger import AITraceLogger
 from logrisk.approval_dedup import group_id_for_key
-from logrisk.approved_rules import ApprovedRuleStore
-from logrisk.database import SQLiteDatabase, utc_now
+from logrisk.approved_rules import (
+    ApprovedRuleStore,
+    ApprovedRuleError,
+    RuleFormat,
+    _is_active,
+    classify_rule,
+    hydrate_persisted_rule,
+    public_rule,
+)
+from logrisk.database import Database, SQLiteDatabase, utc_now
+from logrisk.feature_jobs import (
+    FeatureJobError,
+    REVIEW_OWNED_FIELDS,
+    _candidate_version_payload,
+    _merge_review_owned_fields,
+    _sanitize_feature_payload,
+    _validate_candidate_review_changes,
+)
 from logrisk.input_jobs import InputJobConfig, InputJobStore
 from logrisk.upload_sessions import UploadConfig, UploadSessionStore
 from logrisk.semantic.store import SemanticDictionaryStore
@@ -29,11 +45,135 @@ def _json(value: Any) -> str:
 
 
 class SQLiteFeatureJobStore:
-    def __init__(self, database: SQLiteDatabase) -> None:
+    def __init__(self, database: Database) -> None:
         self.database = database
 
+    @classmethod
+    def _candidate_from_row(cls, row: Any) -> dict[str, Any] | None:
+        candidate = _sanitize_feature_payload(cls._decode_json(row["candidate_json"], {}))
+        if not isinstance(candidate, dict):
+            return None
+        candidate["candidate_id"] = str(row["candidate_id"])
+        candidate["job_id"] = str(row["job_id"])
+        if row["status"] is not None:
+            candidate["status"] = row["status"]
+        for field in ("approval_key", "problem_code", "approval_group_id", "resolved_rule_id", "resolution_type"):
+            if row[field] is not None:
+                candidate[field] = row[field]
+        candidate.setdefault("entity_id", row["entity_id"])
+        candidate["created_at"] = row["created_at"]
+        candidate["updated_at"] = row["updated_at"]
+        try:
+            job = cls._decode_json(row["job_json"], {})
+        except (IndexError, KeyError):
+            job = {}
+        if not isinstance(job, dict):
+            job = {}
+        for field in ("model", "provider", "prompt_id", "model_profile_id"):
+            if candidate.get(field) is None and job.get(field) is not None:
+                candidate[field] = copy.deepcopy(job[field])
+        candidate.setdefault("job_created_at", job.get("created_at"))
+        candidate.setdefault("job_status", job.get("status"))
+        return candidate
+
+    @staticmethod
+    def _candidate_not_found() -> FeatureJobError:
+        return FeatureJobError("候选特征不存在", code="candidate_not_found", status_code=404)
+
+    @staticmethod
+    def _candidate_state_conflict() -> FeatureJobError:
+        return FeatureJobError("候选特征状态已变化", code="candidate_state_conflict", status_code=409)
+
+    @classmethod
+    def _candidate_for_merge(cls, row: Any) -> dict[str, Any]:
+        candidate = _sanitize_feature_payload(cls._decode_json(row["candidate_json"], {}))
+        if not isinstance(candidate, dict):
+            candidate = {}
+        candidate["candidate_id"] = str(row["candidate_id"])
+        for field in (
+            "status",
+            "approval_key",
+            "problem_code",
+            "approval_group_id",
+            "resolved_rule_id",
+            "resolution_type",
+        ):
+            if row[field] is not None:
+                candidate[field] = row[field]
+        return candidate
+
+    @classmethod
+    def _upsert_generated_candidate(
+        cls,
+        connection: Any,
+        job_id: str,
+        candidate: dict[str, Any],
+        now: str,
+        *,
+        for_update: bool = False,
+    ) -> dict[str, Any]:
+        candidate_id = str(candidate.get("candidate_id") or "")
+        if not candidate_id:
+            raise FeatureJobError("候选特征缺少 candidate_id")
+        candidate = _sanitize_feature_payload(candidate)
+        query = (
+            "SELECT candidate_id, job_id, entity_id, status, approval_key, problem_code, approval_group_id, "
+            "resolved_rule_id, resolution_type, candidate_json, created_at, updated_at "
+            "FROM feature_candidates WHERE candidate_id=?"
+        )
+        if for_update:
+            query += " FOR UPDATE"
+        existing = connection.execute(query, (candidate_id,)).fetchone()
+        if existing is not None and str(existing["job_id"]) != str(job_id):
+            feedback = connection.execute(
+                "SELECT 1 FROM feature_candidate_feedback WHERE candidate_id=? LIMIT 1", (candidate_id,)
+            ).fetchone()
+            if feedback is not None:
+                raise ValueError("cannot re-parent candidate with feedback history")
+        merged = (
+            _merge_review_owned_fields(cls._candidate_for_merge(existing), candidate)
+            if existing is not None
+            else copy.deepcopy(candidate)
+        )
+        merged["candidate_id"] = candidate_id
+        unchanged = (
+            existing is not None
+            and str(existing["job_id"]) == str(job_id)
+            and _candidate_version_payload(cls._candidate_for_merge(existing))
+            == _candidate_version_payload(merged)
+        )
+        updated_at = existing["updated_at"] if unchanged else now
+        merged["updated_at"] = updated_at
+        connection.execute(
+            "INSERT INTO feature_candidates(candidate_id, job_id, entity_id, status, approval_key, problem_code, "
+            "approval_group_id, resolved_rule_id, resolution_type, candidate_json, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(candidate_id) DO UPDATE SET job_id=excluded.job_id, entity_id=excluded.entity_id, "
+            "status=excluded.status, approval_key=excluded.approval_key, problem_code=excluded.problem_code, "
+            "approval_group_id=excluded.approval_group_id, resolved_rule_id=excluded.resolved_rule_id, "
+            "resolution_type=excluded.resolution_type, candidate_json=excluded.candidate_json, updated_at=excluded.updated_at",
+            (
+                candidate_id,
+                job_id,
+                (merged.get("entity") or {}).get("id") or merged.get("entity_id"),
+                merged.get("status"),
+                merged.get("approval_key"),
+                merged.get("problem_code"),
+                merged.get("approval_group_id"),
+                merged.get("resolved_rule_id"),
+                merged.get("resolution_type"),
+                _json(merged),
+                existing["created_at"] if existing is not None else (merged.get("created_at") or now),
+                updated_at,
+            ),
+        )
+        return merged
+
     def save(self, job: dict[str, Any]) -> None:
-        snapshot = {key: copy.deepcopy(value) for key, value in job.items() if key not in {"condition", "events"}}
+        safe_job = _sanitize_feature_payload(
+            {key: value for key, value in job.items() if key != "condition"}
+        )
+        snapshot = {key: copy.deepcopy(value) for key, value in safe_job.items() if key not in {"condition", "events"}}
         now = utc_now()
         with self.database.transaction() as connection:
             connection.execute(
@@ -43,76 +183,80 @@ class SQLiteFeatureJobStore:
                 "connection_snapshot_json=excluded.connection_snapshot_json, profile_snapshot_json=excluded.profile_snapshot_json, "
                 "job_json=excluded.job_json, completed_at=excluded.completed_at, updated_at=excluded.updated_at",
                 (
-                    job["job_id"],
-                    job.get("status", "unknown"),
-                    job.get("model_profile_id"),
-                    _json(job.get("connection_snapshot")) if job.get("connection_snapshot") else None,
-                    _json(job.get("profile_snapshot")) if job.get("profile_snapshot") else None,
+                    safe_job["job_id"],
+                    safe_job.get("status", "unknown"),
+                    safe_job.get("model_profile_id"),
+                    _json(safe_job.get("connection_snapshot")) if safe_job.get("connection_snapshot") else None,
+                    _json(safe_job.get("profile_snapshot")) if safe_job.get("profile_snapshot") else None,
                     _json(snapshot),
-                    job.get("created_at") or now,
-                    job.get("completed_at"),
+                    safe_job.get("created_at") or now,
+                    safe_job.get("completed_at"),
                     now,
                 ),
             )
-            connection.execute("DELETE FROM feature_job_entities WHERE job_id=?", (job["job_id"],))
-            connection.execute("DELETE FROM feature_job_events WHERE job_id=?", (job["job_id"],))
-            candidate_ids = [str(candidate_id) for candidate_id in (job.get("features") or {})]
-            if candidate_ids:
-                placeholders = ",".join("?" for _ in candidate_ids)
-                connection.execute(
-                    "DELETE FROM feature_candidates WHERE job_id=? AND candidate_id NOT IN (" + placeholders + ") "
-                    "AND candidate_id NOT IN (SELECT candidate_id FROM feature_candidate_feedback)",
-                    [job["job_id"], *candidate_ids],
-                )
-            else:
-                connection.execute(
-                    "DELETE FROM feature_candidates WHERE job_id=? "
-                    "AND candidate_id NOT IN (SELECT candidate_id FROM feature_candidate_feedback)",
-                    (job["job_id"],),
-                )
-            for entity in job.get("entities", []):
+            connection.execute("DELETE FROM feature_job_entities WHERE job_id=?", (safe_job["job_id"],))
+            for entity in safe_job.get("entities", []):
                 connection.execute(
                     "INSERT INTO feature_job_entities(job_id, entity_id, status, risk_score, entity_json, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
-                    (job["job_id"], entity["entity_id"], entity.get("status", "unknown"), entity.get("risk_score"), _json(entity), now),
+                    (safe_job["job_id"], entity["entity_id"], entity.get("status", "unknown"), entity.get("risk_score"), _json(entity), now),
                 )
-            for candidate_id, candidate in (job.get("features") or {}).items():
-                existing = connection.execute(
-                    "SELECT job_id FROM feature_candidates WHERE candidate_id=?", (candidate_id,)
-                ).fetchone()
-                if existing is not None and str(existing["job_id"]) != str(job["job_id"]):
-                    feedback = connection.execute(
-                        "SELECT 1 FROM feature_candidate_feedback WHERE candidate_id=? LIMIT 1", (candidate_id,)
-                    ).fetchone()
-                    if feedback is not None:
-                        raise ValueError("cannot re-parent candidate with feedback history")
+            persisted_features: dict[str, dict[str, Any]] = {}
+            for candidate_id, candidate in (safe_job.get("features") or {}).items():
+                if not isinstance(candidate, dict):
+                    continue
+                candidate["candidate_id"] = str(candidate.get("candidate_id") or candidate_id)
+                persisted_features[candidate["candidate_id"]] = self._upsert_generated_candidate(
+                    connection,
+                    str(safe_job["job_id"]),
+                    candidate,
+                    now,
+                    for_update=getattr(self.database, "provider", "sqlite") == "postgres",
+                )
+            if persisted_features:
+                snapshot["features"] = persisted_features
                 connection.execute(
-                    "INSERT INTO feature_candidates(candidate_id, job_id, entity_id, status, approval_key, problem_code, "
-                    "approval_group_id, resolved_rule_id, resolution_type, candidate_json, created_at, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
-                    "ON CONFLICT(candidate_id) DO UPDATE SET job_id=excluded.job_id, entity_id=excluded.entity_id, "
-                    "status=excluded.status, approval_key=excluded.approval_key, problem_code=excluded.problem_code, "
-                    "approval_group_id=excluded.approval_group_id, resolved_rule_id=excluded.resolved_rule_id, "
-                    "resolution_type=excluded.resolution_type, candidate_json=excluded.candidate_json, updated_at=excluded.updated_at",
-                    (
-                        candidate_id,
-                        job["job_id"],
-                        (candidate.get("entity") or {}).get("id") or candidate.get("entity_id"),
-                        candidate.get("status"),
-                        candidate.get("approval_key"),
-                        candidate.get("problem_code"),
-                        candidate.get("approval_group_id"),
-                        candidate.get("resolved_rule_id"),
-                        candidate.get("resolution_type"),
-                        _json(candidate),
-                        candidate.get("created_at") or now,
-                        now,
-                    ),
+                    "UPDATE feature_jobs SET job_json=? WHERE job_id=?",
+                    (_json(snapshot), safe_job["job_id"]),
                 )
-            for event in job.get("events", []):
+            persisted_events = [
+                (int(row["sequence"]), _sanitize_feature_payload(self._decode_json(row["event_json"], {})))
+                for row in connection.execute(
+                    "SELECT sequence, event_json FROM feature_job_events WHERE job_id=? ORDER BY sequence",
+                    (safe_job["job_id"],),
+                )
+            ]
+            merged_events = [copy.deepcopy(event) for _, event in persisted_events if isinstance(event, dict)]
+            used_sequences = {sequence for sequence, _ in persisted_events}
+            fingerprints = {
+                json.dumps(event, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                for event in merged_events
+            }
+            next_sequence = max(used_sequences, default=-1) + 1
+            for incoming in safe_job.get("events", []):
+                if not isinstance(incoming, dict):
+                    continue
+                fingerprint = json.dumps(incoming, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+                if fingerprint in fingerprints:
+                    continue
+                event = copy.deepcopy(incoming)
+                sequence = int(event.get("sequence", next_sequence))
+                if sequence in used_sequences:
+                    sequence = next_sequence
+                while sequence in used_sequences:
+                    sequence += 1
+                event["sequence"] = sequence
+                merged_events.append(event)
+                used_sequences.add(sequence)
+                fingerprints.add(fingerprint)
+                next_sequence = max(next_sequence, sequence + 1)
+            for event in merged_events:
                 connection.execute(
-                    "INSERT INTO feature_job_events(job_id, sequence, event_type, event_json, created_at) VALUES (?, ?, ?, ?, ?)",
-                    (job["job_id"], int(event.get("sequence", 0)), str(event.get("type") or "event"), _json(event), event.get("timestamp") or now),
+                    "INSERT INTO feature_job_events(job_id, sequence, event_type, event_json, created_at) VALUES (?, ?, ?, ?, ?) "
+                    "ON CONFLICT(job_id, sequence) DO NOTHING",
+                    (safe_job["job_id"], int(event.get("sequence", 0)), str(event.get("type") or "event"), _json(event), event.get("timestamp") or now),
                 )
+        job["features"] = copy.deepcopy(persisted_features)
+        job["events"] = copy.deepcopy(merged_events)
 
     @staticmethod
     def _decode_json(value: Any, default: Any) -> Any:
@@ -125,12 +269,12 @@ class SQLiteFeatureJobStore:
 
     @classmethod
     def _load_job_row(cls, connection: Any, row: Any) -> dict[str, Any]:
-        job = cls._decode_json(row["job_json"], {})
+        job = _sanitize_feature_payload(cls._decode_json(row["job_json"], {}))
         if not isinstance(job, dict):
             job = {}
         job["job_id"] = str(row["job_id"])
         job["entities"] = [
-            cls._decode_json(item[0], {})
+            _sanitize_feature_payload(cls._decode_json(item[0], {}))
             for item in connection.execute(
                 "SELECT entity_json FROM feature_job_entities WHERE job_id=? ORDER BY updated_at, entity_id",
                 (row["job_id"],),
@@ -142,7 +286,7 @@ class SQLiteFeatureJobStore:
             "resolved_rule_id, resolution_type FROM feature_candidates WHERE job_id=? ORDER BY created_at, candidate_id",
             (row["job_id"],),
         ):
-            candidate = cls._decode_json(item["candidate_json"], {})
+            candidate = _sanitize_feature_payload(cls._decode_json(item["candidate_json"], {}))
             if not isinstance(candidate, dict):
                 continue
             candidate["candidate_id"] = str(item["candidate_id"])
@@ -152,7 +296,7 @@ class SQLiteFeatureJobStore:
             features[candidate["candidate_id"]] = candidate
         job["features"] = features
         job["events"] = [
-            cls._decode_json(item[0], {})
+            _sanitize_feature_payload(cls._decode_json(item[0], {}))
             for item in connection.execute(
                 "SELECT event_json FROM feature_job_events WHERE job_id=? ORDER BY sequence", (row["job_id"],)
             )
@@ -171,12 +315,166 @@ class SQLiteFeatureJobStore:
             ).fetchone()
             return self._load_job_row(connection, row) if row else None
 
-    def list_candidates(
-        self, status: str | None = None, limit: int = 100
-    ) -> list[dict[str, Any]]:
-        page_size = max(1, min(int(limit), 100000))
+    def load_candidate(
+        self, candidate_id: str, job_id: str | None = None
+    ) -> dict[str, Any] | None:
         query = (
-            "SELECT c.candidate_id, c.job_id, c.status, c.approval_key, c.problem_code, c.approval_group_id, "
+            "SELECT c.candidate_id, c.job_id, c.entity_id, c.status, c.approval_key, c.problem_code, "
+            "c.approval_group_id, c.resolved_rule_id, c.resolution_type, c.candidate_json, c.created_at, c.updated_at, "
+            "j.job_json FROM feature_candidates c JOIN feature_jobs j ON j.job_id=c.job_id "
+            "WHERE c.candidate_id=?"
+        )
+        parameters: list[Any] = [str(candidate_id)]
+        if job_id is not None:
+            query += " AND c.job_id=?"
+            parameters.append(str(job_id))
+        with self.database.connect() as connection:
+            row = connection.execute(query, parameters).fetchone()
+        return self._candidate_from_row(row) if row else None
+
+    def save_generated_candidate(
+        self, job_id: str, candidate: dict[str, Any]
+    ) -> dict[str, Any]:
+        if not isinstance(candidate, dict):
+            raise FeatureJobError("候选特征必须是 JSON object")
+        candidate_id = str(candidate.get("candidate_id") or "")
+        if not candidate_id:
+            raise FeatureJobError("候选特征缺少 candidate_id")
+        with self.database.transaction() as connection:
+            job = connection.execute(
+                "SELECT 1 FROM feature_jobs WHERE job_id=?", (str(job_id),)
+            ).fetchone()
+            if job is None:
+                raise self._candidate_not_found()
+            merged = self._upsert_generated_candidate(
+                connection,
+                str(job_id),
+                {**copy.deepcopy(candidate), "candidate_id": candidate_id},
+                utc_now(),
+                for_update=getattr(self.database, "provider", "sqlite") == "postgres",
+            )
+            row = connection.execute(
+                "SELECT c.candidate_id, c.job_id, c.entity_id, c.status, c.approval_key, c.problem_code, "
+                "c.approval_group_id, c.resolved_rule_id, c.resolution_type, c.candidate_json, c.created_at, c.updated_at, "
+                "j.job_json FROM feature_candidates c JOIN feature_jobs j ON j.job_id=c.job_id "
+                "WHERE c.candidate_id=?",
+                (candidate_id,),
+            ).fetchone()
+            loaded = self._candidate_from_row(row) if row else None
+            return loaded if loaded is not None else merged
+
+    def update_candidate_review_state(
+        self,
+        candidate_id: str,
+        changes: dict[str, Any],
+        *,
+        expected_status: str,
+        job_id: str | None = None,
+        expected_updated_at: Any | None = None,
+        allow_terminal_rollback: bool = False,
+    ) -> dict[str, Any]:
+        if not isinstance(changes, dict):
+            raise FeatureJobError(
+                "审批内容必须是 JSON object",
+                code="invalid_feature_update",
+                status_code=422,
+            )
+        _validate_candidate_review_changes(changes)
+        candidate_id = str(candidate_id)
+        with self.database.transaction() as connection:
+            query = (
+                "SELECT c.candidate_id, c.job_id, c.entity_id, c.status, c.approval_key, c.problem_code, "
+                "c.approval_group_id, c.resolved_rule_id, c.resolution_type, c.candidate_json, c.created_at, c.updated_at, "
+                "j.job_json FROM feature_candidates c JOIN feature_jobs j ON j.job_id=c.job_id "
+                "WHERE c.candidate_id=?"
+            )
+            parameters: list[Any] = [candidate_id]
+            if job_id is not None:
+                query += " AND c.job_id=?"
+                parameters.append(str(job_id))
+            row = connection.execute(query, parameters).fetchone()
+            if row is None:
+                raise self._candidate_not_found()
+            current = self._candidate_from_row(row)
+            if current is None:
+                raise self._candidate_not_found()
+            current_status = current.get("status")
+            requested_status = changes.get("status")
+            if current_status in {"approved", "rejected"} and requested_status is not None and requested_status != current_status:
+                if not (allow_terminal_rollback and current_status == expected_status and requested_status == "pending"):
+                    raise self._candidate_state_conflict()
+            if expected_updated_at is not None and current.get("updated_at") != expected_updated_at:
+                raise self._candidate_state_conflict()
+            if current_status != expected_status:
+                if current_status == "approved" and requested_status == "approved":
+                    return current
+                raise self._candidate_state_conflict()
+            if all(current.get(field) == value for field, value in changes.items()):
+                return current
+            updated = copy.deepcopy(current)
+            for field, value in changes.items():
+                updated[field] = copy.deepcopy(value)
+            updated["candidate_id"] = candidate_id
+            updated["job_id"] = str(row["job_id"])
+            updated_at = utc_now()
+            updated["updated_at"] = updated_at
+            update_query = (
+                "UPDATE feature_candidates SET status=?, resolved_rule_id=?, resolution_type=?, candidate_json=?, updated_at=? "
+                "WHERE candidate_id=? AND status=?"
+            )
+            update_parameters: list[Any] = [
+                updated.get("status"),
+                updated.get("resolved_rule_id"),
+                updated.get("resolution_type"),
+                _json(updated),
+                updated_at,
+                candidate_id,
+                expected_status,
+            ]
+            if expected_updated_at is not None:
+                update_query += " AND updated_at=?"
+                update_parameters.append(expected_updated_at)
+            cursor = connection.execute(update_query, update_parameters)
+            if cursor.rowcount != 1:
+                latest = connection.execute(
+                    "SELECT status FROM feature_candidates WHERE candidate_id=?", (candidate_id,)
+                ).fetchone()
+                if latest is None:
+                    raise self._candidate_not_found()
+                raise self._candidate_state_conflict()
+            updated_row = connection.execute(
+                "SELECT c.candidate_id, c.job_id, c.entity_id, c.status, c.approval_key, c.problem_code, "
+                "c.approval_group_id, c.resolved_rule_id, c.resolution_type, c.candidate_json, c.created_at, c.updated_at, "
+                "j.job_json FROM feature_candidates c JOIN feature_jobs j ON j.job_id=c.job_id "
+                "WHERE c.candidate_id=?",
+                (candidate_id,),
+            ).fetchone()
+            loaded = self._candidate_from_row(updated_row) if updated_row else None
+            return loaded if loaded is not None else updated
+
+    def rollback_candidate_review_state(
+        self,
+        candidate_id: str,
+        changes: dict[str, Any],
+        *,
+        expected_status: str,
+        expected_updated_at: Any,
+        job_id: str | None = None,
+    ) -> dict[str, Any]:
+        return self.update_candidate_review_state(
+            candidate_id,
+            changes,
+            expected_status=expected_status,
+            job_id=job_id,
+            expected_updated_at=expected_updated_at,
+            allow_terminal_rollback=True,
+        )
+
+    def list_candidates(
+        self, status: str | None = None, limit: int | None = None
+    ) -> list[dict[str, Any]]:
+        query = (
+            "SELECT c.candidate_id, c.job_id, c.entity_id, c.status, c.approval_key, c.problem_code, c.approval_group_id, "
             "c.resolved_rule_id, c.resolution_type, c.candidate_json, c.created_at, c.updated_at, "
             "j.job_json FROM feature_candidates c JOIN feature_jobs j ON j.job_id=c.job_id"
         )
@@ -184,32 +482,17 @@ class SQLiteFeatureJobStore:
         if status is not None:
             query += " WHERE c.status=?"
             parameters.append(str(status))
-        query += " ORDER BY c.created_at, c.candidate_id LIMIT ?"
-        parameters.append(page_size)
+        query += " ORDER BY c.created_at, c.candidate_id"
+        if limit is not None:
+            query += " LIMIT ?"
+            parameters.append(max(1, int(limit)))
         with self.database.connect() as connection:
             rows = connection.execute(query, parameters).fetchall()
         candidates: list[dict[str, Any]] = []
         for row in rows:
-            candidate = self._decode_json(row["candidate_json"], {})
-            job = self._decode_json(row["job_json"], {})
-            if not isinstance(candidate, dict):
-                continue
-            if not isinstance(job, dict):
-                job = {}
-            candidate["candidate_id"] = str(row["candidate_id"])
-            candidate["job_id"] = str(row["job_id"])
-            candidate["status"] = row["status"]
-            for field in ("approval_key", "problem_code", "approval_group_id", "resolved_rule_id", "resolution_type"):
-                if row[field] is not None:
-                    candidate[field] = row[field]
-            candidate.setdefault("created_at", row["created_at"])
-            candidate.setdefault("updated_at", row["updated_at"])
-            for field in ("model", "provider", "prompt_id", "model_profile_id"):
-                if candidate.get(field) is None and job.get(field) is not None:
-                    candidate[field] = copy.deepcopy(job[field])
-            candidate.setdefault("job_created_at", job.get("created_at"))
-            candidate.setdefault("job_status", job.get("status"))
-            candidates.append(candidate)
+            candidate = self._candidate_from_row(row)
+            if candidate is not None:
+                candidates.append(candidate)
         return candidates
 
 
@@ -221,30 +504,42 @@ class SQLiteApprovedRuleStore(ApprovedRuleStore):
     def _read_locked(self) -> list[dict[str, Any]]:
         with self.database.connect() as connection:
             rows = connection.execute(
-                "SELECT rule_id, rule_json, status, current_version, next_review_at, schema_version, approved_at, updated_at, "
+                "SELECT rule_id, signature, feature_type, rule_json, status, current_version, next_review_at, schema_version, approved_at, updated_at, "
                 "problem_code, approval_key "
                 "FROM approved_rules ORDER BY rule_id"
             )
             rules = []
             for row in rows:
-                rule = json.loads(row["rule_json"])
-                rule.update({
-                    "status": row["status"],
-                    "current_version": int(row["current_version"]),
-                    "next_review_at": row["next_review_at"],
-                    "schema_version": row["schema_version"],
-                    "approved_at": row["approved_at"],
-                    "created_at": rule.get("created_at") or row["approved_at"],
-                    "updated_at": row["updated_at"],
-                    "problem_code": row["problem_code"] or rule.get("problem_code"),
-                    "approval_key": row["approval_key"] or rule.get("approval_key"),
-                })
-                rules.append(rule)
+                rules.append(hydrate_persisted_rule(
+                    row["rule_json"],
+                    persisted_projection={
+                        "rule_id": row["rule_id"],
+                        "signature": row["signature"] if "signature" in row.keys() else None,
+                        "feature_type": row["feature_type"] if "feature_type" in row.keys() else None,
+                        "schema_version": row["schema_version"],
+                        "problem_code": row["problem_code"],
+                        "approval_key": row["approval_key"],
+                    },
+                    lifecycle={
+                        "status": row["status"],
+                        "current_version": int(row["current_version"]),
+                        "next_review_at": row["next_review_at"],
+                        "approved_at": row["approved_at"],
+                        "updated_at": row["updated_at"],
+                    },
+                ))
             return rules
 
     def _write_locked(self, rules: list[dict[str, Any]]) -> None:
         with self.database.transaction() as connection:
             for rule in rules:
+                persisted = public_rule(rule)
+                schema_version = str(persisted.get("schema_version") or "").strip()
+                if not schema_version:
+                    raise ValueError("批准规则缺少 schema_version，不能在运行时自动归一化")
+                projection = (None, None) if schema_version == "approved_rule_v1" or classify_rule(persisted).kind == RuleFormat.LEGACY_V1 else (
+                    persisted.get("problem_code"), persisted.get("approval_key")
+                )
                 connection.execute(
                     "INSERT INTO approved_rules(rule_id, signature, feature_type, rule_json, approved_at, updated_at, "
                     "status, current_version, next_review_at, schema_version, problem_code, approval_key) "
@@ -254,22 +549,22 @@ class SQLiteApprovedRuleStore(ApprovedRuleStore):
                     "current_version=excluded.current_version, next_review_at=excluded.next_review_at, "
                     "schema_version=excluded.schema_version, problem_code=excluded.problem_code, approval_key=excluded.approval_key",
                     (
-                        rule["rule_id"], rule["signature"], rule["feature_type"], _json(rule),
-                        rule["approved_at"], rule["updated_at"], rule.get("status", "active"),
-                        int(rule.get("current_version") or 1), rule.get("next_review_at"),
-                        rule.get("schema_version", "approved_rule_v2"), rule.get("problem_code"), rule.get("approval_key"),
+                        persisted["rule_id"], persisted["signature"], persisted["feature_type"], _json(persisted),
+                        persisted["approved_at"], persisted["updated_at"], persisted.get("status", "active"),
+                        int(persisted.get("current_version") or 1), persisted.get("next_review_at"),
+                        schema_version, projection[0], projection[1],
                     ),
                 )
-                version = int(rule.get("current_version") or 1)
+                version = int(persisted.get("current_version") or 1)
                 change_type = "rule_created" if version == 1 else "rule_updated"
                 created = connection.execute(
                     "INSERT INTO rule_versions(rule_id, version, rule_json, change_type, change_reason, "
                     "operator, created_at, schema_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
                     "ON CONFLICT(rule_id, version) DO NOTHING",
                     (
-                        rule["rule_id"], version, _json(rule), change_type,
+                        persisted["rule_id"], version, _json(persisted), change_type,
                         "人工批准特征" if version == 1 else "人工审批更新规则",
-                        "manual-approval", rule["updated_at"], "rule_version_v1",
+                        "manual-approval", persisted["updated_at"], "rule_version_v1",
                     ),
                 )
                 if created.rowcount:
@@ -277,10 +572,10 @@ class SQLiteApprovedRuleStore(ApprovedRuleStore):
                         "INSERT INTO rule_audit_events(event_id, rule_id, event_type, from_version, to_version, "
                         "event_json, operator, created_at, schema_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                         (
-                            f"rule-event-{uuid.uuid4().hex}", rule["rule_id"], change_type,
+                            f"rule-event-{uuid.uuid4().hex}", persisted["rule_id"], change_type,
                             version - 1 if version > 1 else None, version,
                             _json({"reason": "人工审批写入规则库"}), "manual-approval",
-                            rule["updated_at"], "rule_audit_event_v1",
+                            persisted["updated_at"], "rule_audit_event_v1",
                         ),
                     )
 
@@ -292,14 +587,60 @@ class SQLiteApprovedRuleStore(ApprovedRuleStore):
         entity_id: str | None = None,
         cluster: str | None = None,
     ) -> dict[str, Any]:
-        rule = super().record_reuse(rule_id, job_id=job_id, entity_id=entity_id, cluster=cluster)
+        """Increment reuse metadata and append its audit row atomically.
+
+        SQLite serializes the transaction at begin time. PostgreSQL needs the
+        row lock explicitly because a read-modify-write sequence otherwise
+        loses increments from concurrent workers.
+        """
+        rule_id = str(rule_id)
         with self.database.transaction() as connection:
+            query = (
+                "SELECT rule_id, signature, feature_type, rule_json, status, current_version, next_review_at, "
+                "schema_version, approved_at, updated_at, problem_code, approval_key "
+                "FROM approved_rules WHERE rule_id=?"
+            )
+            if getattr(self.database, "provider", "sqlite") == "postgres":
+                query += " FOR UPDATE"
+            row = connection.execute(query, (rule_id,)).fetchone()
+            if row is None:
+                raise ApprovedRuleError("批准规则不存在")
+            rule = hydrate_persisted_rule(
+                row["rule_json"],
+                persisted_projection={
+                    "rule_id": row["rule_id"],
+                    "signature": row["signature"],
+                    "feature_type": row["feature_type"],
+                    "schema_version": row["schema_version"],
+                    "problem_code": row["problem_code"],
+                    "approval_key": row["approval_key"],
+                },
+                lifecycle={
+                    "status": row["status"],
+                    "current_version": int(row["current_version"]),
+                    "next_review_at": row["next_review_at"],
+                    "approved_at": row["approved_at"],
+                    "updated_at": row["updated_at"],
+                },
+            )
+            classification = classify_rule(rule)
+            if classification.kind == RuleFormat.MALFORMED_V2:
+                raise ApprovedRuleError("批准规则损坏，不能记录复用")
+            if not _is_active(rule):
+                raise ApprovedRuleError("只有 active 批准规则可以记录复用")
+            rule["reuse_count"] = int(rule.get("reuse_count") or 0) + 1
+            rule["last_reused_at"] = self.clock()
+            persisted = public_rule(rule)
+            connection.execute(
+                "UPDATE approved_rules SET rule_json=? WHERE rule_id=?",
+                (_json(persisted), rule_id),
+            )
             connection.execute(
                 "INSERT INTO rule_reuse_events(rule_id, job_id, entity_id, reused_at, cluster, schema_version) "
                 "VALUES (?, ?, ?, ?, ?, ?)",
-                (rule_id, job_id, entity_id, rule["last_reused_at"], cluster, "rule_reuse_event_v2"),
+                (rule_id, job_id, entity_id, persisted["last_reused_at"], cluster, "rule_reuse_event_v2"),
             )
-        return rule
+        return persisted
 
 
 class SQLiteApprovalGroupStore:
@@ -364,19 +705,22 @@ class SQLiteApprovalGroupStore:
         value.setdefault("created_at", self.clock())
         value["updated_at"] = value.get("updated_at") or self.clock()
         with self.database.transaction() as connection:
-            existing = connection.execute(
-                "SELECT * FROM approval_groups WHERE approval_key=?", (value["approval_key"],)
-            ).fetchone()
+            query = "SELECT * FROM approval_groups WHERE approval_key=?"
+            if getattr(self.database, "provider", "sqlite") == "postgres":
+                query += " FOR UPDATE"
+            existing = connection.execute(query, (value["approval_key"],)).fetchone()
             if existing:
                 previous = self._row_to_group(existing)
                 value["approval_group_id"] = previous["approval_group_id"]
                 value["created_at"] = previous["created_at"]
                 value["candidate_ids"] = sorted(set(previous.get("candidate_ids") or []) | set(value.get("candidate_ids") or []))
                 value["entity_keys"] = sorted(set(previous.get("entity_keys") or []) | set(value.get("entity_keys") or []))
-                value["candidate_count"] = max(int(previous.get("candidate_count") or 0), int(value.get("candidate_count") or 0), len(value["candidate_ids"]))
-                value["affected_entity_count"] = max(int(previous.get("affected_entity_count") or 0), int(value.get("affected_entity_count") or 0), len(value["entity_keys"]))
-                value["occurrence_count"] = max(int(previous.get("occurrence_count") or 0), int(value.get("occurrence_count") or 0))
-                if previous.get("status") in {"approved", "auto_resolved"} and value.get("status") != "approved":
+                value["candidate_count"] = len(value["candidate_ids"])
+                value["affected_entity_count"] = len(value["entity_keys"])
+                value["occurrence_count"] = int(value.get("occurrence_count") or 0)
+                if previous.get("status") in {"rejected", "superseded"}:
+                    value["status"] = previous["status"]
+                elif previous.get("status") in {"approved", "auto_resolved"} and value.get("status") != "approved":
                     value["status"] = previous["status"]
                 value["rule_id"] = value.get("rule_id") or previous.get("rule_id")
             connection.execute(
@@ -385,7 +729,8 @@ class SQLiteApprovalGroupStore:
                 "group_json, created_at, updated_at, schema_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(approval_key) DO UPDATE SET problem_code=excluded.problem_code, feature_type=excluded.feature_type, "
                 "title=excluded.title, summary=excluded.summary, importance=excluded.importance, "
-                "status=CASE WHEN approval_groups.status IN ('approved', 'auto_resolved') "
+                "status=CASE WHEN approval_groups.status IN ('rejected', 'superseded') THEN approval_groups.status "
+                "WHEN approval_groups.status IN ('approved', 'auto_resolved') "
                 "AND excluded.status <> 'approved' THEN approval_groups.status ELSE excluded.status END, "
                 "rule_id=excluded.rule_id, first_seen=excluded.first_seen, last_seen=excluded.last_seen, "
                 "occurrence_count=excluded.occurrence_count, affected_entity_count=excluded.affected_entity_count, "

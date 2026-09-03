@@ -817,17 +817,29 @@ class ApiFacade:
     def feature_approvals(self, query: Mapping[str, Any]) -> ApiResult:
         status = self._query(query, "status") or "pending"
         page_size = max(1, min(self._integer(query, "page_size", 100), 500))
+        cursor = self._query(query, "cursor")
+        if cursor is None:
+            offset = 0
+        elif cursor.isdigit():
+            offset = int(cursor)
+        else:
+            return ApiResult(422, {
+                "code": "invalid_cursor",
+                "error": "cursor 必须是非负整数偏移量",
+            })
         candidates = self._service("feature_jobs", self.container.feature_jobs).list_persisted_candidates(
             status=status,
-            limit=page_size,
+            limit=None,
         )
         groups = build_review_groups(candidates)
+        page_end = offset + page_size
         return ApiResult(200, {
             "schema_version": "feature_approval_queue_v1",
             "status": status,
             "total_groups": len(groups),
             "total_candidates": sum(int(group.get("candidate_count") or 0) for group in groups),
-            "items": groups[:page_size],
+            "next_cursor": str(page_end) if page_end < len(groups) else None,
+            "items": groups[offset:page_end],
         })
 
     def orchestration_detail(self, orchestration_run_id: str) -> ApiResult:

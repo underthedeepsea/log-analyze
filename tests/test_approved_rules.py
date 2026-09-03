@@ -2,7 +2,15 @@ import json
 
 import pytest
 
-from logrisk.approved_rules import ApprovedRuleError, ApprovedRuleStore
+from logrisk.approved_rules import (
+    ApprovedRuleError,
+    ApprovedRuleIntegrityError,
+    ApprovedRuleStore,
+    RuleFormat,
+    RuleNormalizationSource,
+    classify_rule,
+    normalize_legacy_rule_version,
+)
 
 
 def feature(title="内存压力"):
@@ -30,6 +38,7 @@ def entity(cluster="prod-a", entity_id="node-a"):
         "cluster": cluster,
         "entity_type": "node",
         "entity_id": entity_id,
+        "feature_type": "resource_pressure",
         "top_templates": [
             {
                 "template_hash": "hash-oom",
@@ -201,7 +210,59 @@ def test_semantic_rule_matches_new_wrapper_without_template_identity(tmp_path):
     assert [item["rule_id"] for item in matches] == [stored["rule_id"]]
 
 
-def test_v1_wrapper_rule_is_reused_by_new_semantic_identity(tmp_path):
+def test_template_set_candidate_does_not_reuse_canonical_semantic_rule(tmp_path):
+    store = ApprovedRuleStore(tmp_path / "rules.json")
+    semantic = store.upsert_feature(cni_feature(component="kubelet"))
+    ambiguous = cni_feature(component="containerd")
+    ambiguous.pop("problem_code")
+
+    assert store.match_feature(ambiguous) == []
+
+    replacement = store.upsert_feature(ambiguous)
+    rules = {item["rule_id"]: item for item in store.list_rules()}
+
+    assert replacement["rule_id"] != semantic["rule_id"]
+    assert len(rules) == 2
+    assert rules[semantic["rule_id"]]["components"] == ["kubelet"]
+
+
+def test_template_set_entity_rejects_missing_component_evidence(tmp_path):
+    store = ApprovedRuleStore(tmp_path / "rules.json")
+    stored = store.upsert_feature(feature())
+    target = entity()
+    target["feature_type"] = "resource_pressure"
+    target["top_templates"][0].pop("component")
+
+    assert stored["match_mode"] == "template_set"
+    assert store.match_entity(target) == []
+
+
+def test_template_set_entity_rejects_missing_feature_type_evidence(tmp_path):
+    store = ApprovedRuleStore(tmp_path / "rules.json")
+    store.upsert_feature(feature())
+    target = entity()
+    target.pop("feature_type")
+
+    assert store.match_entity(target) == []
+
+
+@pytest.mark.parametrize("missing_field", ["feature_type", "components", "anchor_signatures"])
+def test_template_set_entity_rejects_incomplete_rule_identity(tmp_path, missing_field):
+    store = ApprovedRuleStore(tmp_path / "rules.json")
+    store.upsert_feature(feature())
+    malformed = store.list_rules()[0]
+    if missing_field == "components":
+        malformed.pop("components")
+    else:
+        malformed.pop(missing_field)
+    store._write_locked([malformed])
+    target = entity()
+    target["feature_type"] = "resource_pressure"
+
+    assert store.match_entity(target) == []
+
+
+def test_v1_wrapper_rule_stays_strict_against_new_semantic_identity(tmp_path):
     store = ApprovedRuleStore(tmp_path / "rules.json")
     stored = store.upsert_feature(cni_feature())
     legacy = store.list_rules()[0]
@@ -209,14 +270,19 @@ def test_v1_wrapper_rule_is_reused_by_new_semantic_identity(tmp_path):
     legacy["problem_code"] = "kubernetes.cni.plugin_failure"
     store._write_locked([legacy])
 
-    reused = store.upsert_feature(cni_feature(
+    wrapper = cni_feature(
         feature_type="pod_sandbox_network_failure",
         problem_code="runtime_sandbox_create_failed",
         component="containerd",
-    ))
+    )
+    assert store.match_feature(wrapper) == []
 
-    assert reused["rule_id"] == stored["rule_id"]
-    assert len(store.list_rules()) == 1
+    replacement = store.upsert_feature(wrapper)
+
+    assert replacement["rule_id"] != stored["rule_id"]
+    rules = {item["rule_id"]: item for item in store.list_rules()}
+    assert len(rules) == 2
+    assert rules[stored["rule_id"]]["approval_key"] == "appr-v1-wrapper"
 
 
 def test_semantic_entity_matching_does_not_require_original_component(tmp_path):
@@ -239,3 +305,230 @@ def test_semantic_entity_matching_does_not_require_original_component(tmp_path):
     matches = store.match_entity(target)
 
     assert [item["rule_id"] for item in matches] == [stored["rule_id"]]
+
+
+def test_canonical_rule_matching_ignores_jobs_nodes_and_wrapper_fields(tmp_path):
+    store = ApprovedRuleStore(tmp_path / "rules.json")
+    stored = store.upsert_feature(cni_feature())
+    wrapper = cni_feature(
+        feature_type="pod_sandbox_network_failure",
+        problem_code="runtime_sandbox_create_failed",
+        component="containerd",
+    )
+    wrapper["job_id"] = "job-wrapper"
+    wrapper["candidate_id"] = "candidate-wrapper"
+    wrapper["source_templates"][0]["template_fingerprint"] = "wrapper-containerd"
+
+    assert [item["rule_id"] for item in store.match_feature(wrapper)] == [stored["rule_id"]]
+    assert [item["rule_id"] for item in store.match_entity({
+        "cluster": "prod-b",
+        "entity_type": "node",
+        "entity_id": "node-b",
+        "top_templates": [{
+            "template_hash": "hash-wrapper",
+            "template_fingerprint": "wrapper-containerd",
+            "category": "network",
+            "component": "containerd",
+            "template": "CreatePodSandbox failed: cni no enough ips",
+        }],
+    })] == [stored["rule_id"]]
+
+
+def test_v1_rule_matching_stays_on_strict_legacy_identity(tmp_path):
+    store = ApprovedRuleStore(tmp_path / "rules.json")
+    legacy = {
+        "rule_id": "legacy-v1-rule",
+        "signature": "legacy-signature",
+        "feature_type": "cni_network_failure",
+        "title": "历史 CNI 规则",
+        "summary": "历史物理规则",
+        "importance": "high",
+        "components": ["kubelet"],
+        "template_signatures": [{"template_hash": "legacy-hash", "category": "network"}],
+        "problem_code": "kubernetes.cni.ip_exhaustion",
+        "approval_key": "appr-v1-physical",
+        "anchor_signatures": ["legacy-hash|network"],
+        "match_mode": "semantic",
+        "schema_version": "approved_rule_v1",
+        "status": "active",
+        "approved_at": "2026-09-01T00:00:00+00:00",
+        "created_at": "2026-09-01T00:00:00+00:00",
+        "updated_at": "2026-09-01T00:00:00+00:00",
+        "current_version": 1,
+        "next_review_at": "2026-10-01T00:00:00+00:00",
+    }
+    store._write_locked([legacy])
+    wrapper = cni_feature(
+        feature_type="pod_sandbox_network_failure",
+        problem_code="runtime_sandbox_create_failed",
+        component="containerd",
+    )
+
+    assert store.match_feature(wrapper) == []
+    assert store.match_entity({
+        "entity_type": "node",
+        "entity_id": "node-b",
+        "top_templates": [{
+            "template_hash": "wrapper-hash",
+            "template_fingerprint": "wrapper-containerd",
+            "category": "network",
+            "component": "containerd",
+            "template": "CreatePodSandbox failed: cni no enough ips",
+        }],
+    }) == []
+
+    physical = cni_feature(component="kubelet")
+    physical["approval_key"] = "appr-v1-physical"
+    physical["source_templates"][0].pop("template_fingerprint")
+    physical["source_templates"][0]["template_hash"] = "legacy-hash"
+    assert [item["rule_id"] for item in store.match_feature(physical)] == [legacy["rule_id"]]
+    assert [item["rule_id"] for item in store.match_entity({
+        "entity_type": "node",
+        "entity_id": "node-a",
+        "feature_type": "cni_network_failure",
+        "top_templates": [{
+            "template_hash": "legacy-hash",
+            "category": "network",
+            "component": "kubelet",
+        }],
+    })] == [legacy["rule_id"]]
+    assert store.match_entity({
+        "entity_type": "node",
+        "entity_id": "node-a",
+        "top_templates": [{
+            "template_hash": "legacy-hash",
+            "category": "network",
+            "component": "kubelet",
+        }],
+    }) == []
+
+
+def test_inactive_rule_gets_distinct_active_replacement_with_lineage(tmp_path):
+    store = ApprovedRuleStore(tmp_path / "rules.json")
+    predecessor = store.upsert_feature(cni_feature())
+    disabled = store.list_rules()[0]
+    disabled["status"] = "disabled"
+    store._write_locked([disabled])
+    replacement_input = cni_feature(
+        feature_type="pod_sandbox_network_failure",
+        problem_code="runtime_sandbox_create_failed",
+        component="containerd",
+    )
+    replacement_input.update({"job_id": "job-replacement", "candidate_id": "candidate-replacement"})
+    replacement_entity = {
+        "entity_type": "node",
+        "entity_id": "node-replacement",
+        "top_templates": [dict(replacement_input["source_templates"][0])],
+    }
+
+    assert store.match_feature(replacement_input) == []
+    assert store.match_entity(replacement_entity) == []
+    replacement = store.upsert_feature(replacement_input)
+    repeated = store.upsert_feature({**replacement_input, "title": "更新后的替换规则"})
+    rules = {item["rule_id"]: item for item in store.list_rules()}
+
+    assert replacement["rule_id"] != predecessor["rule_id"]
+    assert replacement["status"] == "active"
+    assert replacement["lineage"]["predecessor_rule_id"] == predecessor["rule_id"]
+    assert replacement["predecessor_rule_id"] == predecessor["rule_id"]
+    assert repeated["rule_id"] == replacement["rule_id"]
+    assert rules[predecessor["rule_id"]]["status"] == "disabled"
+    assert rules[replacement["rule_id"]]["status"] == "active"
+
+
+def test_runtime_classifier_requires_explicit_version_but_trusted_legacy_boundary_normalizes():
+    unversioned = {
+        "rule_id": "legacy-rule",
+        "signature": "legacy-signature",
+        "feature_type": "kernel_error",
+    }
+
+    assert classify_rule(unversioned).kind == RuleFormat.MALFORMED_V2
+
+    normalized = normalize_legacy_rule_version(
+        unversioned,
+        source=RuleNormalizationSource.LEGACY_IMPORT,
+    )
+
+    assert normalized["schema_version"] == "approved_rule_v1"
+    assert classify_rule(normalized).kind == RuleFormat.LEGACY_V1
+
+
+def test_legacy_file_load_normalizes_in_memory_without_rewriting(tmp_path):
+    store = ApprovedRuleStore(tmp_path / "rules.json")
+    legacy = {
+        "rule_id": "legacy-file-rule",
+        "signature": "legacy-file-signature",
+        "feature_type": "kernel_error",
+        "components": ["kernel"],
+        "template_signatures": [{"template_hash": "hash-legacy", "category": "kernel"}],
+    }
+    store._write_locked([legacy])
+
+    loaded = store.load_legacy_file()
+
+    assert loaded[0]["schema_version"] == "approved_rule_v1"
+    assert "schema_version" not in store.list_rules()[0]
+
+
+def test_classifier_accepts_explicit_v1_and_valid_semantic_and_template_set_v2(tmp_path):
+    store = ApprovedRuleStore(tmp_path / "rules.json")
+    semantic = store.upsert_feature(cni_feature())
+    template_set = store.upsert_feature(feature())
+    explicit_v1 = {**template_set, "schema_version": "approved_rule_v1"}
+
+    assert classify_rule(explicit_v1).kind == RuleFormat.LEGACY_V1
+    assert classify_rule(semantic).kind == RuleFormat.VALID_V2
+    assert classify_rule(template_set).kind == RuleFormat.VALID_V2
+
+
+@pytest.mark.parametrize("damage", ["missing_match_mode", "bad_approval_key", "missing_templates", "unknown_schema"])
+def test_classifier_rejects_malformed_v2_without_downgrading(damage, tmp_path):
+    store = ApprovedRuleStore(tmp_path / "rules.json")
+    value = store.upsert_feature(feature())
+    if damage == "missing_match_mode":
+        value.pop("match_mode")
+    elif damage == "bad_approval_key":
+        value["approval_key"] = "appr-corrupt"
+    elif damage == "missing_templates":
+        value.pop("template_signatures")
+    else:
+        value["schema_version"] = "approved_rule_v9"
+
+    classification = classify_rule(value)
+
+    assert classification.kind == RuleFormat.MALFORMED_V2
+    assert classification.integrity_errors
+
+
+def test_malformed_v2_never_enters_legacy_matching(tmp_path):
+    store = ApprovedRuleStore(tmp_path / "rules.json")
+    malformed = store.upsert_feature(feature())
+    malformed.update({
+        "schema_version": "approved_rule_v2",
+        "match_mode": "unsupported",
+        "approval_key": "legacy-key",
+        "signature": "legacy-signature",
+    })
+    store._write_locked([malformed])
+
+    legacy_input = feature()
+    legacy_input.update({"schema_version": "approved_rule_v1", "approval_key": "legacy-key"})
+
+    assert store.match_feature(legacy_input) == []
+    assert store.match_entity(entity()) == []
+
+
+def test_malformed_v2_identity_conflict_blocks_duplicate_approval(tmp_path):
+    store = ApprovedRuleStore(tmp_path / "rules.json")
+    malformed = store.upsert_feature(feature())
+    malformed.pop("match_mode")
+    store._write_locked([malformed])
+
+    with pytest.raises(ApprovedRuleIntegrityError) as error:
+        store.upsert_feature(feature())
+
+    assert error.value.code == "malformed_rule_identity_conflict"
+    assert error.value.status_code == 409
+    assert error.value.rule_id == malformed["rule_id"]
+    assert len(store.list_rules()) == 1

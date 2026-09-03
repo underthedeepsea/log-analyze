@@ -39,11 +39,17 @@ def test_django_core_read_apis_use_the_shared_api_facade(tmp_path) -> None:
             "/api/release-readiness",
         )]
         approvals = client.get("/api/feature-approvals?status=pending&page_size=100")
+        invalid_cursor = client.get("/api/feature-approvals?cursor=not-a-cursor")
+        spa_routes = [client.get(path) for path in ("/review", "/queue", "/export")]
         clear_cached_container()
 
     assert all(response.status_code in {200, 503} for response in responses)
     assert approvals.status_code == 200
     assert approvals.json()["schema_version"] == "feature_approval_queue_v1"
+    assert approvals.json()["next_cursor"] is None
+    assert invalid_cursor.status_code == 422
+    assert invalid_cursor.json()["code"] == "invalid_cursor"
+    assert all(response.status_code == 200 for response in spa_routes)
     assert responses[0].json()["service"] == "logrisk-dashboard"
     assert "profiles" in responses[2].json()
     assert "items" in responses[3].json()

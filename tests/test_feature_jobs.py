@@ -1,3 +1,5 @@
+import json
+
 import pytest
 
 from logrisk.approved_rules import ApprovedRuleStore
@@ -67,6 +69,27 @@ def document():
             entity("node-mid", 50, log_count=3),
         ],
     }
+
+
+class _InterleavingSQLiteFeatureJobStore(SQLiteFeatureJobStore):
+    def __init__(self, database):
+        super().__init__(database)
+        self.review_calls = 0
+
+    def update_candidate_review_state(self, *args, **kwargs):
+        self.review_calls += 1
+        result = super().update_candidate_review_state(*args, **kwargs)
+        if self.review_calls == 1:
+            SQLiteFeatureJobStore(self.database).update_candidate_review_state(
+                args[0],
+                {
+                    "title": "并发审核标题",
+                    "reviewer_note": "并发审核备注",
+                    "tags": ["并发审核"],
+                },
+                expected_status=str(result.get("status") or kwargs["expected_status"]),
+            )
+        return result
 
 
 def test_validate_result_document_requires_risk_entities():
@@ -299,6 +322,7 @@ def reusable_entity(entity_id="node-a", cluster="prod-a"):
 def reusable_candidate(source):
     value = candidate(source, title="已批准的 OOM 特征")
     value["feature_type"] = "resource_pressure"
+    value["problem_code"] = "linux.memory.oom"
     value["template_hashes"] = ["hash-oom"]
     value["source_templates"] = [dict(source["top_templates"][0])]
     value["status"] = "approved"
@@ -354,6 +378,77 @@ def test_matching_rule_skips_extractor_and_uses_current_entity_facts(tmp_path):
         "cluster": "another-cluster",
     }]
     assert reused["source_templates"][0]["template_hash"] == "hash-oom"
+
+
+def test_late_rule_match_does_not_count_as_pre_llm_reuse(tmp_path):
+    reuse_events = []
+
+    class RecordingRuleStore(ApprovedRuleStore):
+        def record_reuse(self, rule_id, **metadata):
+            reuse_events.append({"rule_id": rule_id, **metadata})
+            return super().record_reuse(rule_id, **metadata)
+
+    source = reusable_entity("node-a")
+    store = RecordingRuleStore(tmp_path / "rules.json")
+    manager = FeatureJobManager(
+        extractor=lambda record, **kwargs: [reusable_candidate(record) | {"status": "pending"}],
+        rule_store=store,
+        auto_start=False,
+    )
+    job_id = manager.create_job(
+        {"summary": {}, "risk_entities": [source]},
+        model="qwen3:1.7b",
+    )
+    manager.run_job(job_id)
+    store.upsert_feature(reusable_candidate(source))
+
+    manager.update_feature(job_id, "feature-node-a", {"title": "首次编辑"})
+    manager.update_feature(job_id, "feature-node-a", {"title": "再次编辑"})
+
+    assert reuse_events == []
+
+
+def test_rule_reuse_counts_pre_llm_match_once_but_not_reconciliation(tmp_path):
+    reuse_events = []
+
+    class RecordingRuleStore(ApprovedRuleStore):
+        def record_reuse(self, rule_id, **metadata):
+            reuse_events.append({"rule_id": rule_id, **metadata})
+            return super().record_reuse(rule_id, **metadata)
+
+    rules = RecordingRuleStore(tmp_path / "rules.json")
+    manager = FeatureJobManager(
+        extractor=lambda source, **kwargs: [reusable_candidate(source) | {"status": "pending"}],
+        rule_store=rules,
+        auto_start=False,
+    )
+    first = manager.create_job(
+        {"summary": {}, "risk_entities": [reusable_entity("node-a")]},
+        model="qwen3:1.7b",
+    )
+    second = manager.create_job(
+        {"summary": {}, "risk_entities": [reusable_entity("node-b")]},
+        model="qwen3:1.7b",
+    )
+    manager.run_job(first)
+    manager.run_job(second)
+
+    approved = manager.update_feature(first, "feature-node-a", {"status": "approved"})
+    assert reuse_events == []
+
+    third = manager.create_job(
+        {"summary": {}, "risk_entities": [reusable_entity("node-c")]},
+        model="qwen3:1.7b",
+    )
+    manager.run_job(third)
+
+    assert reuse_events == [{
+        "rule_id": approved["rule_id"],
+        "job_id": third,
+        "entity_id": "node-c",
+        "cluster": "prod-a",
+    }]
+    assert rules.list_rules()[0]["reuse_count"] == 1
 
 
 def test_approving_ollama_feature_persists_reusable_rule(tmp_path):
@@ -669,6 +764,320 @@ def test_feature_job_manager_lazy_loads_job_for_persisted_approval(tmp_path):
     )
 
     assert updated["status"] == "rejected"
+
+
+def test_review_failure_does_not_leave_candidate_approved(tmp_path):
+    class FailingRuleStore(ApprovedRuleStore):
+        def upsert_feature(self, feature):
+            raise RuntimeError("rule write failed")
+
+    database = SQLiteDatabase(tmp_path / "state.sqlite3")
+    persistence = SQLiteFeatureJobStore(database)
+    rules = FailingRuleStore(tmp_path / "rules.json")
+    manager = FeatureJobManager(
+        extractor=lambda source, **kwargs: [candidate(source)],
+        rule_store=rules,
+        persistence=persistence,
+        auto_start=False,
+        interrupt_on_restore=False,
+    )
+    job_id = manager.create_job(
+        {"summary": {}, "risk_entities": [entity("node-a", 90)]},
+        model="qwen3:1.7b",
+    )
+    manager.run_job(job_id)
+
+    with pytest.raises(RuntimeError, match="rule write failed"):
+        manager.update_feature(job_id, "feature-node-a", {"status": "approved"})
+
+    assert persistence.load_candidate("feature-node-a")["status"] == "pending"
+
+
+def test_rule_failure_rolls_back_status_without_clobbering_concurrent_review(tmp_path):
+    class FailingRuleStore(ApprovedRuleStore):
+        def upsert_feature(self, feature):
+            raise RuntimeError("rule write failed")
+
+    database = SQLiteDatabase(tmp_path / "state.sqlite3")
+    persistence = _InterleavingSQLiteFeatureJobStore(database)
+    manager = FeatureJobManager(
+        extractor=lambda source, **kwargs: [candidate(source)],
+        rule_store=FailingRuleStore(tmp_path / "rules.json"),
+        persistence=persistence,
+        auto_start=False,
+        interrupt_on_restore=False,
+    )
+    job_id = manager.create_job(
+        {"summary": {}, "risk_entities": [entity("node-a", 90)]},
+        model="qwen3:1.7b",
+    )
+    manager.run_job(job_id)
+
+    with pytest.raises(RuntimeError, match="rule write failed"):
+        manager.update_feature(job_id, "feature-node-a", {"status": "approved"})
+
+    persisted = persistence.load_candidate("feature-node-a")
+    assert persisted["status"] == "pending"
+    assert persisted["title"] == "并发审核标题"
+    assert persisted["reviewer_note"] == "并发审核备注"
+    assert persisted["tags"] == ["并发审核"]
+
+
+def test_review_operation_uses_one_cas_without_overwriting_concurrent_review(tmp_path):
+    database = SQLiteDatabase(tmp_path / "state.sqlite3")
+    persistence = _InterleavingSQLiteFeatureJobStore(database)
+    manager = FeatureJobManager(
+        extractor=lambda source, **kwargs: [candidate(source)],
+        persistence=persistence,
+        auto_start=False,
+        interrupt_on_restore=False,
+    )
+    job_id = manager.create_job(
+        {"summary": {}, "risk_entities": [entity("node-a", 90)]},
+        model="qwen3:1.7b",
+    )
+    manager.run_job(job_id)
+
+    manager.update_feature(
+        job_id,
+        "feature-node-a",
+        {"status": "approved", "title": "管理器标题"},
+    )
+
+    persisted = persistence.load_candidate("feature-node-a")
+    assert persistence.review_calls == 1
+    assert persisted["status"] == "approved"
+    assert persisted["title"] == "并发审核标题"
+    assert persisted["reviewer_note"] == "并发审核备注"
+    assert persisted["tags"] == ["并发审核"]
+
+
+def test_losing_review_cannot_leave_rule_or_sibling_group_side_effect(tmp_path):
+    class LosingReviewStore(SQLiteFeatureJobStore):
+        def __init__(self, database):
+            super().__init__(database)
+            self.interleaved = False
+
+        def update_candidate_review_state(self, candidate_id, changes, **kwargs):
+            if (
+                candidate_id == "feature-node-a"
+                and changes.get("status") == "approved"
+                and not self.interleaved
+            ):
+                self.interleaved = True
+                SQLiteFeatureJobStore(self.database).update_candidate_review_state(
+                    candidate_id,
+                    {"status": "rejected"},
+                    expected_status="pending",
+                )
+            return super().update_candidate_review_state(candidate_id, changes, **kwargs)
+
+    database = SQLiteDatabase(tmp_path / "state.sqlite3")
+    persistence = LosingReviewStore(database)
+    rules = SQLiteApprovedRuleStore(database)
+    groups = SQLiteApprovalGroupStore(database)
+    manager = FeatureJobManager(
+        extractor=lambda source, **kwargs: [candidate(source)],
+        rule_store=rules,
+        approval_group_store=groups,
+        persistence=persistence,
+        auto_start=False,
+        interrupt_on_restore=False,
+    )
+    first = manager.create_job(
+        {"summary": {}, "risk_entities": [entity("node-a", 90)]},
+        model="qwen3:1.7b",
+    )
+    second = manager.create_job(
+        {"summary": {}, "risk_entities": [entity("node-b", 90)]},
+        model="qwen3:1.7b",
+    )
+    manager.run_job(first)
+    manager.run_job(second)
+
+    with pytest.raises(FeatureJobError) as conflict:
+        manager.update_feature(first, "feature-node-a", {"status": "approved"})
+
+    assert (conflict.value.code, conflict.value.status_code) == ("candidate_state_conflict", 409)
+    assert rules.list_rules() == []
+    assert persistence.load_candidate("feature-node-a")["status"] == "rejected"
+    assert persistence.load_candidate("feature-node-b")["status"] == "pending"
+    assert groups.list_groups()[0]["status"] == "pending"
+    assert groups.list_groups()[0]["rule_id"] is None
+
+
+def test_stale_idempotent_approval_cannot_run_or_rollback_winner_side_effects(tmp_path):
+    class ConcurrentApprovalStore(SQLiteFeatureJobStore):
+        def __init__(self, database):
+            super().__init__(database)
+            self.interleaved = False
+
+        def update_candidate_review_state(self, candidate_id, changes, **kwargs):
+            if (
+                candidate_id == "feature-node-a"
+                and changes.get("status") == "approved"
+                and not self.interleaved
+            ):
+                self.interleaved = True
+                SQLiteFeatureJobStore(self.database).update_candidate_review_state(
+                    candidate_id,
+                    {"status": "approved", "reviewer_note": "并发审核胜者"},
+                    expected_status="pending",
+                    expected_updated_at=kwargs.get("expected_updated_at"),
+                )
+            return super().update_candidate_review_state(candidate_id, changes, **kwargs)
+
+    database = SQLiteDatabase(tmp_path / "state.sqlite3")
+    persistence = ConcurrentApprovalStore(database)
+    rules = SQLiteApprovedRuleStore(database)
+    groups = SQLiteApprovalGroupStore(database)
+    manager = FeatureJobManager(
+        extractor=lambda source, **kwargs: [candidate(source)],
+        rule_store=rules,
+        approval_group_store=groups,
+        persistence=persistence,
+        auto_start=False,
+        interrupt_on_restore=False,
+    )
+    job_id = manager.create_job(
+        {"summary": {}, "risk_entities": [entity("node-a", 90)]},
+        model="qwen3:1.7b",
+    )
+    manager.run_job(job_id)
+
+    with pytest.raises(FeatureJobError) as conflict:
+        manager.update_feature(job_id, "feature-node-a", {"status": "approved"})
+
+    assert (conflict.value.code, conflict.value.status_code) == ("candidate_state_conflict", 409)
+    assert rules.list_rules() == []
+    persisted = persistence.load_candidate("feature-node-a")
+    assert persisted["status"] == "approved"
+    assert persisted["reviewer_note"] == "并发审核胜者"
+    assert groups.list_groups()[0]["status"] == "pending"
+    assert groups.list_groups()[0]["rule_id"] is None
+
+
+def test_refresh_does_not_replace_live_job_with_older_persisted_snapshot(tmp_path):
+    store = FeatureJobFileStore(tmp_path / "feature_jobs")
+    manager = FeatureJobManager(
+        extractor=lambda source, **kwargs: [],
+        persistence=store,
+        auto_start=False,
+        interrupt_on_restore=False,
+    )
+    job_id = manager.create_job(
+        {"summary": {}, "risk_entities": [entity("node-a", 90)]},
+        model="qwen3:1.7b",
+    )
+    with manager._lock:
+        manager._job(job_id)["status"] = "running"
+    persisted = store.load_job(job_id)
+    persisted["status"] = "queued"
+    store.save(persisted)
+
+    manager.refresh_from_persistence(job_id)
+
+    assert manager.get_job(job_id)["status"] == "running"
+
+
+def test_refresh_imports_review_state_when_persistence_has_no_new_job_event(tmp_path):
+    database = SQLiteDatabase(tmp_path / "state.sqlite3")
+    persistence = SQLiteFeatureJobStore(database)
+    groups = SQLiteApprovalGroupStore(database)
+    manager = FeatureJobManager(
+        extractor=lambda source, **kwargs: [candidate(source, "candidate-node-a")],
+        persistence=persistence,
+        approval_group_store=groups,
+        auto_start=False,
+        interrupt_on_restore=False,
+    )
+    job_id = manager.create_job(
+        {"summary": {}, "risk_entities": [entity("node-a", 90)]},
+        model="qwen3:1.7b",
+    )
+    manager.run_job(job_id)
+    before = manager.get_job(job_id)
+    before_events = persistence.load_job(job_id)["events"]
+    persistence.update_candidate_review_state(
+        "feature-node-a",
+        {"status": "approved"},
+        expected_status="pending",
+    )
+
+    assert persistence.load_job(job_id)["events"] == before_events
+    manager.refresh_from_persistence(job_id)
+
+    assert next(item for item in manager.get_job(job_id)["features"] if item["candidate_id"] == "feature-node-a")["status"] == "approved"
+    assert manager.get_job(job_id)["status"] == before["status"]
+
+
+def test_job_state_and_extractor_input_drop_raw_payloads(tmp_path):
+    captured_sources = []
+
+    def extractor(source, **kwargs):
+        captured_sources.append(source)
+        return [candidate(source)]
+
+    persistence = SQLiteFeatureJobStore(SQLiteDatabase(tmp_path / "state.sqlite3"))
+    manager = FeatureJobManager(
+        extractor=extractor,
+        persistence=persistence,
+        auto_start=False,
+        interrupt_on_restore=False,
+    )
+    source = entity("node-a", 90)
+    source.update({
+        "raw_logs": ["secret raw line"],
+        "samples": ["secret sample"],
+        "nested": {"api_key": "secret-key"},
+    })
+    job_id = manager.create_job(
+        {
+            "summary": {"raw_logs": ["secret summary line"]},
+            "risk_entities": [source],
+        },
+        model="qwen3:1.7b",
+        connection_snapshot={"dsn": "postgresql://secret"},
+        profile_snapshot={"token": "secret-token"},
+    )
+
+    manager.run_job(job_id)
+
+    assert captured_sources
+    assert all("secret" not in json.dumps(value, ensure_ascii=False) for value in captured_sources)
+    serialized = json.dumps(persistence.load_job(job_id), ensure_ascii=False)
+    assert "secret" not in serialized
+    assert "raw_logs" not in serialized
+    assert '"samples"' not in serialized
+
+
+def test_refresh_keeps_live_review_fields_for_equal_progress_snapshot(tmp_path):
+    store = FeatureJobFileStore(tmp_path / "feature_jobs")
+    manager = FeatureJobManager(
+        extractor=lambda source, **kwargs: [candidate(source)],
+        persistence=store,
+        auto_start=False,
+        interrupt_on_restore=False,
+    )
+    job_id = manager.create_job(
+        {"summary": {}, "risk_entities": [entity("node-a", 90)]},
+        model="qwen3:1.7b",
+    )
+    manager.run_job(job_id)
+    with manager._lock:
+        live = manager._job(job_id)["features"]["feature-node-a"]
+        live["title"] = "实时审核标题"
+        live["reviewer_note"] = "实时审核备注"
+        live["tags"] = ["实时审核"]
+
+    persisted = store.load_job(job_id)
+    store.save(persisted)
+    manager.refresh_from_persistence(job_id)
+
+    live = manager.get_job(job_id)["features"][0]
+    assert live["title"] == "实时审核标题"
+    assert live["reviewer_note"] == "实时审核备注"
+    assert live["tags"] == ["实时审核"]
 
 
 def test_file_store_marks_running_job_interrupted_without_model_retry(tmp_path):

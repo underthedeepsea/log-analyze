@@ -1,10 +1,17 @@
 from __future__ import annotations
 
-from datetime import date
+import multiprocessing
+import json
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
 from logrisk.database import SQLiteDatabase
+from logrisk.approved_rules import ApprovedRuleError
+from logrisk.feature_jobs import FeatureJobError, FeatureJobFileStore
 from logrisk.sqlite_stores import (
     SQLiteAICache,
     SQLiteAITraceLogger,
@@ -17,6 +24,92 @@ from logrisk.sqlite_stores import (
 )
 from logrisk.input_jobs import InputJobConfig
 from logrisk.upload_sessions import UploadConfig
+
+
+def feature() -> dict[str, object]:
+    return {
+        "feature_type": "kernel_error",
+        "title": "内核错误",
+        "summary": "检测到内核错误",
+        "importance": "high",
+        "tags": ["内核"],
+        "components": ["kernel"],
+        "source_templates": [{"template_hash": "hash-1", "category": "kernel"}],
+    }
+
+
+class _DelayedFileFeatureJobStore(FeatureJobFileStore):
+    def __init__(self, root, delay):
+        super().__init__(root)
+        self.delay = delay
+
+    def load_candidate(self, *args, **kwargs):
+        candidate = super().load_candidate(*args, **kwargs)
+        if self.delay:
+            time.sleep(self.delay)
+        return candidate
+
+
+def _file_review_worker(root, status, delay, result_queue):
+    store = _DelayedFileFeatureJobStore(root, delay)
+    try:
+        store.update_candidate_review_state(
+            "candidate-1", {"status": status}, expected_status="pending"
+        )
+        result_queue.put(("success", status))
+    except FeatureJobError as exc:
+        result_queue.put(("error", exc.code, exc.status_code))
+
+
+def _sqlite_reuse_worker(database_path, rule_id, result_queue):
+    try:
+        rule = SQLiteApprovedRuleStore(SQLiteDatabase(database_path)).record_reuse(
+            rule_id,
+            job_id=f"job-{rule_id}",
+            entity_id="node-a",
+        )
+        result_queue.put(("success", rule["reuse_count"]))
+    except Exception as exc:  # pragma: no cover - the assertion reports the failure
+        result_queue.put(("error", type(exc).__name__, str(exc)))
+
+
+def _candidate_job(candidate_id="candidate-1", *, status="pending"):
+    return {
+        "job_id": "job-candidates",
+        "status": "completed",
+        "model": "worker-model",
+        "provider": "ollama",
+        "prompt_id": "prompt-worker",
+        "model_profile_id": None,
+        "created_at": "2026-07-16T00:00:00+00:00",
+        "completed_at": "2026-07-16T00:01:00+00:00",
+        "entities": [],
+        "features": {
+            candidate_id: {
+                "candidate_id": candidate_id,
+                "status": status,
+                "reviewer_note": "",
+                "approved_at": None,
+                "entity": {"type": "node", "id": "node-a"},
+                "feature_type": "memory_pressure",
+                "title": "Worker title",
+                "summary": "Worker summary",
+                "tags": ["worker"],
+                "model": "worker-model",
+                "provider": "ollama",
+                "prompt_id": "prompt-worker",
+                "trace_id": "trace-worker",
+                "evidence": {"template_hashes": ["hash-1"]},
+            },
+        },
+        "events": [],
+    }
+
+
+def _candidate_store(tmp_path, kind):
+    if kind == "sqlite":
+        return SQLiteFeatureJobStore(SQLiteDatabase(tmp_path / "state.sqlite3"))
+    return FeatureJobFileStore(tmp_path / "feature_jobs")
 
 
 def test_sqlite_feature_jobs_round_trip_entities_candidates_and_events(tmp_path):
@@ -101,6 +194,331 @@ def test_sqlite_feature_job_store_loads_one_job(tmp_path):
 
     assert store.load_job("job-single")["job_id"] == "job-single"
     assert store.load_job("missing") is None
+
+
+def test_sqlite_feature_job_save_merges_events_from_stale_worker_snapshot(tmp_path):
+    store = SQLiteFeatureJobStore(SQLiteDatabase(tmp_path / "logrisk.sqlite3"))
+    base = _candidate_job()
+    base["events"] = [{"sequence": 0, "type": "job_created", "timestamp": "2026-07-16T00:00:00+00:00"}]
+    store.save(base)
+
+    first_worker = store.load_job("job-candidates")
+    second_worker = store.load_job("job-candidates")
+    first_worker["events"].append({"sequence": 1, "type": "entity_completed", "timestamp": "2026-07-16T00:01:00+00:00"})
+    second_worker["events"].append({"sequence": 1, "type": "entity_failed", "timestamp": "2026-07-16T00:02:00+00:00"})
+    store.save(first_worker)
+    store.save(second_worker)
+
+    events = store.load_job("job-candidates")["events"]
+
+    assert {event["type"] for event in events} == {"job_created", "entity_completed", "entity_failed"}
+
+
+@pytest.mark.parametrize("kind", ["sqlite", "file"])
+@pytest.mark.parametrize("review_status", ["approved", "rejected"])
+def test_generated_candidate_save_preserves_review_owned_fields(tmp_path, kind, review_status):
+    store = _candidate_store(tmp_path, kind)
+    full_stale = _candidate_job()
+    full_stale["model"] = "new-worker-model"
+    full_stale["provider"] = "new-provider"
+    full_stale["prompt_id"] = "prompt-new"
+    full_stale["features"]["candidate-1"].update({
+        "model": "new-worker-model",
+        "provider": "new-provider",
+        "prompt_id": "prompt-new",
+        "trace_id": "trace-new",
+        "evidence": {"template_hashes": ["hash-2"]},
+    })
+    store.save(full_stale)
+
+    review = {
+        "status": review_status,
+        "reviewer_note": "人工复核完成",
+        "approved_at": "2026-07-16T00:02:00+00:00" if review_status == "approved" else None,
+        "resolved_rule_id": "rule-1" if review_status == "approved" else None,
+        "rule_id": "rule-1" if review_status == "approved" else None,
+        "resolution_type": "manual",
+        "review_scope": "approval_identity",
+        "title": "人工标题",
+        "summary": "人工摘要",
+        "tags": ["人工"],
+    }
+    store.update_candidate_review_state("candidate-1", review, expected_status="pending")
+
+    store.save_generated_candidate("job-candidates", {
+        "candidate_id": "candidate-1",
+        "status": "pending",
+        "reviewer_note": "",
+        "approved_at": None,
+        "title": "Stale worker title",
+        "summary": "Stale worker summary",
+        "tags": ["stale-worker"],
+        "model": "new-worker-model",
+        "provider": "new-provider",
+        "prompt_id": "prompt-new",
+        "trace_id": "trace-new",
+        "evidence": {"template_hashes": ["hash-2"]},
+    })
+    store.save(full_stale)
+
+    loaded = store.load_candidate("candidate-1")
+    assert loaded["status"] == review_status
+    assert loaded["reviewer_note"] == "人工复核完成"
+    assert loaded["title"] == "人工标题"
+    assert loaded["summary"] == "人工摘要"
+    assert loaded["tags"] == ["人工"]
+    assert loaded["review_scope"] == "approval_identity"
+    assert loaded["model"] == "new-worker-model"
+    assert loaded["provider"] == "new-provider"
+    assert loaded["prompt_id"] == "prompt-new"
+    assert loaded["trace_id"] == "trace-new"
+
+
+@pytest.mark.parametrize("kind", ["sqlite", "file"])
+def test_persisted_candidate_removes_raw_logs_and_secrets(tmp_path, kind):
+    store = _candidate_store(tmp_path, kind)
+    job = _candidate_job()
+    job["features"]["candidate-1"].update({
+        "raw_sample": "secret raw line",
+        "raw_logs": ["secret raw line 2"],
+        "nested": {"message": "raw message", "api_key": "secret-token"},
+    })
+
+    store.save(job)
+    loaded = store.load_candidate("candidate-1")
+
+    serialized = json.dumps(loaded, ensure_ascii=False)
+    assert "raw_sample" not in serialized
+    assert "raw_logs" not in serialized
+    assert "raw message" not in serialized
+    assert "secret-token" not in serialized
+
+
+@pytest.mark.parametrize("kind", ["sqlite", "file"])
+def test_persisted_job_events_remove_raw_logs_and_secrets(tmp_path, kind):
+    store = _candidate_store(tmp_path, kind)
+    job = _candidate_job()
+    job["events"] = [{
+        "sequence": 0,
+        "type": "entity_failed",
+        "raw_log": "secret raw line",
+        "credentials": {"token": "secret-token"},
+    }]
+
+    store.save(job)
+    serialized = json.dumps(store.load_job("job-candidates"), ensure_ascii=False)
+
+    assert "secret" not in serialized
+    assert '"raw_log"' not in serialized
+    assert '"token"' not in serialized
+
+
+def test_sqlite_candidate_review_cas_has_one_winner_and_a_conflict(tmp_path):
+    database = SQLiteDatabase(tmp_path / "state.sqlite3")
+    SQLiteFeatureJobStore(database).save(_candidate_job())
+    barrier = threading.Barrier(2)
+
+    def review(status):
+        store = SQLiteFeatureJobStore(database)
+        barrier.wait()
+        try:
+            result = store.update_candidate_review_state(
+                "candidate-1", {"status": status}, expected_status="pending"
+            )
+            return "success", result
+        except FeatureJobError as exc:
+            return "error", (exc.code, exc.status_code)
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(review, ["approved", "rejected"]))
+
+    assert [result[0] for result in results].count("success") == 1
+    errors = [result[1] for result in results if result[0] == "error"]
+    assert errors == [("candidate_state_conflict", 409)]
+    assert SQLiteFeatureJobStore(database).load_candidate("candidate-1")["status"] in {"approved", "rejected"}
+
+
+def test_sqlite_candidate_review_distinguishes_missing_from_status_conflict(tmp_path):
+    store = _candidate_store(tmp_path, "sqlite")
+    store.save(_candidate_job())
+
+    with pytest.raises(FeatureJobError) as missing:
+        store.update_candidate_review_state(
+            "missing-candidate", {"status": "approved"}, expected_status="pending"
+        )
+    with pytest.raises(FeatureJobError) as conflict:
+        store.update_candidate_review_state(
+            "candidate-1", {"status": "approved"}, expected_status="approved"
+        )
+
+    assert (missing.value.code, missing.value.status_code) == ("candidate_not_found", 404)
+    assert (conflict.value.code, conflict.value.status_code) == ("candidate_state_conflict", 409)
+
+
+def test_sqlite_candidate_review_cas_rejects_a_stale_updated_at(tmp_path):
+    store = _candidate_store(tmp_path, "sqlite")
+    store.save(_candidate_job())
+    initial = store.load_candidate("candidate-1")
+
+    store.update_candidate_review_state(
+        "candidate-1",
+        {"reviewer_note": "较新的审核"},
+        expected_status="pending",
+    )
+
+    with pytest.raises(FeatureJobError) as conflict:
+        store.update_candidate_review_state(
+            "candidate-1",
+            {"status": "approved"},
+            expected_status="pending",
+            expected_updated_at=initial["updated_at"],
+        )
+
+    assert (conflict.value.code, conflict.value.status_code) == ("candidate_state_conflict", 409)
+    assert store.load_candidate("candidate-1")["reviewer_note"] == "较新的审核"
+
+
+def test_sqlite_candidate_review_cas_rejects_stale_idempotent_approval(tmp_path):
+    store = _candidate_store(tmp_path, "sqlite")
+    store.save(_candidate_job())
+    stale = store.load_candidate("candidate-1")
+
+    winner = store.update_candidate_review_state(
+        "candidate-1",
+        {"status": "approved", "reviewer_note": "并发审核胜者"},
+        expected_status="pending",
+        expected_updated_at=stale["updated_at"],
+    )
+
+    with pytest.raises(FeatureJobError) as conflict:
+        store.update_candidate_review_state(
+            "candidate-1",
+            {"status": "approved", "reviewer_note": "过期审核"},
+            expected_status="pending",
+            expected_updated_at=stale["updated_at"],
+        )
+
+    assert (conflict.value.code, conflict.value.status_code) == ("candidate_state_conflict", 409)
+    assert store.load_candidate("candidate-1")["updated_at"] == winner["updated_at"]
+    assert store.load_candidate("candidate-1")["reviewer_note"] == "并发审核胜者"
+
+
+def test_sqlite_rule_reuse_count_is_atomic_across_processes(tmp_path):
+    if "fork" not in multiprocessing.get_all_start_methods():
+        pytest.skip("cross-process reuse regression requires fork")
+    database_path = tmp_path / "logrisk.sqlite3"
+    database = SQLiteDatabase(database_path)
+    rule = SQLiteApprovedRuleStore(database).upsert_feature(feature())
+    context = multiprocessing.get_context("fork")
+    result_queue = context.Queue()
+    workers = [
+        context.Process(target=_sqlite_reuse_worker, args=(database_path, rule["rule_id"], result_queue))
+        for _ in range(4)
+    ]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(5)
+
+    assert all(worker.exitcode == 0 for worker in workers)
+    results = [result_queue.get(timeout=2) for _ in workers]
+    assert all(result[0] == "success" for result in results), results
+    assert SQLiteApprovedRuleStore(database).list_rules()[0]["reuse_count"] == len(workers)
+
+
+def test_sqlite_rule_reuse_rejects_inactive_rule_without_audit_event(tmp_path):
+    database = SQLiteDatabase(tmp_path / "logrisk.sqlite3")
+    rules = SQLiteApprovedRuleStore(database)
+    saved = rules.upsert_feature(feature())
+    with database.transaction() as connection:
+        connection.execute("UPDATE approved_rules SET status='disabled' WHERE rule_id=?", (saved["rule_id"],))
+
+    with pytest.raises(ApprovedRuleError, match="active"):
+        rules.record_reuse(saved["rule_id"], job_id="job-1", entity_id="node-a")
+
+    with database.connect() as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM rule_reuse_events WHERE rule_id=?", (saved["rule_id"],)
+        ).fetchone()[0] == 0
+
+
+def test_rejected_approval_group_cannot_be_regressed_by_stale_pending_save(tmp_path):
+    database = SQLiteDatabase(tmp_path / "logrisk.sqlite3")
+    groups = SQLiteApprovalGroupStore(database)
+    value = {
+        "approval_group_id": "group-terminal",
+        "approval_key": "appr-terminal",
+        "problem_code": "kubernetes.cni.ip_exhaustion",
+        "feature_type": "network_failure",
+        "title": "CNI",
+        "summary": "摘要",
+        "importance": "high",
+        "status": "pending",
+        "candidate_ids": ["candidate-1"],
+        "entity_keys": ["node-a"],
+        "candidate_count": 1,
+        "affected_entity_count": 1,
+        "occurrence_count": 1,
+        "created_at": "2026-07-16T00:00:00+00:00",
+        "updated_at": "2026-07-16T00:00:00+00:00",
+    }
+    groups.save(value)
+    groups.save({**value, "status": "rejected", "updated_at": "2026-07-16T00:01:00+00:00"})
+
+    groups.save({**value, "status": "pending", "updated_at": "2026-07-16T00:00:01+00:00"})
+
+    assert groups.get_by_key("appr-terminal")["status"] == "rejected"
+
+
+def test_file_candidate_review_cas_is_safe_across_processes(tmp_path):
+    if "fork" not in multiprocessing.get_all_start_methods():
+        pytest.skip("cross-process file CAS regression requires fork")
+    store = FeatureJobFileStore(tmp_path / "feature_jobs")
+    store.save(_candidate_job())
+    context = multiprocessing.get_context("fork")
+    result_queue = context.Queue()
+    first = context.Process(
+        target=_file_review_worker,
+        args=(str(tmp_path / "feature_jobs"), "approved", 1.0, result_queue),
+    )
+    second = context.Process(
+        target=_file_review_worker,
+        args=(str(tmp_path / "feature_jobs"), "rejected", 0.0, result_queue),
+    )
+    first.start()
+    time.sleep(0.1)
+    second.start()
+    first.join(5)
+    second.join(5)
+
+    assert first.exitcode == 0
+    assert second.exitcode == 0
+    results = [result_queue.get(timeout=2), result_queue.get(timeout=2)]
+    assert [item[0] for item in results].count("success") == 1
+    assert [item[1:] for item in results if item[0] == "error"] == [
+        ("candidate_state_conflict", 409)
+    ]
+
+
+@pytest.mark.parametrize("kind", ["sqlite", "file"])
+def test_candidate_listing_is_not_silently_limited_to_one_hundred(tmp_path, kind):
+    store = _candidate_store(tmp_path, kind)
+    job = _candidate_job()
+    base_created_at = datetime(2026, 7, 16, tzinfo=timezone.utc)
+    job["features"] = {
+        f"candidate-{index:03d}": {
+            "candidate_id": f"candidate-{index:03d}",
+            "status": "pending",
+            "created_at": (base_created_at + timedelta(seconds=index)).isoformat(),
+        }
+        for index in range(101)
+    }
+    store.save(job)
+
+    candidates = store.list_candidates(status="pending")
+
+    assert len(candidates) == 101
+    assert candidates[-1]["candidate_id"] == "candidate-100"
 
 
 def test_sqlite_feature_job_replace_preserves_continuous_learning_feedback(tmp_path):
@@ -222,6 +640,68 @@ def test_sqlite_trace_cache_metrics_and_rules_survive_new_store_instances(tmp_pa
     assert tuple(version) == (1, "rule_created")
 
 
+def test_sqlite_rule_store_projects_v1_identity_columns_as_null(tmp_path):
+    database = SQLiteDatabase(tmp_path / "logrisk.sqlite3")
+    store = SQLiteApprovedRuleStore(database)
+    saved = store.upsert_feature(feature())
+    saved["schema_version"] = "approved_rule_v1"
+    store._write_locked([saved])
+
+    with database.connect() as connection:
+        projection = connection.execute(
+            "SELECT schema_version, problem_code, approval_key FROM approved_rules WHERE rule_id=?",
+            (saved["rule_id"],),
+        ).fetchone()
+    assert tuple(projection) == ("approved_rule_v1", None, None)
+
+
+@pytest.mark.parametrize("conflict", ["schema", "approval_key", "signature", "v1_projection"])
+def test_sqlite_rule_reader_fail_closes_db_json_identity_conflicts(tmp_path, conflict):
+    database = SQLiteDatabase(tmp_path / "logrisk.sqlite3")
+    store = SQLiteApprovedRuleStore(database)
+    saved = store.upsert_feature(feature())
+    with database.connect() as connection:
+        payload = json.loads(connection.execute(
+            "SELECT rule_json FROM approved_rules WHERE rule_id=?", (saved["rule_id"],)
+        ).fetchone()[0])
+    if conflict == "schema":
+        payload["schema_version"] = "approved_rule_v1"
+        input_feature = feature()
+    elif conflict == "approval_key":
+        payload["approval_key"] = "appr-json-corrupt"
+        input_feature = feature()
+    elif conflict == "signature":
+        payload["signature"] = "sig-json-corrupt"
+        input_feature = feature()
+    else:
+        payload["schema_version"] = "approved_rule_v1"
+        input_feature = {**feature(), "schema_version": "approved_rule_v1", "approval_key": saved["approval_key"]}
+
+    with database.transaction() as connection:
+        if conflict == "schema":
+            connection.execute(
+                "UPDATE approved_rules SET rule_json=? WHERE rule_id=?",
+                (json.dumps(payload, ensure_ascii=False), saved["rule_id"]),
+            )
+        elif conflict == "approval_key":
+            connection.execute(
+                "UPDATE approved_rules SET rule_json=? WHERE rule_id=?",
+                (json.dumps(payload, ensure_ascii=False), saved["rule_id"]),
+            )
+        elif conflict == "signature":
+            connection.execute(
+                "UPDATE approved_rules SET rule_json=? WHERE rule_id=?",
+                (json.dumps(payload, ensure_ascii=False), saved["rule_id"]),
+            )
+        else:
+            connection.execute(
+                "UPDATE approved_rules SET rule_json=?, schema_version='approved_rule_v1', problem_code=NULL, approval_key=? WHERE rule_id=?",
+                (json.dumps(payload, ensure_ascii=False), saved["approval_key"], saved["rule_id"]),
+            )
+
+    assert store.match_feature(input_feature) == []
+
+
 def test_sqlite_rule_store_only_matches_active_rules(tmp_path):
     database = SQLiteDatabase(tmp_path / "logrisk.sqlite3")
     rules = SQLiteApprovedRuleStore(database)
@@ -238,7 +718,8 @@ def test_sqlite_rule_store_only_matches_active_rules(tmp_path):
     entity = {
         "entity_id": "node-a",
         "cluster": "prod-a",
-        "top_templates": [{"template_hash": "hash-1", "category": "kernel"}],
+        "feature_type": "kernel_error",
+        "top_templates": [{"template_hash": "hash-1", "category": "kernel", "component": "kernel"}],
     }
 
     assert rules.match_entity(entity)[0]["rule_id"] == saved["rule_id"]
@@ -249,6 +730,84 @@ def test_sqlite_rule_store_only_matches_active_rules(tmp_path):
         )
 
     assert rules.match_entity(entity) == []
+
+
+def test_sqlite_inactive_rule_approval_creates_distinct_active_replacement(tmp_path):
+    database = SQLiteDatabase(tmp_path / "logrisk.sqlite3")
+    rules = SQLiteApprovedRuleStore(database)
+    feature = {
+        "candidate_id": "candidate-old",
+        "feature_type": "cni_network_failure",
+        "problem_code": "kubernetes.cni.ip_exhaustion",
+        "title": "CNI 地址耗尽",
+        "summary": "CNI 地址池没有可用 IP。",
+        "importance": "high",
+        "source_templates": [{
+            "template_hash": "hash-cni",
+            "template_fingerprint": "fingerprint-cni",
+            "category": "network",
+            "component": "kubelet",
+        }],
+    }
+    predecessor = rules.upsert_feature(feature)
+    with database.transaction() as connection:
+        connection.execute(
+            "UPDATE approved_rules SET status='disabled' WHERE rule_id=?",
+            (predecessor["rule_id"],),
+        )
+
+    replacement = rules.upsert_feature({
+        **feature,
+        "candidate_id": "candidate-new",
+        "feature_type": "pod_sandbox_network_failure",
+        "problem_code": "runtime_sandbox_create_failed",
+    })
+    persisted = {item["rule_id"]: item for item in rules.list_rules()}
+
+    assert replacement["rule_id"] != predecessor["rule_id"]
+    assert replacement["status"] == "active"
+    assert replacement["lineage"]["predecessor_rule_id"] == predecessor["rule_id"]
+    assert persisted[predecessor["rule_id"]]["status"] == "disabled"
+
+
+def test_sqlite_template_set_candidate_does_not_overwrite_semantic_rule(tmp_path):
+    database = SQLiteDatabase(tmp_path / "logrisk.sqlite3")
+    rules = SQLiteApprovedRuleStore(database)
+    semantic = {
+        "feature_type": "cni_network_failure",
+        "problem_code": "kubernetes.cni.ip_exhaustion",
+        "title": "CNI 地址耗尽",
+        "summary": "CNI 地址池没有可用 IP。",
+        "importance": "high",
+        "components": ["kubelet"],
+        "source_templates": [{
+            "template_hash": "hash-kubelet",
+            "template_fingerprint": "fingerprint-cni",
+            "category": "network",
+            "component": "kubelet",
+            "template": "CNI failed: no enough ips",
+        }],
+    }
+    ambiguous = {
+        **semantic,
+        "components": ["containerd"],
+        "source_templates": [{
+            **semantic["source_templates"][0],
+            "template_hash": "hash-containerd",
+            "component": "containerd",
+        }],
+    }
+    ambiguous.pop("problem_code")
+
+    predecessor = rules.upsert_feature(semantic)
+    assert rules.match_feature(ambiguous) == []
+
+    replacement = rules.upsert_feature(ambiguous)
+    persisted = {item["rule_id"]: item for item in rules.list_rules()}
+
+    assert replacement["rule_id"] != predecessor["rule_id"]
+    assert len(persisted) == 2
+    assert persisted[predecessor["rule_id"]]["components"] == ["kubelet"]
 
 
 def test_sqlite_approval_group_round_trip_and_candidate_uniqueness(tmp_path):

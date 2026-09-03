@@ -6,6 +6,31 @@
 - 仅修复 Bug 时提升最后一位，例如 `1.2.0 → 1.2.1`；
 - 每次代码更新必须同步更新本文件。
 
+## 1.36.2 - 2026-09-03
+
+### Added
+
+- 新增 SQLite/PostgreSQL `0021` forward-only classification migration，以及 `LEGACY_V1`、`VALID_V2`、`MALFORMED_V2` 三态规则分类。
+- 完善持久化人工审批工作台：支持全量队列游标、脏草稿保护、真实执行上下文展示和明确的并发冲突提示。
+
+### Fixed
+
+- 修复 Approval Identity V2 对未知或歧义根因的严格回退，并保留历史 V1 `approval_key` 的比较与物理分组兼容。
+- 修正多重具体语义关键字、递归根因字段和未知命名空间的收集与校验；严格回退保留来源锚点，并避免将 PodSandbox OOM 误判为 CNI 插件故障。
+- 收紧 CNI 关键字上下文，避免通用 network/网络文本或普通 PodSandbox 失败被误判为 CNI IP 耗尽，同时保留 sandbox 网络包装器识别。
+- 修复 Worker 旧 Candidate 快照覆盖人工审核状态，并为审核更新增加 SQLite/PostgreSQL 兼容的原子 CAS、完整队列读取和明确的 404/409 错误。
+- 修复审核操作的二阶段 CAS 覆盖和部分批准，补强文件存储跨进程 CAS，并阻止同进度旧快照覆盖实时审核字段。
+- 修复代表 Candidate CAS 失败后仍写入规则、同身份 Candidate 或 Approval Group，并在规则写入失败时回滚审批状态。
+- 修复过期的幂等批准绕过 Candidate 版本校验，并避免重复编辑已复用规则的 Candidate 时重复累计复用次数。
+- 修复批准规则 V1/V2 匹配与停用规则替换：仅复用 active 规则，保留 V1 物理身份；停用前身生成可追溯的独立 active replacement，并将规则复用统计限定为模型调用前命中。
+- 收紧 V2 语义匹配的 `match_mode` 门禁，并让 template-set 的 feature_type、组件、模板锚点证据缺失或不兼容时拒绝实体复用；canonical template-set 规则使用确定性的严格存储键，避免覆盖语义规则。
+- 修复损坏的 `approved_rule_v2` 回退到 V1 匹配路径的问题，以及数据库 reader、legacy import、治理状态变更和 rollback 对规则 identity 的静默覆盖或无条件升级。
+- 修复审批批准后的跨任务 pending Candidate 持久化收敛、重启恢复和重复审批幂等，并保证 group reject 不修改已结束 Candidate。
+- 修复持久化审批队列在全量 Candidate 聚合后的 logical Group 分页、游标校验、全局统计和代表性证据脱敏。
+- 统一 standalone Dashboard 与 Django facade 的审批校验错误映射，补齐 422 validation 响应，并验证无当前 Job 时的 review/queue/export 路由。
+- 补强 SQLite/PostgreSQL 共享存储的并发复用计数、终态审批组保护和无事件刷新恢复，避免跨进程并发与 Worker/Reviewer 时序造成状态回退。
+- 持久化 Candidate、Job 快照和文件事件写入现在递归剔除原始日志、样例、消息及凭据字段，保持审批、模型和审计边界不泄漏敏感内容。
+
 ## 1.36.1 - 2026-09-01
 
 ### Fixed

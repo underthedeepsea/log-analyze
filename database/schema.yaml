@@ -1,4 +1,4 @@
-schema_version: 20
+schema_version: 21
 database: logrisk
 description: LOGRISK 双模式运行时数据字典；SQLite 是默认本地实现，PostgreSQL 用于显式配置的外部生产部署。
 authoritative_ddl:
@@ -93,7 +93,7 @@ tables:
     foreign_keys: {job_id: feature_jobs.job_id ON DELETE CASCADE}
     columns: {job_id: 所属任务, sequence: 任务内递增序号, event_type: 事件类型, event_json: 事件详情, created_at: 发生时间}
   approved_rules:
-    description: 人工批准且可复用的版本化规则资产；仅 active 状态参与匹配
+    description: 人工批准且可复用的版本化规则资产；schema_version 是 approved_rule_v1/approved_rule_v2 规则格式声明，不是 current_version 生命周期版本；仅 active 状态参与匹配；V1 的 problem_code/approval_key 数据库投影必须为 NULL
     primary_key: rule_id
     constraints: signature 唯一；非空 approval_key 唯一；status 为 active/disabled/under_review/deprecated/archived；current_version 大于 0
     indexes: [idx_approved_rules_status(status), idx_approved_rules_approval_key(approval_key)]

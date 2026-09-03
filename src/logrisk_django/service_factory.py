@@ -31,7 +31,7 @@ def get_facade() -> ApiFacade:
     if _facade is None:
         _facade = ApiFacade(
             get_container(),
-            version="1.36.1",
+            version="1.36.2",
             service_resolver=_resolve_facade_service,
         )
     return _facade

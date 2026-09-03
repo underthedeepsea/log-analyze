@@ -6,6 +6,15 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
+from logrisk.approved_rules import (
+    ApprovedRuleError,
+    RuleFormat,
+    RuleNormalizationSource,
+    classify_rule,
+    hydrate_persisted_rule,
+    normalize_legacy_rule_version,
+    public_rule,
+)
 from logrisk.database import SQLiteDatabase
 
 
@@ -30,22 +39,30 @@ class RuleGovernanceRepository:
 
     @staticmethod
     def _rule(row: Any) -> dict[str, Any]:
-        rule = json.loads(row["rule_json"])
-        rule.update({
-            "status": row["status"],
-            "current_version": int(row["current_version"]),
-            "next_review_at": row["next_review_at"],
-            "schema_version": row["schema_version"],
-            "approved_at": row["approved_at"],
-            "created_at": rule.get("created_at") or row["approved_at"],
-            "updated_at": row["updated_at"],
-        })
-        return rule
+        return hydrate_persisted_rule(
+            row["rule_json"],
+            persisted_projection={
+                "rule_id": row["rule_id"],
+                "signature": row["signature"],
+                "feature_type": row["feature_type"],
+                "schema_version": row["schema_version"],
+                "problem_code": row["problem_code"],
+                "approval_key": row["approval_key"],
+            },
+            lifecycle={
+                "status": row["status"],
+                "current_version": int(row["current_version"]),
+                "next_review_at": row["next_review_at"],
+                "approved_at": row["approved_at"],
+                "updated_at": row["updated_at"],
+            },
+        )
 
     def list_rules(self) -> list[dict[str, Any]]:
         with self.database.connect() as connection:
             rows = connection.execute(
-                "SELECT rule_json, status, current_version, next_review_at, schema_version, approved_at, updated_at "
+                "SELECT rule_id, signature, feature_type, rule_json, status, current_version, next_review_at, schema_version, "
+                "approved_at, updated_at, problem_code, approval_key "
                 "FROM approved_rules ORDER BY updated_at DESC, rule_id"
             ).fetchall()
         return [self._rule(row) for row in rows]
@@ -53,7 +70,8 @@ class RuleGovernanceRepository:
     def get_rule(self, rule_id: str) -> dict[str, Any] | None:
         with self.database.connect() as connection:
             row = connection.execute(
-                "SELECT rule_json, status, current_version, next_review_at, schema_version, approved_at, updated_at "
+                "SELECT rule_id, signature, feature_type, rule_json, status, current_version, next_review_at, schema_version, "
+                "approved_at, updated_at, problem_code, approval_key "
                 "FROM approved_rules WHERE rule_id=?",
                 (rule_id,),
             ).fetchone()
@@ -86,27 +104,38 @@ class RuleGovernanceRepository:
                 )
             version = current_version + 1
             snapshot = copy.deepcopy(rule)
+            classification = classify_rule(snapshot)
+            if classification.kind == RuleFormat.MALFORMED_V2:
+                raise RuleGovernanceError(
+                    "规则快照损坏，无法提交治理变更",
+                    code="malformed_rule_snapshot",
+                    status_code=409,
+                )
             snapshot.update({
-                "schema_version": "approved_rule_v2",
                 "current_version": version,
                 "updated_at": created_at,
             })
+            schema_version = str(snapshot.get("schema_version") or "")
+            projection = (None, None) if classification.kind == RuleFormat.LEGACY_V1 else (
+                snapshot.get("problem_code"), snapshot.get("approval_key")
+            )
+            persisted_snapshot = public_rule(snapshot)
             connection.execute(
                 "UPDATE approved_rules SET rule_json=?, status=?, current_version=?, next_review_at=?, "
-                "problem_code=?, approval_key=?, schema_version='approved_rule_v2', updated_at=? WHERE rule_id=?",
+                "problem_code=?, approval_key=?, schema_version=?, updated_at=? WHERE rule_id=?",
                 (
-                    json.dumps(snapshot, ensure_ascii=False, separators=(",", ":")),
-                    snapshot["status"], version, snapshot.get("next_review_at"),
-                    snapshot.get("problem_code"), snapshot.get("approval_key"), created_at,
-                    snapshot["rule_id"],
+                    json.dumps(persisted_snapshot, ensure_ascii=False, separators=(",", ":")),
+                    persisted_snapshot["status"], version, persisted_snapshot.get("next_review_at"),
+                    projection[0], projection[1], schema_version, created_at,
+                    persisted_snapshot["rule_id"],
                 ),
             )
             connection.execute(
                 "INSERT INTO rule_versions(rule_id, version, rule_json, change_type, change_reason, operator, "
                 "created_at, schema_version) VALUES (?, ?, ?, ?, ?, ?, ?, 'rule_version_v1')",
                 (
-                    snapshot["rule_id"], version,
-                    json.dumps(snapshot, ensure_ascii=False, separators=(",", ":")),
+                    persisted_snapshot["rule_id"], version,
+                    json.dumps(persisted_snapshot, ensure_ascii=False, separators=(",", ":")),
                     change_type, reason, operator, created_at,
                 ),
             )
@@ -114,7 +143,7 @@ class RuleGovernanceRepository:
                 "INSERT INTO rule_audit_events(event_id, rule_id, event_type, from_version, to_version, event_json, "
                 "operator, created_at, schema_version) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'rule_audit_event_v1')",
                 (
-                    f"rule-event-{uuid.uuid4().hex}", snapshot["rule_id"], change_type,
+                    f"rule-event-{uuid.uuid4().hex}", persisted_snapshot["rule_id"], change_type,
                     current_version, version,
                     json.dumps(event or {"reason": reason}, ensure_ascii=False, separators=(",", ":")),
                     operator, created_at,
@@ -270,7 +299,7 @@ class RuleGovernanceService:
         if page < 1 or page_size < 1 or page_size > 100:
             raise RuleGovernanceError("分页参数无效")
         items = [rule for rule in self.repository.list_rules() if not status or rule["status"] == status]
-        enriched = [dict(rule, health=self.health(rule)) for rule in items]
+        enriched = [dict(public_rule(rule), health=self.health(rule)) for rule in items]
         start = (page - 1) * page_size
         return {
             "schema_version": "rule_asset_list_v1",
@@ -282,7 +311,7 @@ class RuleGovernanceService:
         rule = self._rule(rule_id)
         return {
             "schema_version": "rule_asset_detail_v1",
-            "rule": rule,
+            "rule": public_rule(rule),
             "health": self.health(rule),
             "versions": self.repository.versions(rule_id),
             "feedback": self.repository.feedback(rule_id),
@@ -370,7 +399,24 @@ class RuleGovernanceService:
         target = next((item for item in self.repository.versions(rule_id) if item["version"] == int(target_version)), None)
         if target is None:
             raise RuleGovernanceError("目标规则版本不存在", code="version_not_found", status_code=404)
-        snapshot = copy.deepcopy(target["rule"])
+        try:
+            snapshot = normalize_legacy_rule_version(
+                target["rule"],
+                source=RuleNormalizationSource.DATABASE_MIGRATION,
+            )
+        except ApprovedRuleError as exc:
+            raise RuleGovernanceError(
+                "目标规则快照损坏，无法回滚",
+                code="malformed_rule_snapshot",
+                status_code=409,
+            ) from exc
+        classification = classify_rule(snapshot)
+        if classification.kind == RuleFormat.MALFORMED_V2:
+            raise RuleGovernanceError(
+                "目标规则快照损坏，无法回滚",
+                code="malformed_rule_snapshot",
+                status_code=409,
+            )
         snapshot.update({
             "rule_id": current["rule_id"],
             "signature": current["signature"],
@@ -378,7 +424,6 @@ class RuleGovernanceService:
             "created_at": current["created_at"],
             "reuse_count": current.get("reuse_count", 0),
             "last_reused_at": current.get("last_reused_at"),
-            "schema_version": "approved_rule_v2",
         })
         updated = self.repository.commit_version(
             snapshot,
@@ -396,7 +441,7 @@ class RuleGovernanceService:
         for rule in self.repository.list_rules():
             health = self.health(rule)
             if health["review_reasons"]:
-                items.append(dict(rule, health=health, review_reasons=health["review_reasons"]))
+                items.append(dict(public_rule(rule), health=health, review_reasons=health["review_reasons"]))
         items.sort(key=lambda item: (item["health"]["score"], item["updated_at"]))
         return {"schema_version": "rule_review_queue_v1", "items": items, "total": len(items)}
 
@@ -407,5 +452,5 @@ class RuleGovernanceService:
             "request_id": f"request-{uuid.uuid4().hex}",
             "rule_id": rule["rule_id"],
             "version": rule["current_version"],
-            "rule": rule,
+            "rule": public_rule(rule),
         }

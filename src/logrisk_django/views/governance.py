@@ -5,6 +5,7 @@ import json
 from django.http import HttpRequest, JsonResponse
 from django.views.decorators.http import require_http_methods
 
+from logrisk.approved_rules import ApprovedRuleError
 from logrisk.feature_jobs import FeatureJobError
 from logrisk.rule_governance import RuleGovernanceError
 from logrisk_django.service_factory import get_facade
@@ -21,8 +22,20 @@ def update_feature(request: HttpRequest, job_id: str, candidate_id: str) -> Json
         return payload
     try:
         result = get_facade().update_feature(job_id, candidate_id, payload, identity)
-    except (FeatureJobError, KeyError, ValueError) as exc:
-        return _error(422, getattr(exc, "code", "invalid_feature_update"), _safe_message(exc))
+    except FeatureJobError as exc:
+        return _error(
+            getattr(exc, "status_code", 422),
+            getattr(exc, "code", "invalid_feature_update"),
+            _safe_message(exc),
+        )
+    except ApprovedRuleError as exc:
+        return _error(
+            getattr(exc, "status_code", 422),
+            getattr(exc, "code", "invalid_feature_update"),
+            _safe_message(exc),
+        )
+    except (KeyError, ValueError) as exc:
+        return _error(422, "invalid_feature_update", _safe_message(exc))
     return _response(result.body, result.status, result.headers)
 
 

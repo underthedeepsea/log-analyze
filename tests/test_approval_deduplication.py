@@ -1,17 +1,21 @@
 from __future__ import annotations
 
+import hashlib
 from concurrent.futures import ThreadPoolExecutor
 
 from logrisk.approval_dedup import (
     approval_identity,
     build_approval_key,
+    collect_problem_codes,
     derive_problem_code,
+    is_canonical_problem_code,
     normalize_problem_code,
     same_approval_identity,
+    select_primary_problem_code,
 )
 from logrisk.approved_rules import ApprovedRuleStore
 from logrisk.database import SQLiteDatabase
-from logrisk.feature_jobs import FeatureJobManager
+from logrisk.feature_jobs import FeatureJobError, FeatureJobManager
 from logrisk.sqlite_stores import SQLiteApprovalGroupStore, SQLiteApprovedRuleStore, SQLiteFeatureJobStore
 
 
@@ -141,6 +145,329 @@ def test_same_approval_identity_supports_legacy_and_v2_semantic_candidates():
     }
 
     assert same_approval_identity(legacy, current)
+
+
+def test_collect_problem_codes_keeps_concrete_and_wrapper_evidence():
+    feature = {
+        "feature_type": "cni_network_failure",
+        "problem_code": "runtime_cni_setup_failed",
+        "semantic_fields": {"risk_type": "kubernetes.cni.config_error"},
+        "source_templates": [{
+            "template_fingerprint": "fingerprint-cni",
+            "template": "NetworkPlugin cni failed: no enough ips",
+        }],
+    }
+
+    assert set(collect_problem_codes(feature)) == {
+        "kubernetes.cni.plugin_failure",
+        "kubernetes.cni.config_error",
+        "kubernetes.cni.ip_exhaustion",
+    }
+
+
+def test_collect_problem_codes_keeps_independent_keyword_hits_from_one_text():
+    feature = {
+        "feature_type": "cni_network_failure",
+        "source_templates": [{
+            "template_fingerprint": "fingerprint-conflict",
+            "template": "CNI config syntax error: no enough ips",
+        }],
+    }
+
+    assert set(collect_problem_codes(feature)) >= {
+        "kubernetes.cni.config_error",
+        "kubernetes.cni.ip_exhaustion",
+    }
+    assert derive_problem_code(feature).startswith("logrisk.cni_network_failure.")
+
+
+def test_recursive_semantic_fields_collect_lists_and_top_level_cause():
+    feature = {
+        "feature_type": "cni_network_failure",
+        "cause": "kubernetes.cni.config_error",
+        "semantic_fields": [{
+            "risk_semantic": ["kubernetes.cni.ip_exhaustion"],
+        }],
+    }
+
+    assert set(collect_problem_codes(feature)) >= {
+        "kubernetes.cni.config_error",
+        "kubernetes.cni.ip_exhaustion",
+    }
+
+
+def test_generic_semantic_code_precedes_runtime_wrapper_code():
+    assert select_primary_problem_code([
+        "runtime_sandbox_create_failed",
+        "kubernetes.cni.network_failure",
+    ]) == "kubernetes.cni.network_failure"
+
+
+def test_conflicting_concrete_codes_use_the_strict_fallback_even_with_explicit_code():
+    codes = [
+        "kubernetes.cni.ip_exhaustion",
+        "kubernetes.cni.config_error",
+    ]
+    left = {
+        "feature_type": "cni_network_failure",
+        "problem_code": "kubernetes.cni.ip_exhaustion",
+        "semantic_fields": {"risk_type": "kubernetes.cni.config_error"},
+        "components": ["kubelet"],
+        "anchor_signatures": ["shared-anchor"],
+        "source_templates": [{
+            "template_fingerprint": "shared-anchor",
+            "category": "network",
+            "template": "CNI config syntax error",
+        }],
+    }
+    right = {
+        "feature_type": "cni_network_failure",
+        "problem_code": "kubernetes.cni.config_error",
+        "semantic_fields": {"risk_type": "kubernetes.cni.ip_exhaustion"},
+        "components": ["kubelet"],
+        "anchor_signatures": ["shared-anchor"],
+        "source_templates": [{
+            "template_fingerprint": "shared-anchor",
+            "category": "network",
+            "template": "CNI no enough ips",
+        }],
+    }
+
+    assert select_primary_problem_code(codes, explicit_code=codes[0]) is None
+    assert derive_problem_code(left).startswith("logrisk.cni_network_failure.")
+    assert derive_problem_code(right).startswith("logrisk.cni_network_failure.")
+    assert approval_identity(left)["approval_key"] == approval_identity(right)["approval_key"]
+
+
+def test_unknown_and_unclassified_codes_use_strict_fallback_identity():
+    assert not is_canonical_problem_code("unknown")
+    assert not is_canonical_problem_code("unknown.cause")
+    assert not is_canonical_problem_code("unclassified")
+    assert not is_canonical_problem_code("unclassified.cause")
+    assert not is_canonical_problem_code("logrisk.cni_network_failure.deadbeef")
+
+    left = {
+        "feature_type": "network_failure",
+        "problem_code": "unknown",
+        "components": ["kubelet"],
+        "anchor_signatures": ["anchor-a"],
+    }
+    right = {
+        "feature_type": "pod_sandbox_failure",
+        "problem_code": "unknown",
+        "components": ["containerd"],
+        "anchor_signatures": ["anchor-b"],
+    }
+
+    assert approval_identity(left)["approval_key"] != approval_identity(right)["approval_key"]
+    assert not same_approval_identity(left, right)
+
+
+def test_unknown_namespaces_are_not_canonical_anywhere_in_the_code():
+    assert not is_canonical_problem_code("vendor.unknown")
+    assert not is_canonical_problem_code("vendor.unknown.cause")
+    assert not is_canonical_problem_code("unknown.vendor.cause")
+    assert not is_canonical_problem_code("vendor.unclassified_problem")
+
+
+def test_unknown_fallback_hashes_all_evidence_and_preserves_source_anchors():
+    base = {
+        "feature_type": "network_failure",
+        "problem_code": "unknown",
+        "cause": "unknown_cause",
+        "source_templates": [{
+            "template_fingerprint": "anchor-a",
+            "category": "network",
+        }],
+    }
+    unknown_only = dict(base)
+    unknown_only.pop("cause")
+    different_anchor = dict(base)
+    different_anchor["source_templates"] = [{
+        "template_fingerprint": "anchor-b",
+        "category": "network",
+    }]
+
+    assert derive_problem_code(base).startswith("logrisk.network_failure.")
+    assert derive_problem_code(unknown_only).startswith("logrisk.network_failure.")
+    assert derive_problem_code(base) != derive_problem_code(unknown_only)
+    assert approval_identity(base)["approval_key"] != approval_identity(different_anchor)["approval_key"]
+
+
+def test_logrisk_fallback_preserves_distinct_source_anchors():
+    left = {
+        "feature_type": "network_failure",
+        "problem_code": "logrisk.network_failure.old",
+        "source_templates": [{"template_fingerprint": "anchor-a"}],
+    }
+    right = {
+        "feature_type": "network_failure",
+        "problem_code": "logrisk.network_failure.old",
+        "source_templates": [{"template_fingerprint": "anchor-b"}],
+    }
+
+    assert approval_identity(left)["approval_key"] != approval_identity(right)["approval_key"]
+
+
+def test_all_cni_ip_exhaustion_wrappers_share_one_v2_identity():
+    candidates = [
+        {
+            "feature_type": "kubelet_network_signal",
+            "title": "kubelet title",
+            "summary": "kubelet summary",
+            "components": ["kubelet"],
+            "source_templates": [{
+                "template_fingerprint": "wrapper-kubelet",
+                "template_hash": "hash-kubelet",
+                "template": "NetworkPlugin cni failed: no enough ips",
+            }],
+        },
+        {
+            "feature_type": "containerd_sandbox_signal",
+            "title": "containerd title",
+            "summary": "containerd summary",
+            "components": ["containerd"],
+            "source_templates": [{
+                "template_fingerprint": "wrapper-containerd",
+                "template_hash": "hash-containerd",
+                "template": "CreatePodSandbox failed: cni no enough ips",
+            }],
+        },
+        {
+            "feature_type": "runtime_cni_setup_failure",
+            "title": "runtime setup title",
+            "summary": "runtime setup summary",
+            "problem_code": "runtime_cni_setup_failed",
+            "components": ["runtime-wrapper"],
+            "source_templates": [{
+                "template_fingerprint": "wrapper-setup",
+                "template_hash": "hash-setup",
+                "template": "runtime CNI setup failed: no enough ips",
+            }],
+        },
+        {
+            "feature_type": "runtime_sandbox_create_failure",
+            "title": "sandbox title",
+            "summary": "sandbox summary",
+            "problem_code": "runtime_sandbox_create_failed",
+            "components": ["sandbox-wrapper"],
+            "source_templates": [{
+                "template_fingerprint": "wrapper-sandbox",
+                "template_hash": "hash-sandbox",
+                "template": "runtime sandbox create failed: cni no enough ips",
+            }],
+        },
+    ]
+
+    assert {derive_problem_code(candidate) for candidate in candidates} == {
+        "kubernetes.cni.ip_exhaustion",
+    }
+    assert len({approval_identity(candidate)["approval_key"] for candidate in candidates}) == 1
+
+
+def test_runtime_sandbox_wrapper_without_cni_token_finds_ip_exhaustion():
+    feature = {
+        "feature_type": "runtime_network_failure",
+        "problem_code": "runtime_sandbox_create_failed",
+        "summary": "failed to setup network for sandbox: no enough ips",
+    }
+
+    assert derive_problem_code(feature) == "kubernetes.cni.ip_exhaustion"
+
+
+def test_generic_network_and_plain_pod_sandbox_text_do_not_become_cni_ip_exhaustion():
+    generic_network = {
+        "feature_type": "network_failure",
+        "summary": "network reports no enough ips",
+    }
+    plain_pod_sandbox = {
+        "feature_type": "pod_sandbox_network_failure",
+        "summary": "CreatePodSandbox failed: no enough ips",
+    }
+
+    assert derive_problem_code(generic_network) != "kubernetes.cni.ip_exhaustion"
+    assert derive_problem_code(plain_pod_sandbox) == "kubernetes.runtime.pod_sandbox_failure"
+
+
+def test_canonical_identity_ignores_presentation_and_operational_fields():
+    left = {
+        "job_id": "job-a",
+        "feature_type": "network_failure",
+        "title": "Old title",
+        "summary": "Old summary",
+        "problem_code": "kubernetes.cni.ip_exhaustion",
+        "components": ["kubelet"],
+        "cluster": "prod-a",
+        "entity": {"type": "node", "id": "node-a"},
+        "window_start": "2026-09-01T10:00:00+00:00",
+        "window_end": "2026-09-01T10:05:00+00:00",
+        "source_templates": [{
+            "template_hash": "hash-a",
+            "template_fingerprint": "fingerprint-a",
+            "category": "network",
+            "component": "kubelet",
+        }],
+    }
+    right = {
+        "job_id": "job-b",
+        "feature_type": "pod_sandbox_network_failure",
+        "title": "New title",
+        "summary": "New summary",
+        "problem_code": "CNI no enough ips",
+        "components": ["containerd"],
+        "cluster": "prod-b",
+        "entity": {"type": "node", "id": "node-b"},
+        "window_start": "2026-09-02T11:00:00+00:00",
+        "window_end": "2026-09-02T11:05:00+00:00",
+        "source_templates": [{
+            "template_hash": "hash-b",
+            "template_fingerprint": "fingerprint-b",
+            "category": "runtime",
+            "component": "containerd",
+        }],
+    }
+
+    assert same_approval_identity(left, right)
+    assert approval_identity(left)["approval_key"] == approval_identity(right)["approval_key"]
+
+
+def test_historical_v1_keys_still_compare_by_their_physical_key():
+    left = {
+        "feature_type": "cni_network_failure",
+        "problem_code": "kubernetes.cni.ip_exhaustion",
+        "components": ["kubelet"],
+        "anchor_signatures": ["legacy-anchor"],
+        "approval_key": "appr-v1-left",
+    }
+    right = dict(left)
+    right["approval_key"] = "appr-v1-right"
+
+    assert not same_approval_identity(left, right)
+    right["approval_key"] = left["approval_key"]
+    assert same_approval_identity(left, right)
+
+
+def test_empty_fallback_keeps_the_historical_v1_digest_material():
+    feature = {"feature_type": "network_failure"}
+    expected_digest = hashlib.sha256(b"[]").hexdigest()[:16]
+
+    assert derive_problem_code(feature) == f"logrisk.network_failure.{expected_digest}"
+
+
+def test_explicit_unknown_code_is_hashed_as_strict_fallback_evidence():
+    assert derive_problem_code({
+        "feature_type": "network_failure",
+        "problem_code": "unknown",
+    }).startswith("logrisk.network_failure.")
+
+
+def test_pod_sandbox_oom_is_not_classified_as_cni_plugin_failure():
+    feature = {
+        "feature_type": "runtime_sandbox_failure",
+        "summary": "pod sandbox failed: out of memory",
+    }
+
+    assert derive_problem_code(feature) == "linux.memory.oom"
 
 
 def test_distinct_problem_codes_do_not_merge_on_same_template_signature(tmp_path):
@@ -317,6 +644,218 @@ def test_approval_reconciles_pending_duplicates_across_jobs(tmp_path):
     assert resolved["duplicate_of"] == "candidate-node-a"
 
 
+def test_approval_reconciliation_persists_every_sibling_and_event_after_restart(tmp_path):
+    database = SQLiteDatabase(tmp_path / "logrisk.sqlite3")
+
+    def build_manager():
+        return FeatureJobManager(
+            extractor=lambda source, **kwargs: [candidate(source, f"candidate-{source['entity_id']}")],
+            rule_store=SQLiteApprovedRuleStore(database),
+            approval_group_store=SQLiteApprovalGroupStore(database),
+            persistence=SQLiteFeatureJobStore(database),
+            auto_start=False,
+            interrupt_on_restore=False,
+        )
+
+    manager = build_manager()
+    first = manager.create_job(
+        {"summary": {}, "risk_entities": [entity("node-a", "2026-06-22T10:00:00+08:00")]},
+        model="qwen3:1.7b",
+    )
+    second = manager.create_job(
+        {"summary": {}, "risk_entities": [entity("node-b", "2026-06-22T11:00:00+08:00")]},
+        model="qwen3:1.7b",
+    )
+    manager.run_job(first)
+    manager.run_job(second)
+
+    approved = manager.update_feature(
+        first,
+        "candidate-node-a",
+        {"status": "approved", "review_scope": "approval_identity"},
+    )
+
+    sibling = SQLiteFeatureJobStore(database).load_candidate("candidate-node-b")
+    assert sibling["status"] == "approved"
+    assert sibling["resolution_type"] == "group_matched"
+    assert sibling["resolved_rule_id"] == approved["rule_id"]
+    assert any(
+        event["type"] == "pending_candidate_reconciled"
+        for event in SQLiteFeatureJobStore(database).load_job(second)["events"]
+    )
+
+    restored = build_manager()
+    assert restored.get_job(second)["features"][0]["status"] == "approved"
+    assert restored.list_persisted_candidates(status="pending") == []
+
+
+def test_duplicate_approval_is_idempotent_without_duplicate_events_or_reuse(tmp_path):
+    rules = ApprovedRuleStore(tmp_path / "rules.json")
+    manager = FeatureJobManager(
+        extractor=lambda source, **kwargs: [candidate(source, "candidate-node-a")],
+        rule_store=rules,
+        auto_start=False,
+    )
+    job_id = manager.create_job(
+        {"summary": {}, "risk_entities": [entity("node-a", "2026-06-22T10:00:00+08:00")]},
+        model="qwen3:1.7b",
+    )
+    manager.run_job(job_id)
+
+    first = manager.update_feature(job_id, "candidate-node-a", {"status": "approved"})
+    events_after_first = manager.list_events(job_id)
+    second = manager.update_feature(job_id, "candidate-node-a", {"status": "approved"})
+
+    assert second["rule_id"] == first["rule_id"]
+    assert len(rules.list_rules()) == 1
+    assert rules.list_rules()[0]["reuse_count"] == 0
+    assert len(manager.list_events(job_id)) == len(events_after_first)
+    assert sum(event["type"] == "feature_updated" for event in manager.list_events(job_id)) == 1
+
+
+def test_group_reject_leaves_terminal_candidate_unchanged_and_creates_no_rule(tmp_path):
+    database = SQLiteDatabase(tmp_path / "logrisk.sqlite3")
+    persistence = SQLiteFeatureJobStore(database)
+    manager = FeatureJobManager(
+        extractor=lambda source, **kwargs: [candidate(source, f"candidate-{source['entity_id']}")],
+        rule_store=SQLiteApprovedRuleStore(database),
+        approval_group_store=SQLiteApprovalGroupStore(database),
+        persistence=persistence,
+        auto_start=False,
+        interrupt_on_restore=False,
+    )
+    job_ids = [
+        manager.create_job(
+            {"summary": {}, "risk_entities": [entity(entity_id, window)]},
+            model="qwen3:1.7b",
+        )
+        for entity_id, window in (
+            ("node-a", "2026-06-22T10:00:00+08:00"),
+            ("node-b", "2026-06-22T11:00:00+08:00"),
+            ("node-c", "2026-06-22T12:00:00+08:00"),
+        )
+    ]
+    for job_id in job_ids:
+        manager.run_job(job_id)
+
+    terminal = manager.update_feature(
+        job_ids[0], "candidate-node-a", {"status": "rejected", "reviewer_note": "已确认误报"}
+    )
+    terminal_updated_at = persistence.load_candidate("candidate-node-a")["updated_at"]
+
+    manager.update_feature(
+        job_ids[1],
+        "candidate-node-b",
+        {"status": "rejected", "review_scope": "approval_identity"},
+    )
+
+    assert persistence.load_candidate("candidate-node-a")["status"] == "rejected"
+    assert persistence.load_candidate("candidate-node-a")["reviewer_note"] == terminal["reviewer_note"]
+    assert persistence.load_candidate("candidate-node-a")["updated_at"] == terminal_updated_at
+    assert all(
+        persistence.load_candidate(f"candidate-node-{node}")["status"] == "rejected"
+        for node in ("a", "b", "c")
+    )
+    assert SQLiteApprovedRuleStore(database).list_rules() == []
+
+
+def test_candidate_level_reject_keeps_other_pending_candidates_reviewable(tmp_path):
+    manager = FeatureJobManager(
+        extractor=lambda source, **kwargs: [candidate(source, f"candidate-{source['entity_id']}")],
+        rule_store=ApprovedRuleStore(tmp_path / "rules.json"),
+        auto_start=False,
+    )
+    first = manager.create_job(
+        {"summary": {}, "risk_entities": [entity("node-a", "2026-06-22T10:00:00+08:00")]},
+        model="qwen3:1.7b",
+    )
+    second = manager.create_job(
+        {"summary": {}, "risk_entities": [entity("node-b", "2026-06-22T11:00:00+08:00")]},
+        model="qwen3:1.7b",
+    )
+    manager.run_job(first)
+    manager.run_job(second)
+
+    manager.update_feature(first, "candidate-node-a", {"status": "rejected"})
+
+    assert manager.get_job(second)["features"][0]["status"] == "pending"
+    assert manager.list_approval_groups()[0]["status"] == "pending"
+
+
+def test_concurrent_duplicate_approvals_create_one_rule_and_one_event(tmp_path):
+    database = SQLiteDatabase(tmp_path / "logrisk.sqlite3")
+    persistence = SQLiteFeatureJobStore(database)
+    setup = FeatureJobManager(
+        extractor=lambda source, **kwargs: [candidate(source, "candidate-node-a")],
+        rule_store=SQLiteApprovedRuleStore(database),
+        approval_group_store=SQLiteApprovalGroupStore(database),
+        persistence=SQLiteFeatureJobStore(database),
+        auto_start=False,
+        interrupt_on_restore=False,
+    )
+    job_id = setup.create_job(
+        {"summary": {}, "risk_entities": [entity("node-a", "2026-06-22T10:00:00+08:00")]},
+        model="qwen3:1.7b",
+    )
+    setup.run_job(job_id)
+    managers = [
+        FeatureJobManager(
+            extractor=lambda source, **kwargs: [],
+            rule_store=SQLiteApprovedRuleStore(database),
+            approval_group_store=SQLiteApprovalGroupStore(database),
+            persistence=SQLiteFeatureJobStore(database),
+            auto_start=False,
+            interrupt_on_restore=False,
+        )
+        for _ in range(2)
+    ]
+
+    def approve(manager):
+        try:
+            return manager.update_feature(job_id, "candidate-node-a", {"status": "approved"})
+        except FeatureJobError as exc:
+            return exc
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(approve, managers))
+
+    assert all(
+        not isinstance(result, FeatureJobError)
+        or (result.code, result.status_code) == ("candidate_state_conflict", 409)
+        for result in results
+    )
+    assert SQLiteApprovedRuleStore(database).list_rules()[0]["reuse_count"] == 0
+    assert len(SQLiteApprovedRuleStore(database).list_rules()) == 1
+    assert persistence.load_candidate("candidate-node-a")["status"] == "approved"
+    assert sum(
+        event["type"] == "feature_updated"
+        for event in persistence.load_job(job_id)["events"]
+    ) == 1
+
+
+def test_candidate_and_group_statistics_are_separate_and_aggregate_members():
+    from logrisk.approval_queue import build_review_groups
+
+    first = candidate(entity("node-a", "2026-06-22T10:00:00+08:00"), "candidate-a")
+    second = candidate(entity("node-b", "2026-06-22T11:00:00+08:00"), "candidate-b")
+    second["occurrence_count"] = 4
+    other = candidate(entity("node-c", "2026-06-22T12:00:00+08:00"), "candidate-c")
+    other["problem_code"] = "OOM"
+    other["feature_type"] = "memory_pressure"
+    other["anchor_signatures"] = ["oom-anchor"]
+    other["template_hashes"] = ["hash-oom"]
+    other["source_templates"] = [{"template_hash": "hash-oom", "category": "memory", "template": "Out of memory", "count": 5}]
+    groups = build_review_groups([first, second, other])
+
+    cni_group = next(item for item in groups if item["problem_code"] == "kubernetes.cni.ip_exhaustion")
+    assert sum(item["candidate_count"] for item in groups) == 3
+    assert cni_group["candidate_count"] == 2
+    assert cni_group["occurrence_count"] == 7
+    assert cni_group["affected_entity_count"] == 2
+    assert cni_group["first_seen"] == "2026-06-22T10:00:00+08:00"
+    assert cni_group["last_seen"] == "2026-06-22T11:05:00+08:00"
+
+
 def test_approval_groups_and_candidate_identity_survive_sqlite_restart(tmp_path):
     database = SQLiteDatabase(tmp_path / "logrisk.sqlite3")
     persistence = SQLiteFeatureJobStore(database)
@@ -365,6 +904,9 @@ def test_restart_backfills_pending_candidate_against_existing_rule(tmp_path):
     job_id = manager.create_job({"summary": {}, "risk_entities": [source]}, model="qwen3:1.7b")
     manager.run_job(job_id)
 
+    crashed_snapshot = persistence.load_job(job_id)
+    crashed_snapshot["entities"][0]["feature_ids"] = []
+    persistence.save(crashed_snapshot)
     SQLiteApprovedRuleStore(database).upsert_feature(candidate(source, "approved-seed"))
 
     restored = FeatureJobManager(

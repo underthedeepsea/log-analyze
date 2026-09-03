@@ -8,6 +8,75 @@ from logrisk.approval_dedup import approval_identity, is_canonical_problem_code
 
 
 _IMPORTANCE_RANK = {"critical": 4, "high": 3, "medium": 2, "low": 1}
+_REPRESENTATIVE_FIELDS = frozenset({
+    "candidate_id",
+    "job_id",
+    "approval_group_id",
+    "approval_key",
+    "problem_code",
+    "schema_version",
+    "feature_type",
+    "title",
+    "summary",
+    "importance",
+    "tags",
+    "reviewer_note",
+    "status",
+    "resolution_type",
+    "resolved_rule_id",
+    "rule_id",
+    "approved_at",
+    "review_scope",
+    "entity",
+    "entity_id",
+    "entity_type",
+    "cluster",
+    "window_start",
+    "window_end",
+    "time_range",
+    "risk_score",
+    "risk_level",
+    "template_hashes",
+    "anchor_signatures",
+    "supporting_signatures",
+    "component_scope",
+    "components",
+    "selection_reason",
+    "occurrence_count",
+    "affected_entities",
+    "source_templates",
+    "provider",
+    "model",
+    "model_profile_id",
+    "prompt_id",
+    "prompt_hash",
+    "trace_id",
+    "evidence_hash",
+    "parameter_size",
+    "thinking_enabled",
+    "context_budget",
+    "evaluator_result",
+    "cache_hit",
+    "latency_ms",
+    "origin",
+    "lineage",
+    "created_at",
+    "updated_at",
+    "job_created_at",
+    "job_status",
+})
+_FORBIDDEN_EVIDENCE_FIELDS = frozenset({
+    "raw",
+    "raw_log",
+    "raw_logs",
+    "raw_record",
+    "raw_records",
+    "raw_sample",
+    "raw_samples",
+    "samples",
+    "log_stream",
+    "raw_stream",
+})
 
 
 def _candidate_occurrence_count(candidate: Mapping[str, Any]) -> int:
@@ -47,11 +116,24 @@ def _time_bounds(candidate: Mapping[str, Any]) -> tuple[str | None, str | None]:
     )
 
 
+def _sanitize_representative_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {
+            key: _sanitize_representative_value(item)
+            for key, item in value.items()
+            if str(key).lower() not in _FORBIDDEN_EVIDENCE_FIELDS
+        }
+    if isinstance(value, list):
+        return [_sanitize_representative_value(item) for item in value]
+    return copy.deepcopy(value)
+
+
 def _safe_representative(candidate: Mapping[str, Any]) -> dict[str, Any]:
-    value = copy.deepcopy(dict(candidate))
-    value.pop("samples", None)
-    value.pop("raw_sample", None)
-    return value
+    return {
+        key: _sanitize_representative_value(candidate[key])
+        for key in sorted(_REPRESENTATIVE_FIELDS)
+        if key in candidate
+    }
 
 
 def _representative_key(candidate: Mapping[str, Any]) -> tuple[Any, ...]:

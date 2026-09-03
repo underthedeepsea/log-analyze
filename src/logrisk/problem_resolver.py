@@ -58,6 +58,7 @@ _ALIASES = {
     "runtime_cni_setup_failed": "kubernetes.cni.plugin_failure",
     "kubernetes_cni_plugin_failure": "kubernetes.cni.plugin_failure",
     "runtime_sandbox_create_failed": "kubernetes.runtime.pod_sandbox_failure",
+    "k8s_node_memory_pressure": "kubernetes.node.memory_pressure",
     "runtime_sandbox_failure": "kubernetes.runtime.pod_sandbox_failure",
     "pod_sandbox_failure": "kubernetes.runtime.pod_sandbox_failure",
     "container_stats_failure": "kubernetes.runtime.container_stats_failure",
@@ -79,6 +80,29 @@ _ALIASES = {
     "filesystem_stats_path_missing": "kubernetes.runtime.filesystem_stats_path_missing",
     "linux_oom": "linux.memory.oom",
 }
+
+_CONCRETE_CODES = frozenset({
+    "kubernetes.cni.config_error",
+    "kubernetes.cni.delete_not_supported",
+    "kubernetes.cni.ip_exhaustion",
+    "kubernetes.cni.workload_endpoint_not_found",
+    "kubernetes.image.gc_failure",
+    "kubernetes.image.pull_not_found",
+    "kubernetes.image.pull_transport_failure",
+    "kubernetes.image.pull_unauthorized",
+    "kubernetes.kubelet.checkpoint_resource_not_found",
+    "kubernetes.kubelet.orphaned_pod_residual",
+    "kubernetes.node.memory_pressure",
+    "kubernetes.pod.crash_loop",
+    "kubernetes.runtime.cadvisor_cache_miss",
+    "kubernetes.runtime.container_not_found",
+    "kubernetes.runtime.container_stats_failure",
+    "kubernetes.runtime.exec_process_still_running",
+    "kubernetes.runtime.filesystem_stats_path_missing",
+    "kubernetes.volume.subpath_cleanup_failure",
+    "kubernetes.volume.unmount_failure",
+    "linux.memory.oom",
+})
 
 
 @dataclass(frozen=True)
@@ -132,13 +156,14 @@ def _is_unknown(code: str) -> bool:
 
 
 def _is_generic(code: str) -> bool:
-    return code in _GENERIC_CODES or code.endswith((".network_failure", ".generic_failure"))
+    return code in _GENERIC_CODES
 
 
 def _is_concrete(code: str) -> bool:
     return bool(
         code
         and "." in code
+        and code in _CONCRETE_CODES
         and not _is_unknown(code)
         and not code.startswith("logrisk.")
         and not _is_generic(code)
@@ -234,7 +259,7 @@ def _structured_matches(
     matches: list[_Match] = []
     for value in values:
         for code in _structured_codes(value):
-            if _is_unknown(code) or code.startswith("logrisk."):
+            if not (_is_concrete(code) or _is_generic(code)):
                 continue
             matches.append(_Match(
                 code=code,
@@ -540,8 +565,7 @@ def resolve_problem(
         )
     if structured_concrete or selected_concrete:
         matches = structured if structured_concrete else selected
-        semantic_safe = selected_concrete != {"linux.memory.oom"} or bool(structured_concrete)
-        return _resolution(matches, semantic_safe=semantic_safe)
+        return _resolution(matches, semantic_safe=True)
 
     type_hints = _feature_type_matches(feature)
     text_hints = _text_hint_matches(feature)

@@ -4,7 +4,7 @@ import copy
 from collections import defaultdict
 from typing import Any, Mapping
 
-from logrisk.approval_dedup import approval_identity, is_canonical_problem_code
+from logrisk.approval_dedup import approval_identity
 
 
 _IMPORTANCE_RANK = {"critical": 4, "high": 3, "medium": 2, "low": 1}
@@ -64,6 +64,7 @@ _REPRESENTATIVE_FIELDS = frozenset({
     "updated_at",
     "job_created_at",
     "job_status",
+    "problem_resolution",
 })
 _FORBIDDEN_EVIDENCE_FIELDS = frozenset({
     "raw",
@@ -166,20 +167,32 @@ def build_review_groups(candidates: list[Mapping[str, Any]]) -> list[dict[str, A
         seen_candidate_ids.add(candidate_id)
         identity = approval_identity(candidate)
         problem_code = str(identity["problem_code"])
-        if is_canonical_problem_code(problem_code):
+        approval_key = str(candidate.get("approval_key") or identity["approval_key"])
+        if identity["semantic_safe"]:
             review_key = f"semantic:{problem_code}"
             match_mode = "semantic"
         else:
-            approval_key = str(candidate.get("approval_key") or identity["approval_key"])
             review_key = f"approval:{approval_key}"
             match_mode = "template_set"
         candidate["problem_code"] = problem_code
         candidate.setdefault("approval_key", identity["approval_key"])
         candidate["match_mode"] = match_mode
+        candidate["problem_resolution"] = {
+            "confidence": identity["resolution_confidence"],
+            "semantic_safe": bool(identity["semantic_safe"]),
+            "ambiguity": bool(identity["ambiguity"]),
+            "evidence_source": identity["resolution_source"],
+            "matched_rule": identity["matched_rule"],
+            "supporting_codes": list(identity["supporting_codes"]),
+        }
         grouped[review_key].append(candidate)
         identities[review_key] = {
             "problem_code": problem_code,
             "match_mode": match_mode,
+            "resolution_confidence": identity["resolution_confidence"],
+            "resolution_source": identity["resolution_source"],
+            "semantic_safe": bool(identity["semantic_safe"]),
+            "ambiguity": bool(identity["ambiguity"]),
         }
 
     result: list[dict[str, Any]] = []
@@ -203,6 +216,10 @@ def build_review_groups(candidates: list[Mapping[str, Any]]) -> list[dict[str, A
             "review_key": review_key,
             "problem_code": identity["problem_code"],
             "match_mode": identity["match_mode"],
+            "resolution_confidence": identity["resolution_confidence"],
+            "resolution_source": identity["resolution_source"],
+            "semantic_safe": identity["semantic_safe"],
+            "ambiguity": identity["ambiguity"],
             "title": str(representative.get("title") or ""),
             "summary": str(representative.get("summary") or ""),
             "importance": str(representative.get("importance") or "medium"),

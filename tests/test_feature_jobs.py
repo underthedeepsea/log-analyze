@@ -166,6 +166,27 @@ def test_job_forwards_model_profile_id_to_extractor():
     assert manager.get_job(job_id)["model_profile_id"] == "qwen3_1_7b_fast"
 
 
+def test_candidate_persists_problem_resolution_metadata():
+    manager = FeatureJobManager(extractor=lambda source, **kwargs: [candidate(source)], auto_start=False)
+    job_id = manager.create_job(
+        {"summary": {}, "risk_entities": [entity("node-a", 90)]},
+        model="qwen3:1.7b",
+    )
+
+    manager.run_job(job_id)
+
+    saved = manager.get_job(job_id)["features"][0]
+    assert saved["problem_code"] == "linux.memory.oom"
+    assert saved["problem_resolution"] == {
+        "confidence": "high",
+        "semantic_safe": True,
+        "ambiguity": False,
+        "evidence_source": "selected_template_pattern",
+        "matched_rule": "linux_oom_v1",
+        "supporting_codes": ["linux.memory.oom"],
+    }
+
+
 def test_failed_entity_can_be_retried():
     attempts = {"count": 0}
 

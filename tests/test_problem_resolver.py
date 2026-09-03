@@ -4,7 +4,7 @@ import hashlib
 
 import pytest
 
-from logrisk.approval_dedup import approval_identity
+from logrisk.approval_dedup import approval_identity, build_approval_key, derive_problem_code
 from logrisk.problem_resolver import ProblemResolution, resolve_problem
 
 
@@ -173,3 +173,54 @@ def test_t9_unknown_selected_pattern_uses_strict_fallback():
     assert resolution.semantic_safe is False
     assert identity["problem_code"].startswith("logrisk.runtime_failure.")
     assert identity["match_mode"] == "template_set"
+
+
+def test_unregistered_dotted_structured_code_uses_strict_fallback():
+    feature = {
+        "feature_type": "runtime_failure",
+        "problem_code": "vendor.some_issue",
+        "components": ["kubelet"],
+        "source_templates": [selected("opaque vendor condition")],
+    }
+
+    resolution = resolve_problem(feature)
+    identity = approval_identity(feature)
+
+    assert resolution.problem_code is None
+    assert resolution.semantic_safe is False
+    assert resolution.supporting_codes == ()
+    assert identity["problem_code"].startswith("logrisk.runtime_failure.")
+    assert identity["match_mode"] == "template_set"
+
+
+def test_legacy_node_memory_pressure_alias_remains_resolvable():
+    feature = {
+        "feature_type": "resource_pressure",
+        "problem_code": "k8s_node_memory_pressure",
+    }
+
+    resolution = resolve_problem(feature)
+
+    assert resolution.problem_code == "kubernetes.node.memory_pressure"
+    assert resolution.semantic_safe is True
+    assert derive_problem_code(feature) == "kubernetes.node.memory_pressure"
+
+
+def test_selected_oom_uses_resolver_safety_for_approval_key():
+    feature = {
+        "feature_type": "runtime_sandbox_failure",
+        "components": ["kubelet"],
+        "source_templates": [selected("pod sandbox failed: out of memory")],
+    }
+
+    resolution = resolve_problem(feature)
+    identity = approval_identity(feature)
+
+    assert resolution.problem_code == "linux.memory.oom"
+    assert resolution.semantic_safe is True
+    assert identity["match_mode"] == "semantic"
+    assert build_approval_key(
+        "runtime_sandbox_failure", "linux.memory.oom", ["kubelet"], ["anchor"], semantic_safe=False,
+    ) != build_approval_key(
+        "runtime_sandbox_failure", "linux.memory.oom", ["kubelet"], ["anchor"], semantic_safe=True,
+    )

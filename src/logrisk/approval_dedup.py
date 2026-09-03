@@ -79,9 +79,6 @@ _UNKNOWN_PROBLEM_CODES = frozenset({
     "unclassified_problem_code",
 })
 
-_NON_SAFE_CANONICAL_KEY_CODES = frozenset({"linux.memory.oom"})
-
-
 def _is_unknown_problem_code(code: str) -> bool:
     segments = code.split(".")
     has_unknown_segment = any(
@@ -405,7 +402,7 @@ def anchor_signatures(feature: Mapping[str, Any], entity: Mapping[str, Any] | No
         return []
 
     resolution = resolve_problem(feature, entity)
-    if resolution.semantic_safe or resolution.problem_code in _NON_SAFE_CANONICAL_KEY_CODES:
+    if resolution.semantic_safe:
         return []
     return anchors[:1]
 
@@ -424,11 +421,12 @@ def build_approval_key(
     if anchor_template_fingerprints is not None and not anchor_signatures:
         anchor_signatures = anchor_template_fingerprints
     normalized_problem_code = normalize_problem_code(problem_code) or "unknown.problem"
-    canonical = (
-        is_canonical_problem_code(normalized_problem_code)
-        if semantic_safe is None
-        else bool(semantic_safe) or normalized_problem_code in _NON_SAFE_CANONICAL_KEY_CODES
-    )
+    if semantic_safe is None:
+        semantic_safe = resolve_problem({
+            "feature_type": feature_type,
+            "problem_code": normalized_problem_code,
+        }).semantic_safe
+    canonical = bool(semantic_safe)
     if canonical:
         payload = {"problem_code": normalized_problem_code}
     else:

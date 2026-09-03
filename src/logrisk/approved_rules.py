@@ -15,10 +15,10 @@ from logrisk.approval_dedup import (
     approval_identity,
     build_approval_key,
     derive_problem_code,
-    is_canonical_problem_code,
     normalize_problem_code,
     normalize_feature_type,
 )
+from logrisk.problem_resolver import resolve_problem
 
 
 class ApprovedRuleError(RuntimeError):
@@ -301,7 +301,7 @@ def validate_v2_rule(rule: dict[str, Any]) -> tuple[str, ...]:
         errors.append("problem_code_missing")
 
     if match_mode == "semantic":
-        if not is_canonical_problem_code(problem_code):
+        if not resolve_problem(rule).semantic_safe:
             errors.append("semantic_problem_code_invalid")
         expected = build_approval_key(
             rule.get("feature_type"), problem_code,
@@ -335,7 +335,8 @@ def validate_v2_rule(rule: dict[str, Any]) -> tuple[str, ...]:
                 ):
                     errors.append(f"{field}_mismatch")
         canonical = str(rule.get("canonical_approval_key") or "").strip()
-        if is_canonical_problem_code(problem_code):
+        resolution = resolve_problem(rule)
+        if resolution.semantic_safe:
             if canonical != base_expected:
                 errors.append("canonical_approval_key_mismatch")
         elif canonical:
@@ -473,7 +474,7 @@ def _legacy_template_pairs(value: Dict[str, Any]) -> set[tuple[str, str]]:
     for item in items:
         if not isinstance(item, dict):
             continue
-        identity = str(item.get("template_hash") or item.get("template_fingerprint") or "").strip()
+        identity = str(item.get("template_fingerprint") or item.get("template_hash") or "").strip()
         if identity:
             pairs.add((identity, str(item.get("category") or "").strip()))
     return pairs
@@ -607,7 +608,7 @@ def hydrate_persisted_rule(
 
 
 def _template_set_storage_key(feature: Dict[str, Any], identity: Dict[str, Any]) -> str:
-    if identity["match_mode"] != "template_set" or not is_canonical_problem_code(identity["problem_code"]):
+    if identity["match_mode"] != "template_set" or identity.get("semantic_safe"):
         return identity["approval_key"]
     payload = {
         "approval_key": identity["approval_key"],
@@ -707,13 +708,21 @@ def _rule_matches_feature(
         return False
     if _v2_exact_feature_match(rule, feature, identity):
         return True
-    code = derive_problem_code(rule)
+    rule_resolution = resolve_problem(rule)
+    feature_resolution = resolve_problem(feature, entity)
+    if (
+        not active_only
+        and rule.get("match_mode") == "semantic"
+        and rule_resolution.semantic_safe
+        and rule_resolution.problem_code == identity["problem_code"]
+    ):
+        return True
     return (
         rule.get("match_mode") == "semantic"
         and identity["match_mode"] == "semantic"
-        and is_canonical_problem_code(identity["problem_code"])
-        and is_canonical_problem_code(code)
-        and code == identity["problem_code"]
+        and rule_resolution.semantic_safe
+        and feature_resolution.semantic_safe
+        and rule_resolution.problem_code == feature_resolution.problem_code == identity["problem_code"]
     )
 
 
@@ -725,9 +734,10 @@ def _rule_matches_entity(rule: Dict[str, Any], entity: Dict[str, Any]) -> bool:
         return _legacy_entity_matches(rule, entity)
     if classification.kind != RuleFormat.VALID_V2:
         return False
-    problem_code = derive_problem_code(rule)
-    if rule.get("match_mode") == "semantic" and is_canonical_problem_code(problem_code):
-        return problem_code == derive_problem_code(entity, entity)
+    rule_resolution = resolve_problem(rule)
+    entity_resolution = resolve_problem(entity, entity)
+    if rule.get("match_mode") == "semantic" and rule_resolution.semantic_safe and entity_resolution.semantic_safe:
+        return rule_resolution.problem_code == entity_resolution.problem_code
     required = {
         _identity_pair(item)
         for item in (rule.get("template_signatures") or [])
@@ -866,14 +876,13 @@ class ApprovedRuleStore:
                 existing is None
                 and not legacy_feature
                 and identity["match_mode"] == "semantic"
-                and is_canonical_problem_code(identity["problem_code"])
             ):
                 semantic = [
                     rule for rule in active
                     if classify_rule(rule).kind == RuleFormat.VALID_V2
                     and rule.get("match_mode") == "semantic"
-                    and is_canonical_problem_code(derive_problem_code(rule))
-                    and derive_problem_code(rule) == identity["problem_code"]
+                    and resolve_problem(rule).semantic_safe
+                    and resolve_problem(rule).problem_code == identity["problem_code"]
                 ]
                 existing = _preferred_rule(semantic)
             if existing is None and legacy_feature:
@@ -904,7 +913,7 @@ class ApprovedRuleStore:
             if (
                 existing is None
                 and identity["match_mode"] == "template_set"
-                and is_canonical_problem_code(identity["problem_code"])
+                and identity["semantic_safe"]
             ):
                 canonical_approval_key = identity["approval_key"]
             if predecessor is not None:
@@ -923,7 +932,7 @@ class ApprovedRuleStore:
 
             rule_id = existing.get("rule_id") if existing else (
                 _template_set_rule_id(approval_key)
-                if identity["match_mode"] == "template_set" and is_canonical_problem_code(identity["problem_code"])
+                if identity["match_mode"] == "template_set" and identity["semantic_safe"]
                 else f"rule-{identity['approval_key'][5:25]}"
             )
             if existing is None and any(rule.get("rule_id") == rule_id for rule in rules):
@@ -987,9 +996,14 @@ class ApprovedRuleStore:
             for rule in self._read_locked():
                 if not _rule_matches_entity(rule, entity):
                     continue
-                problem_code = derive_problem_code(rule)
-                if classify_rule(rule).kind == RuleFormat.VALID_V2 and rule.get("match_mode") == "semantic" and is_canonical_problem_code(problem_code):
-                    semantic_matches.setdefault(problem_code, []).append(rule)
+                resolution = resolve_problem(rule)
+                if (
+                    classify_rule(rule).kind == RuleFormat.VALID_V2
+                    and rule.get("match_mode") == "semantic"
+                    and resolution.semantic_safe
+                    and resolution.problem_code
+                ):
+                    semantic_matches.setdefault(resolution.problem_code, []).append(rule)
                 else:
                     matches.append(public_rule(rule))
             for code in sorted(semantic_matches):
@@ -1022,14 +1036,19 @@ class ApprovedRuleStore:
             ])
             if exact is not None:
                 return [public_rule(exact)]
-            if identity["match_mode"] == "semantic" and is_canonical_problem_code(identity["problem_code"]):
-                semantic = _preferred_rule([
-                    rule for rule in rules
-                    if classify_rule(rule).kind == RuleFormat.VALID_V2
-                    and rule.get("match_mode") == "semantic"
-                    and is_canonical_problem_code(derive_problem_code(rule))
-                    and derive_problem_code(rule) == identity["problem_code"]
-                ])
+            incoming_resolution = resolve_problem(feature, entity)
+            if identity["match_mode"] == "semantic" and incoming_resolution.semantic_safe:
+                semantic_candidates = []
+                for rule in rules:
+                    if classify_rule(rule).kind != RuleFormat.VALID_V2 or rule.get("match_mode") != "semantic":
+                        continue
+                    rule_resolution = resolve_problem(rule)
+                    if (
+                        rule_resolution.semantic_safe
+                        and rule_resolution.problem_code == incoming_resolution.problem_code == identity["problem_code"]
+                    ):
+                        semantic_candidates.append(rule)
+                semantic = _preferred_rule(semantic_candidates)
                 if semantic is not None:
                     return [public_rule(semantic)]
             return []

@@ -2,6 +2,7 @@ import json
 
 import pytest
 
+from logrisk.approval_dedup import build_approval_key
 from logrisk.approved_rules import (
     ApprovedRuleError,
     ApprovedRuleIntegrityError,
@@ -10,6 +11,7 @@ from logrisk.approved_rules import (
     RuleNormalizationSource,
     classify_rule,
     normalize_legacy_rule_version,
+    validate_v2_rule,
 )
 
 
@@ -17,20 +19,34 @@ def feature(title="内存压力"):
     return {
         "feature_type": "resource_pressure",
         "title": title,
-        "summary": "节点发生内存不足",
+        "summary": "节点发生资源压力",
         "importance": "critical",
-        "tags": ["oom", "memory"],
-        "selection_reason": "高风险模板",
+        "tags": ["resource"],
+        "selection_reason": "资源压力模板",
         "source_templates": [
             {
                 "template_hash": "hash-oom",
-                "category": "memory",
-                "template": "Out of memory: Killed process <*> ",
+                "category": "resource",
+                "template": "Resource pressure observed <*> ",
                 "component": "kernel",
                 "count": 3,
             }
         ],
     }
+
+
+def oom_feature(title="内存压力"):
+    value = feature(title)
+    value.update({
+        "summary": "节点发生内存不足",
+        "tags": ["oom", "memory"],
+        "selection_reason": "高风险模板",
+    })
+    value["source_templates"][0].update({
+        "category": "memory",
+        "template": "Out of memory: Killed process <*> ",
+    })
+    return value
 
 
 def entity(cluster="prod-a", entity_id="node-a"):
@@ -42,13 +58,22 @@ def entity(cluster="prod-a", entity_id="node-a"):
         "top_templates": [
             {
                 "template_hash": "hash-oom",
-                "category": "memory",
-                "template": "Out of memory: Killed process 42",
+                "category": "resource",
+                "template": "Resource pressure observed 42",
                 "component": "kernel",
                 "count": 8,
             }
         ],
     }
+
+
+def oom_entity(cluster="prod-a", entity_id="node-a"):
+    value = entity(cluster=cluster, entity_id=entity_id)
+    value["top_templates"][0].update({
+        "category": "memory",
+        "template": "Out of memory: Killed process 42",
+    })
+    return value
 
 
 def cni_feature(feature_type="cni_network_failure", problem_code="kubernetes.cni.ip_exhaustion", component="kubelet"):
@@ -160,6 +185,16 @@ def test_rule_requires_all_template_category_pairs(tmp_path):
     assert store.match_entity(entity()) == []
 
 
+def test_concrete_oom_rule_uses_semantic_identity(tmp_path):
+    store = ApprovedRuleStore(tmp_path / "rules.json")
+
+    stored = store.upsert_feature(oom_feature())
+
+    assert stored["problem_code"] == "linux.memory.oom"
+    assert stored["match_mode"] == "semantic"
+    assert store.match_entity(oom_entity())[0]["rule_id"] == stored["rule_id"]
+
+
 def test_malformed_existing_rule_file_is_rejected(tmp_path):
     path = tmp_path / "rules.json"
     path.write_text("not json", encoding="utf-8")
@@ -224,6 +259,66 @@ def test_selected_template_pattern_reuses_canonical_semantic_rule(tmp_path):
     assert replacement["rule_id"] == semantic["rule_id"]
     assert len(rules) == 1
     assert rules[semantic["rule_id"]]["components"] == ["containerd"]
+
+
+def test_semantic_rule_rejects_unregistered_dotted_problem_code(tmp_path):
+    store = ApprovedRuleStore(tmp_path / "rules.json")
+    rule = store.upsert_feature(cni_feature())
+    rule["problem_code"] = "vendor.some_issue"
+    rule["approval_key"] = build_approval_key(
+        rule["feature_type"], rule["problem_code"], rule["components"], rule["anchor_signatures"],
+    )
+    rule["canonical_approval_key"] = rule["approval_key"]
+
+    assert "semantic_problem_code_invalid" in validate_v2_rule(rule)
+
+
+def test_approved_rule_does_not_reuse_unsafe_semantic_feature_or_entity(tmp_path):
+    store = ApprovedRuleStore(tmp_path / "rules.json")
+    rule = store.upsert_feature(cni_feature())
+    rule["problem_code"] = "vendor.some_issue"
+    rule["approval_key"] = build_approval_key(
+        rule["feature_type"], rule["problem_code"], rule["components"], rule["anchor_signatures"],
+    )
+    rule["canonical_approval_key"] = rule["approval_key"]
+    store._write_locked([rule])
+
+    incoming = {
+        "feature_type": rule["feature_type"],
+        "problem_code": "vendor.some_issue",
+        "components": ["containerd"],
+        "source_templates": [{
+            "template_hash": "different-template",
+            "category": "network",
+            "component": "containerd",
+            "template": "opaque vendor condition",
+        }],
+    }
+    entity_value = {
+        "feature_type": rule["feature_type"],
+        "problem_code": "vendor.some_issue",
+        "top_templates": [{
+            "template_hash": "different-entity-template",
+            "category": "network",
+            "component": "containerd",
+        }],
+    }
+
+    assert store.match_feature(incoming) == []
+    assert store.match_entity(entity_value) == []
+
+
+def test_generic_wrapper_rule_does_not_get_semantic_canonical_key(tmp_path):
+    store = ApprovedRuleStore(tmp_path / "rules.json")
+    wrapper = cni_feature(
+        problem_code="kubernetes.cni.plugin_failure",
+    )
+    wrapper["source_templates"][0]["template"] = "CNI plugin failed"
+
+    stored = store.upsert_feature(wrapper)
+
+    assert stored["match_mode"] == "template_set"
+    assert stored.get("canonical_approval_key") is None
 
 
 def test_template_set_entity_rejects_missing_component_evidence(tmp_path):

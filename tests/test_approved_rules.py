@@ -210,20 +210,20 @@ def test_semantic_rule_matches_new_wrapper_without_template_identity(tmp_path):
     assert [item["rule_id"] for item in matches] == [stored["rule_id"]]
 
 
-def test_template_set_candidate_does_not_reuse_canonical_semantic_rule(tmp_path):
+def test_selected_template_pattern_reuses_canonical_semantic_rule(tmp_path):
     store = ApprovedRuleStore(tmp_path / "rules.json")
     semantic = store.upsert_feature(cni_feature(component="kubelet"))
     ambiguous = cni_feature(component="containerd")
     ambiguous.pop("problem_code")
 
-    assert store.match_feature(ambiguous) == []
+    assert [item["rule_id"] for item in store.match_feature(ambiguous)] == [semantic["rule_id"]]
 
     replacement = store.upsert_feature(ambiguous)
     rules = {item["rule_id"]: item for item in store.list_rules()}
 
-    assert replacement["rule_id"] != semantic["rule_id"]
-    assert len(rules) == 2
-    assert rules[semantic["rule_id"]]["components"] == ["kubelet"]
+    assert replacement["rule_id"] == semantic["rule_id"]
+    assert len(rules) == 1
+    assert rules[semantic["rule_id"]]["components"] == ["containerd"]
 
 
 def test_template_set_entity_rejects_missing_component_evidence(tmp_path):

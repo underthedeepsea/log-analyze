@@ -947,6 +947,15 @@ class FeatureJobManager:
             "anchor_signatures": identity["anchor_signatures"],
             "component_scope": identity["component_scope"],
             "match_mode": identity["match_mode"],
+            "problem_resolution": {
+                "confidence": identity["resolution_confidence"],
+                "semantic_safe": bool(identity["semantic_safe"]),
+                "ambiguity": bool(identity["ambiguity"]),
+                "evidence_source": identity["resolution_source"],
+                "matched_rule": identity["matched_rule"],
+                "supporting_codes": list(identity["supporting_codes"]),
+                "subtype": identity["subtype"],
+            },
         })
         prepared.setdefault("job_id", job_id)
         if prepared.get("status") == "pending":

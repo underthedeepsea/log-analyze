@@ -795,6 +795,7 @@ def test_sqlite_template_set_candidate_does_not_overwrite_semantic_rule(tmp_path
             **semantic["source_templates"][0],
             "template_hash": "hash-containerd",
             "component": "containerd",
+            "template": "CNI plugin failed",
         }],
     }
     ambiguous.pop("problem_code")

@@ -1,0 +1,391 @@
+{
+  "schema_version": "approval_semantic_regression_v1",
+  "cases": [
+    {
+      "case_id": "container_stats_unknown_container",
+      "feature": {
+        "feature_type": "container_runtime_signal",
+        "source_templates": [{
+          "template_fingerprint": "fixture-container-stats",
+          "category": "runtime",
+          "component": "kubelet",
+          "template": "Failed to get system container stats"
+        }]
+      },
+      "expected": {
+        "problem_code": "kubernetes.runtime.container_stats_failure",
+        "semantic_safe": true,
+        "ambiguity": false,
+        "subtype": null
+      }
+    },
+    {
+      "case_id": "container_not_found",
+      "feature": {
+        "feature_type": "container_runtime_signal",
+        "source_templates": [{
+          "template_fingerprint": "fixture-container-not-found",
+          "category": "runtime",
+          "component": "containerd",
+          "template": "No such container"
+        }]
+      },
+      "expected": {
+        "problem_code": "kubernetes.runtime.container_not_found",
+        "semantic_safe": true,
+        "ambiguity": false,
+        "subtype": null
+      }
+    },
+    {
+      "case_id": "crashloop",
+      "feature": {
+        "feature_type": "pod_restart_failure",
+        "source_templates": [{
+          "template_fingerprint": "fixture-crashloop",
+          "category": "pod",
+          "component": "kubelet",
+          "template": "Back-off restarting failed container"
+        }]
+      },
+      "expected": {
+        "problem_code": "kubernetes.pod.crash_loop",
+        "semantic_safe": true,
+        "ambiguity": false,
+        "subtype": null
+      }
+    },
+    {
+      "case_id": "orphaned_volume_path",
+      "feature": {
+        "feature_type": "pod_cleanup_failure",
+        "source_templates": [{
+          "template_fingerprint": "fixture-orphaned-path",
+          "category": "volume",
+          "component": "kubelet",
+          "template": "orphaned pod volume paths still present"
+        }]
+      },
+      "expected": {
+        "problem_code": "kubernetes.kubelet.orphaned_pod_residual",
+        "semantic_safe": true,
+        "ambiguity": false,
+        "subtype": "volume_path"
+      }
+    },
+    {
+      "case_id": "orphaned_volume_subpath",
+      "feature": {
+        "feature_type": "pod_cleanup_failure",
+        "source_templates": [{
+          "template_fingerprint": "fixture-orphaned-subpath",
+          "category": "volume",
+          "component": "kubelet",
+          "template": "failed to clean up volume subpath"
+        }]
+      },
+      "expected": {
+        "problem_code": "kubernetes.volume.subpath_cleanup_failure",
+        "semantic_safe": true,
+        "ambiguity": false,
+        "subtype": "volume_subpath"
+      }
+    },
+    {
+      "case_id": "orphaned_directory_not_empty",
+      "feature": {
+        "feature_type": "pod_cleanup_failure",
+        "source_templates": [{
+          "template_fingerprint": "fixture-orphaned-directory",
+          "category": "volume",
+          "component": "kubelet",
+          "template": "orphaned pod directory not empty"
+        }]
+      },
+      "expected": {
+        "problem_code": "kubernetes.kubelet.orphaned_pod_residual",
+        "semantic_safe": true,
+        "ambiguity": false,
+        "subtype": "directory_not_empty"
+      }
+    },
+    {
+      "case_id": "image_pull_transport",
+      "feature": {
+        "feature_type": "image_pull_failure",
+        "source_templates": [{
+          "template_fingerprint": "fixture-image-transport",
+          "category": "image",
+          "component": "containerd",
+          "template": "failed to pull image: connection reset by peer"
+        }]
+      },
+      "expected": {
+        "problem_code": "kubernetes.image.pull_transport_failure",
+        "semantic_safe": true,
+        "ambiguity": false,
+        "subtype": null
+      }
+    },
+    {
+      "case_id": "image_pull_unauthorized",
+      "feature": {
+        "feature_type": "image_pull_failure",
+        "source_templates": [{
+          "template_fingerprint": "fixture-image-unauthorized",
+          "category": "image",
+          "component": "containerd",
+          "template": "failed to pull image: unauthorized"
+        }]
+      },
+      "expected": {
+        "problem_code": "kubernetes.image.pull_unauthorized",
+        "semantic_safe": true,
+        "ambiguity": false,
+        "subtype": null
+      }
+    },
+    {
+      "case_id": "image_pull_not_found",
+      "feature": {
+        "feature_type": "image_pull_failure",
+        "source_templates": [{
+          "template_fingerprint": "fixture-image-not-found",
+          "category": "image",
+          "component": "containerd",
+          "template": "failed to pull image: manifest unknown"
+        }]
+      },
+      "expected": {
+        "problem_code": "kubernetes.image.pull_not_found",
+        "semantic_safe": true,
+        "ambiguity": false,
+        "subtype": null
+      }
+    },
+    {
+      "case_id": "image_gc_failure",
+      "feature": {
+        "feature_type": "image_gc_failure",
+        "source_templates": [{
+          "template_fingerprint": "fixture-image-gc",
+          "category": "image",
+          "component": "kubelet",
+          "template": "failed to garbage collect images"
+        }]
+      },
+      "expected": {
+        "problem_code": "kubernetes.image.gc_failure",
+        "semantic_safe": true,
+        "ambiguity": false,
+        "subtype": null
+      }
+    },
+    {
+      "case_id": "cni_ip_exhaustion",
+      "feature": {
+        "feature_type": "cni_network_failure",
+        "source_templates": [{
+          "template_fingerprint": "fixture-cni-ip",
+          "category": "network",
+          "component": "kubelet",
+          "template": "NetworkPlugin cni failed: no enough ips"
+        }]
+      },
+      "expected": {
+        "problem_code": "kubernetes.cni.ip_exhaustion",
+        "semantic_safe": true,
+        "ambiguity": false,
+        "subtype": null
+      }
+    },
+    {
+      "case_id": "cni_config_error",
+      "feature": {
+        "feature_type": "cni_network_failure",
+        "source_templates": [{
+          "template_fingerprint": "fixture-cni-config",
+          "category": "network",
+          "component": "kubelet",
+          "template": "CNI config syntax error"
+        }]
+      },
+      "expected": {
+        "problem_code": "kubernetes.cni.config_error",
+        "semantic_safe": true,
+        "ambiguity": false,
+        "subtype": null
+      }
+    },
+    {
+      "case_id": "cni_endpoint_not_found",
+      "feature": {
+        "feature_type": "cni_network_failure",
+        "source_templates": [{
+          "template_fingerprint": "fixture-cni-endpoint",
+          "category": "network",
+          "component": "kubelet",
+          "template": "CNI WorkloadEndpoint not found"
+        }]
+      },
+      "expected": {
+        "problem_code": "kubernetes.cni.workload_endpoint_not_found",
+        "semantic_safe": true,
+        "ambiguity": false,
+        "subtype": null
+      }
+    },
+    {
+      "case_id": "cni_delete_unsupported",
+      "feature": {
+        "feature_type": "cni_network_failure",
+        "source_templates": [{
+          "template_fingerprint": "fixture-cni-delete",
+          "category": "network",
+          "component": "kubelet",
+          "template": "CNI delete not supported"
+        }]
+      },
+      "expected": {
+        "problem_code": "kubernetes.cni.delete_not_supported",
+        "semantic_safe": true,
+        "ambiguity": false,
+        "subtype": null
+      }
+    },
+    {
+      "case_id": "checkpoint_not_found",
+      "feature": {
+        "feature_type": "checkpoint_resource_failure",
+        "source_templates": [{
+          "template_fingerprint": "fixture-checkpoint",
+          "category": "runtime",
+          "component": "kubelet",
+          "template": "checkpoint resource not found"
+        }]
+      },
+      "expected": {
+        "problem_code": "kubernetes.kubelet.checkpoint_resource_not_found",
+        "semantic_safe": true,
+        "ambiguity": false,
+        "subtype": null
+      }
+    },
+    {
+      "case_id": "exec_process_alive",
+      "feature": {
+        "feature_type": "exec_session_failure",
+        "source_templates": [{
+          "template_fingerprint": "fixture-exec-process",
+          "category": "runtime",
+          "component": "containerd",
+          "template": "exec session ended but process still running"
+        }]
+      },
+      "expected": {
+        "problem_code": "kubernetes.runtime.exec_process_still_running",
+        "semantic_safe": true,
+        "ambiguity": false,
+        "subtype": null
+      }
+    },
+    {
+      "case_id": "cadvisor_cache_miss",
+      "feature": {
+        "feature_type": "container_stats_failure",
+        "source_templates": [{
+          "template_fingerprint": "fixture-cadvisor-cache",
+          "category": "runtime",
+          "component": "kubelet",
+          "template": "unable to find data in memory cache"
+        }]
+      },
+      "expected": {
+        "problem_code": "kubernetes.runtime.cadvisor_cache_miss",
+        "semantic_safe": true,
+        "ambiguity": false,
+        "subtype": null
+      }
+    },
+    {
+      "case_id": "filesystem_stats_path_missing",
+      "feature": {
+        "feature_type": "filesystem_stats_failure",
+        "source_templates": [{
+          "template_fingerprint": "fixture-filesystem-stats",
+          "category": "filesystem",
+          "component": "kubelet",
+          "template": "failed to get filesystem stats: path not found"
+        }]
+      },
+      "expected": {
+        "problem_code": "kubernetes.runtime.filesystem_stats_path_missing",
+        "semantic_safe": true,
+        "ambiguity": false,
+        "subtype": null
+      }
+    },
+    {
+      "case_id": "generic_cni_wrapper",
+      "feature": {
+        "feature_type": "cni_network_failure",
+        "source_templates": [{
+          "template_fingerprint": "fixture-cni-generic",
+          "category": "network",
+          "component": "kubelet",
+          "template": "CNI plugin failed"
+        }]
+      },
+      "expected": {
+        "problem_code": "kubernetes.cni.plugin_failure",
+        "semantic_safe": false,
+        "ambiguity": false,
+        "subtype": null
+      }
+    },
+    {
+      "case_id": "mixed_stats_and_image_pull",
+      "feature": {
+        "feature_type": "mixed_runtime_failure",
+        "source_templates": [
+          {
+            "template_fingerprint": "fixture-mixed-stats",
+            "category": "runtime",
+            "component": "kubelet",
+            "template": "Failed to get system container stats"
+          },
+          {
+            "template_fingerprint": "fixture-mixed-image",
+            "category": "image",
+            "component": "containerd",
+            "template": "failed to pull image: connection reset by peer"
+          }
+        ]
+      },
+      "expected": {
+        "problem_code": null,
+        "semantic_safe": false,
+        "ambiguity": true,
+        "subtype": null
+      }
+    },
+    {
+      "case_id": "unknown_fallback",
+      "feature": {
+        "feature_type": "runtime_failure",
+        "source_templates": [{
+          "template_fingerprint": "fixture-unknown",
+          "category": "runtime",
+          "component": "kubelet",
+          "template": "opaque vendor condition"
+        }]
+      },
+      "expected": {
+        "problem_code": null,
+        "semantic_safe": false,
+        "ambiguity": false,
+        "subtype": null
+      }
+    }
+  ]
+}

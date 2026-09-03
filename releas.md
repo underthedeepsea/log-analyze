@@ -6,6 +6,16 @@
 - 仅修复 Bug 时提升最后一位，例如 `1.2.0 → 1.2.1`；
 - 每次代码更新必须同步更新本文件。
 
+## 1.36.3 - 2026-09-03
+
+### Fixed
+
+- 新增基于选定模板证据的确定性语义解析器，区分具体根因与通用 wrapper，保守处理混合语义并保持未知问题严格回退。
+- 修复审批身份推导读取实体 `top_templates` 造成的语义污染；审批身份由 `semantic_safe` 驱动，同时保留历史 V1 物理 identity 比较兼容。
+- 统一审批队列、规则复用与 Candidate 持久化的 `semantic_safe` 门禁，保留具体 OOM 语义并为审核组保存脱敏解析诊断。
+- 固化脱敏语义回归 corpus，新增 pending Approval 的只读重分类审计 CLI，并输出旧/新 identity、解析原因与汇总指标。
+- 所有 Feature Extract Prompt 增加单一异常语义约束与契约校验；新增 `LOGRISK_SEMANTIC_RESOLVER_ENABLED=false` 回滚开关和审批队列覆盖率、fallback、歧义指标。
+
 ## 1.36.2 - 2026-09-03
 
 ### Added

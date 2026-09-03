@@ -4,7 +4,7 @@
   <img src="frontend/logo/logrisk-app-icon-orange-v2.png" width="112" alt="LOGRISK 应用图标" />
 </p>
 
-当前版本：`1.36.2`。完整变更记录见 [`releas.md`](releas.md)。
+当前版本：`1.36.3`。完整变更记录见 [`releas.md`](releas.md)。
 
 LOGRISK 在本地完成日志规范化、Drain3 模板化、确定性语义增强、风险评分、规则复用、模型特征识别和人工审批。系统只生成可审查、可导出的日志特征，不执行根因分析（RCA），也不会把原始日志直接发送给模型。
 
@@ -283,6 +283,16 @@ DASHBOARD_CORS_ORIGINS=https://logrisk.example.internal \
 ```
 
 常用环境变量包括 `LOGRISK_DB_PATH`、`OLLAMA_MODEL`、`OLLAMA_HOST`、`OLLAMA_TIMEOUT`、`DASHBOARD_HOST` 和 `DASHBOARD_PORT`。Dashboard 默认仅监听 `127.0.0.1`。
+
+审批语义治理默认启用确定性 Resolver；如需紧急回滚到严格 template-set 身份，可设置 `LOGRISK_SEMANTIC_RESOLVER_ENABLED=false` 后重启服务。上线前可使用只读审计工具核对 pending Candidate，不会修改历史 Approval Group：
+
+```bash
+PYTHONPATH=src python -m logrisk.tools.reclassify_pending_approvals \
+  --dry-run \
+  --input pending-approvals.csv \
+  --output reclassified.csv \
+  --summary reclassified-summary.json
+```
 
 ### Django + Airflow 生产适配
 

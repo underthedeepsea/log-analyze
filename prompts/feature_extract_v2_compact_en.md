@@ -62,6 +62,12 @@ Do not invent node, pod, namespace, container, component, template_hash, timelin
 
 ## What to Extract
 
+Single-feature semantic constraint:
+
+- Every feature must represent exactly one coherent abnormal pattern.
+- If selected templates represent different failure semantics, emit separate features.
+- Do not combine unrelated failure patterns into one feature.
+
 Extract a feature only when it is clearly useful for external RCA evidence or future rule reuse.
 
 Good feature candidates include:

@@ -5,6 +5,8 @@ import importlib
 from pathlib import Path
 from types import SimpleNamespace
 
+from logrisk.approval_dedup import approval_identity
+
 
 def test_persisted_candidates_from_different_jobs_form_one_semantic_review_group():
     build_review_groups = importlib.import_module("logrisk.approval_queue").build_review_groups
@@ -202,15 +204,15 @@ def test_queue_paginates_groups_after_full_candidate_enumeration():
     assert first.body["total_candidates"] == 101
     assert len(first.body["items"]) == 2
     assert first.body["next_cursor"] == "2"
-    assert [item["review_key"] for item in first.body["items"]] == [
-        "semantic:service.failure.000",
-        "semantic:service.failure.001",
-    ]
-    assert [item["review_key"] for item in second.body["items"]] == [
-        "semantic:service.failure.002",
-        "semantic:service.failure.003",
-    ]
+    expected_keys = sorted(
+        f"approval:{approval_identity(candidate)['approval_key']}"
+        for candidate in candidates
+    )
+    assert [item["review_key"] for item in first.body["items"]] == expected_keys[:2]
+    assert [item["review_key"] for item in second.body["items"]] == expected_keys[2:4]
     assert second.body["next_cursor"] == "4"
+    assert first.body["metrics"]["logrisk_approval_candidates_total"] == 101
+    assert first.body["metrics"]["logrisk_approval_fallback_candidates"] == 101
 
 
 def test_queue_rejects_invalid_cursor_and_selects_deterministic_representative():
@@ -219,7 +221,7 @@ def test_queue_rejects_invalid_cursor_and_selects_deterministic_representative()
         {
             "candidate_id": "later-critical",
             "job_id": "job-2",
-            "problem_code": "service.failure",
+            "problem_code": "kubernetes.cni.ip_exhaustion",
             "feature_type": "service_failure",
             "status": "pending",
             "importance": "critical",
@@ -232,7 +234,7 @@ def test_queue_rejects_invalid_cursor_and_selects_deterministic_representative()
         {
             "candidate_id": "earlier-high",
             "job_id": "job-1",
-            "problem_code": "service.failure",
+            "problem_code": "kubernetes.cni.ip_exhaustion",
             "feature_type": "service_failure",
             "status": "pending",
             "importance": "high",
@@ -262,3 +264,128 @@ def test_queue_rejects_invalid_cursor_and_selects_deterministic_representative()
 
     assert invalid.status == 422
     assert invalid.body["code"] == "invalid_cursor"
+
+
+def test_queue_keeps_generic_wrapper_in_template_set_group():
+    build_review_groups = importlib.import_module("logrisk.approval_queue").build_review_groups
+    candidate = {
+        "candidate_id": "generic-wrapper",
+        "job_id": "job-generic",
+        "feature_type": "cni_network_failure",
+        "problem_code": "kubernetes.cni.plugin_failure",
+        "components": ["kubelet"],
+        "status": "pending",
+        "source_templates": [{
+            "template_hash": "generic-wrapper-hash",
+            "category": "network",
+            "component": "kubelet",
+            "template": "CNI plugin failed",
+        }],
+    }
+
+    groups = build_review_groups([candidate])
+
+    assert groups[0]["problem_code"] == "kubernetes.cni.plugin_failure"
+    assert groups[0]["match_mode"] == "template_set"
+    assert groups[0]["review_key"] == f"approval:{approval_identity(candidate)['approval_key']}"
+    assert groups[0]["resolution_confidence"] == "high"
+    assert groups[0]["resolution_source"] == "selected_template_pattern"
+    assert groups[0]["semantic_safe"] is False
+    assert groups[0]["ambiguity"] is False
+    assert groups[0]["representative"]["problem_resolution"] == {
+        "confidence": "high",
+        "semantic_safe": False,
+        "ambiguity": False,
+        "evidence_source": "selected_template_pattern",
+        "matched_rule": "cni_plugin_failure_wrapper_v1",
+        "supporting_codes": ["kubernetes.cni.plugin_failure"],
+        "subtype": None,
+    }
+
+
+def test_approval_metrics_report_semantic_safe_and_fallback_candidates():
+    from logrisk.approval_queue import approval_metrics, build_review_groups
+
+    candidates = [
+        {
+            "candidate_id": "oom",
+            "status": "pending",
+            "feature_type": "runtime_failure",
+            "source_templates": [{"template": "Out of memory: killed process <*>"}],
+        },
+        {
+            "candidate_id": "generic",
+            "status": "pending",
+            "feature_type": "cni_network_failure",
+            "source_templates": [{"template": "CNI plugin failed"}],
+        },
+    ]
+
+    groups = build_review_groups(candidates)
+    metrics = approval_metrics(candidates, groups)
+
+    assert metrics == {
+        "logrisk_approval_candidates_total": 2,
+        "logrisk_approval_review_groups": 2,
+        "logrisk_approval_canonical_candidates": 1,
+        "logrisk_approval_fallback_candidates": 1,
+        "logrisk_approval_ambiguous_candidates": 0,
+        "logrisk_approval_semantic_safe_candidates": 1,
+        "canonical_problem_code_coverage": 0.5,
+        "fallback_problem_code_ratio": 0.5,
+        "approval_compression_ratio": 0.0,
+        "semantic_ambiguity_ratio": 0.0,
+    }
+
+
+def test_queue_preserves_orphaned_volume_subtype_for_reviewers():
+    from logrisk.approval_queue import build_review_groups
+
+    groups = build_review_groups([{
+        "candidate_id": "orphaned-subpath",
+        "status": "pending",
+        "feature_type": "pod_cleanup_failure",
+        "source_templates": [{
+            "template_fingerprint": "fixture-orphaned-subpath",
+            "category": "volume",
+            "component": "kubelet",
+            "template": "volume subpaths still present",
+        }],
+    }])
+
+    assert groups[0]["resolution_subtype"] == "volume_subpath"
+    assert groups[0]["representative"]["problem_resolution"]["subtype"] == "volume_subpath"
+
+
+def test_queue_subtype_describes_the_selected_representative():
+    groups = importlib.import_module("logrisk.approval_queue").build_review_groups([
+        {
+            "candidate_id": "directory",
+            "status": "pending",
+            "importance": "critical",
+            "created_at": "2026-09-01T00:01:00+00:00",
+            "feature_type": "pod_cleanup_failure",
+            "source_templates": [{
+                "template_fingerprint": "fixture-directory",
+                "category": "volume",
+                "component": "kubelet",
+                "template": "orphaned pod directory not empty",
+            }],
+        },
+        {
+            "candidate_id": "path",
+            "status": "pending",
+            "importance": "low",
+            "created_at": "2026-09-01T00:00:00+00:00",
+            "feature_type": "pod_cleanup_failure",
+            "source_templates": [{
+                "template_fingerprint": "fixture-path",
+                "category": "volume",
+                "component": "kubelet",
+                "template": "orphaned pod volume paths still present",
+            }],
+        },
+    ])
+
+    assert groups[0]["representative"]["candidate_id"] == "directory"
+    assert groups[0]["resolution_subtype"] == "directory_not_empty"

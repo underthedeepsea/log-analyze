@@ -22,6 +22,10 @@ FEATURE_OUTPUT_FIELDS = (
     "tags",
     "selection_reason",
 )
+_SINGLE_FEATURE_CONSTRAINTS = (
+    "one coherent abnormal pattern",
+    "different failure semantics",
+)
 
 
 def validate_feature_prompt_contract(content: str) -> None:
@@ -30,6 +34,9 @@ def validate_feature_prompt_contract(content: str) -> None:
         raise ValueError(f"feature_extract Prompt 缺少必填输出字段: {', '.join(missing)}")
     if "lowercase_snake_case" not in content:
         raise ValueError("feature_extract Prompt 必须要求 feature_type 使用 lowercase_snake_case")
+    normalized = content.lower()
+    if any(item not in normalized for item in _SINGLE_FEATURE_CONSTRAINTS):
+        raise ValueError("feature_extract Prompt 必须约束 one coherent abnormal pattern 和 different failure semantics")
     stripped = content.strip()
     if stripped.startswith("```") and stripped.endswith("```"):
         raise ValueError("feature_extract Prompt 不能整体包裹在 Markdown 代码围栏中")

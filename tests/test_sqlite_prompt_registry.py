@@ -12,7 +12,9 @@ def valid_feature_prompt(label: str) -> str:
     return (
         f"{label}\nReturn raw JSON only. feature_type must be lowercase_snake_case. "
         "Every feature must contain exactly: feature_type, title, summary, importance, "
-        "template_hashes, components, tags, selection_reason."
+        "template_hashes, components, tags, selection_reason. "
+        "Every feature must represent exactly one coherent abnormal pattern. "
+        "If selected templates represent different failure semantics, emit separate features."
     )
 
 

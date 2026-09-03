@@ -51,6 +51,12 @@ Task:
 
 Extract useful abnormal log features from the Evidence JSON.
 
+Single-feature semantic constraint:
+
+- Every feature MUST represent exactly one coherent abnormal pattern.
+- If selected templates represent different failure semantics, emit separate features.
+- Do not combine unrelated failure patterns into one feature.
+
 Extract only meaningful abnormal patterns, such as:
 kernel ERROR, registration failure, abnormal exit, container runtime error, kubelet error, eviction, OOM, disk pressure, network error, DNS failure, apiserver error, etcd error.
 

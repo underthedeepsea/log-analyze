@@ -1,6 +1,8 @@
 import hashlib
 
-from logrisk.ai_harness.prompt_registry import PromptRegistry
+import pytest
+
+from logrisk.ai_harness.prompt_registry import PromptRegistry, validate_feature_prompt_contract
 
 
 def test_load_prompt_template_with_hash(tmp_path):
@@ -69,6 +71,16 @@ def test_repo_default_uses_compact_strict_json_v3_prompt():
     assert prompts["feature_extract_v2_strict_en"].description == "for 大参数模型"
 
 
+def test_feature_prompt_contract_requires_single_coherent_anomaly_constraint():
+    content = (
+        "feature_type title summary importance template_hashes components tags selection_reason "
+        "lowercase_snake_case"
+    )
+
+    with pytest.raises(ValueError, match="coherent abnormal pattern"):
+        validate_feature_prompt_contract(content)
+
+
 def test_all_repo_feature_prompts_declare_the_complete_output_contract():
     registry = PromptRegistry("prompts", "configs/ai_harness.yaml")
     required_fields = (
@@ -87,6 +99,8 @@ def test_all_repo_feature_prompts_declare_the_complete_output_contract():
             continue
         assert all(field in prompt.content for field in required_fields), prompt.prompt_id
         assert "lowercase_snake_case" in prompt.content, prompt.prompt_id
+        assert "one coherent abnormal pattern" in prompt.content.lower(), prompt.prompt_id
+        assert "different failure semantics" in prompt.content.lower(), prompt.prompt_id
         assert not (
             prompt.content.strip().startswith("```")
             and prompt.content.strip().endswith("```")
@@ -98,11 +112,13 @@ def test_update_prompt_records_version_history(tmp_path):
     prompt_dir.mkdir()
     old_prompt = (
         "old prompt lowercase_snake_case feature_type title summary importance "
-        "template_hashes components tags selection_reason"
+        "template_hashes components tags selection_reason one coherent abnormal pattern "
+        "different failure semantics"
     )
     new_prompt = (
         "new prompt lowercase_snake_case feature_type title summary importance "
-        "template_hashes components tags selection_reason"
+        "template_hashes components tags selection_reason one coherent abnormal pattern "
+        "different failure semantics"
     )
     (prompt_dir / "feature_extract_v1.md").write_text(old_prompt, encoding="utf-8")
     history = tmp_path / "state" / "prompt_versions.json"

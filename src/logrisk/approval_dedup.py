@@ -3,11 +3,18 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 import re
 import threading
 import unicodedata
 from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping
+
+from logrisk.problem_resolver import resolve_problem
+
+
+_SEMANTIC_RESOLVER_ENV = "LOGRISK_SEMANTIC_RESOLVER_ENABLED"
+_FALSE_ENV_VALUES = frozenset({"0", "false", "no", "off", "disabled"})
 
 
 def _now() -> str:
@@ -19,6 +26,13 @@ def normalize_feature_type(value: Any) -> str:
 
     normalized = re.sub(r"[^a-z0-9]+", "_", str(value or "").strip().lower()).strip("_")
     return normalized or "unknown_feature"
+
+
+def semantic_resolver_enabled() -> bool:
+    """Return whether semantic regrouping and semantic rule reuse are enabled."""
+
+    value = os.environ.get(_SEMANTIC_RESOLVER_ENV, "true")
+    return str(value).strip().lower() not in _FALSE_ENV_VALUES
 
 
 def _alias_key(value: str) -> str:
@@ -76,7 +90,6 @@ _UNKNOWN_PROBLEM_CODES = frozenset({
     "unclassified_problem",
     "unclassified_problem_code",
 })
-
 
 def _is_unknown_problem_code(code: str) -> bool:
     segments = code.split(".")
@@ -159,14 +172,21 @@ def _source_templates(feature: Mapping[str, Any], entity: Mapping[str, Any] | No
     signatures = feature.get("template_signatures")
     if isinstance(signatures, list) and signatures:
         return [item for item in signatures if isinstance(item, Mapping)]
+    if entity is feature:
+        templates = feature.get("top_templates")
+        if isinstance(templates, list):
+            return [item for item in templates if isinstance(item, Mapping)]
     if entity:
         templates = entity.get("top_templates")
-        if isinstance(templates, list):
-            hashes = {str(item) for item in _iter_values(feature.get("template_hashes"))}
+        hashes = {str(item) for item in _iter_values(feature.get("template_hashes"))}
+        if isinstance(templates, list) and hashes:
             return [
                 item for item in templates
                 if isinstance(item, Mapping)
-                and (not hashes or str(item.get("template_hash") or "") in hashes)
+                and bool({
+                    str(item.get("template_hash") or ""),
+                    str(item.get("template_fingerprint") or ""),
+                } & hashes)
             ]
     return []
 
@@ -279,10 +299,9 @@ def _has_semantic_identity(feature: Mapping[str, Any], sources: Iterable[Mapping
 def collect_problem_codes(
     feature: Mapping[str, Any], entity: Mapping[str, Any] | None = None
 ) -> list[str]:
-    """Collect every available semantic signal before choosing a primary cause."""
+    """Collect semantic signals from the feature and its selected templates."""
 
     sources = _source_templates(feature, entity)
-    entity_sources = _source_templates(entity, entity) if entity else []
     codes: list[str] = []
     for value in (
         feature.get("problem_code"),
@@ -294,27 +313,10 @@ def collect_problem_codes(
     for value in (feature.get("semantic_fields"), feature.get("risk_semantic")):
         for normalized in _nested_semantic_values(value):
             _append_problem_code(codes, normalized)
-    if entity:
-        for value in (
-            entity.get("problem_code"),
-            entity.get("problemCode"),
-            entity.get("risk_type"),
-            entity.get("cause"),
-            entity.get("risk_semantic"),
-        ):
-            _append_problem_code(codes, value)
-            for normalized in _nested_semantic_values(value):
-                _append_problem_code(codes, normalized)
-        for normalized in _nested_semantic_values(entity.get("semantic_fields")):
-            _append_problem_code(codes, normalized)
-
     for keyword in _keyword_problem_codes(_feature_text(feature, sources)):
         _append_problem_code(codes, keyword)
-    if entity:
-        for keyword in _keyword_problem_codes(_feature_text(entity, entity_sources)):
-            _append_problem_code(codes, keyword)
 
-    for source in [*sources, *entity_sources]:
+    for source in sources:
         for value in (
             source.get("problem_code"),
             source.get("problemCode"),
@@ -365,7 +367,7 @@ def _problem_code_priority(code: str) -> int:
     return 2
 
 
-def derive_problem_code(feature: Mapping[str, Any], entity: Mapping[str, Any] | None = None) -> str:
+def _legacy_problem_code(feature: Mapping[str, Any], entity: Mapping[str, Any] | None = None) -> str:
     sources = _source_templates(feature, entity)
     codes = collect_problem_codes(feature, entity)
     selected = select_primary_problem_code(codes)
@@ -381,8 +383,19 @@ def derive_problem_code(feature: Mapping[str, Any], entity: Mapping[str, Any] | 
             "problem_codes": sorted(set(codes)),
             "anchor_signatures": anchors,
         }
-    digest = hashlib.sha256(json.dumps(fallback_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()[:16]
+    digest = hashlib.sha256(
+        json.dumps(fallback_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:16]
     return f"logrisk.{normalize_feature_type(feature.get('feature_type'))}.{digest}"
+
+
+def derive_problem_code(feature: Mapping[str, Any], entity: Mapping[str, Any] | None = None) -> str:
+    if not semantic_resolver_enabled():
+        return _legacy_problem_code(feature, entity)
+    resolution = resolve_problem(feature, entity)
+    if resolution.problem_code:
+        return resolution.problem_code
+    return _legacy_problem_code(feature, entity)
 
 
 def entity_problem_codes(entity: Mapping[str, Any]) -> set[str]:
@@ -410,7 +423,7 @@ def anchor_signatures(feature: Mapping[str, Any], entity: Mapping[str, Any] | No
     if not anchors:
         return []
 
-    if is_canonical_problem_code(derive_problem_code(feature, entity)):
+    if semantic_resolver_enabled() and resolve_problem(feature, entity).semantic_safe:
         return []
     return anchors[:1]
 
@@ -422,13 +435,20 @@ def build_approval_key(
     anchor_signatures: Iterable[Any] | Any = (),
     *,
     anchor_template_fingerprints: Iterable[Any] | Any | None = None,
+    semantic_safe: bool | None = None,
 ) -> str:
     """Build an approval identity from semantic fields only."""
 
     if anchor_template_fingerprints is not None and not anchor_signatures:
         anchor_signatures = anchor_template_fingerprints
     normalized_problem_code = normalize_problem_code(problem_code) or "unknown.problem"
-    if is_canonical_problem_code(normalized_problem_code):
+    if semantic_safe is None:
+        semantic_safe = semantic_resolver_enabled() and resolve_problem({
+            "feature_type": feature_type,
+            "problem_code": normalized_problem_code,
+        }).semantic_safe
+    canonical = bool(semantic_safe)
+    if canonical:
         payload = {"problem_code": normalized_problem_code}
     else:
         payload = {
@@ -446,16 +466,75 @@ def build_approval_key(
 
 
 def approval_identity(feature: Mapping[str, Any], entity: Mapping[str, Any] | None = None) -> dict[str, Any]:
-    sources = _source_templates(feature, entity)
-    problem_code = derive_problem_code(feature, entity)
+    if not semantic_resolver_enabled():
+        problem_code = _legacy_problem_code(feature, entity)
+        components = component_scope(feature, entity)
+        anchors = anchor_signatures(feature, entity)
+        return {
+            "problem_code": problem_code,
+            "approval_key": build_approval_key(
+                feature.get("feature_type"),
+                problem_code,
+                components,
+                anchors,
+                semantic_safe=False,
+            ),
+            "component_scope": components,
+            "anchor_signatures": anchors,
+            "match_mode": "template_set",
+            "resolution_confidence": "low",
+            "resolution_source": "rollback_legacy",
+            "semantic_safe": False,
+            "ambiguity": False,
+            "matched_rule": None,
+            "supporting_codes": collect_problem_codes(feature, entity),
+            "subtype": None,
+        }
+    resolution = resolve_problem(feature, entity)
+    problem_code = resolution.problem_code
+    if not problem_code:
+        sources = _source_templates(feature, entity)
+        codes = collect_problem_codes(feature, entity)
+        anchors = _canonical_signatures(feature.get("anchor_signatures"))
+        if not anchors:
+            anchors = _canonical_signatures(sources) or _canonical_signatures(feature.get("template_hashes"))
+        fallback_payload: Any = anchors
+        if codes:
+            fallback_payload = {
+                "problem_codes": sorted(set(codes)),
+                "anchor_signatures": anchors,
+            }
+        digest = hashlib.sha256(
+            json.dumps(
+                fallback_payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()[:16]
+        problem_code = f"logrisk.{normalize_feature_type(feature.get('feature_type'))}.{digest}"
     components = component_scope(feature, entity)
     anchors = anchor_signatures(feature, entity)
+    approval_key = build_approval_key(
+        feature.get("feature_type"),
+        problem_code,
+        components,
+        anchors,
+        semantic_safe=resolution.semantic_safe,
+    )
     return {
         "problem_code": problem_code,
-        "approval_key": build_approval_key(feature.get("feature_type"), problem_code, components, anchors),
+        "approval_key": approval_key,
         "component_scope": components,
         "anchor_signatures": anchors,
-        "match_mode": "semantic" if _has_semantic_identity(feature, sources) else "template_set",
+        "match_mode": "semantic" if resolution.semantic_safe else "template_set",
+        "resolution_confidence": resolution.confidence,
+        "resolution_source": resolution.evidence_source,
+        "semantic_safe": resolution.semantic_safe,
+        "ambiguity": resolution.ambiguity,
+        "matched_rule": resolution.matched_rule,
+        "supporting_codes": list(resolution.supporting_codes),
+        "subtype": resolution.subtype,
     }
 
 
@@ -469,15 +548,17 @@ def is_canonical_problem_code(code: str | None) -> bool:
 
 
 def same_approval_identity(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
-    left_code = derive_problem_code(left)
-    right_code = derive_problem_code(right)
-    left_canonical = is_canonical_problem_code(left_code)
-    right_canonical = is_canonical_problem_code(right_code)
+    left_identity = approval_identity(left)
+    right_identity = approval_identity(right)
+    left_code = left_identity["problem_code"]
+    right_code = right_identity["problem_code"]
+    left_semantic_safe = bool(left_identity["semantic_safe"])
+    right_semantic_safe = bool(right_identity["semantic_safe"])
 
     left_key = str(left.get("approval_key") or "").strip()
     right_key = str(right.get("approval_key") or "").strip()
-    left_v2_key = approval_identity(left)["approval_key"]
-    right_v2_key = approval_identity(right)["approval_key"]
+    left_v2_key = left_identity["approval_key"]
+    right_v2_key = right_identity["approval_key"]
     left_legacy = bool(left_key and left_key != left_v2_key)
     right_legacy = bool(right_key and right_key != right_v2_key)
 
@@ -485,9 +566,9 @@ def same_approval_identity(left: Mapping[str, Any], right: Mapping[str, Any]) ->
         return True
     if left_legacy and right_legacy:
         return False
-    if left_canonical and right_canonical:
+    if left_semantic_safe and right_semantic_safe:
         return left_code == right_code
-    if left_canonical != right_canonical:
+    if left_semantic_safe != right_semantic_safe:
         return False
 
     left_key = left_key or left_v2_key

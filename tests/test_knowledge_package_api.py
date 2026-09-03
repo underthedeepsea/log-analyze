@@ -18,7 +18,9 @@ from pipeline.dashboard_server import build_server
 def _archive() -> bytes:
     prompt = (
         b"feature_type must use lowercase_snake_case. Output fields: feature_type, title, summary, "
-        b"importance, template_hashes, components, tags, selection_reason."
+        b"importance, template_hashes, components, tags, selection_reason. "
+        b"Every feature must represent exactly one coherent abnormal pattern. "
+        b"If selected templates represent different failure semantics, emit separate features."
     )
     manifest = {
         "schema_version": 1,

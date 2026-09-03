@@ -6,7 +6,7 @@ from typing import Any, Callable, Mapping
 
 from logrisk.ai_harness.connection_check import check_model_connection
 from logrisk.application.container import ApplicationContainer
-from logrisk.approval_queue import build_review_groups
+from logrisk.approval_queue import approval_metrics, build_review_groups
 from logrisk.database import DatabaseError, PostgresDatabase
 from logrisk.database_config import database_url_from_candidate
 from logrisk.feature_extractor_ollama import FEATURE_PROMPT_ID
@@ -832,12 +832,14 @@ class ApiFacade:
             limit=None,
         )
         groups = build_review_groups(candidates)
+        metrics = approval_metrics(candidates, groups)
         page_end = offset + page_size
         return ApiResult(200, {
             "schema_version": "feature_approval_queue_v1",
             "status": status,
             "total_groups": len(groups),
             "total_candidates": sum(int(group.get("candidate_count") or 0) for group in groups),
+            "metrics": metrics,
             "next_cursor": str(page_end) if page_end < len(groups) else None,
             "items": groups[offset:page_end],
         })

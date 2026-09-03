@@ -17,6 +17,7 @@ from logrisk.approval_dedup import (
     derive_problem_code,
     normalize_problem_code,
     normalize_feature_type,
+    semantic_resolver_enabled,
 )
 from logrisk.problem_resolver import resolve_problem
 
@@ -736,7 +737,12 @@ def _rule_matches_entity(rule: Dict[str, Any], entity: Dict[str, Any]) -> bool:
         return False
     rule_resolution = resolve_problem(rule)
     entity_resolution = resolve_problem(entity, entity)
-    if rule.get("match_mode") == "semantic" and rule_resolution.semantic_safe and entity_resolution.semantic_safe:
+    if (
+        semantic_resolver_enabled()
+        and rule.get("match_mode") == "semantic"
+        and rule_resolution.semantic_safe
+        and entity_resolution.semantic_safe
+    ):
         return rule_resolution.problem_code == entity_resolution.problem_code
     required = {
         _identity_pair(item)

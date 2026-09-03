@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 import re
 import threading
 import unicodedata
@@ -10,6 +11,10 @@ from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping
 
 from logrisk.problem_resolver import resolve_problem
+
+
+_SEMANTIC_RESOLVER_ENV = "LOGRISK_SEMANTIC_RESOLVER_ENABLED"
+_FALSE_ENV_VALUES = frozenset({"0", "false", "no", "off", "disabled"})
 
 
 def _now() -> str:
@@ -21,6 +26,13 @@ def normalize_feature_type(value: Any) -> str:
 
     normalized = re.sub(r"[^a-z0-9]+", "_", str(value or "").strip().lower()).strip("_")
     return normalized or "unknown_feature"
+
+
+def semantic_resolver_enabled() -> bool:
+    """Return whether semantic regrouping and semantic rule reuse are enabled."""
+
+    value = os.environ.get(_SEMANTIC_RESOLVER_ENV, "true")
+    return str(value).strip().lower() not in _FALSE_ENV_VALUES
 
 
 def _alias_key(value: str) -> str:
@@ -355,13 +367,12 @@ def _problem_code_priority(code: str) -> int:
     return 2
 
 
-def derive_problem_code(feature: Mapping[str, Any], entity: Mapping[str, Any] | None = None) -> str:
-    resolution = resolve_problem(feature, entity)
-    if resolution.problem_code:
-        return resolution.problem_code
-
+def _legacy_problem_code(feature: Mapping[str, Any], entity: Mapping[str, Any] | None = None) -> str:
     sources = _source_templates(feature, entity)
     codes = collect_problem_codes(feature, entity)
+    selected = select_primary_problem_code(codes)
+    if selected:
+        return selected
 
     anchors = _canonical_signatures(feature.get("anchor_signatures"))
     if not anchors:
@@ -372,8 +383,19 @@ def derive_problem_code(feature: Mapping[str, Any], entity: Mapping[str, Any] | 
             "problem_codes": sorted(set(codes)),
             "anchor_signatures": anchors,
         }
-    digest = hashlib.sha256(json.dumps(fallback_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()[:16]
+    digest = hashlib.sha256(
+        json.dumps(fallback_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()[:16]
     return f"logrisk.{normalize_feature_type(feature.get('feature_type'))}.{digest}"
+
+
+def derive_problem_code(feature: Mapping[str, Any], entity: Mapping[str, Any] | None = None) -> str:
+    if not semantic_resolver_enabled():
+        return _legacy_problem_code(feature, entity)
+    resolution = resolve_problem(feature, entity)
+    if resolution.problem_code:
+        return resolution.problem_code
+    return _legacy_problem_code(feature, entity)
 
 
 def entity_problem_codes(entity: Mapping[str, Any]) -> set[str]:
@@ -401,8 +423,7 @@ def anchor_signatures(feature: Mapping[str, Any], entity: Mapping[str, Any] | No
     if not anchors:
         return []
 
-    resolution = resolve_problem(feature, entity)
-    if resolution.semantic_safe:
+    if semantic_resolver_enabled() and resolve_problem(feature, entity).semantic_safe:
         return []
     return anchors[:1]
 
@@ -422,7 +443,7 @@ def build_approval_key(
         anchor_signatures = anchor_template_fingerprints
     normalized_problem_code = normalize_problem_code(problem_code) or "unknown.problem"
     if semantic_safe is None:
-        semantic_safe = resolve_problem({
+        semantic_safe = semantic_resolver_enabled() and resolve_problem({
             "feature_type": feature_type,
             "problem_code": normalized_problem_code,
         }).semantic_safe
@@ -445,6 +466,30 @@ def build_approval_key(
 
 
 def approval_identity(feature: Mapping[str, Any], entity: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    if not semantic_resolver_enabled():
+        problem_code = _legacy_problem_code(feature, entity)
+        components = component_scope(feature, entity)
+        anchors = anchor_signatures(feature, entity)
+        return {
+            "problem_code": problem_code,
+            "approval_key": build_approval_key(
+                feature.get("feature_type"),
+                problem_code,
+                components,
+                anchors,
+                semantic_safe=False,
+            ),
+            "component_scope": components,
+            "anchor_signatures": anchors,
+            "match_mode": "template_set",
+            "resolution_confidence": "low",
+            "resolution_source": "rollback_legacy",
+            "semantic_safe": False,
+            "ambiguity": False,
+            "matched_rule": None,
+            "supporting_codes": collect_problem_codes(feature, entity),
+            "subtype": None,
+        }
     resolution = resolve_problem(feature, entity)
     problem_code = resolution.problem_code
     if not problem_code:
@@ -489,6 +534,7 @@ def approval_identity(feature: Mapping[str, Any], entity: Mapping[str, Any] | No
         "ambiguity": resolution.ambiguity,
         "matched_rule": resolution.matched_rule,
         "supporting_codes": list(resolution.supporting_codes),
+        "subtype": resolution.subtype,
     }
 
 
@@ -502,17 +548,17 @@ def is_canonical_problem_code(code: str | None) -> bool:
 
 
 def same_approval_identity(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
-    left_resolution = resolve_problem(left)
-    right_resolution = resolve_problem(right)
-    left_code = derive_problem_code(left)
-    right_code = derive_problem_code(right)
-    left_semantic_safe = left_resolution.semantic_safe
-    right_semantic_safe = right_resolution.semantic_safe
+    left_identity = approval_identity(left)
+    right_identity = approval_identity(right)
+    left_code = left_identity["problem_code"]
+    right_code = right_identity["problem_code"]
+    left_semantic_safe = bool(left_identity["semantic_safe"])
+    right_semantic_safe = bool(right_identity["semantic_safe"])
 
     left_key = str(left.get("approval_key") or "").strip()
     right_key = str(right.get("approval_key") or "").strip()
-    left_v2_key = approval_identity(left)["approval_key"]
-    right_v2_key = approval_identity(right)["approval_key"]
+    left_v2_key = left_identity["approval_key"]
+    right_v2_key = right_identity["approval_key"]
     left_legacy = bool(left_key and left_key != left_v2_key)
     right_legacy = bool(right_key and right_key != right_v2_key)
 

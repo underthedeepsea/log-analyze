@@ -237,7 +237,17 @@ def _attach_source_facts(
         "provider": provider,
         "model": model,
     }
-    attached.update(approval_identity(attached, entity))
+    identity = approval_identity(attached, entity)
+    attached.update(identity)
+    attached["problem_resolution"] = {
+        "confidence": identity["resolution_confidence"],
+        "semantic_safe": bool(identity["semantic_safe"]),
+        "ambiguity": bool(identity["ambiguity"]),
+        "evidence_source": identity["resolution_source"],
+        "matched_rule": identity["matched_rule"],
+        "supporting_codes": list(identity["supporting_codes"]),
+        "subtype": identity["subtype"],
+    }
     return attached
 
 

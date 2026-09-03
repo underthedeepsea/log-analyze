@@ -17,6 +17,7 @@ class ProblemResolution:
     evidence_source: str
     matched_rule: str | None
     supporting_codes: tuple[str, ...]
+    subtype: str | None = None
 
 
 _UNKNOWN_CODES = frozenset({
@@ -111,6 +112,7 @@ class _Match:
     source: str
     confidence: str
     matched_rule: str | None
+    subtype: str | None = None
 
 
 def _alias_key(value: str) -> str:
@@ -352,14 +354,22 @@ def _template_matches(source: Mapping[str, Any]) -> list[_Match]:
                  r"(?:volume\s+)?subpath.{0,45}(?:cleanup|clean\s*up|remove|delete)", text):
         matches.append(_Match(
             "kubernetes.volume.subpath_cleanup_failure", "selected_template_pattern", "high",
-            "volume_subpath_cleanup_v1",
+            "volume_subpath_cleanup_v1", "volume_subpath",
         ))
-    elif re.search(r"orphaned\s+pod|volume\s+paths?\s+still\s+present|"
-                   r"volume\s+subpaths?\s+still\s+present|"
-                   r"(?:pod|volume).{0,40}directory\s+not\s+empty", text):
+    elif re.search(r"volume\s+subpaths?\s+still\s+present", text):
         matches.append(_Match(
             "kubernetes.kubelet.orphaned_pod_residual", "selected_template_pattern", "high",
-            "orphaned_pod_residual_v1",
+            "orphaned_pod_residual_v1", "volume_subpath",
+        ))
+    elif re.search(r"(?:pod|volume).{0,40}directory\s+not\s+empty", text):
+        matches.append(_Match(
+            "kubernetes.kubelet.orphaned_pod_residual", "selected_template_pattern", "high",
+            "orphaned_pod_residual_v1", "directory_not_empty",
+        ))
+    elif re.search(r"orphaned\s+pod|volume\s+paths?\s+still\s+present", text):
+        matches.append(_Match(
+            "kubernetes.kubelet.orphaned_pod_residual", "selected_template_pattern", "high",
+            "orphaned_pod_residual_v1", "volume_path",
         ))
     if re.search(r"(?:failed\s+to\s+)?unmount(?:ing)?\s+(?:the\s+)?volume|"
                  r"unmountvolume|volume.{0,30}unmount", text):
@@ -529,6 +539,7 @@ def _resolution(
         match.source,
         match.matched_rule,
         tuple(codes),
+        match.subtype,
     )
 
 

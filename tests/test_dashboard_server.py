@@ -147,7 +147,7 @@ def test_database_status_and_restart_candidate_configuration_are_available(dashb
     assert saved["candidate"]["provider"] == "postgres"
     assert saved["candidate"]["password_configured"] is False
     assert saved["restart_required"] is True
-    assert health["version"] == "1.36.2"
+    assert health["version"] == "1.36.3"
     assert health["storage"] == "sqlite"
 
 

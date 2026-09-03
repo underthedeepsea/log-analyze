@@ -224,3 +224,21 @@ def test_selected_oom_uses_resolver_safety_for_approval_key():
     ) != build_approval_key(
         "runtime_sandbox_failure", "linux.memory.oom", ["kubelet"], ["anchor"], semantic_safe=True,
     )
+
+
+def test_semantic_resolver_switch_restores_strict_rollback_identity(monkeypatch):
+    feature = {
+        "feature_type": "runtime_failure",
+        "source_templates": [selected("Out of memory: Killed process <*>")],
+    }
+    enabled_identity = approval_identity(feature)
+
+    monkeypatch.setenv("LOGRISK_SEMANTIC_RESOLVER_ENABLED", "false")
+    disabled_identity = approval_identity(feature)
+
+    assert enabled_identity["match_mode"] == "semantic"
+    assert disabled_identity["problem_code"] == "linux.memory.oom"
+    assert disabled_identity["match_mode"] == "template_set"
+    assert disabled_identity["semantic_safe"] is False
+    assert disabled_identity["resolution_source"] == "rollback_legacy"
+    assert disabled_identity["approval_key"] != enabled_identity["approval_key"]

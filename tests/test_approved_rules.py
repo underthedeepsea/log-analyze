@@ -321,6 +321,16 @@ def test_generic_wrapper_rule_does_not_get_semantic_canonical_key(tmp_path):
     assert stored.get("canonical_approval_key") is None
 
 
+def test_disabled_semantic_resolver_skips_pre_llm_rule_reuse(tmp_path, monkeypatch):
+    store = ApprovedRuleStore(tmp_path / "rules.json")
+    stored = store.upsert_feature(oom_feature())
+
+    monkeypatch.setenv("LOGRISK_SEMANTIC_RESOLVER_ENABLED", "false")
+
+    assert store.match_feature(oom_feature()) == []
+    assert stored["match_mode"] == "semantic"
+
+
 def test_template_set_entity_rejects_missing_component_evidence(tmp_path):
     store = ApprovedRuleStore(tmp_path / "rules.json")
     stored = store.upsert_feature(feature())

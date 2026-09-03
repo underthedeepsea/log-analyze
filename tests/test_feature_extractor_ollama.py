@@ -104,6 +104,8 @@ def test_generate_features_sanitizes_evidence_and_owns_source_facts(monkeypatch)
     assert feature["model"] == "qwen3:1.7b"
     assert feature["problem_code"] == "linux.memory.oom"
     assert feature["approval_key"].startswith("appr_")
+    assert feature["problem_resolution"]["semantic_safe"] is True
+    assert feature["problem_resolution"]["matched_rule"] == "linux_oom_v1"
 
 
 def test_generate_features_uses_prompt_registry_and_writes_trace(monkeypatch, tmp_path):

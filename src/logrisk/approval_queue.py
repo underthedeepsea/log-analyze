@@ -184,6 +184,7 @@ def build_review_groups(candidates: list[Mapping[str, Any]]) -> list[dict[str, A
             "evidence_source": identity["resolution_source"],
             "matched_rule": identity["matched_rule"],
             "supporting_codes": list(identity["supporting_codes"]),
+            "subtype": identity["subtype"],
         }
         grouped[review_key].append(candidate)
         identities[review_key] = {
@@ -220,6 +221,9 @@ def build_review_groups(candidates: list[Mapping[str, Any]]) -> list[dict[str, A
             "resolution_source": identity["resolution_source"],
             "semantic_safe": identity["semantic_safe"],
             "ambiguity": identity["ambiguity"],
+            "resolution_subtype": (
+                (representative.get("problem_resolution") or {}).get("subtype")
+            ),
             "title": str(representative.get("title") or ""),
             "summary": str(representative.get("summary") or ""),
             "importance": str(representative.get("importance") or "medium"),
@@ -232,3 +236,40 @@ def build_review_groups(candidates: list[Mapping[str, Any]]) -> list[dict[str, A
             "representative": _safe_representative(representative),
         })
     return result
+
+
+def approval_metrics(
+    candidates: list[Mapping[str, Any]],
+    groups: list[Mapping[str, Any]] | None = None,
+) -> dict[str, int | float]:
+    """Return bounded approval metrics from the same pending-candidate view."""
+
+    seen_candidate_ids: set[str] = set()
+    semantic_safe_count = 0
+    ambiguous_count = 0
+    candidate_count = 0
+    for candidate in candidates:
+        if not isinstance(candidate, Mapping) or candidate.get("status") != "pending":
+            continue
+        candidate_id = str(candidate.get("candidate_id") or "")
+        if not candidate_id or candidate_id in seen_candidate_ids:
+            continue
+        seen_candidate_ids.add(candidate_id)
+        identity = approval_identity(candidate)
+        candidate_count += 1
+        semantic_safe_count += int(bool(identity["semantic_safe"]))
+        ambiguous_count += int(bool(identity["ambiguity"]))
+    group_count = len(groups if groups is not None else build_review_groups(candidates))
+    fallback_count = candidate_count - semantic_safe_count
+    return {
+        "logrisk_approval_candidates_total": candidate_count,
+        "logrisk_approval_review_groups": group_count,
+        "logrisk_approval_canonical_candidates": semantic_safe_count,
+        "logrisk_approval_fallback_candidates": fallback_count,
+        "logrisk_approval_ambiguous_candidates": ambiguous_count,
+        "logrisk_approval_semantic_safe_candidates": semantic_safe_count,
+        "canonical_problem_code_coverage": semantic_safe_count / candidate_count if candidate_count else 0.0,
+        "fallback_problem_code_ratio": fallback_count / candidate_count if candidate_count else 0.0,
+        "approval_compression_ratio": 1 - group_count / candidate_count if candidate_count else 0.0,
+        "semantic_ambiguity_ratio": ambiguous_count / candidate_count if candidate_count else 0.0,
+    }

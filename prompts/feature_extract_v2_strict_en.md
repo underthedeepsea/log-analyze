@@ -294,6 +294,12 @@ Do not output fields outside the schema.
 Do not output comments.
 </output_contract>
 
+<single_feature_semantic_constraint>
+Every feature must represent exactly one coherent abnormal pattern.
+If selected templates represent different failure semantics, emit separate features.
+Do not combine unrelated failure patterns into one feature.
+</single_feature_semantic_constraint>
+
 ---
 
 <empty_result_policy>

@@ -184,6 +184,7 @@ def test_candidate_persists_problem_resolution_metadata():
         "evidence_source": "selected_template_pattern",
         "matched_rule": "linux_oom_v1",
         "supporting_codes": ["linux.memory.oom"],
+        "subtype": None,
     }
 
 

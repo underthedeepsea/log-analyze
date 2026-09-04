@@ -105,6 +105,11 @@ _CONCRETE_CODES = frozenset({
     "linux.memory.oom",
 })
 
+
+def concrete_problem_codes() -> tuple[str, ...]:
+    return tuple(sorted(_CONCRETE_CODES))
+
+
 _STATS_OPERATION_PATTERN = re.compile(
     r"failed\s+to\s+get\s+(?:system\s+)?container\s+(?:stats|statistics|info)"
     r"|system\s+container\s+stats"

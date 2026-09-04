@@ -1,6 +1,19 @@
 from __future__ import annotations
 
-from logrisk.feature_semantic_partition import partition_feature_by_semantics
+from logrisk.feature_extractor_ollama import _candidate_id
+from logrisk.feature_semantic_partition import (
+    ProblemPresentation,
+    partition_feature_by_semantics,
+    problem_presentation,
+)
+from logrisk.problem_resolver import concrete_problem_codes
+
+
+def test_every_concrete_code_has_presentation():
+    for problem_code in concrete_problem_codes():
+        presentation = problem_presentation(problem_code)
+        assert presentation is not None
+        assert isinstance(presentation, ProblemPresentation)
 
 
 def test_partition_splits_two_high_confidence_semantics():
@@ -71,3 +84,35 @@ def test_partition_keeps_feature_when_any_selected_template_is_unresolved():
     children = partition_feature_by_semantics(entity, feature)
 
     assert children == [feature]
+
+
+def test_candidate_id_differs_for_mixed_feature_and_each_semantic_child():
+    entity = {
+        "cluster": "kubernetes",
+        "entity_type": "node",
+        "entity_id": "node-a",
+        "window_start": "2026-09-04T00:00:00Z",
+        "top_templates": [
+            {
+                "template_hash": "hash-crash",
+                "component": "kubelet",
+                "template": "CrashLoopBackOff",
+            },
+            {
+                "template_hash": "hash-stats",
+                "component": "kubelet",
+                "template": "Failed to get system container stats",
+            },
+        ],
+    }
+    feature = {
+        "feature_type": "mixed_kubelet_failure",
+        "template_hashes": ["hash-crash", "hash-stats"],
+    }
+
+    children = partition_feature_by_semantics(entity, feature)
+    original_id = _candidate_id(entity, feature)
+    child_ids = [_candidate_id(entity, child) for child in children]
+
+    assert all(child_id != original_id for child_id in child_ids)
+    assert len(set(child_ids)) == len(children)

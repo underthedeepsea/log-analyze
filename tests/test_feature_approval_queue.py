@@ -389,3 +389,42 @@ def test_queue_subtype_describes_the_selected_representative():
 
     assert groups[0]["representative"]["candidate_id"] == "directory"
     assert groups[0]["resolution_subtype"] == "directory_not_empty"
+
+
+def test_queue_separates_container_stats_from_standalone_container_not_found():
+    build_review_groups = importlib.import_module("logrisk.approval_queue").build_review_groups
+    candidates = [
+        {
+            "candidate_id": "stats-with-missing-container",
+            "status": "pending",
+            "feature_type": "kubelet_container_stats_error",
+            "source_templates": [{
+                "template_hash": "stats-hash",
+                "component": "kubelet",
+                "template": (
+                    "Failed to get system container stats: "
+                    "failed to get container info: unknown container"
+                ),
+            }],
+        },
+        {
+            "candidate_id": "standalone-not-found",
+            "status": "pending",
+            "feature_type": "kubelet_container_runtime_error",
+            "source_templates": [{
+                "template_hash": "not-found-hash",
+                "component": "kubelet",
+                "template": (
+                    'ContainerStatus "<id>" from runtime service failed: '
+                    "rpc error: code = Unknown desc = No such container"
+                ),
+            }],
+        },
+    ]
+
+    groups = build_review_groups(candidates)
+
+    assert {group["review_key"] for group in groups} == {
+        "semantic:kubernetes.runtime.container_stats_failure",
+        "semantic:kubernetes.runtime.container_not_found",
+    }

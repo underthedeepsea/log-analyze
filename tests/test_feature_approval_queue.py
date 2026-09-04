@@ -428,3 +428,85 @@ def test_queue_separates_container_stats_from_standalone_container_not_found():
         "semantic:kubernetes.runtime.container_stats_failure",
         "semantic:kubernetes.runtime.container_not_found",
     }
+
+
+def test_feature_approvals_reports_logical_groups_separately_from_candidate_totals():
+    from logrisk.application.api import ApiFacade
+
+    candidates = [
+        {
+            "candidate_id": "oom-1",
+            "feature_type": "runtime_failure",
+            "status": "pending",
+            "source_templates": [{
+                "template_hash": "oom-template-1",
+                "component": "kernel",
+                "template": "Out of memory: killed process <*>",
+                "count": 1,
+            }],
+        },
+        {
+            "candidate_id": "oom-2",
+            "feature_type": "runtime_failure",
+            "status": "pending",
+            "source_templates": [{
+                "template_hash": "oom-template-2",
+                "component": "kernel",
+                "template": "oom: killed process <*>",
+                "count": 1,
+            }],
+        },
+        {
+            "candidate_id": "oom-3",
+            "feature_type": "runtime_failure",
+            "status": "pending",
+            "source_templates": [{
+                "template_hash": "oom-template-3",
+                "component": "kernel",
+                "template": "Memory exhausted: killed process <*>",
+                "count": 1,
+            }],
+        },
+        {
+            "candidate_id": "cni-1",
+            "feature_type": "cni_network_failure",
+            "status": "pending",
+            "source_templates": [{
+                "template_hash": "cni-template-1",
+                "component": "cni",
+                "template": "NetworkPlugin cni failed: no enough ips",
+                "count": 1,
+            }],
+        },
+        {
+            "candidate_id": "cni-2",
+            "feature_type": "cni_network_failure",
+            "status": "pending",
+            "source_templates": [{
+                "template_hash": "cni-template-2",
+                "component": "cni",
+                "template": "CNI network setup failed: no free IPs",
+                "count": 1,
+            }],
+        },
+    ]
+    facade = ApiFacade(
+        SimpleNamespace(
+            feature_jobs=SimpleNamespace(
+                list_persisted_candidates=lambda **_: candidates,
+            ),
+        ),
+        version="1.36.1",
+    )
+
+    response = facade.feature_approvals({"status": "pending", "page_size": "100"})
+
+    assert response.status == 200
+    assert response.body["total_groups"] == 2
+    assert response.body["total_candidates"] == 5
+    assert len(response.body["items"]) == 2
+    assert {item["review_key"] for item in response.body["items"]} == {
+        "semantic:kubernetes.cni.ip_exhaustion",
+        "semantic:linux.memory.oom",
+    }
+    assert {item["candidate_count"] for item in response.body["items"]} == {3, 2}

@@ -747,10 +747,17 @@ def test_review_workbench_uses_manual_refresh_and_separate_counts():
 
 def test_review_workbench_disables_automatic_polling():
     source = (FRONTEND / "src" / "app.js").read_text(encoding="utf-8")
+    review_guard = source.index('if (view !== "review")')
+    review_start = source.rfind("    useEffect(function () {", 0, review_guard)
+    review_end = source.index("    async function loadFile", review_guard)
+    review_effect = source[review_start:review_end]
 
     assert "const REVIEW_AUTO_POLLING = false;" in source
     assert "reviewVisibilityRefresh" not in source
     assert "startReviewPolling" not in source
+    assert 'loadApprovalQueue({ mode: "initial" })' in review_effect
+    for marker in ("refreshApprovalQueue", "startPolling", "setInterval", "visibilitychange", "document.hidden", "3000"):
+        assert marker not in review_effect
 
 
 def test_review_workbench_bundles_are_identical():

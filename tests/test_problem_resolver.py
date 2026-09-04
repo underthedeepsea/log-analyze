@@ -4,9 +4,8 @@ import hashlib
 
 import pytest
 
-import logrisk.problem_resolver as problem_resolver
 from logrisk.approval_dedup import approval_identity, build_approval_key, derive_problem_code
-from logrisk.problem_resolver import ProblemResolution, resolve_problem
+from logrisk.problem_resolver import ProblemResolution, resolve_problem, resolve_selected_template
 
 
 def selected(template: str, *, category: str = "runtime", component: str = "kubelet") -> dict:
@@ -66,6 +65,7 @@ def test_container_stats_operation_keeps_stats_as_primary_and_not_found_as_subty
 
     assert resolution.problem_code == "kubernetes.runtime.container_stats_failure"
     assert resolution.subtype == "container_not_found"
+    assert resolution.matched_rule == "container_stats_failure_v2"
     assert resolution.semantic_safe is True
     assert resolution.ambiguity is False
 
@@ -83,18 +83,73 @@ def test_standalone_no_such_container_remains_container_not_found():
 
     assert resolution.problem_code == "kubernetes.runtime.container_not_found"
     assert resolution.subtype is None
+    assert resolution.matched_rule == "container_not_found_v1"
     assert resolution.semantic_safe is True
 
 
-def test_resolve_selected_template_preserves_generic_wrapper_safety():
-    resolver = getattr(problem_resolver, "resolve_selected_template", None)
-    assert callable(resolver)
-
-    resolution = resolver(selected("CNI plugin failed", category="network"))
-
-    assert resolution.problem_code == "kubernetes.cni.plugin_failure"
-    assert resolution.semantic_safe is False
-    assert resolution.ambiguity is False
+@pytest.mark.parametrize(
+    ("template", "category", "expected"),
+    [
+        pytest.param(
+            "Failed to get system container stats",
+            "runtime",
+            ProblemResolution(
+                "kubernetes.runtime.container_stats_failure",
+                "high",
+                True,
+                False,
+                "selected_template_pattern",
+                "container_stats_failure_v2",
+                ("kubernetes.runtime.container_stats_failure",),
+                None,
+            ),
+            id="safe-concrete",
+        ),
+        pytest.param(
+            "failed to pull image: unauthorized and manifest unknown",
+            "image",
+            ProblemResolution(
+                None,
+                "high",
+                False,
+                True,
+                "selected_template_pattern",
+                None,
+                (
+                    "kubernetes.image.pull_not_found",
+                    "kubernetes.image.pull_unauthorized",
+                ),
+                None,
+            ),
+            id="multi-concrete-ambiguity",
+        ),
+        pytest.param(
+            "unclassified runtime condition",
+            "runtime",
+            ProblemResolution(None, "low", False, False, "fallback", None, (), None),
+            id="low-confidence-fallback",
+        ),
+        pytest.param(
+            "CNI plugin failed",
+            "network",
+            ProblemResolution(
+                "kubernetes.cni.plugin_failure",
+                "high",
+                False,
+                False,
+                "selected_template_pattern",
+                "cni_plugin_failure_wrapper_v1",
+                ("kubernetes.cni.plugin_failure",),
+                None,
+            ),
+            id="generic-wrapper",
+        ),
+    ],
+)
+def test_resolve_selected_template_covers_all_outcomes(
+    template: str, category: str, expected: ProblemResolution,
+):
+    assert resolve_selected_template(selected(template, category=category)) == expected
 
 
 def test_t2_selected_ip_evidence_wins_over_summary_pollution():

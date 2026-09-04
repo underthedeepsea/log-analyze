@@ -3,6 +3,9 @@
 .approval-workspace{display:grid;grid-template-columns:minmax(220px,.72fr) minmax(320px,1.15fr) minmax(320px,1fr);gap:12px;align-items:start}
 .approval-feature-list,.evidence-panel,.review-editor{min-height:600px}
 .approval-feature-list .feature-list,.evidence-body{max-height:650px;overflow:auto}
+.review-group-head-meta{display:flex;align-items:center;gap:10px;font-size:12px;color:var(--muted)}
+.review-refresh-button{min-height:30px;padding:0 12px;white-space:nowrap}
+.review-refresh-button:disabled{opacity:.55;cursor:not-allowed}
 .evidence-body{padding:12px}
 .evidence-notice{padding:9px 10px;border:1px solid #ffd7c1;background:#fff8f4;color:#955331;border-radius:8px;font-size:9px;line-height:1.5;margin-bottom:10px}
 .evidence-relation{display:grid;grid-template-columns:auto 1fr;gap:5px 10px;align-items:center;padding:10px;margin-bottom:10px;border:1px solid #e5e8ec;background:#f7f8fa;border-radius:9px}.evidence-relation b{font-size:9px;color:var(--orange-dark)}.evidence-relation span{font-size:9px;color:#4d5967}.evidence-relation small{grid-column:2;font-size:8px;color:var(--muted)}

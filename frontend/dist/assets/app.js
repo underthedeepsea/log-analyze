@@ -2,6 +2,7 @@
   "use strict";
   const h = React.createElement;
   const { useEffect, useMemo, useRef, useState } = React;
+  const REVIEW_AUTO_POLLING = false;
   const INLINE_RESULT_MAX_BYTES = 10 * 1024 * 1024;
   const LARGE_CHUNK_BYTES = 1024 * 1024;
   const DEPLOYMENT_API_BASE = String(window.LOGRISK_CONFIG && window.LOGRISK_CONFIG.apiBase || "").replace(/\/$/, "");
@@ -457,7 +458,7 @@
   function ReviewGroupList(props) {
     const groups = props.groups || [];
     return h("section", { className: "surface approval-feature-list" },
-      h("div", { className: "surface-head" }, h("b", null, "待审批 Review Group"), h("span", null, (props.totalCandidates || 0) + " 个候选")),
+      h("div", { className: "surface-head" }, h("b", null, "待审批 Review Group"), h("div", { className: "review-group-head-meta" }, (props.totalGroups || 0) + " 组 · " + (props.totalCandidates || 0) + " 个候选", h("button", { type: "button", className: "secondary-button review-refresh-button", disabled: props.refreshing, onClick: props.onRefresh }, props.refreshing ? "刷新中…" : "刷新"))),
       h("div", { className: "feature-list" },
         props.loading && h("div", { className: "empty-state" }, "正在加载持久化审批队列…"),
         !props.loading && groups.length === 0 && h("div", { className: "empty-state" }, "暂无待审批特征"),
@@ -2032,7 +2033,10 @@
     const [ollama, setOllama] = useState({ online: false }), [result, setResult] = useState(null), [fileName, setFileName] = useState("");
     const [snapshot, setSnapshot] = useState(null), [jobId, setJobId] = useState(null), [rules, setRules] = useState([]);
     const [ruleLoading, setRuleLoading] = useState(false), [ruleReviewQueue, setRuleReviewQueue] = useState({ items: [], total: 0 });
-    const [approvalQueue, setApprovalQueue] = useState({ items: [], total_groups: 0, total_candidates: 0 }), [approvalLoading, setApprovalLoading] = useState(false), [selectedReviewKey, setSelectedReviewKey] = useState(function () { return new URLSearchParams(window.location.search).get("review_key") || ""; });
+    const [approvalQueue, setApprovalQueue] = useState({ items: [], total_groups: 0, total_candidates: 0 });
+    const [approvalInitialLoading, setApprovalInitialLoading] = useState(false);
+    const [approvalRefreshing, setApprovalRefreshing] = useState(false);
+    const [selectedReviewKey, setSelectedReviewKey] = useState(function () { return new URLSearchParams(window.location.search).get("review_key") || ""; });
     const [reviewDirty, setReviewDirty] = useState(false), [reviewNotice, setReviewNotice] = useState("");
     const [systemMetrics, setSystemMetrics] = useState({ today_llm_logs: 0 });
     const [harness, setHarness] = useState({ trace_enabled: true, current_prompt_id: "feature_extract_v3_compact_strict_json_en" }), [prompts, setPrompts] = useState([]), [traces, setTraces] = useState([]);
@@ -2110,10 +2114,12 @@
       loadHarness(query).catch(function (reason) { setError(reason.message); });
     }
     async function loadHarness(query) { const values = await Promise.all([api.harnessStatus(), api.prompts(), api.traces(query || "?limit=50"), api.modelProfiles()]); setHarness(values[0]); setPrompts(values[1].items || []); setPromptId(values[1].current_prompt_id || "feature_extract_v3_compact_strict_json_en"); setTraces(values[2].items || []); setModelProfiles(values[3]); setModelProfileId(function (current) { return current || values[3].default_profile_id || ""; }); }
-    async function loadApprovalQueue() {
+    async function loadApprovalQueue(options) {
       const requestId = approvalRequestSequence.current + 1;
       approvalRequestSequence.current = requestId;
-      setApprovalLoading(true);
+      const mode = options && options.mode === "refresh" ? "refresh" : "initial";
+      setApprovalInitialLoading(mode === "initial");
+      setApprovalRefreshing(mode === "refresh");
       try {
         let cursor = "", value = { items: [], total_groups: 0, total_candidates: 0, next_cursor: null }, items = [];
         do {
@@ -2136,7 +2142,10 @@
         if (requestId === approvalRequestSequence.current) setError(reason.message);
         throw reason;
       } finally {
-        if (requestId === approvalRequestSequence.current) setApprovalLoading(false);
+        if (requestId === approvalRequestSequence.current) {
+          setApprovalInitialLoading(false);
+          setApprovalRefreshing(false);
+        }
       }
     }
     async function loadAgentRuns(selectedId) {
@@ -2281,30 +2290,10 @@
       return function () { clearInterval(timer); };
     }, [view, (streamingData.tasks || []).map(function (task) { return task.task_id + ":" + task.status + ":" + task.updated_at; }).join("|")]);
     useEffect(function () {
-      if (view !== "review") return undefined;
-      let timer = null;
-      function stopPolling() {
-        if (timer !== null) {
-          clearInterval(timer);
-          timer = null;
-        }
-      }
-      function refreshApprovalQueue() { loadApprovalQueue().catch(function () {}); }
-      function startPolling() {
-        stopPolling();
-        if (!document.hidden) timer = setInterval(function () { if (!document.hidden) refreshApprovalQueue(); }, 3000);
-      }
-      refreshApprovalQueue();
-      function onVisibilityChange() {
-        if (document.hidden) stopPolling();
-        else { refreshApprovalQueue(); startPolling(); }
-      }
-      document.addEventListener("visibilitychange", onVisibilityChange);
-      startPolling();
+      if (view !== "review") return;
+      loadApprovalQueue({ mode: "initial" }).catch(function () {});
       return function () {
         approvalRequestSequence.current += 1;
-        stopPolling();
-        document.removeEventListener("visibilitychange", onVisibilityChange);
       };
     }, [view]);
     async function loadFile(file) { if (!file) return; setBusy(true); setError(""); setUploadProgress(null); setPreprocessProgress(null); try { const next = await api.analyzeFile(file, { onUploadProgress: setUploadProgress, onPreprocessProgress: setPreprocessProgress }); setResult(next); setFileName(file.name); setSnapshot(null); setJobId(null); changeView("overview"); } catch (reason) { setError(reason.message); } finally { setBusy(false); } }
@@ -2333,7 +2322,7 @@
         );
         const resolved = Number(updated.auto_resolved_count || 0);
         setReviewNotice(changes.status === "approved" ? "已批准该 Review Group，已同步收敛 " + resolved + " 个重复候选。" : "已驳回该 Review Group 下仍待审批的候选。");
-        await Promise.all([loadApprovalQueue(), loadRules()]);
+        await Promise.all([loadApprovalQueue({ mode: "refresh" }), loadRules()]);
         return updated;
       } catch (reason) {
         setError(reviewFailureMessage(reason));
@@ -2396,7 +2385,16 @@
         view === "agentWorkflows" && h(AgentWorkflowsPage, { data: agentWorkflowData, profiles: activeProfiles, onRefresh: loadAgentWorkflows, onSelect: loadAgentWorkflows, onReview: function () { changeView("review"); }, onCreateWorkflow: function (definition) { return api.createAgentWorkflow(definition).then(function () { return loadAgentWorkflows(); }); }, onCreateRun: function (workflowId, payload) { return api.createAgentWorkflowRun(workflowId, payload).then(function (created) { return loadAgentWorkflows(created.workflow_run_id); }); }, onAction: changeAgentWorkflow, onRetryNode: function (runId, nodeId) { return api.retryNode(runId, nodeId).then(function () { return loadAgentWorkflows(runId); }); } }),
         view === "review" && h("section", { className: "approval-workspace" },
           reviewNotice && h("div", { className: "review-notice" }, reviewNotice),
-          h(ReviewGroupList, { groups: approvalQueue.items, totalCandidates: approvalQueue.total_candidates, loading: approvalLoading, selectedKey: selectedReviewKey, onSelect: selectReviewGroup }),
+          h(ReviewGroupList, {
+            groups: approvalQueue.items,
+            totalGroups: approvalQueue.total_groups,
+            totalCandidates: approvalQueue.total_candidates,
+            loading: approvalInitialLoading,
+            refreshing: approvalRefreshing,
+            selectedKey: selectedReviewKey,
+            onSelect: selectReviewGroup,
+            onRefresh: function () { return loadApprovalQueue({ mode: "refresh" }).catch(function () {}); },
+          }),
           h(FeatureEvidence, { feature: selectedRepresentative, onSelectTemplate: setSelectedTemplate }),
           h(ReviewEditor, { feature: selectedRepresentative, selectedTemplate: selectedTemplate, onSave: saveReview, onOpenTrace: openTrace, onDirtyChange: setReviewDirty })),
         view === "rules" && h(RuleLibrary, { rules: rules, reviewQueue: ruleReviewQueue, loading: ruleLoading, focusRuleId: ruleFocus, onOpenTrace: openTrace, onChanged: loadRules }),

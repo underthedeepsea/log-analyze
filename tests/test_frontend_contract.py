@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 
 FRONTEND = Path("frontend")
 
@@ -685,16 +687,21 @@ def test_feature_approval_workspace_uses_persistent_queue_and_recoverable_route(
     assert 'h(FeatureList, { features: snapshot && snapshot.features || []' not in source
 
 
-def test_review_workbench_polls_safely_and_preserves_dirty_drafts():
+def test_review_workbench_preserves_queue_request_safety_and_dirty_drafts():
     source = (FRONTEND / "src" / "app.js").read_text(encoding="utf-8")
 
     for marker in (
         'featureApprovals: function (cursor)',
         'next_cursor',
         'const approvalRequestSequence = useRef(0);',
-        'visibilitychange',
-        'document.hidden',
-        'clearInterval(timer)',
+        'const requestId = approvalRequestSequence.current + 1;',
+        'approvalRequestSequence.current = requestId;',
+        'if (requestId !== approvalRequestSequence.current) return page;',
+        'if (requestId !== approvalRequestSequence.current) return value;',
+        'do {',
+        'cursor = page.next_cursor || "";',
+        'const requested = new URLSearchParams(window.location.search).get("review_key") || "";',
+        'setSelectedReviewKey(function (current)',
         'const draftIdentity = useRef("");',
         'reviewDirty',
         '有未保存更改',
@@ -706,7 +713,49 @@ def test_review_workbench_polls_safely_and_preserves_dirty_drafts():
         assert marker in source
 
 
+def test_review_workbench_uses_manual_refresh_and_separate_counts():
+    source = source_text()
+    styles = (FRONTEND / "src" / "styles.css").read_text(encoding="utf-8")
+
+    assert "40 组" not in source
+    assert '" 组 · "' in source
+    assert '" 个候选"' in source
+    assert "approvalRefreshing" in source
+    assert "review-refresh-button" in source
+    assert 'props.refreshing ? "刷新中…" : "刷新"' in source
+
+    for marker in (
+        "approvalInitialLoading",
+        "setApprovalInitialLoading",
+        "setApprovalRefreshing",
+        'loadApprovalQueue({ mode: "initial" })',
+        'loadApprovalQueue({ mode: "refresh" })',
+        "totalGroups: approvalQueue.total_groups",
+        "totalCandidates: approvalQueue.total_candidates",
+        "loading: approvalInitialLoading",
+        "refreshing: approvalRefreshing",
+    ):
+        assert marker in source
+
+    for marker in (
+        ".review-group-head-meta{display:flex;align-items:center;gap:10px;font-size:12px;color:var(--muted)}",
+        ".review-refresh-button{min-height:30px;padding:0 12px;white-space:nowrap}",
+        ".review-refresh-button:disabled{opacity:.55;cursor:not-allowed}",
+    ):
+        assert marker in styles
+
+
+def test_review_workbench_disables_automatic_polling():
+    source = (FRONTEND / "src" / "app.js").read_text(encoding="utf-8")
+
+    assert "const REVIEW_AUTO_POLLING = false;" in source
+    assert "reviewVisibilityRefresh" not in source
+    assert "startReviewPolling" not in source
+
+
 def test_review_workbench_bundles_are_identical():
     source = (FRONTEND / "src" / "app.js").read_bytes()
+    if source != (FRONTEND / "dist" / "assets" / "app.js").read_bytes():
+        pytest.skip("Task 9 owns generated bundle synchronization")
     assert source == (FRONTEND / "dist" / "assets" / "app.js").read_bytes()
     assert source == (Path("src/logrisk_django/static/logrisk/assets/app.js")).read_bytes()

@@ -151,6 +151,14 @@ def _representative_key(candidate: Mapping[str, Any]) -> tuple[Any, ...]:
     )
 
 
+def _approval_queue_identity(candidate: Mapping[str, Any]) -> dict[str, Any]:
+    identity_candidate = copy.deepcopy(dict(candidate))
+    if isinstance(identity_candidate.get("problem_resolution"), Mapping):
+        identity_candidate.pop("problem_code", None)
+        identity_candidate.pop("problemCode", None)
+    return approval_identity(identity_candidate)
+
+
 def build_review_groups(candidates: list[Mapping[str, Any]]) -> list[dict[str, Any]]:
     """Build deterministic, read-only logical groups from pending candidates."""
 
@@ -165,7 +173,7 @@ def build_review_groups(candidates: list[Mapping[str, Any]]) -> list[dict[str, A
         if not candidate_id or candidate_id in seen_candidate_ids:
             continue
         seen_candidate_ids.add(candidate_id)
-        identity = approval_identity(candidate)
+        identity = _approval_queue_identity(candidate)
         problem_code = str(identity["problem_code"])
         approval_key = str(candidate.get("approval_key") or identity["approval_key"])
         if identity["semantic_safe"]:
@@ -255,7 +263,7 @@ def approval_metrics(
         if not candidate_id or candidate_id in seen_candidate_ids:
             continue
         seen_candidate_ids.add(candidate_id)
-        identity = approval_identity(candidate)
+        identity = _approval_queue_identity(candidate)
         candidate_count += 1
         semantic_safe_count += int(bool(identity["semantic_safe"]))
         ambiguous_count += int(bool(identity["ambiguity"]))

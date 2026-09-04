@@ -430,6 +430,45 @@ def test_queue_separates_container_stats_from_standalone_container_not_found():
     }
 
 
+def test_queue_re_resolves_persisted_stats_candidate_without_stale_resolver_code():
+    from logrisk.approval_queue import build_review_groups
+
+    candidate = {
+        "candidate_id": "persisted-stats-stale-code",
+        "job_id": "job-persisted-stats",
+        "approval_group_id": "approval-group-old-container-not-found",
+        "approval_key": "appr_old-container-not-found",
+        "status": "pending",
+        "feature_type": "kubelet_container_stats_error",
+        "problem_code": "kubernetes.runtime.container_not_found",
+        "problem_resolution": {
+            "confidence": "high",
+            "semantic_safe": True,
+            "ambiguity": False,
+            "evidence_source": "selected_template_pattern",
+            "matched_rule": "container_not_found_v1",
+            "supporting_codes": ["kubernetes.runtime.container_not_found"],
+            "subtype": None,
+        },
+        "source_templates": [{
+            "template_hash": "persisted-stats-template",
+            "component": "kubelet",
+            "template": (
+                "Failed to get system container stats: "
+                "failed to get container info: unknown container"
+            ),
+        }],
+    }
+
+    groups = build_review_groups([candidate])
+
+    assert groups[0]["review_key"] == "semantic:kubernetes.runtime.container_stats_failure"
+    assert groups[0]["problem_code"] == "kubernetes.runtime.container_stats_failure"
+    assert groups[0]["semantic_safe"] is True
+    assert groups[0]["ambiguity"] is False
+    assert groups[0]["resolution_subtype"] == "container_not_found"
+
+
 def test_feature_approvals_reports_logical_groups_separately_from_candidate_totals():
     from logrisk.application.api import ApiFacade
 

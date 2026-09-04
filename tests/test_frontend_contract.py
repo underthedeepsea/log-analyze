@@ -1,7 +1,5 @@
 from pathlib import Path
 
-import pytest
-
 
 FRONTEND = Path("frontend")
 
@@ -761,8 +759,14 @@ def test_review_workbench_disables_automatic_polling():
 
 
 def test_review_workbench_bundles_are_identical():
-    source = (FRONTEND / "src" / "app.js").read_bytes()
-    if source != (FRONTEND / "dist" / "assets" / "app.js").read_bytes():
-        pytest.skip("Task 9 owns generated bundle synchronization")
-    assert source == (FRONTEND / "dist" / "assets" / "app.js").read_bytes()
-    assert source == (Path("src/logrisk_django/static/logrisk/assets/app.js")).read_bytes()
+    source_js = (FRONTEND / "src" / "app.js").read_bytes()
+    dist_js = (FRONTEND / "dist" / "assets" / "app.js").read_bytes()
+    django_js = Path("src/logrisk_django/static/logrisk/assets/app.js").read_bytes()
+    assert source_js == dist_js
+    assert source_js == django_js
+
+    source_css = (FRONTEND / "src" / "styles.css").read_bytes()
+    dist_css = (FRONTEND / "dist" / "assets" / "app.css").read_bytes()
+    django_css = Path("src/logrisk_django/static/logrisk/assets/app.css").read_bytes()
+    assert source_css == dist_css
+    assert source_css == django_css

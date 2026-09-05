@@ -97,7 +97,7 @@ from pipeline.manual_import_pipeline import analyze_records
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 MAX_LARGE_UPLOAD_BYTES = 500 * 1024 * 1024
 DEFAULT_MODEL = "qwen3:1.7b"
-APP_VERSION = "1.36.3"
+APP_VERSION = "1.36.4"
 
 
 class DashboardHTTPServer(ThreadingHTTPServer):

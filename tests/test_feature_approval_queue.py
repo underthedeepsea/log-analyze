@@ -389,3 +389,163 @@ def test_queue_subtype_describes_the_selected_representative():
 
     assert groups[0]["representative"]["candidate_id"] == "directory"
     assert groups[0]["resolution_subtype"] == "directory_not_empty"
+
+
+def test_queue_separates_container_stats_from_standalone_container_not_found():
+    build_review_groups = importlib.import_module("logrisk.approval_queue").build_review_groups
+    candidates = [
+        {
+            "candidate_id": "stats-with-missing-container",
+            "status": "pending",
+            "feature_type": "kubelet_container_stats_error",
+            "source_templates": [{
+                "template_hash": "stats-hash",
+                "component": "kubelet",
+                "template": (
+                    "Failed to get system container stats: "
+                    "failed to get container info: unknown container"
+                ),
+            }],
+        },
+        {
+            "candidate_id": "standalone-not-found",
+            "status": "pending",
+            "feature_type": "kubelet_container_runtime_error",
+            "source_templates": [{
+                "template_hash": "not-found-hash",
+                "component": "kubelet",
+                "template": (
+                    'ContainerStatus "<id>" from runtime service failed: '
+                    "rpc error: code = Unknown desc = No such container"
+                ),
+            }],
+        },
+    ]
+
+    groups = build_review_groups(candidates)
+
+    assert {group["review_key"] for group in groups} == {
+        "semantic:kubernetes.runtime.container_stats_failure",
+        "semantic:kubernetes.runtime.container_not_found",
+    }
+
+
+def test_queue_re_resolves_persisted_stats_candidate_without_stale_resolver_code():
+    from logrisk.approval_queue import build_review_groups
+
+    candidate = {
+        "candidate_id": "persisted-stats-stale-code",
+        "job_id": "job-persisted-stats",
+        "approval_group_id": "approval-group-old-container-not-found",
+        "approval_key": "appr_old-container-not-found",
+        "status": "pending",
+        "feature_type": "kubelet_container_stats_error",
+        "problem_code": "kubernetes.runtime.container_not_found",
+        "problem_resolution": {
+            "confidence": "high",
+            "semantic_safe": True,
+            "ambiguity": False,
+            "evidence_source": "selected_template_pattern",
+            "matched_rule": "container_not_found_v1",
+            "supporting_codes": ["kubernetes.runtime.container_not_found"],
+            "subtype": None,
+        },
+        "source_templates": [{
+            "template_hash": "persisted-stats-template",
+            "component": "kubelet",
+            "template": (
+                "Failed to get system container stats: "
+                "failed to get container info: unknown container"
+            ),
+        }],
+    }
+
+    groups = build_review_groups([candidate])
+
+    assert groups[0]["review_key"] == "semantic:kubernetes.runtime.container_stats_failure"
+    assert groups[0]["problem_code"] == "kubernetes.runtime.container_stats_failure"
+    assert groups[0]["semantic_safe"] is True
+    assert groups[0]["ambiguity"] is False
+    assert groups[0]["resolution_subtype"] == "container_not_found"
+
+
+def test_feature_approvals_reports_logical_groups_separately_from_candidate_totals():
+    from logrisk.application.api import ApiFacade
+
+    candidates = [
+        {
+            "candidate_id": "oom-1",
+            "feature_type": "runtime_failure",
+            "status": "pending",
+            "source_templates": [{
+                "template_hash": "oom-template-1",
+                "component": "kernel",
+                "template": "Out of memory: killed process <*>",
+                "count": 1,
+            }],
+        },
+        {
+            "candidate_id": "oom-2",
+            "feature_type": "runtime_failure",
+            "status": "pending",
+            "source_templates": [{
+                "template_hash": "oom-template-2",
+                "component": "kernel",
+                "template": "oom: killed process <*>",
+                "count": 1,
+            }],
+        },
+        {
+            "candidate_id": "oom-3",
+            "feature_type": "runtime_failure",
+            "status": "pending",
+            "source_templates": [{
+                "template_hash": "oom-template-3",
+                "component": "kernel",
+                "template": "Memory exhausted: killed process <*>",
+                "count": 1,
+            }],
+        },
+        {
+            "candidate_id": "cni-1",
+            "feature_type": "cni_network_failure",
+            "status": "pending",
+            "source_templates": [{
+                "template_hash": "cni-template-1",
+                "component": "cni",
+                "template": "NetworkPlugin cni failed: no enough ips",
+                "count": 1,
+            }],
+        },
+        {
+            "candidate_id": "cni-2",
+            "feature_type": "cni_network_failure",
+            "status": "pending",
+            "source_templates": [{
+                "template_hash": "cni-template-2",
+                "component": "cni",
+                "template": "CNI network setup failed: no free IPs",
+                "count": 1,
+            }],
+        },
+    ]
+    facade = ApiFacade(
+        SimpleNamespace(
+            feature_jobs=SimpleNamespace(
+                list_persisted_candidates=lambda **_: candidates,
+            ),
+        ),
+        version="1.36.1",
+    )
+
+    response = facade.feature_approvals({"status": "pending", "page_size": "100"})
+
+    assert response.status == 200
+    assert response.body["total_groups"] == 2
+    assert response.body["total_candidates"] == 5
+    assert len(response.body["items"]) == 2
+    assert {item["review_key"] for item in response.body["items"]} == {
+        "semantic:kubernetes.cni.ip_exhaustion",
+        "semantic:linux.memory.oom",
+    }
+    assert {item["candidate_count"] for item in response.body["items"]} == {3, 2}

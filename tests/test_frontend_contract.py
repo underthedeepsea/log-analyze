@@ -554,7 +554,7 @@ def test_release_docs_describe_current_feature_version():
     assert "## 1.32.0 - 2026-08-10" in release
     assert "## 1.34.0 - 2026-08-13" in release
     assert "## 1.36.1 - 2026-09-01" in release
-    assert "当前版本：`1.36.3`" in readme
+    assert "当前版本：`1.36.4`" in readme
     assert "## 1.24.0 - 2026-07-22" in release
     assert "## 1.24.1 - 2026-07-22" in release
     assert "## 1.24.2 - 2026-07-22" in release
@@ -685,16 +685,21 @@ def test_feature_approval_workspace_uses_persistent_queue_and_recoverable_route(
     assert 'h(FeatureList, { features: snapshot && snapshot.features || []' not in source
 
 
-def test_review_workbench_polls_safely_and_preserves_dirty_drafts():
+def test_review_workbench_preserves_queue_request_safety_and_dirty_drafts():
     source = (FRONTEND / "src" / "app.js").read_text(encoding="utf-8")
 
     for marker in (
         'featureApprovals: function (cursor)',
         'next_cursor',
         'const approvalRequestSequence = useRef(0);',
-        'visibilitychange',
-        'document.hidden',
-        'clearInterval(timer)',
+        'const requestId = approvalRequestSequence.current + 1;',
+        'approvalRequestSequence.current = requestId;',
+        'if (requestId !== approvalRequestSequence.current) return page;',
+        'if (requestId !== approvalRequestSequence.current) return value;',
+        'do {',
+        'cursor = page.next_cursor || "";',
+        'const requested = new URLSearchParams(window.location.search).get("review_key") || "";',
+        'setSelectedReviewKey(function (current)',
         'const draftIdentity = useRef("");',
         'reviewDirty',
         '有未保存更改',
@@ -706,7 +711,62 @@ def test_review_workbench_polls_safely_and_preserves_dirty_drafts():
         assert marker in source
 
 
+def test_review_workbench_uses_manual_refresh_and_separate_counts():
+    source = source_text()
+    styles = (FRONTEND / "src" / "styles.css").read_text(encoding="utf-8")
+
+    assert "40 组" not in source
+    assert '" 组 · "' in source
+    assert '" 个候选"' in source
+    assert "approvalRefreshing" in source
+    assert "review-refresh-button" in source
+    assert 'props.refreshing ? "刷新中…" : "刷新"' in source
+
+    for marker in (
+        "approvalInitialLoading",
+        "setApprovalInitialLoading",
+        "setApprovalRefreshing",
+        'loadApprovalQueue({ mode: "initial" })',
+        'loadApprovalQueue({ mode: "refresh" })',
+        "totalGroups: approvalQueue.total_groups",
+        "totalCandidates: approvalQueue.total_candidates",
+        "loading: approvalInitialLoading",
+        "refreshing: approvalRefreshing",
+    ):
+        assert marker in source
+
+    for marker in (
+        ".review-group-head-meta{display:flex;align-items:center;gap:10px;font-size:12px;color:var(--muted)}",
+        ".review-refresh-button{min-height:30px;padding:0 12px;white-space:nowrap}",
+        ".review-refresh-button:disabled{opacity:.55;cursor:not-allowed}",
+    ):
+        assert marker in styles
+
+
+def test_review_workbench_disables_automatic_polling():
+    source = (FRONTEND / "src" / "app.js").read_text(encoding="utf-8")
+    review_guard = source.index('if (view !== "review")')
+    review_start = source.rfind("    useEffect(function () {", 0, review_guard)
+    review_end = source.index("    async function loadFile", review_guard)
+    review_effect = source[review_start:review_end]
+
+    assert "const REVIEW_AUTO_POLLING = false;" in source
+    assert "reviewVisibilityRefresh" not in source
+    assert "startReviewPolling" not in source
+    assert 'loadApprovalQueue({ mode: "initial" })' in review_effect
+    for marker in ("refreshApprovalQueue", "startPolling", "setInterval", "visibilitychange", "document.hidden", "3000"):
+        assert marker not in review_effect
+
+
 def test_review_workbench_bundles_are_identical():
-    source = (FRONTEND / "src" / "app.js").read_bytes()
-    assert source == (FRONTEND / "dist" / "assets" / "app.js").read_bytes()
-    assert source == (Path("src/logrisk_django/static/logrisk/assets/app.js")).read_bytes()
+    source_js = (FRONTEND / "src" / "app.js").read_bytes()
+    dist_js = (FRONTEND / "dist" / "assets" / "app.js").read_bytes()
+    django_js = Path("src/logrisk_django/static/logrisk/assets/app.js").read_bytes()
+    assert source_js == dist_js
+    assert source_js == django_js
+
+    source_css = (FRONTEND / "src" / "styles.css").read_bytes()
+    dist_css = (FRONTEND / "dist" / "assets" / "app.css").read_bytes()
+    django_css = Path("src/logrisk_django/static/logrisk/assets/app.css").read_bytes()
+    assert source_css == dist_css
+    assert source_css == django_css

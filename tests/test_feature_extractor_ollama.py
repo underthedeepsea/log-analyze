@@ -108,6 +108,120 @@ def test_generate_features_sanitizes_evidence_and_owns_source_facts(monkeypatch)
     assert feature["problem_resolution"]["matched_rule"] == "linux_oom_v1"
 
 
+def test_generate_features_partitions_mixed_feature_before_source_fact_attachment(monkeypatch):
+    payload = entity()
+    payload["top_templates"] = [
+        {
+            "template_hash": "hash-crash",
+            "component": "kubelet",
+            "severity": "ERROR",
+            "template": "CrashLoopBackOff",
+            "count": 2,
+            "first_seen": "2026-06-22T10:01:00+08:00",
+            "last_seen": "2026-06-22T10:02:00+08:00",
+        },
+        {
+            "template_hash": "hash-stats",
+            "component": "kubelet",
+            "severity": "ERROR",
+            "template": "Failed to get system container stats",
+            "count": 3,
+            "first_seen": "2026-06-22T10:03:00+08:00",
+            "last_seen": "2026-06-22T10:04:00+08:00",
+        },
+    ]
+    mixed_feature = {
+        "feature_type": "mixed_kubelet_failure",
+        "title": "Kubelet mixed failure",
+        "summary": "Two selected kubelet evidence templates.",
+        "importance": "high",
+        "template_hashes": ["hash-crash", "hash-stats"],
+        "components": ["kubelet"],
+        "tags": ["kubelet"],
+        "selection_reason": "Selected by model evidence.",
+    }
+
+    monkeypatch.setattr(
+        "logrisk.ai_harness.providers.ollama.urlopen",
+        lambda *args, **kwargs: response([mixed_feature]),
+    )
+
+    candidates = generate_feature_candidates(
+        [payload],
+        model="qwen3:1.7b",
+        cache_enabled=False,
+    )
+
+    assert len(candidates) == 2
+    assert candidates[0]["candidate_id"] != candidates[1]["candidate_id"]
+    assert {item["problem_code"] for item in candidates} == {
+        "kubernetes.pod.crash_loop",
+        "kubernetes.runtime.container_stats_failure",
+    }
+    assert [
+        (
+            item["template_hashes"],
+            item["source_templates"][0]["template_hash"],
+            item["source_templates"][0]["template"],
+            item["occurrence_count"],
+        )
+        for item in candidates
+    ] == [
+        (["hash-crash"], "hash-crash", "CrashLoopBackOff", 2),
+        (["hash-stats"], "hash-stats", "Failed to get system container stats", 3),
+    ]
+    assert all(item["feature_type"] != "mixed_kubelet_failure" for item in candidates)
+    assert all(item["evaluator_result"]["passed"] is True for item in candidates)
+
+
+def test_generate_features_keeps_unresolved_mixed_feature_as_one_candidate(monkeypatch):
+    payload = entity()
+    payload["top_templates"] = [
+        {
+            "template_hash": "hash-known",
+            "component": "kubelet",
+            "severity": "ERROR",
+            "template": "CrashLoopBackOff",
+            "count": 2,
+        },
+        {
+            "template_hash": "hash-opaque",
+            "component": "kubelet",
+            "severity": "ERROR",
+            "template": "opaque vendor runtime failure",
+            "count": 1,
+        },
+    ]
+    mixed_feature = {
+        "feature_type": "mixed_runtime_failure",
+        "title": "Runtime mixed failure",
+        "summary": "One known and one unresolved evidence template.",
+        "importance": "high",
+        "template_hashes": ["hash-known", "hash-opaque"],
+        "components": ["kubelet"],
+        "tags": ["runtime"],
+        "selection_reason": "Selected by model evidence.",
+    }
+
+    monkeypatch.setattr(
+        "logrisk.ai_harness.providers.ollama.urlopen",
+        lambda *args, **kwargs: response([mixed_feature]),
+    )
+
+    candidates = generate_feature_candidates(
+        [payload],
+        model="qwen3:1.7b",
+        cache_enabled=False,
+    )
+
+    assert len(candidates) == 1
+    assert candidates[0]["feature_type"] == "mixed_runtime_failure"
+    assert candidates[0]["template_hashes"] == ["hash-known", "hash-opaque"]
+    assert [
+        source["template_hash"] for source in candidates[0]["source_templates"]
+    ] == ["hash-known", "hash-opaque"]
+
+
 def test_generate_features_uses_prompt_registry_and_writes_trace(monkeypatch, tmp_path):
     prompt_dir = tmp_path / "prompts"
     prompt_dir.mkdir()

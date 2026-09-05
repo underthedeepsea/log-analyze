@@ -21,6 +21,7 @@ from logrisk.ai_harness.model_profile import ModelProfile, ModelProfileRegistry
 from logrisk.ai_harness.prompt_registry import PromptRegistry, PromptTemplate
 from logrisk.ai_harness.providers.ollama import OllamaModelClient
 from logrisk.ai_harness.trace_logger import AITraceLogger
+from logrisk.feature_semantic_partition import partition_feature_by_semantics
 
 
 DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
@@ -464,7 +465,12 @@ def extract_features_for_entity(
         prompt_template,
         connection_snapshot,
     )
-    attached = [_attach_source_facts(entity, feature, model_name, provider) for feature in features]
+    partitioned_features = [
+        child
+        for feature in features
+        for child in partition_feature_by_semantics(entity, feature)
+    ]
+    attached = [_attach_source_facts(entity, feature, model_name, provider) for feature in partitioned_features]
     for feature in attached:
         feature["prompt_id"] = selected_prompt
         feature["prompt_hash"] = request_meta["prompt_hash"]

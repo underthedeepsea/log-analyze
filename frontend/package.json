@@ -1,7 +1,7 @@
 {
   "name": "logrisk-dashboard",
   "private": true,
-  "version": "1.36.3",
+  "version": "1.36.4",
   "dependencies": {
     "react": "18.3.1",
     "react-dom": "18.3.1"

@@ -3,8 +3,12 @@ import json
 import pytest
 
 from logrisk.approved_rules import ApprovedRuleStore
+from logrisk.ai_harness.model_profile import ModelProfileRegistry
+from logrisk.ai_harness.prompt_registry import PromptRegistry
+from logrisk.ai_harness.trace_logger import AITraceLogger
 from logrisk.database import SQLiteDatabase
 from logrisk.feature_jobs import FeatureJobError, FeatureJobFileStore, FeatureJobManager, validate_result_document
+from logrisk.feature_extractor_ollama import extract_features_for_entity
 from logrisk.processing_metrics import ProcessingMetricsStore
 from logrisk.sqlite_stores import SQLiteApprovalGroupStore, SQLiteApprovedRuleStore, SQLiteFeatureJobStore
 
@@ -185,7 +189,29 @@ def test_candidate_persists_problem_resolution_metadata():
         "matched_rule": "linux_oom_v1",
         "supporting_codes": ["linux.memory.oom"],
         "subtype": None,
+        "missing_selected_ids": [],
+        "unresolved_selected_ids": [],
     }
+
+
+def test_candidate_persists_selected_evidence_diagnostics():
+    def extractor(source, **kwargs):
+        value = candidate(source)
+        value["template_hashes"] = ["missing-selected"]
+        value["source_templates"] = []
+        return [value]
+
+    manager = FeatureJobManager(extractor=extractor, auto_start=False)
+    job_id = manager.create_job(
+        {"summary": {}, "risk_entities": [entity("node-a", 90)]},
+        model="qwen3:1.7b",
+    )
+
+    manager.run_job(job_id)
+
+    resolution = manager.get_job(job_id)["features"][0]["problem_resolution"]
+    assert resolution["missing_selected_ids"] == ["missing-selected"]
+    assert resolution["unresolved_selected_ids"] == []
 
 
 def test_failed_entity_can_be_retried():
@@ -254,6 +280,251 @@ def test_job_passes_selected_prompt_and_job_id_to_extractor():
     assert calls[0]["prompt_id"] == "feature_extract_v2_strict_en"
     assert calls[0]["job_id"] == job_id
     assert manager.get_job(job_id)["prompt_id"] == "feature_extract_v2_strict_en"
+
+
+def test_restored_job_locks_profile_default_prompt_content_and_lineage(monkeypatch, tmp_path):
+    prompt_dir = tmp_path / "prompts"
+    prompt_dir.mkdir()
+    (prompt_dir / "feature_extract_v4_atomic_evidence_en.md").write_text("locked v4 content", encoding="utf-8")
+    profile_config = tmp_path / "profiles.yaml"
+    profile_config.write_text("profiles: {}\n", encoding="utf-8")
+    profile_snapshot = {
+        "profile_id": "locked-v4",
+        "enabled": True,
+        "provider": "ollama",
+        "connection_id": "ollama-local",
+        "model": "qwen3:1.7b",
+        "default_prompt_id": "feature_extract_v4_atomic_evidence_en",
+        "structured_output_mode": "json_schema",
+        "thinking_enabled": False,
+        "evidence_budget": {"max_evidence_chars": 2000},
+        "options": {"temperature": 0},
+    }
+    calls = []
+
+    class Client:
+        def generate_json(self, messages, schema, *, model, timeout, options=None):
+            calls.append(messages[0]["content"])
+            return {"features": [{
+                "feature_type": "resource_pressure",
+                "title": "节点内存耗尽",
+                "summary": "内核 OOM 模板在窗口内重复出现",
+                "importance": "critical",
+                "template_hashes": ["hash-node-a"],
+                "components": ["kernel"],
+                "tags": ["oom", "memory"],
+                "selection_reason": "高风险资源压力信号",
+            }]}
+
+    registry = ModelProfileRegistry(profile_config)
+    monkeypatch.setattr("logrisk.feature_extractor_ollama.PROMPT_REGISTRY", PromptRegistry(prompt_dir))
+    monkeypatch.setattr("logrisk.feature_extractor_ollama.TRACE_LOGGER", AITraceLogger(tmp_path / "traces.jsonl"))
+
+    def configured_extractor(source, **kwargs):
+        profile = registry.from_snapshot(kwargs["profile_snapshot"])
+        return extract_features_for_entity(
+            source,
+            model=profile.model,
+            prompt_id=kwargs["prompt_id"] or profile.default_prompt_id,
+            model_profile=profile,
+            model_client=Client(),
+            cache_enabled=False,
+        )
+
+    source = entity("node-a", 90)
+    source["top_templates"] = [{
+        "template_hash": "hash-node-a",
+        "component": "kernel",
+        "template": "Memory cgroup out of memory Killed process <*>",
+        "count": 2,
+    }]
+    store = FeatureJobFileStore(tmp_path / "jobs")
+    writer = FeatureJobManager(
+        extractor=configured_extractor,
+        persistence=store,
+        auto_start=False,
+        interrupt_on_restore=False,
+    )
+    job_id = writer.create_job(
+        {"summary": {}, "risk_entities": [source]},
+        model="qwen3:1.7b",
+        profile_snapshot=profile_snapshot,
+    )
+
+    restored = FeatureJobManager(
+        extractor=configured_extractor,
+        persistence=store,
+        auto_start=False,
+        interrupt_on_restore=False,
+    )
+    restored.run_job(job_id)
+
+    snapshot = restored.get_job(job_id)
+    assert snapshot["prompt_id"] == "feature_extract_v4_atomic_evidence_en"
+    assert calls == ["locked v4 content"]
+    assert len(snapshot["features"]) == 1
+    assert snapshot["features"][0]["prompt_id"] == "feature_extract_v4_atomic_evidence_en"
+
+
+def test_created_job_persists_and_reuses_immutable_prompt_snapshot_after_restore(tmp_path):
+    prompt_dir = tmp_path / "prompts"
+    prompt_dir.mkdir()
+    prompt_path = prompt_dir / "locked.md"
+    prompt_path.write_text("original registered prompt", encoding="utf-8")
+    registry = PromptRegistry(prompt_dir)
+    observed = []
+
+    def extractor(source, **kwargs):
+        observed.append(kwargs["prompt_snapshot"])
+        return [candidate(source)]
+
+    store = FeatureJobFileStore(tmp_path / "jobs")
+    writer = FeatureJobManager(
+        extractor=extractor,
+        persistence=store,
+        prompt_resolver=lambda prompt_id: dict(registry.load(prompt_id).__dict__),
+        auto_start=False,
+        interrupt_on_restore=False,
+    )
+    job_id = writer.create_job(
+        {"summary": {}, "risk_entities": [entity("node-a", 90)]},
+        model="qwen3:1.7b",
+        prompt_id="locked",
+    )
+    created_snapshot = writer.get_job(job_id)["prompt_snapshot"]
+    prompt_path.write_text("edited registered prompt", encoding="utf-8")
+
+    restored = FeatureJobManager(
+        extractor=extractor,
+        persistence=store,
+        prompt_resolver=lambda prompt_id: dict(registry.load(prompt_id).__dict__),
+        auto_start=False,
+        interrupt_on_restore=False,
+    )
+    restored.run_job(job_id)
+
+    assert observed == [created_snapshot]
+    assert created_snapshot == {
+        "prompt_id": "locked",
+        "sha256": "a2faac09317905ad200bfa234031f128079c37c5e6c3a328f36564aecfb9b85f",
+        "content": "original registered prompt",
+        "path": str(prompt_path),
+        "version": "v1",
+    }
+    assert restored.get_job(job_id)["prompt_snapshot"] == created_snapshot
+
+
+def test_rollback_mode_job_persists_empty_selected_evidence_diagnostics(monkeypatch):
+    monkeypatch.setenv("LOGRISK_SEMANTIC_RESOLVER_ENABLED", "false")
+    manager = FeatureJobManager(
+        extractor=lambda source, **kwargs: [candidate(source)],
+        auto_start=False,
+    )
+    job_id = manager.create_job(
+        {"summary": {}, "risk_entities": [entity("node-a", 90)]},
+        model="qwen3:1.7b",
+    )
+
+    manager.run_job(job_id)
+
+    snapshot = manager.get_job(job_id)
+    assert snapshot["status"] == "completed"
+    resolution = snapshot["features"][0]["problem_resolution"]
+    assert resolution["missing_selected_ids"] == []
+    assert resolution["unresolved_selected_ids"] == []
+
+
+def test_default_manager_resolves_locked_prompt_and_profile_snapshots(monkeypatch, tmp_path):
+    prompt_path = tmp_path / "locked-prompt.md"
+    prompt_path.write_text("locked prompt content", encoding="utf-8")
+    prompt = PromptRegistry(tmp_path).load("locked-prompt")
+    profile_snapshot = {
+        "profile_id": "locked-profile",
+        "provider": "ollama",
+        "connection_id": "ollama-local",
+        "model": "qwen3:1.7b",
+        "default_prompt_id": "locked-prompt",
+        "options": {"temperature": 0},
+        "evidence_budget": {"max_templates": 8, "max_template_chars": 300},
+    }
+    source = entity("node-a", 90)
+    source["top_templates"] = [{
+        "template_hash": "hash-node-a",
+        "component": "kernel",
+        "template": "Memory cgroup out of memory Killed process <*> ",
+        "count": 2,
+    }]
+    captured = {}
+
+    def fake_generate(self, messages, schema, *, model, timeout, options=None):
+        captured.update({
+            "prompt": messages[0]["content"],
+            "model": model,
+            "options": options,
+        })
+        self.last_metadata = {}
+        return {"features": [{
+            "feature_type": "resource_pressure",
+            "title": "节点内存耗尽",
+            "summary": "内核 OOM 模板在窗口内重复出现",
+            "importance": "critical",
+            "template_hashes": ["hash-node-a"],
+            "components": ["kernel"],
+            "tags": ["oom"],
+            "selection_reason": "高风险资源压力信号",
+        }]}
+
+    monkeypatch.setattr(
+        "logrisk.ai_harness.providers.ollama.OllamaModelClient.generate_json",
+        fake_generate,
+    )
+    monkeypatch.setattr(
+        "logrisk.feature_extractor_ollama.TRACE_LOGGER",
+        AITraceLogger(tmp_path / "traces.jsonl"),
+    )
+
+    manager = FeatureJobManager(
+        auto_start=False,
+        prompt_resolver=lambda _prompt_id: dict(prompt.__dict__),
+    )
+    job_id = manager.create_job(
+        {"summary": {}, "risk_entities": [source]},
+        model="qwen3:1.7b",
+        model_profile_id="locked-profile",
+        profile_snapshot=profile_snapshot,
+        cache_enabled=False,
+    )
+
+    manager.run_job(job_id)
+
+    snapshot = manager.get_job(job_id)
+    assert snapshot["status"] == "completed"
+    assert captured["prompt"] == "locked prompt content"
+    assert captured["model"] == "qwen3:1.7b"
+    assert snapshot["features"][0]["prompt_id"] == "locked-prompt"
+
+
+def test_custom_extractor_without_snapshot_kwargs_remains_compatible():
+    captured = {}
+
+    def legacy_extractor(
+        source, *, model, base_url, timeout, prompt_id, job_id, cache_enabled,
+        model_profile_id, provider, connection_snapshot,
+    ):
+        captured.update({"model": model, "prompt_id": prompt_id, "job_id": job_id})
+        return [candidate(source)]
+
+    manager = FeatureJobManager(extractor=legacy_extractor, auto_start=False)
+    job_id = manager.create_job(
+        {"summary": {}, "risk_entities": [entity("node-a", 90)]},
+        model="qwen3:1.7b",
+        profile_snapshot={"profile_id": "legacy-profile"},
+    )
+
+    manager.run_job(job_id)
+
+    assert manager.get_job(job_id)["status"] == "completed"
+    assert captured["job_id"] == job_id
 
 
 def test_review_edit_and_export_only_approved_features():

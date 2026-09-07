@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import fcntl
 import hashlib
+import inspect
 import json
 import os
 import threading
@@ -11,7 +12,7 @@ import uuid
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict
+from typing import Any, Callable, Dict, Mapping
 
 from logrisk.approval_dedup import (
     InMemoryApprovalGroupStore,
@@ -97,6 +98,57 @@ def _sanitize_feature_payload(value: Any) -> Any:
     if isinstance(value, tuple):
         return [_sanitize_feature_payload(item) for item in value]
     return copy.deepcopy(value)
+
+
+def _sanitize_prompt_snapshot(value: Any, *, required: bool = False) -> Dict[str, str] | None:
+    if value is None and not required:
+        return None
+    if not isinstance(value, Mapping):
+        raise FeatureJobError("Prompt 快照无效")
+    snapshot = {
+        field: str(value.get(field) or "")
+        for field in ("prompt_id", "sha256", "content", "path", "version")
+    }
+    if not all(snapshot.values()):
+        raise FeatureJobError("Prompt 快照缺少必填字段")
+    digest = hashlib.sha256(snapshot["content"].encode("utf-8")).hexdigest()
+    if snapshot["sha256"] != digest:
+        raise FeatureJobError("Prompt 快照哈希不匹配")
+    return snapshot
+
+
+def _sanitize_job_payload(value: Mapping[str, Any]) -> Dict[str, Any]:
+    safe = _sanitize_feature_payload({
+        key: item for key, item in value.items() if key != "prompt_snapshot"
+    })
+    prompt_snapshot = _sanitize_prompt_snapshot(value.get("prompt_snapshot"))
+    if prompt_snapshot is not None:
+        safe["prompt_snapshot"] = prompt_snapshot
+    return safe
+
+
+def _invoke_extractor(
+    extractor: Callable[..., list[Dict[str, Any]]],
+    source: Dict[str, Any],
+    kwargs: Dict[str, Any],
+) -> list[Dict[str, Any]]:
+    try:
+        signature = inspect.signature(extractor)
+    except (TypeError, ValueError):
+        return extractor(source, **kwargs)
+    if any(parameter.kind == inspect.Parameter.VAR_KEYWORD for parameter in signature.parameters.values()):
+        return extractor(source, **kwargs)
+    accepted = {
+        name
+        for name, parameter in signature.parameters.items()
+        if parameter.kind in {
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            inspect.Parameter.KEYWORD_ONLY,
+        }
+    }
+    return extractor(source, **{
+        name: value for name, value in kwargs.items() if name in accepted
+    })
 
 
 def _merge_review_owned_fields(
@@ -202,7 +254,7 @@ class FeatureJobFileStore:
     def _write(
         self, job: Dict[str, Any], features: dict[str, Dict[str, Any]]
     ) -> None:
-        safe_job = _sanitize_feature_payload(
+        safe_job = _sanitize_job_payload(
             {key: value for key, value in job.items() if key != "condition"}
         )
         snapshot = {
@@ -240,7 +292,7 @@ class FeatureJobFileStore:
         jobs = []
         for snapshot_path in sorted(self.root.glob("*/snapshot.json")):
             try:
-                job = _sanitize_feature_payload(json.loads(snapshot_path.read_text(encoding="utf-8")))
+                job = _sanitize_job_payload(json.loads(snapshot_path.read_text(encoding="utf-8")))
                 events_path = snapshot_path.with_name("events.jsonl")
                 events = []
                 if events_path.exists():
@@ -647,6 +699,7 @@ class FeatureJobManager:
         observability: Any | None = None,
         interrupt_on_restore: bool = True,
         approval_group_store: Any | None = None,
+        prompt_resolver: Callable[[str], Mapping[str, Any]] | None = None,
     ) -> None:
         self.extractor = extractor
         self.rule_store = rule_store
@@ -657,6 +710,7 @@ class FeatureJobManager:
         self.observability = observability
         self.interrupt_on_restore = bool(interrupt_on_restore)
         self.approval_group_store = approval_group_store if approval_group_store is not None else InMemoryApprovalGroupStore()
+        self.prompt_resolver = prompt_resolver
         self._jobs: Dict[str, Dict[str, Any]] = {}
         self._lock = threading.RLock()
         self._restore_jobs()
@@ -809,7 +863,7 @@ class FeatureJobManager:
         min_score: float = 40,
         base_url: str = DEFAULT_OLLAMA_URL,
         timeout: float = 120,
-        prompt_id: str = FEATURE_PROMPT_ID,
+        prompt_id: str | None = None,
         cache_enabled: bool | None = None,
         model_profile_id: str | None = None,
         retry_count: int = 0,
@@ -841,6 +895,20 @@ class FeatureJobManager:
         source_summary = _sanitize_feature_payload(document.get("summary") or {})
         safe_connection_snapshot = _sanitize_feature_payload(connection_snapshot) if connection_snapshot else None
         safe_profile_snapshot = _sanitize_feature_payload(profile_snapshot) if profile_snapshot else None
+        locked_default_prompt = (
+            safe_profile_snapshot.get("default_prompt_id")
+            if isinstance(safe_profile_snapshot, dict)
+            else None
+        )
+        resolved_prompt_id = str(prompt_id or locked_default_prompt or FEATURE_PROMPT_ID)
+        prompt_snapshot = None
+        if self.prompt_resolver is not None:
+            prompt_snapshot = _sanitize_prompt_snapshot(
+                self.prompt_resolver(resolved_prompt_id),
+                required=True,
+            )
+            if prompt_snapshot["prompt_id"] != resolved_prompt_id:
+                raise FeatureJobError("Prompt 快照 ID 不匹配")
         for source in sorted(
             sources,
             key=lambda item: float(item.get("risk_score") or 0),
@@ -882,7 +950,8 @@ class FeatureJobManager:
                 "provider": str(provider or "ollama"),
                 "base_url": base_url,
                 "timeout": float(timeout),
-                "prompt_id": str(prompt_id or FEATURE_PROMPT_ID),
+                "prompt_id": resolved_prompt_id,
+                "prompt_snapshot": prompt_snapshot,
                 "model_profile_id": model_profile_id,
                 "connection_snapshot": safe_connection_snapshot,
                 "profile_snapshot": safe_profile_snapshot,
@@ -955,6 +1024,8 @@ class FeatureJobManager:
                 "matched_rule": identity["matched_rule"],
                 "supporting_codes": list(identity["supporting_codes"]),
                 "subtype": identity["subtype"],
+                "missing_selected_ids": list(identity.get("missing_selected_ids") or []),
+                "unresolved_selected_ids": list(identity.get("unresolved_selected_ids") or []),
             },
         })
         prepared.setdefault("job_id", job_id)
@@ -1064,10 +1135,22 @@ class FeatureJobManager:
         if candidate_id not in group["candidate_ids"]:
             group["candidate_ids"].append(candidate_id)
 
+        group_rule = None
+        if group.get("rule_id") and self.rule_store:
+            group_rule = next((
+                rule for rule in self.rule_store.list_rules()
+                if str(rule.get("rule_id") or "") == str(group["rule_id"])
+                and str(rule.get("status") or "active") == "active"
+            ), None)
         if (
             group.get("status") in {"approved", "auto_resolved"}
             and group.get("rule_id")
             and (not was_pending or resolve_existing_rule)
+            and (
+                not was_pending
+                or resolved_rule is not None
+                or (group_rule is not None and same_approval_identity(feature, group_rule))
+            )
         ):
             feature.update({
                 "status": "approved",
@@ -1077,7 +1160,7 @@ class FeatureJobManager:
                 "approved_at": feature.get("approved_at") or group.get("updated_at") or _now(),
             })
         if was_pending:
-            feature["resolution_type"] = "manual" if resolved_rule is None and is_new_candidate and existing is None else "group_matched"
+            feature["resolution_type"] = "manual" if feature.get("status") == "pending" else "group_matched"
         primary = str(group.get("primary_candidate_id") or "")
         if primary and primary != candidate_id:
             feature["duplicate_of"] = primary
@@ -1540,18 +1623,22 @@ class FeatureJobManager:
                 retry_count = int(job.get("retry_count") or 0)
                 for attempt in range(retry_count + 1):
                     try:
-                        features = self.extractor(
+                        features = _invoke_extractor(
+                            self.extractor,
                             copy.deepcopy(record["source"]),
-                            model=job["model"],
-                            base_url=job["base_url"],
-                            timeout=job["timeout"],
-                            prompt_id=job["prompt_id"],
-                            job_id=job["job_id"],
-                            cache_enabled=job["cache_enabled"],
-                            model_profile_id=job.get("model_profile_id"),
-                            provider=job.get("provider", "ollama"),
-                            connection_snapshot=copy.deepcopy(job.get("connection_snapshot")),
-                            profile_snapshot=copy.deepcopy(job.get("profile_snapshot")),
+                            {
+                                "model": job["model"],
+                                "base_url": job["base_url"],
+                                "timeout": job["timeout"],
+                                "prompt_id": job["prompt_id"],
+                                "prompt_snapshot": copy.deepcopy(job.get("prompt_snapshot")),
+                                "job_id": job["job_id"],
+                                "cache_enabled": job["cache_enabled"],
+                                "model_profile_id": job.get("model_profile_id"),
+                                "provider": job.get("provider", "ollama"),
+                                "connection_snapshot": copy.deepcopy(job.get("connection_snapshot")),
+                                "profile_snapshot": copy.deepcopy(job.get("profile_snapshot")),
+                            },
                         )
                         break
                     except Exception as exc:
@@ -1715,6 +1802,7 @@ class FeatureJobManager:
                 "model": job["model"],
                 "provider": job.get("provider", "ollama"),
                 "prompt_id": job["prompt_id"],
+                "prompt_snapshot": copy.deepcopy(job.get("prompt_snapshot")),
                 "model_profile_id": job.get("model_profile_id"),
                 "connection_snapshot": copy.deepcopy(job.get("connection_snapshot")),
                 "profile_snapshot": copy.deepcopy(job.get("profile_snapshot")),

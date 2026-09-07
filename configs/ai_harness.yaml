@@ -51,3 +51,10 @@ prompts:
     status: active
     is_default: true
     version: v3
+  - prompt_id: feature_extract_v4_atomic_evidence_en
+    display_name: 日志特征识别 v4 Atomic Evidence
+    description: atomic evidence candidate for controlled evaluation
+    analysis_type: feature_extract
+    status: active
+    is_default: false
+    version: v4

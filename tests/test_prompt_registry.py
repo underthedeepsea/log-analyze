@@ -1,8 +1,11 @@
 import hashlib
+import json
+import re
 
 import pytest
 
 from logrisk.ai_harness.prompt_registry import PromptRegistry, validate_feature_prompt_contract
+from logrisk.feature_extractor_ollama import FeatureExtractionError, _validate_model_feature
 
 
 def test_load_prompt_template_with_hash(tmp_path):
@@ -69,6 +72,9 @@ def test_repo_default_uses_compact_strict_json_v3_prompt():
     assert prompts["feature_extract_v3_compact_strict_json_en"].description == "compact strict JSON for 小参数模型"
     assert prompts["feature_extract_v2_compact_en"].description == "compact for 小参数模型"
     assert prompts["feature_extract_v2_strict_en"].description == "for 大参数模型"
+    assert prompts["feature_extract_v4_atomic_evidence_en"].is_default is False
+    assert prompts["feature_extract_v4_atomic_evidence_en"].version == "v4"
+    assert len(prompts["feature_extract_v4_atomic_evidence_en"].sha256) == 64
 
 
 def test_feature_prompt_contract_requires_single_coherent_anomaly_constraint():
@@ -105,6 +111,31 @@ def test_all_repo_feature_prompts_declare_the_complete_output_contract():
             prompt.content.strip().startswith("```")
             and prompt.content.strip().endswith("```")
         ), prompt.prompt_id
+
+
+def test_v4_example_is_parseable_and_illustrative_hashes_are_not_accepted():
+    content = PromptRegistry("prompts", "configs/ai_harness.yaml").load(
+        "feature_extract_v4_atomic_evidence_en"
+    ).content
+    match = re.search(r"Example output:\s*(\{.*\})\s*\n\n", content, flags=re.DOTALL)
+
+    assert match is not None
+    example = json.loads(match.group(1))
+    expected_fields = {
+        "feature_type",
+        "title",
+        "summary",
+        "importance",
+        "template_hashes",
+        "components",
+        "tags",
+        "selection_reason",
+    }
+    assert example["features"]
+    for feature in example["features"]:
+        assert set(feature) == expected_fields
+        with pytest.raises(FeatureExtractionError, match="未知 template_hash"):
+            _validate_model_feature(feature, {"real-evidence-hash"})
 
 
 def test_update_prompt_records_version_history(tmp_path):

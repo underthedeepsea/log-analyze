@@ -4,7 +4,7 @@
   <img src="frontend/logo/logrisk-app-icon-orange-v2.png" width="112" alt="LOGRISK 应用图标" />
 </p>
 
-当前版本：`1.36.4`。完整变更记录见 [`releas.md`](releas.md)。
+当前版本：`1.37.0`。完整变更记录见 [`releas.md`](releas.md)。
 
 LOGRISK 在本地完成日志规范化、Drain3 模板化、确定性语义增强、风险评分、规则复用、模型特征识别和人工审批。系统只生成可审查、可导出的日志特征，不执行根因分析（RCA），也不会把原始日志直接发送给模型。
 
@@ -146,9 +146,9 @@ bash scripts/dashboard.sh restart
 
 对于内部的 Token、签名或私有 SDK 协议，请选择 `extension` 连接并使用已提交的适配器模板。模板与核心任务链路隔离，连接仅保存适配器 ID、非敏感配置和环境变量名；实际 Token 不会保存或展示。请按 [本地扩展模型 Provider 开发指南](LOCAL_PROVIDER_DEVELOPMENT_GUIDE.md) 在内部环境完成适配。
 
-仓库内置 `qwen3.5:4b-mlx`、`qwen3.5:9b-mlx`、`qwen3:1.7b`、`qwen3.6:35b-a3b` 和 `deepseek-v4:flash` Profile。默认 Profile 仍为 `qwen3_1_7b_fast`，默认 Prompt 为 `feature_extract_v3_compact_strict_json_en`。`qwen3.5:9b-mlx` 使用 262144 tokens 上下文、12000 tokens 推荐输入预算和 2000 tokens 输出预算，默认关闭 Thinking 以提高结构化 JSON 稳定性。
+仓库内置 `qwen3.5:4b-mlx`、`qwen3.5:9b-mlx`、`qwen3:1.7b`、`qwen3.6:35b-a3b` 和 `deepseek-v4:flash` Profile。默认 Profile 仍为 `qwen3_1_7b_fast`，默认 Prompt 为 `feature_extract_v3_compact_strict_json_en`。`feature_extract_v4_atomic_evidence_en` 是注册的非默认候选 Prompt，仅用于受控评测，不会自动切换默认；Qwen3.5 4B Profile 继续使用 v3。`qwen3.5:9b-mlx` 使用 262144 tokens 上下文、12000 tokens 推荐输入预算和 2000 tokens 输出预算，默认关闭 Thinking 以提高结构化 JSON 稳定性。
 
-分析任务可配置自动重试 0–3 次。缺少字段、JSON 无效或结构不合法时，会使用同一连接和 Profile 重试，不会隐式降级。AI Cache 默认启用；相同 Evidence、Prompt、Provider、模型和 Thinking 配置会复用结果。调试时可临时关闭：
+分析任务可配置自动重试 0–3 次。缺少字段、JSON 无效或结构不合法时，会使用同一连接和 Profile 重试，不会隐式降级。AI Cache 默认启用；相同 Evidence、Prompt、Provider、模型、Thinking、有效生成参数和输出 Schema 标识会复用结果。调试时可临时关闭：
 
 ```bash
 AI_CACHE_ENABLED=0 bash scripts/dashboard.sh restart

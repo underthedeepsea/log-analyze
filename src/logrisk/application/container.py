@@ -373,6 +373,8 @@ def build_application_container(
         manager.rule_store = rule_store
     if manager is not None and isinstance(getattr(manager, "approval_group_store", None), InMemoryApprovalGroupStore):
         manager.approval_group_store = approval_group_store
+    if manager is not None and getattr(manager, "prompt_resolver", None) is None:
+        manager.prompt_resolver = lambda prompt_id: dict(prompts.load(prompt_id).__dict__)
     feature_jobs = manager or FeatureJobManager(
         extractor=configured_extractor,
         rule_store=rule_store,
@@ -382,6 +384,7 @@ def build_application_container(
         observability=span_recorder,
         auto_start=config.feature_jobs_auto_start,
         interrupt_on_restore=config.interrupt_feature_jobs,
+        prompt_resolver=lambda prompt_id: dict(prompts.load(prompt_id).__dict__),
     )
     feature_jobs.observability = span_recorder
     rule_governance = RuleGovernanceService(RuleGovernanceRepository(database))
@@ -391,7 +394,7 @@ def build_application_container(
     knowledge_packages = KnowledgePackageService(
         database,
         artifact_store,
-        app_version="1.36.4",
+        app_version="1.37.0",
         adapters=build_domain_adapter_registry(
             prompt_registry=prompts,
             drain_quality=drain_quality,

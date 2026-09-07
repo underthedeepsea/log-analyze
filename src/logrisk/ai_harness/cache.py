@@ -6,7 +6,46 @@ import json
 import os
 import threading
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
+
+
+_SUPPORTED_GENERATION_OPTIONS = frozenset({
+    "temperature",
+    "top_k",
+    "top_p",
+    "min_p",
+    "typical_p",
+    "tfs_z",
+    "repeat_penalty",
+    "repeat_last_n",
+    "num_predict",
+    "num_ctx",
+    "num_keep",
+    "seed",
+    "stop",
+    "think",
+    "structured_output_mode",
+})
+
+
+def safe_generation_options(options: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Return only supported, scalar provider generation controls.
+
+    Connection credentials belong to a provider connection, never to a Profile's
+    generation options.  Building this payload from known controls prevents a
+    newly named credential field from reaching the client, Trace, or cache key.
+    """
+    result: dict[str, Any] = {}
+    for key, value in dict(options or {}).items():
+        if key not in _SUPPORTED_GENERATION_OPTIONS:
+            continue
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            result[key] = value
+        elif key == "stop" and isinstance(value, (list, tuple)) and all(
+            isinstance(item, str) for item in value
+        ):
+            result[key] = list(value)
+    return result
 
 
 class AICache:
@@ -44,6 +83,17 @@ def cache_signature(
     provider: str,
     model: str,
     thinking_enabled: bool | None = None,
+    generation_options: Mapping[str, Any] | None = None,
+    schema_digest: str | None = None,
 ) -> str:
-    raw = "\x1f".join([evidence_hash, prompt_hash, provider, model, str(thinking_enabled)])
+    raw = json.dumps({
+        "version": 2,
+        "evidence_hash": evidence_hash,
+        "prompt_hash": prompt_hash,
+        "provider": provider,
+        "model": model,
+        "thinking_enabled": thinking_enabled,
+        "generation_options": safe_generation_options(generation_options),
+        "schema_digest": schema_digest or "",
+    }, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()

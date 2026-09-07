@@ -5,6 +5,7 @@ import hashlib
 import pytest
 
 from logrisk.approval_dedup import approval_identity, build_approval_key, derive_problem_code
+from logrisk import problem_resolver
 from logrisk.problem_resolver import ProblemResolution, resolve_problem, resolve_selected_template
 
 
@@ -30,6 +31,27 @@ def test_problem_resolution_is_frozen_metadata():
 
     with pytest.raises(AttributeError):
         resolution.problem_code = "changed"
+
+
+def test_selected_evidence_sources_applies_source_precedence_and_selected_id_filtering():
+    feature = {
+        "template_hashes": ["selected-id"],
+        "source_templates": [
+            {"template_fingerprint": "selected-id", "template": "selected"},
+            {"template_fingerprint": "unselected-id", "template": "unselected"},
+        ],
+        "template_signatures": [
+            {"template_fingerprint": "selected-id", "template": "lower precedence"},
+        ],
+    }
+
+    selector = getattr(problem_resolver, "selected_evidence_sources", None)
+    assert selector is not None
+    sources, selected_ids, source_ids = selector(feature)
+
+    assert sources == [{"template_fingerprint": "selected-id", "template": "selected"}]
+    assert selected_ids == frozenset({"selected-id"})
+    assert source_ids == frozenset({"selected-id"})
 
 
 def test_t1_same_container_stats_semantics_ignore_wrapper_and_presentation():
@@ -196,6 +218,69 @@ def test_t4_generic_cni_wrapper_is_not_semantic_safe():
     assert identity["match_mode"] == "template_set"
 
 
+def test_selected_known_and_unknown_templates_are_not_semantic_safe():
+    feature = {
+        "feature_type": "mixed_runtime_failure",
+        "source_templates": [
+            selected("Failed to get system container stats"),
+            selected("opaque vendor cleanup failure"),
+        ],
+    }
+
+    resolution = resolve_problem(feature)
+    identity = approval_identity(feature)
+
+    assert resolution.problem_code == "kubernetes.runtime.container_stats_failure"
+    assert resolution.semantic_safe is False
+    assert resolution.ambiguity is False
+    assert identity["match_mode"] == "template_set"
+
+
+def test_missing_selected_hash_cannot_become_semantic_safe_from_partial_evidence():
+    entity = {"top_templates": [selected("Failed to get system container stats")]}
+    feature = {
+        "feature_type": "mixed_runtime_failure",
+        "template_hashes": [entity["top_templates"][0]["template_hash"], "missing-selected"],
+    }
+
+    resolution = resolve_problem(feature, entity)
+
+    assert resolution.problem_code == "kubernetes.runtime.container_stats_failure"
+    assert resolution.semantic_safe is False
+
+
+def test_missing_selected_hash_with_stale_structured_code_is_unsafe_and_diagnosed():
+    feature = {
+        "feature_type": "mixed_runtime_failure",
+        "template_hashes": ["missing-selected"],
+        "problem_code": "kubernetes.runtime.container_stats_failure",
+    }
+
+    resolution = resolve_problem(feature)
+    identity = approval_identity(feature)
+
+    assert resolution.semantic_safe is False
+    assert resolution.missing_selected_ids == ("missing-selected",)
+    assert identity["match_mode"] == "template_set"
+    assert identity["missing_selected_ids"] == ["missing-selected"]
+
+
+@pytest.mark.parametrize("identifier_field", ["template_hash", "template_fingerprint"])
+def test_bodyless_selected_signature_with_stale_code_is_unsafe_and_diagnosed(identifier_field: str):
+    feature = {
+        "feature_type": "mixed_runtime_failure",
+        "template_hashes": ["selected-id"],
+        "problem_code": "kubernetes.runtime.container_stats_failure",
+        "source_templates": [{identifier_field: "selected-id", "category": "runtime"}],
+    }
+
+    resolution = resolve_problem(feature)
+
+    assert resolution.semantic_safe is False
+    assert resolution.missing_selected_ids == ()
+    assert resolution.unresolved_selected_ids == ("selected-id",)
+
+
 @pytest.mark.parametrize(
     ("template", "expected"),
     [
@@ -210,6 +295,34 @@ def test_t5_cni_concrete_causes_are_distinct(template: str, expected: str):
 
     assert resolution.problem_code == expected
     assert resolution.semantic_safe is True
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        "WorkloadEndpoint <*> not found",
+        "WorkloadEndpoint <*> does not exist",
+    ],
+)
+def test_workload_endpoint_placeholder_not_found_variants_are_resolved(template: str):
+    resolution = resolve_selected_template(selected(template, category="network"))
+
+    assert resolution.problem_code == "kubernetes.cni.workload_endpoint_not_found"
+    assert resolution.semantic_safe is True
+
+
+@pytest.mark.parametrize(
+    "template",
+    [
+        "image <*> not found",
+        "container <*> not found",
+        "WorkloadEndpoint <*> updated successfully",
+    ],
+)
+def test_workload_endpoint_matching_does_not_widen_to_unrelated_not_found(template: str):
+    resolution = resolve_selected_template(selected(template, category="runtime"))
+
+    assert resolution.problem_code != "kubernetes.cni.workload_endpoint_not_found"
 
 
 def test_t6_crashloop_wrappers_share_one_semantic_identity():

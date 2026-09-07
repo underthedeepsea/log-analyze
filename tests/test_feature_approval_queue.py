@@ -357,6 +357,72 @@ def test_queue_preserves_orphaned_volume_subtype_for_reviewers():
     assert groups[0]["representative"]["problem_resolution"]["subtype"] == "volume_subpath"
 
 
+def test_semantic_group_uses_registered_presentation_without_rewriting_members():
+    from logrisk.approval_queue import build_review_groups
+
+    candidate = {
+        "candidate_id": "orphaned-presented",
+        "status": "pending",
+        "feature_type": "pod_cleanup_failure",
+        "title": "孤立 Pod 残留并伴随终止超时",
+        "summary": "终止超时后目录仍然存在。",
+        "source_templates": [{
+            "template_hash": "orphaned-presented-template",
+            "component": "kubelet",
+            "template": "orphaned pod volume paths still present",
+        }],
+    }
+
+    group = build_review_groups([candidate])[0]
+
+    assert group["title"] == "Kubelet 孤立 Pod 残留日志"
+    assert "终止超时" not in group["summary"]
+    assert group["representative"]["title"] == "孤立 Pod 残留并伴随终止超时"
+
+
+def test_modern_unsafe_candidates_ignore_stale_physical_key_for_logical_grouping():
+    from logrisk.approval_queue import build_review_groups
+
+    def candidate(candidate_id, opaque_hash):
+        return {
+            "candidate_id": candidate_id,
+            "status": "pending",
+            "schema_version": "approved_rule_v2",
+            "approval_key": "appr_old_semantic_stats",
+            "approval_group_id": "physical-old-stats",
+            "feature_type": "mixed_runtime_failure",
+            "problem_code": "kubernetes.runtime.container_stats_failure",
+            "source_templates": [
+                {"template_hash": "a-stats", "component": "kubelet", "template": "Failed to get system container stats"},
+                {"template_hash": opaque_hash, "component": "kubelet", "template": "opaque vendor cleanup failure"},
+            ],
+        }
+
+    groups = build_review_groups([candidate("unsafe-a", "z-opaque-a"), candidate("unsafe-b", "z-opaque-b")])
+
+    assert len(groups) == 2
+    assert {group["review_key"] for group in groups} != {"approval:appr_old_semantic_stats"}
+    assert {group["representative"]["approval_key"] for group in groups} == {"appr_old_semantic_stats"}
+    assert {group["representative"]["approval_group_id"] for group in groups} == {"physical-old-stats"}
+
+
+def test_queue_exposes_missing_selected_template_diagnostics():
+    from logrisk.approval_queue import build_review_groups
+
+    candidate = {
+        "candidate_id": "missing-selected-diagnostic",
+        "status": "pending",
+        "feature_type": "mixed_runtime_failure",
+        "template_hashes": ["missing-selected"],
+        "problem_code": "kubernetes.runtime.container_stats_failure",
+    }
+
+    group = build_review_groups([candidate])[0]
+
+    assert group["missing_selected_ids"] == ["missing-selected"]
+    assert group["representative"]["problem_resolution"]["missing_selected_ids"] == ["missing-selected"]
+
+
 def test_queue_subtype_describes_the_selected_representative():
     groups = importlib.import_module("logrisk.approval_queue").build_review_groups([
         {

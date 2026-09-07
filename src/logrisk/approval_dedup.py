@@ -423,9 +423,17 @@ def anchor_signatures(feature: Mapping[str, Any], entity: Mapping[str, Any] | No
     if not anchors:
         return []
 
-    if semantic_resolver_enabled() and resolve_problem(feature, entity).semantic_safe:
+    evaluator_failed = (
+        isinstance(feature.get("evaluator_result"), Mapping)
+        and feature["evaluator_result"].get("passed") is False
+    )
+    if (
+        semantic_resolver_enabled()
+        and not evaluator_failed
+        and resolve_problem(feature, entity).semantic_safe
+    ):
         return []
-    return anchors[:1]
+    return anchors
 
 
 def build_approval_key(
@@ -489,8 +497,15 @@ def approval_identity(feature: Mapping[str, Any], entity: Mapping[str, Any] | No
             "matched_rule": None,
             "supporting_codes": collect_problem_codes(feature, entity),
             "subtype": None,
+            "missing_selected_ids": [],
+            "unresolved_selected_ids": [],
         }
     resolution = resolve_problem(feature, entity)
+    evaluator_failed = (
+        isinstance(feature.get("evaluator_result"), Mapping)
+        and feature["evaluator_result"].get("passed") is False
+    )
+    semantic_safe = resolution.semantic_safe and not evaluator_failed
     problem_code = resolution.problem_code
     if not problem_code:
         sources = _source_templates(feature, entity)
@@ -520,21 +535,23 @@ def approval_identity(feature: Mapping[str, Any], entity: Mapping[str, Any] | No
         problem_code,
         components,
         anchors,
-        semantic_safe=resolution.semantic_safe,
+        semantic_safe=semantic_safe,
     )
     return {
         "problem_code": problem_code,
         "approval_key": approval_key,
         "component_scope": components,
         "anchor_signatures": anchors,
-        "match_mode": "semantic" if resolution.semantic_safe else "template_set",
+        "match_mode": "semantic" if semantic_safe else "template_set",
         "resolution_confidence": resolution.confidence,
         "resolution_source": resolution.evidence_source,
-        "semantic_safe": resolution.semantic_safe,
+        "semantic_safe": semantic_safe,
         "ambiguity": resolution.ambiguity,
         "matched_rule": resolution.matched_rule,
         "supporting_codes": list(resolution.supporting_codes),
         "subtype": resolution.subtype,
+        "missing_selected_ids": list(resolution.missing_selected_ids),
+        "unresolved_selected_ids": list(resolution.unresolved_selected_ids),
     }
 
 
@@ -547,7 +564,67 @@ def is_canonical_problem_code(code: str | None) -> bool:
     )
 
 
+def _exact_template_set_compatible(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
+    schemas = {
+        str(left.get("schema_version") or ""),
+        str(right.get("schema_version") or ""),
+    }
+    if "approved_rule_v1" not in schemas or any(
+        schema not in {"", "approved_rule_v1"} for schema in schemas
+    ):
+        return False
+
+    left_type = str(left.get("feature_type") or "").strip()
+    right_type = str(right.get("feature_type") or "").strip()
+    if not left_type or not right_type:
+        return False
+
+    def pairs(value: Mapping[str, Any]) -> set[tuple[str, str]]:
+        return {
+            (
+                str(item.get("template_fingerprint") or item.get("template_hash") or "").strip(),
+                str(item.get("category") or "").strip().lower(),
+            )
+            for item in _source_templates(value, None)
+            if str(item.get("template_fingerprint") or item.get("template_hash") or "").strip()
+        }
+
+    def selected_ids_covered(value: Mapping[str, Any], available: set[tuple[str, str]]) -> bool:
+        selected = {
+            str(item).strip()
+            for item in _iter_values(value.get("template_hashes"))
+            if str(item).strip()
+        }
+        return not selected or selected.issubset({identity for identity, _ in available})
+
+    left_pairs = pairs(left)
+    right_pairs = pairs(right)
+    if not left_pairs or left_pairs != right_pairs:
+        return False
+    if not selected_ids_covered(left, left_pairs) or not selected_ids_covered(right, right_pairs):
+        return False
+    if normalize_feature_type(left_type) != normalize_feature_type(right_type):
+        return False
+    if component_scope(left) != component_scope(right):
+        return False
+
+    def exact_anchors(value: Mapping[str, Any]) -> list[str]:
+        anchors = _canonical_signatures(value.get("anchor_signatures"))
+        return anchors or ["|".join(pair) for pair in sorted(pairs(value))]
+
+    return exact_anchors(left) == exact_anchors(right)
+
+
 def same_approval_identity(left: Mapping[str, Any], right: Mapping[str, Any]) -> bool:
+    schemas = {
+        str(left.get("schema_version") or "").strip(),
+        str(right.get("schema_version") or "").strip(),
+    }
+    if "approved_rule_v1" in schemas:
+        if any(schema not in {"", "approved_rule_v1"} for schema in schemas):
+            return False
+        return _exact_template_set_compatible(left, right)
+
     left_identity = approval_identity(left)
     right_identity = approval_identity(right)
     left_code = left_identity["problem_code"]
@@ -555,25 +632,13 @@ def same_approval_identity(left: Mapping[str, Any], right: Mapping[str, Any]) ->
     left_semantic_safe = bool(left_identity["semantic_safe"])
     right_semantic_safe = bool(right_identity["semantic_safe"])
 
-    left_key = str(left.get("approval_key") or "").strip()
-    right_key = str(right.get("approval_key") or "").strip()
     left_v2_key = left_identity["approval_key"]
     right_v2_key = right_identity["approval_key"]
-    left_legacy = bool(left_key and left_key != left_v2_key)
-    right_legacy = bool(right_key and right_key != right_v2_key)
-
-    if left_key and right_key and left_key == right_key:
-        return True
-    if left_legacy and right_legacy:
-        return False
     if left_semantic_safe and right_semantic_safe:
         return left_code == right_code
     if left_semantic_safe != right_semantic_safe:
-        return False
-
-    left_key = left_key or left_v2_key
-    right_key = right_key or right_v2_key
-    return bool(left_key) and left_key == right_key
+        return _exact_template_set_compatible(left, right)
+    return bool(left_v2_key) and left_v2_key == right_v2_key
 
 
 def group_id_for_key(approval_key: str) -> str:

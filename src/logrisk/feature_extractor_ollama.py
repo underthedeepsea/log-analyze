@@ -6,9 +6,9 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Mapping
 
-from logrisk.ai_harness.cache import AICache, cache_signature
+from logrisk.ai_harness.cache import AICache, cache_signature, safe_generation_options
 from logrisk.approval_dedup import approval_identity
 from logrisk.ai_harness.evidence_builder import (
     build_feature_evidence,
@@ -67,6 +67,9 @@ FEATURE_RESPONSE_SCHEMA = {
     "required": ["features"],
     "additionalProperties": False,
 }
+FEATURE_RESPONSE_SCHEMA_DIGEST = hashlib.sha256(
+    json.dumps(FEATURE_RESPONSE_SCHEMA, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+).hexdigest()
 
 
 class FeatureExtractionError(RuntimeError):
@@ -191,6 +194,21 @@ def _validate_model_feature(value: Any, known_hashes: set[str]) -> Dict[str, Any
     }
 
 
+def _validate_unique_template_assignments(features: list[Dict[str, Any]]) -> None:
+    owners: dict[str, int] = {}
+    duplicates: set[str] = set()
+    for index, feature in enumerate(features):
+        for template_hash in feature["template_hashes"]:
+            if template_hash in owners:
+                duplicates.add(template_hash)
+            else:
+                owners[template_hash] = index
+    if duplicates:
+        raise FeatureExtractionError(
+            "同一次模型输出重复分配 template_hash: " + ", ".join(sorted(duplicates))
+        )
+
+
 def _candidate_id(entity: Dict[str, Any], feature: Dict[str, Any]) -> str:
     material = "|".join([
         str(entity.get("cluster") or ""),
@@ -248,6 +266,8 @@ def _attach_source_facts(
         "matched_rule": identity["matched_rule"],
         "supporting_codes": list(identity["supporting_codes"]),
         "subtype": identity["subtype"],
+        "missing_selected_ids": identity.get("missing_selected_ids") or [],
+        "unresolved_selected_ids": identity.get("unresolved_selected_ids") or [],
     }
     return attached
 
@@ -265,7 +285,7 @@ def _request_features(
     provider: str = "ollama",
     prompt_template: PromptTemplate | None = None,
     connection_snapshot: dict[str, Any] | None = None,
-) -> tuple[list[Dict[str, Any]], str | None, Dict[str, Any], bool, Dict[str, Any]]:
+) -> tuple[list[Dict[str, Any]], list[Dict[str, Any]], str | None, Dict[str, Any], bool, Dict[str, Any]]:
     prompt = prompt_template or PROMPT_REGISTRY.load(prompt_id)
     if model_profile:
         evidence, evidence_meta = build_feature_evidence(
@@ -274,7 +294,7 @@ def _request_features(
             model_profile_id=model_profile.profile_id,
             return_meta=True,
         )
-        model_options = model_profile.build_model_options()
+        model_options = safe_generation_options(model_profile.build_model_options())
     else:
         evidence, evidence_meta = build_feature_evidence(entity, return_meta=True)
         model_options = {"temperature": 0}
@@ -284,6 +304,8 @@ def _request_features(
         provider,
         model,
         model_profile.thinking.enabled if model_profile else None,
+        generation_options=model_options,
+        schema_digest=FEATURE_RESPONSE_SCHEMA_DIGEST,
     )
     messages = [
         {"role": "system", "content": prompt.content},
@@ -348,6 +370,7 @@ def _request_features(
     }
     try:
         features = [_validate_model_feature(feature, known_hashes) for feature in model_output["features"]]
+        _validate_unique_template_assignments(features)
     except FeatureExtractionError as exc:
         _write_trace(
             prompt=prompt,
@@ -415,7 +438,8 @@ def _request_features(
     )
     if cache_enabled and not cache_hit:
         AI_CACHE.set(signature, model_output)
-    return features, trace_id, evaluator_summary, cache_hit, {
+    return features, evaluator_results, trace_id, evaluator_summary, cache_hit, {
+        "prompt_id": prompt.prompt_id,
         "prompt_hash": prompt.sha256,
         "evidence_hash": evidence_hash(evidence),
         "latency_ms": int((time.perf_counter() - start) * 1000),
@@ -428,7 +452,7 @@ def extract_features_for_entity(
     base_url: str = DEFAULT_OLLAMA_URL,
     timeout: float = 120,
     model_client: ModelClient | None = None,
-    prompt_id: str = FEATURE_PROMPT_ID,
+    prompt_id: str | None = None,
     job_id: str | None = None,
     cache_enabled: bool = True,
     model_profile_id: str | None = None,
@@ -437,13 +461,36 @@ def extract_features_for_entity(
     model_profile: ModelProfile | None = None,
     prompt_template: PromptTemplate | None = None,
     connection_snapshot: dict[str, Any] | None = None,
+    prompt_snapshot: Mapping[str, Any] | None = None,
+    profile_snapshot: Mapping[str, Any] | None = None,
 ) -> list[Dict[str, Any]]:
-    if model_profile is None:
+    if profile_snapshot is not None:
+        if not isinstance(profile_snapshot, Mapping):
+            raise FeatureExtractionError("模型 Profile 快照无效")
+        registry = ModelProfileRegistry(profile_config_path) if profile_config_path else MODEL_PROFILES
+        try:
+            profile = registry.from_snapshot(dict(profile_snapshot))
+        except (KeyError, TypeError, ValueError) as exc:
+            raise FeatureExtractionError("模型 Profile 快照无效") from exc
+    elif model_profile is None:
         registry = ModelProfileRegistry(profile_config_path) if profile_config_path else MODEL_PROFILES
         profile = registry.get(model_profile_id)
     else:
         profile = model_profile
-    resolved_model = model or profile.model
+    if prompt_snapshot is not None:
+        if not isinstance(prompt_snapshot, Mapping):
+            raise FeatureExtractionError("Prompt 快照无效")
+        try:
+            locked_prompt = PromptTemplate(**dict(prompt_snapshot))
+        except (TypeError, ValueError) as exc:
+            raise FeatureExtractionError("Prompt 快照无效") from exc
+        expected_prompt_id = prompt_id or profile.default_prompt_id or FEATURE_PROMPT_ID
+        if locked_prompt.prompt_id != expected_prompt_id:
+            raise FeatureExtractionError("Prompt 快照 ID 不匹配")
+        if hashlib.sha256(locked_prompt.content.encode("utf-8")).hexdigest() != locked_prompt.sha256:
+            raise FeatureExtractionError("Prompt 快照哈希不匹配")
+        prompt_template = locked_prompt
+    resolved_model = profile.model if profile_snapshot is not None else (model or profile.model)
     if not resolved_model or not resolved_model.strip():
         raise FeatureExtractionError("必须指定模型")
     if timeout <= 0:
@@ -451,7 +498,7 @@ def extract_features_for_entity(
     normalized_url = _validate_base_url(base_url)
     model_name = resolved_model.strip()
     selected_prompt = prompt_id or profile.default_prompt_id or FEATURE_PROMPT_ID
-    features, trace_id, evaluator_result, cache_hit, request_meta = _request_features(
+    features, request_evaluator_results, trace_id, evaluator_summary, cache_hit, request_meta = _request_features(
         entity,
         model_name,
         normalized_url,
@@ -465,25 +512,56 @@ def extract_features_for_entity(
         prompt_template,
         connection_snapshot,
     )
-    partitioned_features = [
-        child
-        for feature in features
+    attached = [
+        (_attach_source_facts(entity, child, model_name, provider), request_evaluator_result)
+        for feature, request_evaluator_result in zip(features, request_evaluator_results)
         for child in partition_feature_by_semantics(entity, feature)
     ]
-    attached = [_attach_source_facts(entity, feature, model_name, provider) for feature in partitioned_features]
-    for feature in attached:
-        feature["prompt_id"] = selected_prompt
+    final_evidence = {
+        "entity": {"type": entity.get("entity_type"), "id": entity.get("entity_id")},
+        "affected_entities": entity.get("affected_entities") or [],
+        "templates": sanitized_templates(entity),
+    }
+    for feature, request_evaluator_result in attached:
+        final_evaluator_result = evaluate_feature_output(
+            feature=feature,
+            entity=entity,
+            evidence=final_evidence,
+            final_candidate=True,
+        )
+        candidate_evaluator_result = {
+            "passed": bool(request_evaluator_result.get("passed")) and bool(final_evaluator_result.get("passed")),
+            "errors": [*request_evaluator_result.get("errors", []), *final_evaluator_result.get("errors", [])],
+            "warnings": [*request_evaluator_result.get("warnings", []), *final_evaluator_result.get("warnings", [])],
+            "score": min(float(request_evaluator_result.get("score") or 0.0), float(final_evaluator_result.get("score") or 0.0)),
+            "rule_results": [*request_evaluator_result.get("rule_results", []), *final_evaluator_result.get("rule_results", [])],
+        }
+        feature["prompt_id"] = request_meta["prompt_id"]
         feature["prompt_hash"] = request_meta["prompt_hash"]
         feature["evidence_hash"] = request_meta["evidence_hash"]
         feature["latency_ms"] = request_meta["latency_ms"]
         feature["trace_id"] = trace_id
-        feature["evaluator_result"] = evaluator_result
+        feature["evaluator_result"] = candidate_evaluator_result
+        if not candidate_evaluator_result["passed"]:
+            identity = approval_identity(feature, entity)
+            feature.update(identity)
+            feature["problem_resolution"] = {
+                "confidence": identity["resolution_confidence"],
+                "semantic_safe": bool(identity["semantic_safe"]),
+                "ambiguity": bool(identity["ambiguity"]),
+                "evidence_source": identity["resolution_source"],
+                "matched_rule": identity["matched_rule"],
+                "supporting_codes": list(identity["supporting_codes"]),
+                "subtype": identity["subtype"],
+                "missing_selected_ids": identity.get("missing_selected_ids") or [],
+                "unresolved_selected_ids": identity.get("unresolved_selected_ids") or [],
+            }
         feature["cache_hit"] = cache_hit
         feature["model_profile_id"] = profile.profile_id
         feature["parameter_size"] = profile.parameter_size
         feature["thinking_enabled"] = profile.thinking.enabled
         feature["context_budget"] = profile.evidence_budget.__dict__
-    return attached
+    return [feature for feature, _ in attached]
 
 
 def generate_feature_candidates(

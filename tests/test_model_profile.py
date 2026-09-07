@@ -65,6 +65,7 @@ def test_project_model_profiles_are_loadable():
     }
     assert profiles["qwen3_5_4b_mlx"].model == "qwen3.5:4b-mlx"
     assert profiles["qwen3_5_4b_mlx"].build_model_options()["num_predict"] == 1600
+    assert profiles["qwen3_5_4b_mlx"].default_prompt_id == "feature_extract_v3_compact_strict_json_en"
     assert profiles["qwen3_5_9b_mlx"].model == "qwen3.5:9b-mlx"
     assert profiles["qwen3_5_9b_mlx"].context_window_tokens == 262144
     assert profiles["qwen3_5_9b_mlx"].recommended_input_tokens == 12000

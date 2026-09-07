@@ -13,6 +13,7 @@ from logrisk.approved_rules import (
     normalize_legacy_rule_version,
     validate_v2_rule,
 )
+from logrisk.problem_resolver import resolve_problem
 
 
 def feature(title="内存压力"):
@@ -261,6 +262,34 @@ def test_selected_template_pattern_reuses_canonical_semantic_rule(tmp_path):
     assert rules[semantic["rule_id"]]["components"] == ["containerd"]
 
 
+def test_incomplete_selected_evidence_does_not_reuse_semantic_rule(tmp_path):
+    store = ApprovedRuleStore(tmp_path / "rules.json")
+    safe = {
+        "feature_type": "kubelet_container_stats_failure",
+        "source_templates": [{
+            "template_hash": "stats-rule",
+            "category": "runtime",
+            "component": "kubelet",
+            "template": "Failed to get system container stats",
+        }],
+    }
+    store.upsert_feature(safe)
+    incomplete = {
+        "feature_type": "mixed_runtime_failure",
+        "source_templates": [
+            {**safe["source_templates"][0], "template_hash": "stats-incoming"},
+            {
+                "template_hash": "opaque-incoming",
+                "category": "runtime",
+                "component": "kubelet",
+                "template": "opaque vendor cleanup failure",
+            },
+        ],
+    }
+
+    assert store.match_feature(incomplete) == []
+
+
 def test_semantic_rule_rejects_unregistered_dotted_problem_code(tmp_path):
     store = ApprovedRuleStore(tmp_path / "rules.json")
     rule = store.upsert_feature(cni_feature())
@@ -482,6 +511,41 @@ def test_v1_rule_matching_stays_on_strict_legacy_identity(tmp_path):
         }],
     }) == []
 
+
+def test_v1_stale_physical_key_cannot_match_distinct_safe_problem(tmp_path):
+    legacy = {
+        "rule_id": "legacy-cni-ip-exhaustion",
+        "signature": "legacy-cni-signature",
+        "feature_type": "cni_network_failure",
+        "components": ["kubelet"],
+        "template_signatures": [{"template_hash": "legacy-hash", "category": "network"}],
+        "problem_code": "kubernetes.cni.ip_exhaustion",
+        "approval_key": "appr-stale-physical",
+        "anchor_signatures": ["legacy-hash|network"],
+        "schema_version": "approved_rule_v1",
+        "status": "active",
+    }
+    different = {
+        "schema_version": "approved_rule_v1",
+        "feature_type": "workload_endpoint_failure",
+        "problem_code": "kubernetes.cni.workload_endpoint_not_found",
+        "approval_key": "appr-stale-physical",
+        "template_hashes": ["different-hash"],
+        "components": ["calico"],
+        "source_templates": [{
+            "template_hash": "different-hash",
+            "category": "network",
+            "component": "calico",
+            "template": "WorkloadEndpoint <*> not found",
+        }],
+        "anchor_signatures": ["different-hash|network"],
+    }
+    store = ApprovedRuleStore(tmp_path / "rules.json")
+    store._write_locked([legacy])
+
+    assert resolve_problem(different).semantic_safe is True
+    assert store.match_feature(different) == []
+
     physical = cni_feature(component="kubelet")
     physical["approval_key"] = "appr-v1-physical"
     physical["source_templates"][0].pop("template_fingerprint")
@@ -495,6 +559,7 @@ def test_v1_rule_matching_stays_on_strict_legacy_identity(tmp_path):
             "template_hash": "legacy-hash",
             "category": "network",
             "component": "kubelet",
+            "template": "CNI failed: no enough ips",
         }],
     })] == [legacy["rule_id"]]
     assert store.match_entity({
@@ -506,6 +571,271 @@ def test_v1_rule_matching_stays_on_strict_legacy_identity(tmp_path):
             "component": "kubelet",
         }],
     }) == []
+
+
+def test_legacy_semantic_rule_rejects_incomplete_feature_and_restore_entity_evidence(tmp_path):
+    store = ApprovedRuleStore(tmp_path / "rules.json")
+    legacy = store.upsert_feature(cni_feature())
+    legacy.update({
+        "schema_version": "approved_rule_v1",
+        "approval_key": "appr-v1-semantic",
+        "match_mode": "semantic",
+    })
+    legacy.pop("canonical_approval_key", None)
+    store._write_locked([legacy])
+
+    incomplete_feature = cni_feature()
+    incomplete_feature.update({
+        "template_hashes": ["missing-selected"],
+        "approval_key": "appr-v1-semantic",
+    })
+    restore_entity = {
+        "entity_type": "node",
+        "entity_id": "node-restore",
+        "feature_type": "cni_network_failure",
+        "top_templates": [
+            *cni_feature()["source_templates"],
+            {
+                "template_hash": "opaque-template",
+                "category": "network",
+                "component": "kubelet",
+                "template": "opaque vendor network failure",
+            },
+        ],
+    }
+
+    assert store.match_feature(incomplete_feature) == []
+    assert store.match_entity(restore_entity) == []
+
+
+def test_imported_v1_rule_without_match_mode_rejects_unsafe_feature_and_restore_entity(tmp_path):
+    legacy = normalize_legacy_rule_version({
+        "schema_version": "approved_rule_v1",
+        "rule_id": "legacy-v1-without-match-mode",
+        "signature": "legacy-signature",
+        "feature_type": "cni_network_failure",
+        "components": ["kubelet"],
+        "template_signatures": [{"template_hash": "legacy-hash", "category": "network"}],
+        "approval_key": "appr-v1-physical",
+        "anchor_signatures": ["legacy-hash|network"],
+        "status": "active",
+    }, source=RuleNormalizationSource.LEGACY_IMPORT)
+    store = ApprovedRuleStore(tmp_path / "rules.json")
+    store._write_locked([legacy])
+    incomplete_feature = cni_feature(component="kubelet")
+    incomplete_feature.update({
+        "template_hashes": ["missing-selected"],
+        "approval_key": "appr-v1-physical",
+    })
+    incomplete_feature["source_templates"][0]["template_hash"] = "legacy-hash"
+    incomplete_feature["source_templates"][0].pop("template_fingerprint")
+    restore_entity = {
+        "entity_type": "node",
+        "entity_id": "node-restore",
+        "feature_type": "cni_network_failure",
+        "top_templates": [
+            {
+                "template_hash": "legacy-hash",
+                "category": "network",
+                "component": "kubelet",
+                "template": "CNI failed: no enough ips",
+            },
+            {
+                "template_hash": "opaque-template",
+                "category": "network",
+                "component": "kubelet",
+                "template": "opaque vendor network failure",
+            },
+        ],
+    }
+
+    assert "match_mode" not in legacy
+    assert store.match_feature(incomplete_feature) == []
+    assert store.match_entity(restore_entity) == []
+
+
+def test_bodyless_v1_rule_keeps_exact_feature_and_entity_compatibility(tmp_path):
+    legacy = normalize_legacy_rule_version({
+        "schema_version": "approved_rule_v1",
+        "rule_id": "legacy-bodyless-exact",
+        "signature": "legacy-bodyless-signature",
+        "feature_type": "network_failure",
+        "components": ["kubelet"],
+        "template_signatures": [{"template_hash": "legacy-hash", "category": "network"}],
+        "anchor_signatures": ["legacy-hash|network"],
+        "status": "active",
+    }, source=RuleNormalizationSource.LEGACY_IMPORT)
+    feature = {
+        "schema_version": "approved_rule_v1",
+        "feature_type": "network_failure",
+        "template_hashes": ["legacy-hash"],
+        "components": ["kubelet"],
+        "source_templates": [{"template_hash": "legacy-hash", "category": "network"}],
+        "anchor_signatures": ["legacy-hash|network"],
+    }
+    entity_value = {
+        "feature_type": "network_failure",
+        "components": ["kubelet"],
+        "top_templates": [{
+            "template_hash": "legacy-hash",
+            "category": "network",
+            "component": "kubelet",
+        }],
+        "anchor_signatures": ["legacy-hash|network"],
+    }
+    store = ApprovedRuleStore(tmp_path / "rules.json")
+    store._write_locked([legacy])
+
+    assert [rule["rule_id"] for rule in store.match_feature(feature, entity_value)] == [legacy["rule_id"]]
+    assert [rule["rule_id"] for rule in store.match_entity(entity_value)] == [legacy["rule_id"]]
+
+
+def test_bodyless_v1_feature_uses_exact_selected_evidence_from_entity(tmp_path):
+    legacy = normalize_legacy_rule_version({
+        "schema_version": "approved_rule_v1",
+        "rule_id": "legacy-entity-evidence",
+        "signature": "legacy-entity-evidence-signature",
+        "feature_type": "network_failure",
+        "components": ["kubelet"],
+        "template_signatures": [{"template_hash": "legacy-hash", "category": "network"}],
+        "anchor_signatures": ["legacy-hash|network"],
+        "status": "active",
+    }, source=RuleNormalizationSource.LEGACY_IMPORT)
+    feature = {
+        "schema_version": "approved_rule_v1",
+        "feature_type": "network_failure",
+        "template_hashes": ["legacy-hash"],
+        "components": ["kubelet"],
+        "anchor_signatures": ["legacy-hash|network"],
+    }
+    exact_entity = {
+        "feature_type": "network_failure",
+        "top_templates": [{
+            "template_hash": "legacy-hash",
+            "category": "network",
+            "component": "kubelet",
+        }],
+    }
+    store = ApprovedRuleStore(tmp_path / "rules.json")
+    store._write_locked([legacy])
+
+    assert [rule["rule_id"] for rule in store.match_feature(feature, exact_entity)] == [legacy["rule_id"]]
+
+    missing = {**feature, "template_hashes": ["legacy-hash", "missing-hash"]}
+    assert store.match_feature(missing, exact_entity) == []
+
+    extra_entity = {
+        **exact_entity,
+        "top_templates": [
+            *exact_entity["top_templates"],
+            {
+                "template_hash": "extra-hash",
+                "category": "network",
+                "component": "kubelet",
+            },
+        ],
+    }
+    assert store.match_feature(feature, extra_entity) == []
+
+
+def test_v1_entity_match_rejects_semantically_safe_template_superset(tmp_path):
+    legacy = normalize_legacy_rule_version({
+        "schema_version": "approved_rule_v1",
+        "rule_id": "legacy-safe-cni",
+        "signature": "legacy-safe-cni-signature",
+        "feature_type": "cni_network_failure",
+        "components": ["kubelet"],
+        "template_signatures": [{"template_hash": "legacy-hash", "category": "network"}],
+        "anchor_signatures": ["legacy-hash|network"],
+        "status": "active",
+    }, source=RuleNormalizationSource.LEGACY_IMPORT)
+    safe_superset = {
+        "feature_type": "cni_network_failure",
+        "components": ["kubelet"],
+        "top_templates": [
+            {
+                "template_hash": "legacy-hash",
+                "category": "network",
+                "component": "kubelet",
+                "template": "CNI failed: no enough ips",
+            },
+            {
+                "template_hash": "second-safe-hash",
+                "category": "network",
+                "component": "kubelet",
+                "template": "CNI failed: no enough ips",
+            },
+        ],
+        "anchor_signatures": ["legacy-hash|network", "second-safe-hash|network"],
+    }
+    store = ApprovedRuleStore(tmp_path / "rules.json")
+    store._write_locked([legacy])
+
+    assert resolve_problem(safe_superset, safe_superset).semantic_safe is True
+    assert store.match_entity(safe_superset) == []
+
+
+def test_v1_exact_identity_requires_nonempty_rule_feature_and_entity_types(tmp_path):
+    rule = normalize_legacy_rule_version({
+        "schema_version": "approved_rule_v1",
+        "rule_id": "legacy-required-type",
+        "signature": "legacy-required-type-signature",
+        "feature_type": "network_failure",
+        "components": ["kubelet"],
+        "template_signatures": [{"template_hash": "legacy-hash", "category": "network"}],
+        "anchor_signatures": ["legacy-hash|network"],
+        "status": "active",
+    }, source=RuleNormalizationSource.LEGACY_IMPORT)
+    feature = {
+        "schema_version": "approved_rule_v1",
+        "feature_type": "network_failure",
+        "template_hashes": ["legacy-hash"],
+        "components": ["kubelet"],
+        "source_templates": [{"template_hash": "legacy-hash", "category": "network"}],
+        "anchor_signatures": ["legacy-hash|network"],
+    }
+    entity_value = {
+        "feature_type": "network_failure",
+        "components": ["kubelet"],
+        "top_templates": [{"template_hash": "legacy-hash", "category": "network"}],
+        "anchor_signatures": ["legacy-hash|network"],
+    }
+    missing_rule_type = dict(rule)
+    missing_rule_type.pop("feature_type")
+    missing_feature_type = dict(feature)
+    missing_feature_type.pop("feature_type")
+    missing_entity_type = dict(entity_value)
+    missing_entity_type.pop("feature_type")
+
+    missing_rule_store = ApprovedRuleStore(tmp_path / "missing-rule-type.json")
+    missing_rule_store._write_locked([missing_rule_type])
+    assert missing_rule_store.match_feature(feature) == []
+    assert missing_rule_store.match_entity(entity_value) == []
+    assert missing_rule_store.match_feature(missing_feature_type) == []
+    assert missing_rule_store.match_entity(missing_entity_type) == []
+
+    store = ApprovedRuleStore(tmp_path / "missing-incoming-type.json")
+    store._write_locked([rule])
+    assert store.match_feature(missing_feature_type) == []
+    assert store.match_entity(missing_entity_type) == []
+
+
+def test_unsafe_feature_reuses_only_a_complete_matching_template_set_rule(tmp_path):
+    strict_feature = cni_feature()
+    strict_feature["source_templates"].append({
+        "template_hash": "opaque-template",
+        "category": "network",
+        "component": "kubelet",
+        "template": "opaque vendor network failure",
+    })
+    store = ApprovedRuleStore(tmp_path / "rules.json")
+    stored = store.upsert_feature(strict_feature)
+    incomplete_selected = dict(strict_feature)
+    incomplete_selected["template_hashes"] = ["hash-cni-kubelet", "missing-selected"]
+
+    assert stored["match_mode"] == "template_set"
+    assert store.match_feature(incomplete_selected) == []
+    assert [rule["rule_id"] for rule in store.match_feature(strict_feature)] == [stored["rule_id"]]
 
 
 def test_inactive_rule_gets_distinct_active_replacement_with_lineage(tmp_path):

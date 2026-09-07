@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 from concurrent.futures import ThreadPoolExecutor
 
+import pytest
+
 from logrisk.approval_dedup import (
     approval_identity,
     build_approval_key,
@@ -431,7 +433,7 @@ def test_canonical_identity_ignores_presentation_and_operational_fields():
     assert approval_identity(left)["approval_key"] == approval_identity(right)["approval_key"]
 
 
-def test_historical_v1_keys_still_compare_by_their_physical_key():
+def test_historical_physical_keys_do_not_override_matching_logical_identity():
     left = {
         "feature_type": "cni_network_failure",
         "problem_code": "kubernetes.cni.ip_exhaustion",
@@ -442,9 +444,275 @@ def test_historical_v1_keys_still_compare_by_their_physical_key():
     right = dict(left)
     right["approval_key"] = "appr-v1-right"
 
-    assert not same_approval_identity(left, right)
+    assert same_approval_identity(left, right)
     right["approval_key"] = left["approval_key"]
     assert same_approval_identity(left, right)
+
+
+def test_stale_physical_key_cannot_bridge_safe_and_unsafe_logical_identities():
+    safe = {
+        "feature_type": "kubelet_container_stats_failure",
+        "approval_key": "appr-old-stats",
+        "source_templates": [{
+            "template_hash": "stats",
+            "component": "kubelet",
+            "template": "Failed to get system container stats",
+        }],
+    }
+    unsafe = {
+        "feature_type": "mixed_runtime_failure",
+        "approval_key": "appr-old-stats",
+        "source_templates": [
+            dict(safe["source_templates"][0]),
+            {
+                "template_hash": "opaque",
+                "component": "kubelet",
+                "template": "opaque vendor cleanup failure",
+            },
+        ],
+    }
+
+    assert approval_identity(safe)["semantic_safe"] is True
+    assert approval_identity(unsafe)["semantic_safe"] is False
+    assert not same_approval_identity(safe, unsafe)
+
+
+def test_bodyless_v1_exact_template_identity_survives_semantic_safety_difference():
+    rule = {
+        "schema_version": "approved_rule_v1",
+        "feature_type": "network_failure",
+        "problem_code": "kubernetes.cni.ip_exhaustion",
+        "components": ["kubelet"],
+        "template_signatures": [{"template_hash": "legacy-hash", "category": "network"}],
+        "anchor_signatures": ["legacy-hash|network"],
+        "approval_key": "appr-old-physical",
+    }
+    candidate = {
+        "schema_version": "approved_rule_v1",
+        "feature_type": "network_failure",
+        "template_hashes": ["legacy-hash"],
+        "components": ["kubelet"],
+        "source_templates": [{"template_hash": "legacy-hash", "category": "network"}],
+        "anchor_signatures": ["legacy-hash|network"],
+        "approval_key": "appr-different-physical",
+    }
+
+    assert approval_identity(rule)["semantic_safe"] is True
+    assert approval_identity(candidate)["semantic_safe"] is False
+    assert same_approval_identity(rule, candidate)
+
+
+def _version_boundary_identity(schema_version=None, *, evaluator_passed=None, candidate_id=None):
+    value = {
+        "feature_type": "network_failure",
+        "problem_code": "kubernetes.cni.ip_exhaustion",
+        "components": ["kubelet"],
+        "template_hashes": ["shared-template"],
+        "source_templates": [{
+            "template_hash": "shared-template",
+            "category": "network",
+            "component": "kubelet",
+            "template": "CNI failed: no enough ips",
+            "count": 1,
+        }],
+        "anchor_signatures": ["shared-template|network"],
+    }
+    if schema_version is not None:
+        value["schema_version"] = schema_version
+    if evaluator_passed is not None:
+        value["evaluator_result"] = {"passed": evaluator_passed}
+    if candidate_id is not None:
+        value.update({
+            "candidate_id": candidate_id,
+            "status": "pending",
+            "entity": {"type": "node", "id": candidate_id},
+        })
+    return value
+
+
+def _version_boundary_rule():
+    rule = _version_boundary_identity("approved_rule_v1")
+    rule.update({
+        "rule_id": "legacy-version-boundary",
+        "signature": "legacy-version-boundary-signature",
+        "template_signatures": rule.pop("source_templates"),
+        "status": "active",
+        "approved_at": "2026-06-22T00:00:00+00:00",
+        "created_at": "2026-06-22T00:00:00+00:00",
+        "updated_at": "2026-06-22T00:00:00+00:00",
+        "current_version": 1,
+        "next_review_at": "2026-07-22T00:00:00+00:00",
+    })
+    return rule
+
+
+def _version_boundary_candidate(source, schema_version, candidate_id, *, evaluator_passed=None):
+    value = _version_boundary_identity(
+        schema_version,
+        evaluator_passed=evaluator_passed,
+        candidate_id=candidate_id,
+    )
+    value.update({
+        "cluster": source["cluster"],
+        "window_start": source["window_start"],
+        "window_end": source["window_end"],
+        "risk_score": source["risk_score"],
+        "risk_level": source["risk_level"],
+        "title": "CNI 网络异常",
+        "summary": "CNI 地址池没有可用 IP。",
+        "importance": "high",
+        "tags": ["cni"],
+        "selection_reason": "模板直接记录 CNI 地址耗尽。",
+        "occurrence_count": 1,
+    })
+    return value
+
+
+def test_shared_identity_rejects_explicit_v1_v2_boundary_even_for_safe_and_failed_candidates():
+    rule = _version_boundary_rule()
+    safe_v2 = _version_boundary_identity("approved_rule_v2", evaluator_passed=True)
+    failed_v2 = _version_boundary_identity("approved_rule_v2", evaluator_passed=False)
+
+    assert not same_approval_identity(rule, safe_v2)
+    assert not same_approval_identity(rule, failed_v2)
+
+    unversioned_legacy = _version_boundary_identity()
+    assert same_approval_identity(rule, unversioned_legacy)
+
+
+@pytest.mark.parametrize("missing_side", ["left", "right", "both"])
+def test_shared_v1_identity_requires_nonempty_raw_feature_types(missing_side):
+    left = _version_boundary_identity("approved_rule_v1")
+    right = _version_boundary_identity("approved_rule_v1")
+    if missing_side in {"left", "both"}:
+        left.pop("feature_type")
+    if missing_side in {"right", "both"}:
+        right.pop("feature_type")
+
+    assert not same_approval_identity(left, right)
+
+
+def test_reconcile_does_not_auto_approve_failed_explicit_v2_candidate_for_v1_rule(tmp_path):
+    rule = _version_boundary_rule()
+    rules = ApprovedRuleStore(tmp_path / "rules.json")
+    rules._write_locked([rule])
+    source = entity("node-v2", "2026-06-22T10:00:00+08:00")
+    manager = FeatureJobManager(
+        extractor=lambda current, **kwargs: [_version_boundary_candidate(
+            current, "approved_rule_v2", "candidate-v2", evaluator_passed=False,
+        )],
+        rule_store=rules,
+        auto_start=False,
+    )
+    job_id = manager.create_job({"summary": {}, "risk_entities": [source]}, model="qwen3:1.7b")
+    manager.run_job(job_id)
+
+    result = manager.reconcile_pending_candidates(rule)
+
+    assert result["auto_resolved_candidates"] == 0
+    assert manager.get_job(job_id)["features"][0]["status"] == "pending"
+
+
+def test_group_rejection_does_not_reject_failed_explicit_v2_candidate_for_v1_candidate(tmp_path):
+    sources = [
+        entity("node-v1", "2026-06-22T10:00:00+08:00"),
+        entity("node-v2", "2026-06-22T11:00:00+08:00"),
+    ]
+
+    def extractor(source, **kwargs):
+        schema = "approved_rule_v1" if source["entity_id"] == "node-v1" else "approved_rule_v2"
+        return [_version_boundary_candidate(
+            source,
+            schema,
+            f"candidate-{source['entity_id']}",
+            evaluator_passed=False if schema == "approved_rule_v2" else None,
+        )]
+
+    manager = FeatureJobManager(extractor=extractor, auto_start=False)
+    job_ids = [
+        manager.create_job({"summary": {}, "risk_entities": [source]}, model="qwen3:1.7b")
+        for source in sources
+    ]
+    for job_id in job_ids:
+        manager.run_job(job_id)
+
+    manager.update_feature(
+        job_ids[0],
+        "candidate-node-v1",
+        {"status": "rejected", "review_scope": "approval_identity"},
+    )
+
+    assert manager.get_job(job_ids[1])["features"][0]["status"] == "pending"
+
+
+def test_restore_does_not_inherit_approved_v1_group_into_failed_explicit_v2_candidate(tmp_path):
+    database = SQLiteDatabase(tmp_path / "state.sqlite3")
+    persistence = SQLiteFeatureJobStore(database)
+    groups = SQLiteApprovalGroupStore(database)
+    rules = SQLiteApprovedRuleStore(database)
+    rules._write_locked([_version_boundary_rule()])
+
+    manager = FeatureJobManager(
+        extractor=lambda source, **kwargs: [_version_boundary_candidate(
+            source,
+            "approved_rule_v1",
+            "candidate-v1",
+        )],
+        rule_store=rules,
+        approval_group_store=groups,
+        persistence=persistence,
+        auto_start=False,
+        interrupt_on_restore=False,
+    )
+    first_source = entity("node-v1", "2026-06-22T10:00:00+08:00")
+    first_source["top_templates"] = [dict(_version_boundary_candidate(
+        first_source,
+        "approved_rule_v1",
+        "source-template",
+    )["source_templates"][0])]
+    first_job = manager.create_job(
+        {"summary": {}, "risk_entities": [first_source]},
+        model="qwen3:1.7b",
+    )
+    manager.run_job(first_job)
+    approved = manager.get_job(first_job)["features"][0]
+    assert approved["status"] == "approved"
+
+    second_job = manager.create_job(
+        {"summary": {}, "risk_entities": [entity("node-v2", "2026-06-22T11:00:00+08:00")]},
+        model="qwen3:1.7b",
+    )
+    pending = _version_boundary_candidate(
+        entity("node-v2", "2026-06-22T11:00:00+08:00"),
+        "approved_rule_v2",
+        "candidate-v2",
+        evaluator_passed=False,
+    )
+    pending.update({
+        "job_id": second_job,
+        "approval_key": approved["approval_key"],
+        "approval_group_id": approved["approval_group_id"],
+    })
+    with manager._lock:
+        job = manager._job(second_job)
+        job["status"] = "completed"
+        job["entities"][0]["status"] = "completed"
+        job["entities"][0]["feature_ids"] = ["candidate-v2"]
+        job["features"]["candidate-v2"] = pending
+        manager.persistence.save(job)
+
+    restored = FeatureJobManager(
+        extractor=lambda source, **kwargs: [],
+        rule_store=SQLiteApprovedRuleStore(database),
+        approval_group_store=SQLiteApprovalGroupStore(database),
+        persistence=SQLiteFeatureJobStore(database),
+        auto_start=False,
+        interrupt_on_restore=False,
+    )
+
+    updated = restored.update_feature(second_job, "candidate-v2", {"reviewer_note": "restored"})
+
+    assert updated["status"] == "pending"
 
 
 def test_empty_fallback_keeps_the_historical_v1_digest_material():
@@ -554,6 +822,99 @@ def candidate(source: dict, candidate_id: str) -> dict:
         "provider": "ollama",
         "model": "qwen3:1.7b",
     }
+
+
+def stats_candidate(source: dict, candidate_id: str, *, mixed: bool = False) -> dict:
+    templates = [{
+        "template_hash": "stats-template",
+        "category": "runtime",
+        "component": "kubelet",
+        "template": "Failed to get system container stats",
+        "count": 1,
+    }]
+    if mixed:
+        templates.append({
+            "template_hash": "opaque-template",
+            "category": "runtime",
+            "component": "kubelet",
+            "template": "opaque vendor cleanup failure",
+            "count": 1,
+        })
+    return {
+        **candidate(source, candidate_id),
+        "feature_type": "mixed_runtime_failure" if mixed else "kubelet_container_stats_failure",
+        "problem_code": "kubernetes.runtime.container_stats_failure",
+        "template_hashes": [item["template_hash"] for item in templates],
+        "source_templates": templates,
+        "components": ["kubelet"],
+        "anchor_signatures": ["stats-template|runtime"],
+    }
+
+
+def _stale_stats_manager(tmp_path):
+    manager = FeatureJobManager(
+        extractor=lambda source, **kwargs: [stats_candidate(
+            source,
+            f"candidate-{source['entity_id']}",
+            mixed=source["entity_id"] == "unsafe",
+        )],
+        rule_store=ApprovedRuleStore(tmp_path / "rules.json"),
+        auto_start=False,
+    )
+    safe_job = manager.create_job(
+        {"summary": {}, "risk_entities": [entity("safe", "2026-06-22T10:00:00+08:00")]},
+        model="qwen3:1.7b",
+    )
+    unsafe_job = manager.create_job(
+        {"summary": {}, "risk_entities": [entity("unsafe", "2026-06-22T11:00:00+08:00")]},
+        model="qwen3:1.7b",
+    )
+    manager.run_job(safe_job)
+    manager.run_job(unsafe_job)
+    safe = manager._jobs[safe_job]["features"]["candidate-safe"]
+    unsafe = manager._jobs[unsafe_job]["features"]["candidate-unsafe"]
+    unsafe["approval_key"] = safe["approval_key"]
+    return manager, safe_job, unsafe_job
+
+
+def test_approval_reconciliation_ignores_stale_physical_key_on_unsafe_candidate(tmp_path):
+    manager, safe_job, unsafe_job = _stale_stats_manager(tmp_path)
+
+    manager.update_feature(safe_job, "candidate-safe", {"status": "approved"})
+
+    assert manager.get_job(unsafe_job)["features"][0]["status"] == "pending"
+
+
+def test_group_rejection_ignores_stale_physical_key_on_unsafe_candidate(tmp_path):
+    manager, safe_job, unsafe_job = _stale_stats_manager(tmp_path)
+
+    manager.update_feature(
+        safe_job,
+        "candidate-safe",
+        {"status": "rejected", "review_scope": "approval_identity"},
+    )
+
+    assert manager.get_job(unsafe_job)["features"][0]["status"] == "pending"
+
+
+def test_restored_physical_group_cannot_auto_approve_logically_unsafe_candidate(tmp_path):
+    manager, safe_job, unsafe_job = _stale_stats_manager(tmp_path)
+    approved = manager.update_feature(safe_job, "candidate-safe", {"status": "approved"})
+    unsafe = manager._jobs[unsafe_job]["features"]["candidate-unsafe"]
+    unsafe.update({
+        "status": "pending",
+        "approval_key": approved["approval_key"],
+        "approval_group_id": approved["approval_group_id"],
+    })
+
+    updated = manager.update_feature(
+        unsafe_job,
+        "candidate-unsafe",
+        {"reviewer_note": "restored historical locator"},
+    )
+
+    assert updated["status"] == "pending"
+    assert updated["resolution_type"] == "manual"
 
 
 def test_same_risk_across_nodes_and_windows_uses_one_approval_group(tmp_path):

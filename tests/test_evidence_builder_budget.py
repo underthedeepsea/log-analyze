@@ -1,5 +1,7 @@
+import pytest
+
 from logrisk.ai_harness.context_budget import EvidenceBudget
-from logrisk.ai_harness.evidence_builder import build_feature_evidence
+from logrisk.ai_harness.evidence_builder import _json_chars, build_feature_evidence
 
 
 def entity():
@@ -52,3 +54,81 @@ def test_build_feature_evidence_old_call_stays_compatible():
 
     assert isinstance(evidence, dict)
     assert len(evidence["templates"]) == 3
+
+
+def test_build_feature_evidence_keeps_tail_error_with_explicit_omission_metadata():
+    payload = entity()
+    payload["top_templates"] = [{
+        "template_hash": "tail-error",
+        "component": "runtime",
+        "template": "normal context " * 20 + "FATAL unauthorized image pull",
+        "count": 1,
+    }]
+    evidence, meta = build_feature_evidence(
+        payload,
+        budget=EvidenceBudget(max_template_chars=80, max_evidence_chars=2000),
+        return_meta=True,
+    )
+
+    model_visible = evidence["templates"][0]
+    assert "normal context" in model_visible["template"]
+    assert "FATAL unauthorized image pull" in model_visible["template"]
+    assert "[...omitted... ]" in model_visible["template"]
+    assert model_visible["template_hash"] == "tail-error"
+    assert model_visible["truncation"] == {"strategy": "head_tail", "original_chars": 329, "omitted_chars": 265}
+    assert "template_char_budget" in (meta.truncation_reason or "")
+
+
+def test_evidence_char_budget_preserves_original_truncation_diagnostics():
+    payload = entity()
+    payload["top_templates"] = [{
+        "template_hash": "tail-error",
+        "component": "runtime",
+        "template": "normal context " * 20 + "FATAL unauthorized image pull",
+        "count": 1,
+    }]
+    evidence, meta = build_feature_evidence(
+        payload,
+        budget=EvidenceBudget(max_template_chars=80, max_evidence_chars=450),
+        return_meta=True,
+    )
+
+    assert meta.evidence_chars <= 450
+    assert evidence["templates"][0]["truncation"]["original_chars"] == 329
+    assert evidence["templates"][0]["truncation"]["omitted_chars"] > 0
+
+
+def test_evidence_char_budget_bounds_long_metadata_and_affected_entities():
+    payload = entity()
+    payload["affected_entities"] = [f"service-{index}-" + "x" * 400 for index in range(4)]
+    payload["top_templates"] = [{
+        "template_hash": "metadata-heavy-hash",
+        "component": "runtime",
+        "template": "normal context " * 30 + "FATAL image pull failure",
+        "count": 1,
+        "semantic_fields": {"explanation": "y" * 400},
+        "semantic_tags": ["z" * 200],
+        "typed_parameters": [{"name": "argument", "description": "w" * 400}],
+        "semantic_dictionary_versions": ["dictionary-" + "v" * 200],
+    }]
+    budget = EvidenceBudget(
+        max_templates=1,
+        max_template_chars=120,
+        max_affected_entities=4,
+        max_evidence_chars=520,
+    )
+
+    evidence, meta = build_feature_evidence(payload, budget=budget, return_meta=True)
+
+    assert _json_chars(evidence) <= budget.max_evidence_chars
+    assert meta.evidence_chars == _json_chars(evidence)
+    assert evidence["templates"][0]["template_hash"] == "metadata-heavy-hash"
+    assert "evidence_char_budget" in (meta.truncation_reason or "")
+
+
+def test_evidence_char_budget_rejects_an_unfit_required_envelope():
+    payload = entity()
+    payload["entity_id"] = "node-" + "x" * 500
+
+    with pytest.raises(ValueError, match="max_evidence_chars"):
+        build_feature_evidence(payload, budget=EvidenceBudget(max_evidence_chars=80))

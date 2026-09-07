@@ -18,6 +18,8 @@ class ProblemResolution:
     matched_rule: str | None
     supporting_codes: tuple[str, ...]
     subtype: str | None = None
+    missing_selected_ids: tuple[str, ...] = ()
+    unresolved_selected_ids: tuple[str, ...] = ()
 
 
 _UNKNOWN_CODES = frozenset({
@@ -226,35 +228,86 @@ def _structured_codes(value: Any) -> Iterable[str]:
             yield from _structured_codes(value[key])
 
 
-def _selected_templates(
-    feature: Mapping[str, Any], entity: Mapping[str, Any] | None,
-) -> list[Mapping[str, Any]]:
+def _selected_ids(feature: Mapping[str, Any]) -> frozenset[str]:
+    return frozenset({
+        str(item).strip()
+        for item in _iter_values(feature.get("template_hashes"))
+        if item is not None and str(item).strip()
+    })
+
+
+def _source_ids(sources: Iterable[Mapping[str, Any]]) -> frozenset[str]:
+    return frozenset({
+        str(source.get(field) or "").strip()
+        for source in sources
+        for field in ("template_hash", "template_fingerprint")
+        if str(source.get(field) or "").strip()
+    })
+
+
+def selected_evidence_sources(
+    feature: Mapping[str, Any], entity: Mapping[str, Any] | None = None,
+) -> tuple[list[Mapping[str, Any]], frozenset[str], frozenset[str]]:
+    """Select resolver evidence and its IDs using the canonical precedence rules."""
+
+    selected_ids = _selected_ids(feature)
     for field in ("source_templates", "template_signatures"):
         value = feature.get(field)
         if isinstance(value, list) and value:
-            return [item for item in value if isinstance(item, Mapping)]
+            sources = [item for item in value if isinstance(item, Mapping)]
+            selected = sources if not selected_ids else [
+                item for item in sources
+                if bool({
+                    str(item.get("template_hash") or "").strip(),
+                    str(item.get("template_fingerprint") or "").strip(),
+                } & selected_ids)
+            ]
+            return selected, selected_ids, _source_ids(selected)
 
     if feature.get("top_templates") and entity is feature:
-        return [item for item in feature["top_templates"] if isinstance(item, Mapping)]
+        sources = [item for item in feature["top_templates"] if isinstance(item, Mapping)]
+        return sources, selected_ids, _source_ids(sources)
 
-    selected_hashes = {
-        str(item).strip()
-        for item in _iter_values(feature.get("template_hashes"))
-        if str(item).strip()
-    }
-    if not selected_hashes or not entity:
-        return []
+    if not selected_ids or not entity:
+        return [], selected_ids, frozenset()
     templates = entity.get("top_templates")
     if not isinstance(templates, list):
-        return []
-    return [
+        return [], selected_ids, frozenset()
+    sources = [
         item for item in templates
         if isinstance(item, Mapping)
         and bool({
             str(item.get("template_hash") or "").strip(),
             str(item.get("template_fingerprint") or "").strip(),
-        } & selected_hashes)
+        } & selected_ids)
     ]
+    return sources, selected_ids, _source_ids(sources)
+
+
+def _selected_template_coverage(
+    selected_ids: frozenset[str], sources: Iterable[Mapping[str, Any]], source_ids: frozenset[str],
+) -> bool:
+    """Return whether every explicitly selected template is present as evidence."""
+
+    return bool(sources) and (not selected_ids or selected_ids.issubset(source_ids))
+
+
+def _selection_diagnostics(
+    selected_ids: frozenset[str], sources: list[Mapping[str, Any]], source_ids: frozenset[str],
+    resolutions: list[ProblemResolution],
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    selected = selected_ids or source_ids
+    missing = selected_ids - source_ids
+    unresolved: set[str] = set()
+    for source, resolution in zip(sources, resolutions):
+        identifiers = {
+            str(source.get(field) or "").strip()
+            for field in ("template_hash", "template_fingerprint")
+            if str(source.get(field) or "").strip()
+        } & selected
+        if not (source.get("template") or source.get("pattern")) or not resolution.semantic_safe:
+            unresolved.update(identifiers)
+    return tuple(sorted(missing)), tuple(sorted(unresolved))
 
 
 def _structured_matches(
@@ -315,11 +368,11 @@ def _template_matches(source: Mapping[str, Any]) -> list[_Match]:
     matches: list[_Match] = []
     cni = _cni_context(text)
 
-    if re.search(r"workload[-_ ]?endpoint\s*(?:was\s+)?(?:not found|does not exist)|"
+    if re.search(r"workload[-_ ]?endpoint(?:\s+<\*>)?\s*(?:was\s+)?(?:not found|does not exist)|"
                  r"(?:no such|missing)\s+workload[-_ ]?endpoint", text):
         matches.append(_Match(
             "kubernetes.cni.workload_endpoint_not_found", "selected_template_pattern", "high",
-            "cni_workload_endpoint_not_found_v1",
+            "cni_workload_endpoint_not_found_v2",
         ))
     if cni and re.search(r"(?:delete|deletion|del).{0,50}(?:not supported|unsupported|not implemented)|"
                         r"(?:not supported|unsupported|not implemented).{0,50}(?:delete|deletion)", text):
@@ -542,6 +595,8 @@ def _resolution(
     ambiguity: bool = False,
     default_source: str = "fallback",
     default_confidence: str = "low",
+    missing_selected_ids: tuple[str, ...] = (),
+    unresolved_selected_ids: tuple[str, ...] = (),
 ) -> ProblemResolution:
     values = _unique_matches(matches)
     codes = sorted(_codes(values))
@@ -549,9 +604,15 @@ def _resolution(
         concrete = tuple(sorted(code for code in codes if _is_concrete(code)))
         source = values[0].source if values else default_source
         confidence = values[0].confidence if values else default_confidence
-        return ProblemResolution(None, confidence, False, True, source, None, concrete)
+        return ProblemResolution(
+            None, confidence, False, True, source, None, concrete, None,
+            missing_selected_ids, unresolved_selected_ids,
+        )
     if not codes:
-        return ProblemResolution(None, default_confidence, False, False, default_source, None, ())
+        return ProblemResolution(
+            None, default_confidence, False, False, default_source, None, (), None,
+            missing_selected_ids, unresolved_selected_ids,
+        )
     concrete = [code for code in codes if _is_concrete(code)]
     code = concrete[0] if concrete else codes[0]
     match = next((item for item in values if item.code == code), values[0])
@@ -565,6 +626,8 @@ def _resolution(
         match.matched_rule,
         tuple(codes),
         match.subtype,
+        missing_selected_ids,
+        unresolved_selected_ids,
     )
 
 
@@ -591,7 +654,7 @@ def resolve_problem(
     if not isinstance(feature, Mapping):
         return ProblemResolution(None, "low", False, False, "fallback", None, ())
 
-    sources = _selected_templates(feature, entity)
+    sources, selected_ids, source_ids = selected_evidence_sources(feature, entity)
     structured = _structured_matches(feature, sources)
     selected = _unique_matches(
         match
@@ -605,6 +668,11 @@ def resolve_problem(
     selected_concrete = _codes(selected) & {
         code for code in _codes(selected) if _is_concrete(code)
     }
+    source_resolutions = [resolve_selected_template(source) for source in sources]
+    missing_selected_ids, unresolved_selected_ids = _selection_diagnostics(
+        selected_ids, sources, source_ids, source_resolutions,
+    )
+    selected_contract = bool(selected_ids)
     if structured_concrete and selected_concrete and structured_concrete != selected_concrete:
         return _resolution(
             [
@@ -613,7 +681,65 @@ def resolve_problem(
             ],
             semantic_safe=False,
             ambiguity=True,
+            missing_selected_ids=missing_selected_ids,
+            unresolved_selected_ids=unresolved_selected_ids,
         )
+    if selected_contract:
+        complete_selected_evidence = (
+            _selected_template_coverage(selected_ids, sources, source_ids)
+            and not missing_selected_ids
+            and not unresolved_selected_ids
+            and all(
+                resolution.semantic_safe
+                and not resolution.ambiguity
+                and resolution.confidence == "high"
+                and resolution.problem_code in _CONCRETE_CODES
+                for resolution in source_resolutions
+            )
+        )
+        if complete_selected_evidence:
+            return _resolution(selected, semantic_safe=True)
+        if selected_concrete:
+            return _resolution(
+                selected, semantic_safe=False,
+                missing_selected_ids=missing_selected_ids,
+                unresolved_selected_ids=unresolved_selected_ids,
+            )
+        if structured_concrete:
+            return _resolution(
+                structured, semantic_safe=False,
+                missing_selected_ids=missing_selected_ids,
+                unresolved_selected_ids=unresolved_selected_ids,
+            )
+        return _resolution(
+            selected or structured, semantic_safe=False,
+            missing_selected_ids=missing_selected_ids,
+            unresolved_selected_ids=unresolved_selected_ids,
+        )
+    if sources and any(source.get("template") or source.get("pattern") for source in sources):
+        complete_selected_evidence = (
+            _selected_template_coverage(selected_ids, sources, source_ids)
+            and not unresolved_selected_ids
+            and all(
+                resolution.semantic_safe
+                and not resolution.ambiguity
+                and resolution.confidence == "high"
+                and resolution.problem_code in _CONCRETE_CODES
+                for resolution in source_resolutions
+            )
+        )
+        if complete_selected_evidence:
+            return _resolution(selected, semantic_safe=True)
+        if selected_concrete:
+            return _resolution(
+                selected, semantic_safe=False,
+                unresolved_selected_ids=unresolved_selected_ids,
+            )
+        if structured_concrete:
+            return _resolution(
+                structured, semantic_safe=False,
+                unresolved_selected_ids=unresolved_selected_ids,
+            )
     if structured_concrete or selected_concrete:
         matches = structured if structured_concrete else selected
         return _resolution(matches, semantic_safe=True)

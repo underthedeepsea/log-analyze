@@ -5,6 +5,7 @@ from collections import defaultdict
 from typing import Any, Mapping
 
 from logrisk.approval_dedup import approval_identity
+from logrisk.feature_semantic_partition import problem_presentation
 
 
 _IMPORTANCE_RANK = {"critical": 4, "high": 3, "medium": 2, "low": 1}
@@ -175,7 +176,12 @@ def build_review_groups(candidates: list[Mapping[str, Any]]) -> list[dict[str, A
         seen_candidate_ids.add(candidate_id)
         identity = _approval_queue_identity(candidate)
         problem_code = str(identity["problem_code"])
-        approval_key = str(candidate.get("approval_key") or identity["approval_key"])
+        physical_approval_key = str(candidate.get("approval_key") or identity["approval_key"])
+        approval_key = (
+            physical_approval_key
+            if candidate.get("schema_version") == "approved_rule_v1"
+            else str(identity["approval_key"])
+        )
         if identity["semantic_safe"]:
             review_key = f"semantic:{problem_code}"
             match_mode = "semantic"
@@ -194,6 +200,10 @@ def build_review_groups(candidates: list[Mapping[str, Any]]) -> list[dict[str, A
             "supporting_codes": list(identity["supporting_codes"]),
             "subtype": identity["subtype"],
         }
+        if identity.get("missing_selected_ids"):
+            candidate["problem_resolution"]["missing_selected_ids"] = list(identity["missing_selected_ids"])
+        if identity.get("unresolved_selected_ids"):
+            candidate["problem_resolution"]["unresolved_selected_ids"] = list(identity["unresolved_selected_ids"])
         grouped[review_key].append(candidate)
         identities[review_key] = {
             "problem_code": problem_code,
@@ -202,6 +212,8 @@ def build_review_groups(candidates: list[Mapping[str, Any]]) -> list[dict[str, A
             "resolution_source": identity["resolution_source"],
             "semantic_safe": bool(identity["semantic_safe"]),
             "ambiguity": bool(identity["ambiguity"]),
+            "missing_selected_ids": list(identity.get("missing_selected_ids") or []),
+            "unresolved_selected_ids": list(identity.get("unresolved_selected_ids") or []),
         }
 
     result: list[dict[str, Any]] = []
@@ -221,6 +233,11 @@ def build_review_groups(candidates: list[Mapping[str, Any]]) -> list[dict[str, A
             entity_keys.add(_entity_key(candidate))
             occurrence_count += _candidate_occurrence_count(candidate)
         identity = identities[review_key]
+        presentation = (
+            problem_presentation(identity["problem_code"])
+            if identity["semantic_safe"]
+            else None
+        )
         result.append({
             "review_key": review_key,
             "problem_code": identity["problem_code"],
@@ -232,8 +249,13 @@ def build_review_groups(candidates: list[Mapping[str, Any]]) -> list[dict[str, A
             "resolution_subtype": (
                 (representative.get("problem_resolution") or {}).get("subtype")
             ),
-            "title": str(representative.get("title") or ""),
-            "summary": str(representative.get("summary") or ""),
+            "missing_selected_ids": identity.get("missing_selected_ids") or [],
+            "unresolved_selected_ids": identity.get("unresolved_selected_ids") or [],
+            "title": presentation.title if presentation else str(representative.get("title") or ""),
+            "summary": (
+                f"本组汇总“{presentation.title}”的待审批证据；各实体细节见候选记录。"
+                if presentation else str(representative.get("summary") or "")
+            ),
             "importance": str(representative.get("importance") or "medium"),
             "candidate_count": len(members),
             "occurrence_count": occurrence_count,

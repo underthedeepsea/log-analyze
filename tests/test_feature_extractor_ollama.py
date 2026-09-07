@@ -220,6 +220,70 @@ def test_generate_features_keeps_unresolved_mixed_feature_as_one_candidate(monke
     assert [
         source["template_hash"] for source in candidates[0]["source_templates"]
     ] == ["hash-known", "hash-opaque"]
+    assert candidates[0]["problem_resolution"]["semantic_safe"] is False
+    assert candidates[0]["match_mode"] == "template_set"
+    assert any("待人工复核" in warning for warning in candidates[0]["evaluator_result"]["warnings"])
+
+
+def test_final_hard_evaluator_failure_cannot_enter_semantic_group_or_reuse_rule(monkeypatch, tmp_path):
+    from logrisk.approved_rules import ApprovedRuleStore
+    from logrisk.approval_queue import build_review_groups
+
+    payload = entity()
+    payload["top_templates"] = [
+        {"template_hash": "stats", "component": "kubelet", "template": "Failed to get system container stats", "count": 1},
+        {"template_hash": "other", "component": "containerd", "template": "opaque unrelated evidence", "count": 1},
+    ]
+    invalid_final_component = {
+        "feature_type": "kubelet_container_stats_failure",
+        "title": "容器统计获取失败",
+        "summary": "kubelet 获取容器统计失败。",
+        "importance": "high",
+        "template_hashes": ["stats"],
+        "components": ["containerd"],
+        "tags": ["统计"],
+        "selection_reason": "所选模板记录统计失败。",
+    }
+    monkeypatch.setattr(
+        "logrisk.ai_harness.providers.ollama.urlopen",
+        lambda *args, **kwargs: response([invalid_final_component]),
+    )
+
+    candidate = generate_feature_candidates([payload], model="qwen3:1.7b", cache_enabled=False)[0]
+    rule_store = ApprovedRuleStore(tmp_path / "rules.json")
+    rule_store.upsert_feature({
+        "feature_type": "kubelet_container_stats_failure",
+        "source_templates": [{
+            "template_hash": "safe-rule", "category": "runtime", "component": "kubelet",
+            "template": "Failed to get system container stats",
+        }],
+    })
+
+    assert candidate["evaluator_result"]["passed"] is False
+    assert candidate["match_mode"] == "template_set"
+    assert build_review_groups([candidate])[0]["match_mode"] == "template_set"
+    assert rule_store.match_feature(candidate) == []
+
+
+def test_final_candidates_own_only_parent_request_evaluation_rules(monkeypatch):
+    payload = entity()
+    payload["top_templates"] = [
+        {"template_hash": "stats", "component": "kubelet", "template": "Failed to get system container stats", "count": 1},
+        {"template_hash": "crash", "component": "kubelet", "template": "CrashLoopBackOff", "count": 1},
+    ]
+    features = [
+        {**model_feature(), "template_hashes": ["stats"], "components": ["kubelet"], "feature_type": "kubelet_container_stats_failure"},
+        {**model_feature(), "template_hashes": ["crash"], "components": ["kubelet"], "feature_type": "kubelet_pod_crash_loop"},
+    ]
+    monkeypatch.setattr("logrisk.ai_harness.providers.ollama.urlopen", lambda *args, **kwargs: response(features))
+
+    candidates = generate_feature_candidates([payload], model="qwen3:1.7b", cache_enabled=False)
+
+    assert len(candidates) == 2
+    for candidate in candidates:
+        rule_ids = [item["rule_id"] for item in candidate["evaluator_result"]["rule_results"]]
+        assert len(rule_ids) == len(set(rule_ids))
+        assert len(rule_ids) == 9
 
 
 def test_generate_features_uses_prompt_registry_and_writes_trace(monkeypatch, tmp_path):
@@ -286,6 +350,183 @@ def test_extract_features_can_use_locked_prompt_snapshot(monkeypatch):
 
     assert captured["body"]["messages"][0]["content"] == "locked benchmark prompt"
     assert result[0]["prompt_hash"] == "a" * 64
+
+
+def test_omitted_prompt_id_resolves_the_selected_profile_default(monkeypatch, tmp_path):
+    prompt_dir = tmp_path / "prompts"
+    prompt_dir.mkdir()
+    (prompt_dir / "feature_extract_v3_compact_strict_json_en.md").write_text("v3 content", encoding="utf-8")
+    (prompt_dir / "feature_extract_v4_atomic_evidence_en.md").write_text("v4 content", encoding="utf-8")
+    profile_path = tmp_path / "profiles.yaml"
+    profile_path.write_text(
+        """
+default_profile_id: v4_profile
+profiles:
+  v4_profile:
+    provider: ollama
+    model: qwen3:1.7b
+    default_prompt_id: feature_extract_v4_atomic_evidence_en
+""",
+        encoding="utf-8",
+    )
+    captured = []
+
+    class Client:
+        def generate_json(self, messages, schema, *, model, timeout, options=None):
+            captured.append(messages[0]["content"])
+            return {"features": [model_feature()]}
+
+    monkeypatch.setattr("logrisk.feature_extractor_ollama.PROMPT_REGISTRY", PromptRegistry(prompt_dir))
+
+    result = extract_features_for_entity(
+        entity(), model_profile_id="v4_profile", profile_config_path=profile_path,
+        model_client=Client(), cache_enabled=False,
+    )
+
+    assert captured == ["v4 content"]
+    assert result[0]["prompt_id"] == "feature_extract_v4_atomic_evidence_en"
+
+
+def test_explicit_and_locked_prompt_selection_record_the_content_actually_sent(monkeypatch, tmp_path):
+    prompt_dir = tmp_path / "prompts"
+    prompt_dir.mkdir()
+    (prompt_dir / "feature_extract_v3_compact_strict_json_en.md").write_text("v3 content", encoding="utf-8")
+    trace_path = tmp_path / "ai_traces.jsonl"
+    captured = []
+
+    class Client:
+        def generate_json(self, messages, schema, *, model, timeout, options=None):
+            captured.append(messages[0]["content"])
+            return {"features": [model_feature()]}
+
+    locked = PromptTemplate("locked-v4", "locked v4 content", "b" * 64, "database:locked-v4", version="v4")
+    monkeypatch.setattr("logrisk.feature_extractor_ollama.PROMPT_REGISTRY", PromptRegistry(prompt_dir))
+    monkeypatch.setattr("logrisk.feature_extractor_ollama.TRACE_LOGGER", AITraceLogger(trace_path))
+
+    explicit = extract_features_for_entity(
+        entity(), model="qwen3:1.7b", prompt_id="feature_extract_v3_compact_strict_json_en",
+        model_client=Client(), cache_enabled=False,
+    )
+    locked_result = extract_features_for_entity(
+        entity(), model="qwen3:1.7b", prompt_id="feature_extract_v3_compact_strict_json_en",
+        prompt_template=locked, model_client=Client(), cache_enabled=False,
+    )
+
+    traces = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
+    assert captured == ["v3 content", "locked v4 content"]
+    assert explicit[0]["prompt_id"] == "feature_extract_v3_compact_strict_json_en"
+    assert locked_result[0]["prompt_id"] == "locked-v4"
+    assert traces[-1]["prompt_id"] == "locked-v4"
+    assert traces[-1]["prompt_hash"] == "b" * 64
+
+
+def test_changed_effective_generation_options_bypass_the_ai_cache(monkeypatch, tmp_path):
+    prompt_dir = tmp_path / "prompts"
+    prompt_dir.mkdir()
+    (prompt_dir / "feature_extract_v3_compact_strict_json_en.md").write_text("v3 content", encoding="utf-8")
+    profile_path = tmp_path / "profiles.yaml"
+    profile_path.write_text(
+        """
+default_profile_id: cold
+profiles:
+  cold:
+    provider: ollama
+    model: qwen3:1.7b
+    default_prompt_id: feature_extract_v3_compact_strict_json_en
+    options: {temperature: 0}
+  warm:
+    provider: ollama
+    model: qwen3:1.7b
+    default_prompt_id: feature_extract_v3_compact_strict_json_en
+    options: {temperature: 0.2}
+""",
+        encoding="utf-8",
+    )
+    calls = []
+
+    class Client:
+        def generate_json(self, messages, schema, *, model, timeout, options=None):
+            calls.append(options)
+            return {"features": [model_feature()]}
+
+    monkeypatch.setattr("logrisk.feature_extractor_ollama.PROMPT_REGISTRY", PromptRegistry(prompt_dir))
+    client = Client()
+
+    extract_features_for_entity(entity(), model_profile_id="cold", profile_config_path=profile_path, model_client=client)
+    extract_features_for_entity(entity(), model_profile_id="cold", profile_config_path=profile_path, model_client=client)
+    extract_features_for_entity(entity(), model_profile_id="warm", profile_config_path=profile_path, model_client=client)
+
+    assert len(calls) == 2
+    assert calls == [
+        {"temperature": 0, "think": False, "structured_output_mode": "json_schema"},
+        {"temperature": 0.2, "think": False, "structured_output_mode": "json_schema"},
+    ]
+
+
+def test_generation_options_exclude_secrets_from_model_call_and_trace(monkeypatch, tmp_path):
+    prompt_dir = tmp_path / "prompts"
+    prompt_dir.mkdir()
+    (prompt_dir / "feature_extract_v3_compact_strict_json_en.md").write_text("v3 content", encoding="utf-8")
+    profile_path = tmp_path / "profiles.yaml"
+    profile_path.write_text(
+        """
+default_profile_id: safe
+profiles:
+  safe:
+    provider: ollama
+    model: qwen3:1.7b
+    default_prompt_id: feature_extract_v3_compact_strict_json_en
+    options:
+      temperature: 0
+      api_key: trace-test-secret
+      x-api-key: trace-hyphenated-secret
+      credentials:
+        bearer: trace-nested-secret
+      auth:
+        access-token: trace-access-token-secret
+""",
+        encoding="utf-8",
+    )
+    trace_path = tmp_path / "ai_traces.jsonl"
+    calls = []
+
+    class Client:
+        def generate_json(self, messages, schema, *, model, timeout, options=None):
+            calls.append(options)
+            return {"features": [model_feature()]}
+
+    monkeypatch.setattr("logrisk.feature_extractor_ollama.PROMPT_REGISTRY", PromptRegistry(prompt_dir))
+    monkeypatch.setattr("logrisk.feature_extractor_ollama.TRACE_LOGGER", AITraceLogger(trace_path))
+
+    extract_features_for_entity(
+        entity(), model_profile_id="safe", profile_config_path=profile_path, model_client=Client(),
+        cache_enabled=False,
+    )
+
+    assert calls == [{"temperature": 0, "think": False, "structured_output_mode": "json_schema"}]
+    trace_text = trace_path.read_text(encoding="utf-8")
+    for secret in (
+        "trace-test-secret",
+        "trace-hyphenated-secret",
+        "trace-nested-secret",
+        "trace-access-token-secret",
+    ):
+        assert secret not in trace_text
+
+
+def test_rejects_duplicate_template_hashes_across_conflicting_features(monkeypatch):
+    duplicate = {
+        **model_feature(),
+        "feature_type": "kernel_memory_alert",
+        "title": "内核内存告警",
+    }
+    monkeypatch.setattr(
+        "logrisk.ai_harness.providers.ollama.urlopen",
+        lambda *args, **kwargs: response([model_feature(), duplicate]),
+    )
+
+    with pytest.raises(FeatureExtractionError, match="重复分配 template_hash"):
+        generate_feature_candidates([entity()], model="qwen3:1.7b", cache_enabled=False)
 
 
 def test_generate_features_records_selected_remote_provider(monkeypatch, tmp_path):

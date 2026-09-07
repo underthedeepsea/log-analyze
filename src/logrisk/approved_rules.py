@@ -256,6 +256,7 @@ def _rule_identity(rule: Dict[str, Any]) -> Dict[str, Any]:
         "approval_key": build_approval_key(
             rule.get("feature_type"), problem_code,
             sorted(components), sorted(anchors),
+            semantic_safe=rule.get("match_mode") == "semantic",
         ),
         "component_scope": sorted(components),
         "anchor_signatures": sorted(anchors),
@@ -336,11 +337,7 @@ def validate_v2_rule(rule: dict[str, Any]) -> tuple[str, ...]:
                 ):
                     errors.append(f"{field}_mismatch")
         canonical = str(rule.get("canonical_approval_key") or "").strip()
-        resolution = resolve_problem(rule)
-        if resolution.semantic_safe:
-            if canonical != base_expected:
-                errors.append("canonical_approval_key_mismatch")
-        elif canonical:
+        if canonical:
             errors.append("canonical_approval_key_unexpected")
     return tuple(dict.fromkeys(errors))
 
@@ -481,6 +478,24 @@ def _legacy_template_pairs(value: Dict[str, Any]) -> set[tuple[str, str]]:
     return pairs
 
 
+def _selected_template_ids_covered(value: Dict[str, Any]) -> bool:
+    selected = {
+        str(item).strip()
+        for item in _value_list(value.get("template_hashes"))
+        if str(item).strip()
+    }
+    if not selected:
+        return True
+    available = {
+        str(item.get(field) or "").strip()
+        for item in (value.get("source_templates") or value.get("template_signatures") or [])
+        if isinstance(item, dict)
+        for field in ("template_hash", "template_fingerprint")
+        if str(item.get(field) or "").strip()
+    }
+    return selected.issubset(available)
+
+
 def _legacy_components(value: Dict[str, Any]) -> set[str]:
     components = {
         str(item).strip().lower()
@@ -511,38 +526,70 @@ def _legacy_anchors(value: Dict[str, Any]) -> set[str]:
     }
 
 
-def _legacy_feature_matches(rule: Dict[str, Any], feature: Dict[str, Any]) -> bool:
-    rule_key = str(rule.get("approval_key") or "").strip()
-    feature_key = str(feature.get("approval_key") or "").strip()
-    if rule_key or feature_key:
-        return bool(rule_key and feature_key and rule_key == feature_key)
-    if normalize_feature_type(rule.get("feature_type")) != normalize_feature_type(feature.get("feature_type")):
+def _legacy_exact_identity_matches(rule: Dict[str, Any], incoming: Dict[str, Any]) -> bool:
+    rule_type = str(rule.get("feature_type") or "").strip()
+    incoming_type = str(incoming.get("feature_type") or "").strip()
+    if not rule_type or not incoming_type:
+        return False
+    if normalize_feature_type(rule_type) != normalize_feature_type(incoming_type):
         return False
     rule_pairs = _legacy_template_pairs(rule)
-    feature_pairs = _legacy_template_pairs(feature)
-    if not rule_pairs or rule_pairs != feature_pairs:
+    if not rule_pairs or rule_pairs != _legacy_template_pairs(incoming):
         return False
-    if _legacy_components(rule) != _legacy_components(feature):
-        return False
-    return _legacy_anchors(rule) == _legacy_anchors(feature)
+    return (
+        _legacy_components(rule) == _legacy_components(incoming)
+        and _legacy_anchors(rule) == _legacy_anchors(incoming)
+    )
+
+
+def _legacy_feature_identity(
+    feature: Dict[str, Any], entity: Dict[str, Any] | None,
+) -> Dict[str, Any] | None:
+    selected = {
+        str(item).strip()
+        for item in _value_list(feature.get("template_hashes"))
+        if str(item).strip()
+    }
+    own_evidence = feature.get("source_templates") or feature.get("template_signatures") or []
+    entity_evidence = (entity or {}).get("top_templates") or []
+
+    def identities(item: Any) -> set[str]:
+        if not isinstance(item, dict):
+            return set()
+        return {
+            str(item.get(field) or "").strip()
+            for field in ("template_hash", "template_fingerprint")
+            if str(item.get(field) or "").strip()
+        }
+
+    if selected and entity_evidence and any(
+        not identities(item).intersection(selected) for item in entity_evidence
+    ):
+        return None
+    evidence = [
+        copy.deepcopy(item)
+        for item in [*own_evidence, *entity_evidence]
+        if isinstance(item, dict) and (not selected or identities(item).intersection(selected))
+    ]
+    covered = set().union(*(identities(item) for item in evidence)) if evidence else set()
+    if selected and not selected.issubset(covered):
+        return None
+    incoming = copy.deepcopy(feature)
+    incoming["source_templates"] = evidence
+    incoming.pop("template_signatures", None)
+    return incoming
+
+
+def _legacy_feature_matches(
+    rule: Dict[str, Any], feature: Dict[str, Any],
+    entity: Dict[str, Any] | None = None,
+) -> bool:
+    incoming = _legacy_feature_identity(feature, entity)
+    return incoming is not None and _legacy_exact_identity_matches(rule, incoming)
 
 
 def _legacy_entity_matches(rule: Dict[str, Any], entity: Dict[str, Any]) -> bool:
-    rule_type = str(rule.get("feature_type") or "").strip()
-    entity_type = str(entity.get("feature_type") or "").strip()
-    if not rule_type or not entity_type or normalize_feature_type(rule_type) != normalize_feature_type(entity_type):
-        return False
-    required = _legacy_template_pairs(rule)
-    actual = _legacy_template_pairs(entity)
-    if not required or not required.issubset(actual):
-        return False
-    required_components = _legacy_components(rule)
-    actual_components = _legacy_components(entity)
-    if required_components and (not actual_components or not required_components.issubset(actual_components)):
-        return False
-    required_anchors = _legacy_anchors(rule)
-    actual_anchors = _legacy_anchors(entity)
-    return not required_anchors or bool(actual_anchors) and required_anchors.issubset(actual_anchors)
+    return _legacy_exact_identity_matches(rule, entity)
 
 
 def _v2_template_pairs(value: Dict[str, Any]) -> set[tuple[str, str]]:
@@ -656,7 +703,11 @@ def _v2_exact_feature_match(
         return False
     if rule.get("match_mode") == "semantic":
         return identity["match_mode"] == "semantic"
-    if identity["match_mode"] != "template_set" or not _template_set_rule_complete(rule):
+    if (
+        identity["match_mode"] != "template_set"
+        or not _template_set_rule_complete(rule)
+        or not _selected_template_ids_covered(feature)
+    ):
         return False
     return (
         normalize_feature_type(rule.get("feature_type")) == normalize_feature_type(feature.get("feature_type"))
@@ -701,7 +752,7 @@ def _rule_matches_feature(
         return False
     classification = classify_rule(rule)
     if classification.kind == RuleFormat.LEGACY_V1:
-        return _legacy_feature_matches(rule, feature)
+        return _legacy_feature_matches(rule, feature, entity)
     if classification.kind != RuleFormat.VALID_V2:
         return False
     identity = approval_identity(feature, entity)
@@ -754,7 +805,9 @@ def _rule_matches_entity(rule: Dict[str, Any], entity: Dict[str, Any]) -> bool:
         for item in (entity.get("top_templates") or [])
         if isinstance(item, dict)
     }
-    if not required or not required.issubset(actual):
+    if not required or (
+        required != actual if rule.get("match_mode") == "template_set" else not required.issubset(actual)
+    ):
         return False
     return _v2_entity_fields_match(rule, entity)
 
@@ -895,7 +948,7 @@ class ApprovedRuleStore:
                 existing = _preferred_rule([
                     rule for rule in active
                     if classify_rule(rule).kind == RuleFormat.LEGACY_V1
-                    and _legacy_feature_matches(rule, feature)
+                    and _legacy_feature_matches(rule, feature, entity)
                 ])
                 if existing is not None:
                     return copy.deepcopy(existing)
@@ -1023,6 +1076,8 @@ class ApprovedRuleStore:
         feature: Dict[str, Any],
         entity: Dict[str, Any] | None = None,
     ) -> list[Dict[str, Any]]:
+        if isinstance(feature.get("evaluator_result"), dict) and feature["evaluator_result"].get("passed") is False:
+            return []
         identity = approval_identity(feature, entity)
         with _PROCESS_LOCK:
             rules = [
@@ -1033,7 +1088,7 @@ class ApprovedRuleStore:
                 legacy = _preferred_rule([
                     rule for rule in rules
                     if classify_rule(rule).kind == RuleFormat.LEGACY_V1
-                    and _legacy_feature_matches(rule, feature)
+                    and _legacy_feature_matches(rule, feature, entity)
                 ])
                 return [public_rule(legacy)] if legacy is not None else []
             exact = _preferred_rule([

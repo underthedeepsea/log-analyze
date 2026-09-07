@@ -26,6 +26,7 @@ from logrisk.feature_jobs import (
     _candidate_version_payload,
     _merge_review_owned_fields,
     _sanitize_feature_payload,
+    _sanitize_job_payload,
     _validate_candidate_review_changes,
 )
 from logrisk.input_jobs import InputJobConfig, InputJobStore
@@ -170,7 +171,7 @@ class SQLiteFeatureJobStore:
         return merged
 
     def save(self, job: dict[str, Any]) -> None:
-        safe_job = _sanitize_feature_payload(
+        safe_job = _sanitize_job_payload(
             {key: value for key, value in job.items() if key != "condition"}
         )
         snapshot = {key: copy.deepcopy(value) for key, value in safe_job.items() if key not in {"condition", "events"}}
@@ -269,7 +270,7 @@ class SQLiteFeatureJobStore:
 
     @classmethod
     def _load_job_row(cls, connection: Any, row: Any) -> dict[str, Any]:
-        job = _sanitize_feature_payload(cls._decode_json(row["job_json"], {}))
+        job = _sanitize_job_payload(cls._decode_json(row["job_json"], {}))
         if not isinstance(job, dict):
             job = {}
         job["job_id"] = str(row["job_id"])

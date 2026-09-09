@@ -174,7 +174,7 @@ def test_generate_features_partitions_mixed_feature_before_source_fact_attachmen
     assert all(item["evaluator_result"]["passed"] is True for item in candidates)
 
 
-def test_generate_features_keeps_unresolved_mixed_feature_as_one_candidate(monkeypatch):
+def test_generate_features_isolates_unresolved_mixed_evidence(monkeypatch):
     payload = entity()
     payload["top_templates"] = [
         {
@@ -214,15 +214,17 @@ def test_generate_features_keeps_unresolved_mixed_feature_as_one_candidate(monke
         cache_enabled=False,
     )
 
-    assert len(candidates) == 1
-    assert candidates[0]["feature_type"] == "mixed_runtime_failure"
-    assert candidates[0]["template_hashes"] == ["hash-known", "hash-opaque"]
+    assert len(candidates) == 2
+    assert [item["template_hashes"] for item in candidates] == [["hash-known"], ["hash-opaque"]]
+    assert [item["occurrence_count"] for item in candidates] == [2, 1]
+    assert [item["semantic_safe"] for item in candidates] == [True, False]
+    assert candidates[1]["feature_type"] == "unresolved_template_evidence"
     assert [
-        source["template_hash"] for source in candidates[0]["source_templates"]
+        source["template_hash"] for candidate in candidates for source in candidate["source_templates"]
     ] == ["hash-known", "hash-opaque"]
-    assert candidates[0]["problem_resolution"]["semantic_safe"] is False
-    assert candidates[0]["match_mode"] == "template_set"
-    assert any("待人工复核" in warning for warning in candidates[0]["evaluator_result"]["warnings"])
+    assert candidates[1]["problem_resolution"]["semantic_safe"] is False
+    assert candidates[1]["match_mode"] == "template_set"
+    assert any("待人工复核" in warning for warning in candidates[1]["evaluator_result"]["warnings"])
 
 
 def test_final_hard_evaluator_failure_cannot_enter_semantic_group_or_reuse_rule(monkeypatch, tmp_path):
@@ -710,7 +712,7 @@ def test_trace_write_failure_does_not_fail_extraction(monkeypatch, tmp_path):
     monkeypatch.setattr("logrisk.feature_extractor_ollama.PROMPT_REGISTRY", PromptRegistry(prompt_dir))
     monkeypatch.setattr("logrisk.feature_extractor_ollama.TRACE_LOGGER", BrokenLogger())
 
-    assert generate_feature_candidates([entity()], model="qwen3:1.7b")[0]["title"] == "节点内存耗尽"
+    assert generate_feature_candidates([entity()], model="qwen3:1.7b")[0]["title"] == "Linux 内存耗尽日志"
 
 
 def test_candidate_id_is_stable(monkeypatch):

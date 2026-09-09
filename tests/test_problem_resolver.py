@@ -9,6 +9,37 @@ from logrisk import problem_resolver
 from logrisk.problem_resolver import ProblemResolution, resolve_problem, resolve_selected_template
 
 
+@pytest.mark.parametrize("text,code", [
+    ('networkPlugin cni failed to teardown pod <*> network WorkloadEndpoint.crd.projectcalico.org '
+     '"WorkloadEndpoint(namespace/' + 'long-pod-name-' * 15 + ')" not found',
+     "kubernetes.cni.workload_endpoint_not_found"),
+    ('failed to collect filesystem stats - rootDiskErr could not stat "/var/lib/docker/overlay2/'
+     '<CONTAINER_ID_FULL>/diff" to get inode usage stat /var/lib/docker/overlay2/'
+     '<CONTAINER_ID_FULL>/diff no such file or directory',
+     "kubernetes.runtime.filesystem_stats_path_missing"),
+    ('"resource allocation not found in checkpoint store" pod <*> container <*>',
+     "kubernetes.kubelet.checkpoint_resource_not_found"),
+    ('container start failed ErrImagePull rpc error desc Get https //registry.example/v2/ EOF',
+     "kubernetes.image.pull_transport_failure"),
+    ('container start failed ErrImagePull unknown artifact library/service <NUM> not found',
+     "kubernetes.image.pull_not_found"),
+])
+def test_observed_sanitized_template_variants(text, code):
+    resolution = resolve_selected_template(selected(text))
+    assert resolution.problem_code == code
+    assert resolution.semantic_safe is True
+
+
+@pytest.mark.parametrize("text", [
+    "image operation EOF", "read checkpoint store successfully",
+    "WorkloadEndpoint exists; unrelated file not found",
+    "failed to collect filesystem stats: permission denied",
+    "Minimum memory limit allowed is <BYTES>",
+])
+def test_template_variants_do_not_infer_missing_cause(text):
+    assert resolve_selected_template(selected(text)).semantic_safe is False
+
+
 def selected(template: str, *, category: str = "runtime", component: str = "kubelet") -> dict:
     return {
         "template_hash": f"selected-{hashlib.sha256(template.encode('utf-8')).hexdigest()[:8]}",
@@ -455,3 +486,44 @@ def test_semantic_resolver_switch_restores_strict_rollback_identity(monkeypatch)
     assert disabled_identity["semantic_safe"] is False
     assert disabled_identity["resolution_source"] == "rollback_legacy"
     assert disabled_identity["approval_key"] != enabled_identity["approval_key"]
+
+
+@pytest.mark.parametrize("text,code", [
+    ("Error adding <*> to network calico/k8s-pod-network no enough ips, end",
+     "kubernetes.cni.ip_exhaustion"),
+    ('Partial failure issuing cadvisor.ContainerInfoV2 partial failures ["/'
+     + 'long-sanitized-slice/' * 20
+     + '" RecentStats unable to find data in memory cache]',
+     "kubernetes.runtime.cadvisor_cache_miss"),
+    ('error cleaning subPath mounts for volume "<*>" (UniqueName "<*>") '
+     + 'sanitized-path/' * 20
+     + ' could not get consistent content of /proc/mounts after <NUM> attempts',
+     "kubernetes.volume.subpath_cleanup_failure"),
+])
+def test_current_pending_template_variants(text, code):
+    result = resolve_selected_template({"template": text, "component": "kubelet"})
+    assert result.problem_code == code
+    assert result.semantic_safe is True
+    assert result.supporting_codes == (code,)
+
+
+@pytest.mark.parametrize("text", [
+    "Error adding <*> to unrelated network no enough ips, end",
+    "network calico/k8s-pod-network successfully allocated an IP",
+    "cleaning subPath mounts completed successfully",
+])
+def test_current_pending_variant_matching_requires_failure_evidence(text):
+    assert resolve_selected_template({"template": text}).semantic_safe is False
+
+
+def test_recentstats_cache_detail_does_not_hide_separate_stats_failure():
+    result = resolve_selected_template({
+        "template": "RecentStats unable to find data in memory cache; "
+                    "failed to get container stats: permission denied",
+    })
+    assert result.semantic_safe is False
+    assert result.ambiguity is True
+    assert set(result.supporting_codes) == {
+        "kubernetes.runtime.cadvisor_cache_miss",
+        "kubernetes.runtime.container_stats_failure",
+    }

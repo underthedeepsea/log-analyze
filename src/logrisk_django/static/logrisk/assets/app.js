@@ -4,6 +4,17 @@
   const { useEffect, useMemo, useRef, useState } = React;
   const REVIEW_AUTO_POLLING = false;
   const INLINE_RESULT_MAX_BYTES = 10 * 1024 * 1024;
+  function featureQualityLabel(feature) {
+    const result = feature.evaluator_result;
+    if (!result || typeof result.passed !== "boolean") return "质量门禁：未记录";
+    if (!result.passed) return "质量门禁：未通过";
+    const resolution = feature.problem_resolution || {};
+    const semanticSafe = typeof resolution.semantic_safe === "boolean" ? resolution.semantic_safe : feature.semantic_safe;
+    if (semanticSafe !== true) {
+      return "质量门禁：结构校验通过 · 语义未确认，待人工复核";
+    }
+    return "质量门禁：已通过 · 语义证据完整";
+  }
   const LARGE_CHUNK_BYTES = 1024 * 1024;
   const DEPLOYMENT_API_BASE = String(window.LOGRISK_CONFIG && window.LOGRISK_CONFIG.apiBase || "").replace(/\/$/, "");
   const SEMANTIC_TEST_EXAMPLES = {
@@ -447,7 +458,7 @@
             key: feature.candidate_id,
             onClick: function () { props.onSelect(feature.candidate_id); },
           }, h("div", null, h("b", null, feature.title), h("span", null,
-            (feature.entity && feature.entity.id || "unknown") + " · " + feature.summary), h("small", null, "质量门禁：" + (feature.evaluator_result && feature.evaluator_result.passed ? "已通过" : "未记录") + (feature.trace_id ? " · 来源：" + (feature.prompt_id || "feature_extract_v3_compact_strict_json_en") + " · " + (feature.model || "—") + " · " + shortHash(feature.trace_id) : " · 来源：历史数据 / 未记录 Trace"))),
+            (feature.entity && feature.entity.id || "unknown") + " · " + feature.summary), h("small", null, featureQualityLabel(feature) + (feature.trace_id ? " · 来源：" + (feature.prompt_id || "feature_extract_v3_compact_strict_json_en") + " · " + (feature.model || "—") + " · " + shortHash(feature.trace_id) : " · 来源：历史数据 / 未记录 Trace"))),
           h("span", { className: "status-chip " + feature.status },
             feature.origin === "approved_rule" ? "规则复用" : feature.status));
         })
@@ -471,7 +482,7 @@
           }, h("div", null,
             h("b", null, group.title || group.problem_code || "未命名问题"),
             h("span", null, group.problem_code || "未知问题"),
-            h("small", null, "候选 " + group.candidate_count + " · 实体 " + group.affected_entity_count + " · 出现 " + group.occurrence_count + " 次"),
+            h("small", null, "候选 " + group.candidate_count + " · 实体 " + group.affected_entity_count + " · 日志命中 " + group.occurrence_count + " 次"),
             h("small", null, timeText(group.first_seen) + " — " + timeText(group.last_seen))),
           h("span", { className: "status-chip pending" }, group.importance || "待审批"));
         })
@@ -584,7 +595,7 @@
         props.onDirtyChange && props.onDirtyChange(false);
       } catch (_) {}
     }
-    return h("section", { className: "surface review-editor" }, h("div", { className: "surface-head" }, h("div", null, h("b", null, "人工审批"), h("span", null, props.feature.origin === "approved_rule" ? "来自批准规则库" : "来自模型 + Drain3")), h("span", { className: "review-dirty-indicator " + (dirty ? "dirty" : "clean") }, dirty ? "有未保存更改" : "草稿已同步")), h("div", { className: "editor-body" }, field("特征标题（来自模型）", "title"), field("特征摘要（模型语义 + 当前 Drain3 模板）", "summary", "textarea"), h("label", null, "重要性", h("select", { value: draft.importance, onChange: function (event) { setField("importance", event.target.value); } }, ["critical", "high", "medium", "low"].map(function (level) { return h("option", { key: level, value: level }, level); }))), field("标签（来自模型，逗号分隔）", "tags"), field("审批备注", "reviewer_note", "textarea"), h("div", { className: "fact-box" }, "执行模型：", props.feature.model || "—", h("br"), "Provider：", props.feature.provider || "—", h("br"), "Model Profile：", props.feature.model_profile_id || "—", h("br"), "Prompt：", props.feature.prompt_id || "—", h("br"), "Job：", props.feature.job_id || "—", h("br"), "Trace：", props.feature.trace_id || "—", h("br"), "审批身份：", props.feature.approval_key || "—"), h("div", { className: "fact-box" }, "当前证据模板：", selectedTemplate.template_hash || "—", h("br"), "组件 " + (selectedTemplate.component || "—") + " · 类别 " + (selectedTemplate.category || "—") + " · 次数 " + (selectedTemplate.count || 0), h("br"), selectedTemplate.template || "暂无模板文本"), h("div", { className: "fact-box" }, "质量门禁：已通过", h("br"), "Evaluator Score：" + (props.feature.evaluator_result && props.feature.evaluator_result.score != null ? props.feature.evaluator_result.score : "—"), h("br"), "实体 " + (props.feature.entity && props.feature.entity.id || "") + " · 风险分 " + props.feature.risk_score + " · 出现 " + props.feature.occurrence_count + " 次", h("br"), props.feature.trace_id ? "来源 " + (props.feature.prompt_id || "feature_extract_v3_compact_strict_json_en") + " · " + (props.feature.model || "—") + " · " + props.feature.trace_id : "来源：历史数据 / 未记录 Trace"), props.feature.trace_id && h("button", { className: "text-button trace-link", onClick: function () { props.onOpenTrace(props.feature.trace_id); } }, "查看 AI Trace"), h("div", { className: "editor-actions" }, h("button", { className: "reject-button", onClick: function () { save("rejected"); } }, "驳回"), h("button", { className: "primary-button", onClick: function () { save("approved"); } }, "批准并写入规则库"))));
+    return h("section", { className: "surface review-editor" }, h("div", { className: "surface-head" }, h("div", null, h("b", null, "人工审批"), h("span", null, props.feature.origin === "approved_rule" ? "来自批准规则库" : "来自模型 + Drain3")), h("span", { className: "review-dirty-indicator " + (dirty ? "dirty" : "clean") }, dirty ? "有未保存更改" : "草稿已同步")), h("div", { className: "editor-body" }, field("特征标题", "title"), field("特征摘要（所选模板证据）", "summary", "textarea"), h("label", null, "重要性", h("select", { value: draft.importance, onChange: function (event) { setField("importance", event.target.value); } }, ["critical", "high", "medium", "low"].map(function (level) { return h("option", { key: level, value: level }, level); }))), field("标签（逗号分隔）", "tags"), field("审批备注", "reviewer_note", "textarea"), h("div", { className: "fact-box" }, "执行模型：", props.feature.model || "—", h("br"), "Provider：", props.feature.provider || "—", h("br"), "Model Profile：", props.feature.model_profile_id || "—", h("br"), "Prompt：", props.feature.prompt_id || "—", h("br"), "Job：", props.feature.job_id || "—", h("br"), "Trace：", props.feature.trace_id || "—", h("br"), "审批身份：", props.feature.approval_key || "—"), h("div", { className: "fact-box" }, "当前证据模板：", selectedTemplate.template_hash || "—", h("br"), "组件 " + (selectedTemplate.component || "—") + " · 类别 " + (selectedTemplate.category || "—") + " · 次数 " + (selectedTemplate.count || 0), h("br"), selectedTemplate.template || "暂无模板文本"), h("div", { className: "fact-box" }, featureQualityLabel(props.feature), h("br"), "Evaluator Score：" + (props.feature.evaluator_result && props.feature.evaluator_result.score != null ? props.feature.evaluator_result.score : "—"), h("br"), "实体 " + (props.feature.entity && props.feature.entity.id || "") + " · 风险分 " + props.feature.risk_score + " · 日志命中 " + props.feature.occurrence_count + " 次", h("br"), props.feature.trace_id ? "来源 " + (props.feature.prompt_id || "feature_extract_v3_compact_strict_json_en") + " · " + (props.feature.model || "—") + " · " + props.feature.trace_id : "来源：历史数据 / 未记录 Trace"), props.feature.trace_id && h("button", { className: "text-button trace-link", onClick: function () { props.onOpenTrace(props.feature.trace_id); } }, "查看 AI Trace"), h("div", { className: "editor-actions" }, h("button", { className: "reject-button", onClick: function () { save("rejected"); } }, "驳回"), h("button", { className: "primary-button", onClick: function () { save("approved"); } }, "批准并写入规则库"))));
   }
 
   function PromptManagement(props) {

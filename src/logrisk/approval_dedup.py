@@ -509,7 +509,10 @@ def approval_identity(feature: Mapping[str, Any], entity: Mapping[str, Any] | No
     problem_code = resolution.problem_code
     if not problem_code:
         sources = _source_templates(feature, entity)
-        codes = collect_problem_codes(feature, entity)
+        # Generated fallback codes are outputs, not evidence. Feeding them back
+        # into the digest changes the identity every time a candidate is read.
+        codes = [code for code in collect_problem_codes(feature, entity)
+                 if not code.startswith("logrisk.")]
         anchors = _canonical_signatures(feature.get("anchor_signatures"))
         if not anchors:
             anchors = _canonical_signatures(sources) or _canonical_signatures(feature.get("template_hashes"))

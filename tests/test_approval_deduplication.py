@@ -1282,3 +1282,45 @@ def test_restart_backfills_pending_candidate_against_existing_rule(tmp_path):
     feature = restored.get_job(job_id)["features"][0]
     assert feature["status"] == "approved"
     assert feature["resolution_type"] == "group_matched"
+
+
+def test_unresolved_identity_is_stable_after_persistence_and_repeated_reads():
+    from logrisk.approval_dedup import approval_identity
+
+    feature = {
+        "feature_type": "unresolved_template_evidence",
+        "title": "未解析证据", "components": ["kubelet"],
+        "template_hashes": ["unknown-a"],
+        "source_templates": [{"template_hash": "unknown-a", "component": "kubelet",
+                              "template": "StopContainer failed: context deadline exceeded"}],
+    }
+    original = approval_identity(feature)
+    assert original["semantic_safe"] is False
+    for _ in range(4):
+        feature.update(approval_identity(feature))
+        assert feature["approval_key"] == original["approval_key"]
+        assert feature["problem_code"] == original["problem_code"]
+    different = {**feature, "template_hashes": ["unknown-b"], "anchor_signatures": [],
+                 "source_templates": [{"template_hash": "unknown-b", "component": "kubelet",
+                                       "template": "different unclassified condition"}]}
+    assert approval_identity(different)["approval_key"] != original["approval_key"]
+
+
+def test_conflicting_identity_is_stable_without_losing_conflict_gate():
+    from logrisk.approval_dedup import approval_identity
+
+    feature = {
+        "feature_type": "unresolved_template_evidence", "components": ["kubelet"],
+        "template_hashes": ["conflict"],
+        "source_templates": [{"template_hash": "conflict", "component": "kubelet",
+                              "template": "failed to pull image: unauthorized and manifest unknown"}],
+    }
+    original = approval_identity(feature)
+    for _ in range(3):
+        feature.update(approval_identity(feature))
+        assert feature["approval_key"] == original["approval_key"]
+        assert feature["semantic_safe"] is False
+        assert feature["ambiguity"] is True
+        assert set(feature["supporting_codes"]) == {
+            "kubernetes.image.pull_unauthorized", "kubernetes.image.pull_not_found",
+        }

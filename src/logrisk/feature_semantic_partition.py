@@ -4,6 +4,7 @@ import copy
 from dataclasses import dataclass
 from typing import Any, Mapping
 
+from logrisk.approval_dedup import semantic_resolver_enabled
 from logrisk.problem_resolver import concrete_problem_codes, resolve_selected_template
 
 
@@ -131,6 +132,8 @@ def _fallback(feature: Any) -> list[dict]:
 
 
 def partition_feature_by_semantics(entity: Any, feature: Any) -> list[dict]:
+    if not semantic_resolver_enabled():
+        return _fallback(feature)
     if not isinstance(entity, Mapping) or not isinstance(feature, Mapping):
         return _fallback(feature)
 
@@ -146,7 +149,11 @@ def partition_feature_by_semantics(entity: Any, feature: Any) -> list[dict]:
     }
     hashes = [str(item) for item in template_hashes]
     sources = [by_hash[item] for item in hashes if item in by_hash]
-    if len(sources) != len(hashes) or not hashes:
+    if len(sources) != len(hashes) or not hashes or len(set(hashes)) != len(hashes):
+        return _fallback(feature)
+    selected_components = {str(source.get("component") or "") for source in sources}
+    if set(feature.get("components") or []) - selected_components:
+        # Preserve invalid model output for the final Evaluator to reject.
         return _fallback(feature)
 
     groups: dict[str, list[tuple[str, Mapping[str, Any]]]] = {}
@@ -157,23 +164,25 @@ def partition_feature_by_semantics(entity: Any, feature: Any) -> list[dict]:
             or resolution.confidence != "high"
             or not resolution.semantic_safe
             or resolution.ambiguity
+            or resolution.problem_code not in concrete_problem_codes()
+            or problem_presentation(resolution.problem_code) is None
         ):
-            return _fallback(feature)
-        if resolution.problem_code not in concrete_problem_codes():
-            return _fallback(feature)
-        presentation = problem_presentation(resolution.problem_code)
-        if presentation is None:
-            return _fallback(feature)
-        groups.setdefault(resolution.problem_code, []).append((item_hash, source))
-
-    if len(groups) <= 1:
-        return _fallback(feature)
+            # Unknown and inseparable evidence stays exact-template-only. Never
+            # attach a generic wrapper to a concrete cause from another template.
+            code = "unresolved"
+        else:
+            code = resolution.problem_code
+        groups.setdefault(code, []).append((item_hash, source))
 
     children: list[dict] = []
     for problem_code, selected in groups.items():
         presentation = problem_presentation(problem_code)
         if presentation is None:
-            return _fallback(feature)
+            presentation = ProblemPresentation(
+                feature_type="unresolved_template_evidence",
+                title="未完全解析的日志证据（待复核）",
+                tags=("日志证据", "待复核"),
+            )
         child_hashes = [item_hash for item_hash, _ in selected]
         templates = [source for _, source in selected]
         child_components = sorted({
@@ -186,6 +195,8 @@ def partition_feature_by_semantics(entity: Any, feature: Any) -> list[dict]:
             "feature_type": presentation.feature_type,
             "title": presentation.title,
             "summary": (
+                f"{component_text} 的 {len(child_hashes)} 个所选模板尚不能确定单一异常类别，需人工复核。"
+                if problem_code == "unresolved" else
                 f"检测到 {component_text} 中与“{presentation.title}”一致的异常证据，"
                 f"当前候选引用 {len(child_hashes)} 个脱敏模板。"
             ),
@@ -193,6 +204,9 @@ def partition_feature_by_semantics(entity: Any, feature: Any) -> list[dict]:
             "template_hashes": child_hashes,
             "components": child_components,
             "tags": list(presentation.tags),
-            "selection_reason": _SELECTION_REASON,
+            "selection_reason": (
+                "所选模板的异常类别尚未完全解析，保留完整证据供人工复核。"
+                if problem_code == "unresolved" else _SELECTION_REASON
+            ),
         })
     return children

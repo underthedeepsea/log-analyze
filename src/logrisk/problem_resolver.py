@@ -358,6 +358,7 @@ def _cni_context(text: str) -> bool:
         r"network\s+(?:config(?:uration)?|setup)|"
         r"network\s+(?:for|in|on)\s+(?:the\s+)?(?:pod\s+)?sandbox|"
         r"(?:pod\s+)?sandbox[-\s]+(?:network|cni)|"
+        r"network\s+calico/k8s-pod-network\b|"
         r"workloadendpoint|网络配置|网络插件|网络.{0,20}沙箱|沙箱.{0,20}网络",
         text,
     ))
@@ -369,6 +370,7 @@ def _template_matches(source: Mapping[str, Any]) -> list[_Match]:
     cni = _cni_context(text)
 
     if re.search(r"workload[-_ ]?endpoint(?:\s+<\*>)?\s*(?:was\s+)?(?:not found|does not exist)|"
+                 r'workloadendpoint\.crd\.projectcalico\.org\s+"[^"\n]+"\s+(?:not found|does not exist)|'
                  r"(?:no such|missing)\s+workload[-_ ]?endpoint", text):
         matches.append(_Match(
             "kubernetes.cni.workload_endpoint_not_found", "selected_template_pattern", "high",
@@ -393,7 +395,13 @@ def _template_matches(source: Mapping[str, Any]) -> list[_Match]:
             "cni_config_error_v1",
         ))
 
-    stats_context = bool(_STATS_OPERATION_PATTERN.search(text))
+    # This exact RecentStats message describes the cache miss itself. Other
+    # statistics failures in the same template must still remain conflicting.
+    stats_text = re.sub(
+        r"recentstats\s+unable\s+to\s+find\s+data\s+in\s+memory\s+cache\b",
+        "", text,
+    )
+    stats_context = bool(_STATS_OPERATION_PATTERN.search(stats_text))
     not_found_context = bool(_CONTAINER_NOT_FOUND_PATTERN.search(text))
 
     if stats_context:
@@ -428,7 +436,8 @@ def _template_matches(source: Mapping[str, Any]) -> list[_Match]:
             "crash_loop_v1",
         ))
 
-    if re.search(r"failed\s+to\s+clean(?:\s+up)?\s+(?:the\s+)?(?:volume\s+)?subpath|"
+    if re.search(r"error\s+cleaning\s+subpath\s+mounts?\b|"
+                 r"failed\s+to\s+clean(?:\s+up)?\s+(?:the\s+)?(?:volume\s+)?subpath|"
                  r"(?:volume\s+)?subpath.{0,45}(?:cleanup|clean\s*up|remove|delete)", text):
         matches.append(_Match(
             "kubernetes.volume.subpath_cleanup_failure", "selected_template_pattern", "high",
@@ -473,6 +482,7 @@ def _template_matches(source: Mapping[str, Any]) -> list[_Match]:
             "image_pull_unauthorized_v1",
         ))
     if image_context and re.search(r"manifest\s+unknown|repository\s+does\s+not\s+exist|"
+                                   r"unknown\s+artifact\s+[^\n]+\s+not found|"
                                    r"name\s+unknown|image.{0,40}(?:not found|does not exist)|"
                                    r"(?:not found|does not exist).{0,40}image", text):
         matches.append(_Match(
@@ -481,13 +491,15 @@ def _template_matches(source: Mapping[str, Any]) -> list[_Match]:
         ))
     if image_context and re.search(r"connection\s+reset|connection\s+refused|timed?\s*out|"
                                    r"timeout|transport|tls|dial\s+tcp|no\s+route\s+to\s+host|"
-                                   r"network\s+is\s+unreachable|i/o\s+timeout|unexpected\s+eof", text):
+                                   r"network\s+is\s+unreachable|i/o\s+timeout|unexpected\s+eof|"
+                                   r"(?:get|head)\s+https?\s*:?\s*//\S+\s+eof\b", text):
         matches.append(_Match(
             "kubernetes.image.pull_transport_failure", "selected_template_pattern", "high",
             "image_pull_transport_v1",
         ))
 
     if re.search(r"checkpoint.{0,60}(?:resource\s+)?(?:not found|does not exist|missing)|"
+                 r"resource\s+allocation\s+not found\s+in\s+checkpoint\s+store|"
                  r"(?:resource|checkpoint).{0,30}no such", text):
         matches.append(_Match(
             "kubernetes.kubelet.checkpoint_resource_not_found", "selected_template_pattern", "high",
@@ -500,7 +512,9 @@ def _template_matches(source: Mapping[str, Any]) -> list[_Match]:
             "kubernetes.runtime.exec_process_still_running", "selected_template_pattern", "high",
             "exec_process_still_running_v1",
         ))
-    if re.search(r"(?:filesystem|file\s+system).{0,70}(?:stat|stats).{0,70}(?:path.{0,20}"
+    if re.search(r"failed\s+to\s+collect\s+filesystem\s+stats[^\n]*"
+                 r"could not stat[^\n]*no such file or directory|"
+                 r"(?:filesystem|file\s+system).{0,70}(?:stat|stats).{0,70}(?:path.{0,20}"
                  r"(?:missing|not found|does not exist)|no such file)|"
                  r"(?:failed\s+to\s+get|get).{0,30}filesystem\s+stats.{0,60}"
                  r"(?:path|no such|not found)", text):

@@ -1285,6 +1285,9 @@ class FeatureJobManager:
     def _reconcile_pending_candidates_locked(self, rule: Dict[str, Any]) -> Dict[str, int]:
         if str(rule.get("status") or "active") != "active" or not (rule.get("approval_key") or rule.get("problem_code")):
             return {"auto_resolved_candidates": 0, "auto_resolved_groups": 0}
+        batch = self._resolve_persisted_identity_locked(rule, status="approved")
+        if batch is not None:
+            return {"auto_resolved_candidates": len(batch["candidates"]), "auto_resolved_groups": batch["groups"]}
         self._load_persisted_candidate_jobs_locked()
         resolved = 0
         groups: set[str] = set()
@@ -1392,6 +1395,9 @@ class FeatureJobManager:
             self.approval_group_store.save(group)
 
     def _reject_pending_identity_locked(self, selected: Dict[str, Any]) -> int:
+        batch = self._resolve_persisted_identity_locked(selected, status="rejected")
+        if batch is not None:
+            return len(batch["candidates"])
         self._load_persisted_candidate_jobs_locked()
         rejected = 0
         for job in self._jobs.values():
@@ -1446,6 +1452,23 @@ class FeatureJobManager:
                 )
                 rejected += 1
         return rejected
+
+    def _resolve_persisted_identity_locked(self, reference: Dict[str, Any], *, status: str) -> Dict[str, Any] | None:
+        resolver = getattr(self.persistence, "resolve_pending_identity", None)
+        if not callable(resolver):
+            return None
+        result = resolver(reference, status=status)
+        for feature in result["candidates"]:
+            job = self._jobs.get(str(feature["job_id"]))
+            if job is not None:
+                job["features"][feature["candidate_id"]] = copy.deepcopy(feature)
+        for job_id, events in result["events"].items():
+            job = self._jobs.get(str(job_id))
+            if job is not None:
+                job["events"].extend(copy.deepcopy(events))
+                self._record_observability_event(job, events[0]["type"], {"resolved_count": len(events)})
+                job["condition"].notify_all()
+        return result
 
     def list_persisted_candidates(
         self, status: str | None = None, limit: int | None = None
@@ -1508,9 +1531,12 @@ class FeatureJobManager:
             "job_id": job["job_id"],
             **payload,
         }
+        append_review = getattr(self.persistence, "append_review_event", None)
+        if callable(append_review) and event_type in {"feature_updated", "pending_candidate_reconciled", "candidate_group_rejected"}:
+            event = append_review(event)
         job["events"].append(event)
         self._record_observability_event(job, event_type, payload)
-        if self.persistence:
+        if self.persistence and not (callable(append_review) and event_type in {"feature_updated", "pending_candidate_reconciled", "candidate_group_rejected"}):
             self.persistence.save(job)
         job["condition"].notify_all()
 

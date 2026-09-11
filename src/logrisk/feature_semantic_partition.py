@@ -16,6 +16,30 @@ class ProblemPresentation:
 
 
 _PROBLEM_PRESENTATIONS = {
+    "kubernetes.runtime.container_stop_timeout": ProblemPresentation(
+        "container_stop_timeout", "容器停止超时日志", ("容器运行时", "停止超时"),
+    ),
+    "kubernetes.runtime.memory_limit_invalid": ProblemPresentation(
+        "container_memory_limit_invalid", "容器内存限制配置无效日志", ("容器运行时", "内存限制配置"),
+    ),
+    "kubernetes.runtime.resource_update_busy": ProblemPresentation(
+        "container_resource_update_busy", "容器资源更新写入忙日志", ("容器运行时", "资源更新"),
+    ),
+    "kubernetes.runtime.container_removal_in_progress": ProblemPresentation(
+        "container_removal_in_progress", "容器移除操作正在进行日志", ("容器运行时", "移除冲突"),
+    ),
+    "kubernetes.runtime.sandbox_stop_failure": ProblemPresentation(
+        "sandbox_stop_failure", "Pod 沙箱停止失败日志", ("容器运行时", "沙箱停止"),
+    ),
+    "kubernetes.kubelet.manifest_path_missing": ProblemPresentation(
+        "kubelet_manifest_path_missing", "Kubelet 静态清单目录缺失日志", ("Kubelet", "清单目录缺失"),
+    ),
+    "kubernetes.pod.prestop_hook_failure": ProblemPresentation(
+        "container_prestop_hook_failure", "容器 preStop 钩子执行失败日志", ("Kubernetes", "preStop"),
+    ),
+    "linux.cgroup.device_missing": ProblemPresentation(
+        "cgroup_device_missing", "Cgroup 读取设备不存在日志", ("Linux", "Cgroup"),
+    ),
     "kubernetes.cni.config_error": ProblemPresentation(
         feature_type="cni_config_error",
         title="CNI 网络配置错误日志",

@@ -65,7 +65,7 @@ tables:
     description: 模型或规则产生的待审批特征
     primary_key: candidate_id
     foreign_keys: {job_id: feature_jobs.job_id ON DELETE CASCADE}
-    indexes: ["uq_feature_candidates_candidate_job(candidate_id, job_id)"]
+    indexes: ["uq_feature_candidates_candidate_job(candidate_id, job_id)", "idx_feature_candidates_status_created(status, created_at, candidate_id)"]
     columns: {candidate_id: 候选特征标识, job_id: 所属任务, entity_id: 来源风险实体, status: 审批状态, approval_key: 稳定审批身份, problem_code: 规范化问题编码, approval_group_id: 审批分组, resolved_rule_id: 收敛到的规则, resolution_type: manual/rule_matched/group_matched, candidate_json: 特征内容和 Evidence 引用, created_at: 创建时间, updated_at: 更新时间}
   feature_candidate_feedback:
     description: Feature Candidate 的追加式人工决策反馈；按 Candidate 与幂等键去重且不覆盖历史

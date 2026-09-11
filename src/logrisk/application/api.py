@@ -833,7 +833,12 @@ class ApiFacade:
         )
         groups = build_review_groups(candidates)
         metrics = approval_metrics(candidates, groups)
+        after = self._query(query, "after")
+        if after:
+            offset = next((index for index, group in enumerate(groups) if group["review_key"] > after), len(groups))
         page_end = offset + page_size
+        selected_key = self._query(query, "review_key")
+        selected_group = next((group for group in groups if group["review_key"] == selected_key), None) if selected_key else None
         return ApiResult(200, {
             "schema_version": "feature_approval_queue_v1",
             "status": status,
@@ -841,6 +846,8 @@ class ApiFacade:
             "total_candidates": sum(int(group.get("candidate_count") or 0) for group in groups),
             "metrics": metrics,
             "next_cursor": str(page_end) if page_end < len(groups) else None,
+            "next_review_key": groups[page_end - 1]["review_key"] if page_end < len(groups) else None,
+            "selected_group": selected_group,
             "items": groups[offset:page_end],
         })
 

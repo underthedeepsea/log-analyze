@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from logrisk.ai_harness.trace_logger import AITraceLogger
-from logrisk.approval_dedup import group_id_for_key
+from logrisk.approval_dedup import group_id_for_key, same_approval_identity
 from logrisk.approved_rules import (
     ApprovedRuleStore,
     ApprovedRuleError,
@@ -50,7 +50,7 @@ class SQLiteFeatureJobStore:
         self.database = database
 
     @classmethod
-    def _candidate_from_row(cls, row: Any) -> dict[str, Any] | None:
+    def _candidate_from_row(cls, row: Any, job_metadata: dict[str, Any] | None = None) -> dict[str, Any] | None:
         candidate = _sanitize_feature_payload(cls._decode_json(row["candidate_json"], {}))
         if not isinstance(candidate, dict):
             return None
@@ -65,7 +65,7 @@ class SQLiteFeatureJobStore:
         candidate["created_at"] = row["created_at"]
         candidate["updated_at"] = row["updated_at"]
         try:
-            job = cls._decode_json(row["job_json"], {})
+            job = job_metadata if job_metadata is not None else cls._decode_json(row["job_json"], {})
         except (IndexError, KeyError):
             job = {}
         if not isinstance(job, dict):
@@ -321,8 +321,8 @@ class SQLiteFeatureJobStore:
     ) -> dict[str, Any] | None:
         query = (
             "SELECT c.candidate_id, c.job_id, c.entity_id, c.status, c.approval_key, c.problem_code, "
-            "c.approval_group_id, c.resolved_rule_id, c.resolution_type, c.candidate_json, c.created_at, c.updated_at, "
-            "j.job_json FROM feature_candidates c JOIN feature_jobs j ON j.job_id=c.job_id "
+            "c.approval_group_id, c.resolved_rule_id, c.resolution_type, c.candidate_json, c.created_at, c.updated_at "
+            "FROM feature_candidates c "
             "WHERE c.candidate_id=?"
         )
         parameters: list[Any] = [str(candidate_id)]
@@ -331,7 +331,7 @@ class SQLiteFeatureJobStore:
             parameters.append(str(job_id))
         with self.database.connect() as connection:
             row = connection.execute(query, parameters).fetchone()
-        return self._candidate_from_row(row) if row else None
+            return next(iter(self._candidates_from_rows(connection, [row])), None) if row else None
 
     def save_generated_candidate(
         self, job_id: str, candidate: dict[str, Any]
@@ -356,12 +356,12 @@ class SQLiteFeatureJobStore:
             )
             row = connection.execute(
                 "SELECT c.candidate_id, c.job_id, c.entity_id, c.status, c.approval_key, c.problem_code, "
-                "c.approval_group_id, c.resolved_rule_id, c.resolution_type, c.candidate_json, c.created_at, c.updated_at, "
-                "j.job_json FROM feature_candidates c JOIN feature_jobs j ON j.job_id=c.job_id "
+                "c.approval_group_id, c.resolved_rule_id, c.resolution_type, c.candidate_json, c.created_at, c.updated_at "
+                "FROM feature_candidates c "
                 "WHERE c.candidate_id=?",
                 (candidate_id,),
             ).fetchone()
-            loaded = self._candidate_from_row(row) if row else None
+            loaded = next(iter(self._candidates_from_rows(connection, [row])), None) if row else None
             return loaded if loaded is not None else merged
 
     def update_candidate_review_state(
@@ -385,8 +385,8 @@ class SQLiteFeatureJobStore:
         with self.database.transaction() as connection:
             query = (
                 "SELECT c.candidate_id, c.job_id, c.entity_id, c.status, c.approval_key, c.problem_code, "
-                "c.approval_group_id, c.resolved_rule_id, c.resolution_type, c.candidate_json, c.created_at, c.updated_at, "
-                "j.job_json FROM feature_candidates c JOIN feature_jobs j ON j.job_id=c.job_id "
+                "c.approval_group_id, c.resolved_rule_id, c.resolution_type, c.candidate_json, c.created_at, c.updated_at "
+                "FROM feature_candidates c "
                 "WHERE c.candidate_id=?"
             )
             parameters: list[Any] = [candidate_id]
@@ -396,7 +396,7 @@ class SQLiteFeatureJobStore:
             row = connection.execute(query, parameters).fetchone()
             if row is None:
                 raise self._candidate_not_found()
-            current = self._candidate_from_row(row)
+            current = next(iter(self._candidates_from_rows(connection, [row])), None)
             if current is None:
                 raise self._candidate_not_found()
             current_status = current.get("status")
@@ -445,12 +445,12 @@ class SQLiteFeatureJobStore:
                 raise self._candidate_state_conflict()
             updated_row = connection.execute(
                 "SELECT c.candidate_id, c.job_id, c.entity_id, c.status, c.approval_key, c.problem_code, "
-                "c.approval_group_id, c.resolved_rule_id, c.resolution_type, c.candidate_json, c.created_at, c.updated_at, "
-                "j.job_json FROM feature_candidates c JOIN feature_jobs j ON j.job_id=c.job_id "
+                "c.approval_group_id, c.resolved_rule_id, c.resolution_type, c.candidate_json, c.created_at, c.updated_at "
+                "FROM feature_candidates c "
                 "WHERE c.candidate_id=?",
                 (candidate_id,),
             ).fetchone()
-            loaded = self._candidate_from_row(updated_row) if updated_row else None
+            loaded = next(iter(self._candidates_from_rows(connection, [updated_row])), None) if updated_row else None
             return loaded if loaded is not None else updated
 
     def rollback_candidate_review_state(
@@ -476,8 +476,8 @@ class SQLiteFeatureJobStore:
     ) -> list[dict[str, Any]]:
         query = (
             "SELECT c.candidate_id, c.job_id, c.entity_id, c.status, c.approval_key, c.problem_code, c.approval_group_id, "
-            "c.resolved_rule_id, c.resolution_type, c.candidate_json, c.created_at, c.updated_at, "
-            "j.job_json FROM feature_candidates c JOIN feature_jobs j ON j.job_id=c.job_id"
+            "c.resolved_rule_id, c.resolution_type, c.candidate_json, c.created_at, c.updated_at "
+            "FROM feature_candidates c"
         )
         parameters: list[Any] = []
         if status is not None:
@@ -489,12 +489,119 @@ class SQLiteFeatureJobStore:
             parameters.append(max(1, int(limit)))
         with self.database.connect() as connection:
             rows = connection.execute(query, parameters).fetchall()
-        candidates: list[dict[str, Any]] = []
-        for row in rows:
-            candidate = self._candidate_from_row(row)
-            if candidate is not None:
-                candidates.append(candidate)
-        return candidates
+            return self._candidates_from_rows(connection, rows)
+
+    def _candidates_from_rows(self, connection: Any, rows: list[Any]) -> list[dict[str, Any]]:
+        # A job snapshot contains every candidate. Never join that blob onto each row.
+        job_ids = sorted({str(row["job_id"]) for row in rows})
+        metadata: dict[str, dict[str, Any]] = {}
+        fields = ("model", "provider", "prompt_id")
+        if getattr(self.database, "provider", "sqlite") == "postgres":
+            projection = ", ".join(f"job_json->>'{field}' AS {field}" for field in fields)
+        else:
+            projection = ", ".join(f"json_extract(job_json, '$.{field}') AS {field}" for field in fields)
+        for start in range(0, len(job_ids), 200):
+            batch = job_ids[start:start + 200]
+            query = (
+                "SELECT job_id, status, created_at, model_profile_id, " + projection
+                + " FROM feature_jobs WHERE job_id IN (" + ",".join("?" for _ in batch) + ")"
+            )
+            for row in connection.execute(query, batch).fetchall():
+                metadata[str(row["job_id"])] = dict(row)
+        return [candidate for row in rows if (candidate := self._candidate_from_row(row, metadata.get(str(row["job_id"]), {}))) is not None]
+
+    def _append_review_events(self, connection: Any, job_id: str, events: list[dict[str, Any]]) -> None:
+        # Caller holds the job row lock, shared with normal job saves, on PostgreSQL.
+        row = connection.execute(
+            "SELECT COALESCE(MAX(sequence), -1) AS last_sequence FROM feature_job_events WHERE job_id=?", (job_id,)
+        ).fetchone()
+        sequence = int(row["last_sequence"]) + 1
+        for offset, event in enumerate(events):
+            event["sequence"] = sequence + offset
+        connection.executemany(
+            "INSERT INTO feature_job_events(job_id, sequence, event_type, event_json, created_at) VALUES (?, ?, ?, ?, ?)",
+            [(job_id, event["sequence"], event["type"], _json(event), event["timestamp"]) for event in events],
+        )
+        connection.execute("UPDATE feature_jobs SET updated_at=? WHERE job_id=?", (utc_now(), job_id))
+
+    def append_review_event(self, event: dict[str, Any]) -> dict[str, Any]:
+        value = _sanitize_feature_payload(event)
+        with self.database.transaction() as connection:
+            suffix = " FOR UPDATE" if getattr(self.database, "provider", "sqlite") == "postgres" else ""
+            connection.execute("SELECT job_id FROM feature_jobs WHERE job_id=?" + suffix, (value["job_id"],)).fetchone()
+            self._append_review_events(connection, value["job_id"], [value])
+        return value
+
+    def resolve_pending_identity(self, reference: dict[str, Any], *, status: str) -> dict[str, Any]:
+        """Settle matching pending rows and their audit events in one transaction."""
+        if status not in {"approved", "rejected"}:
+            raise ValueError("Invalid review resolution")
+        # Recompute identities from evidence: persisted physical keys may be stale.
+        matches = [item for item in self.list_candidates(status="pending") if same_approval_identity(item, reference)]
+        updated: list[dict[str, Any]] = []
+        events_by_job: dict[str, list[dict[str, Any]]] = {}
+        group_keys: set[str] = set()
+        group_count = 0
+        if not matches:
+            return {"candidates": updated, "events": events_by_job, "groups": group_count}
+        now = utc_now()
+        rule_id = reference.get("rule_id") if status == "approved" else None
+        with self.database.transaction() as connection:
+            suffix = " FOR UPDATE" if getattr(self.database, "provider", "sqlite") == "postgres" else ""
+            # Lock parents first, then candidates, consistently with generated-candidate saves.
+            for job_id in sorted({str(item["job_id"]) for item in matches}):
+                connection.execute("SELECT job_id FROM feature_jobs WHERE job_id=?" + suffix, (job_id,)).fetchone()
+            ids = sorted(str(item["candidate_id"]) for item in matches)
+            for start in range(0, len(ids), 200):
+                batch = ids[start:start + 200]
+                rows = connection.execute(
+                    "SELECT * FROM feature_candidates WHERE candidate_id IN (" + ",".join("?" for _ in batch)
+                    + ") AND status='pending' ORDER BY candidate_id" + suffix, batch,
+                ).fetchall()
+                updates = []
+                for row in rows:
+                    feature = self._candidate_from_row(row)
+                    if feature is None or not same_approval_identity(feature, reference):
+                        continue
+                    feature.update({
+                        "status": status,
+                        "approved_at": (feature.get("approved_at") or reference.get("approved_at") or now) if rule_id else None,
+                        "resolution_type": "group_matched" if rule_id else "group_rejected",
+                        "updated_at": now,
+                    })
+                    if rule_id:
+                        feature.update({"rule_id": rule_id, "resolved_rule_id": rule_id})
+                    else:
+                        feature["review_scope"] = "approval_identity"
+                    updates.append((status, feature.get("resolved_rule_id"), feature["resolution_type"], _json(feature), now, feature["candidate_id"]))
+                    updated.append(feature)
+                    if feature.get("approval_key"):
+                        group_keys.add(str(feature["approval_key"]))
+                    event = {
+                        "type": "pending_candidate_reconciled" if rule_id else "candidate_group_rejected",
+                        "timestamp": now, "job_id": feature["job_id"], "candidate_id": feature["candidate_id"],
+                        "entity_id": str(feature.get("entity_id") or (feature.get("entity") or {}).get("id") or ""),
+                        "approval_group_id": feature.get("approval_group_id"), "approval_key": feature.get("approval_key"),
+                    }
+                    if rule_id:
+                        event["rule_id"] = rule_id
+                    events_by_job.setdefault(feature["job_id"], []).append(event)
+                connection.executemany(
+                    "UPDATE feature_candidates SET status=?, resolved_rule_id=?, resolution_type=?, candidate_json=?, updated_at=? WHERE candidate_id=? AND status='pending'",
+                    updates,
+                )
+            keys = sorted(group_keys)
+            for start in range(0, len(keys), 200):
+                batch = keys[start:start + 200]
+                cursor = connection.execute(
+                    "UPDATE approval_groups SET status=?, rule_id=COALESCE(?, rule_id), updated_at=? WHERE status='pending' AND approval_key IN ("
+                    + ",".join("?" for _ in batch) + ")",
+                    ["auto_resolved" if rule_id else "rejected", rule_id, now, *batch],
+                )
+                group_count += cursor.rowcount
+            for job_id, events in events_by_job.items():
+                self._append_review_events(connection, job_id, events)
+        return {"candidates": updated, "events": events_by_job, "groups": group_count}
 
 
 class SQLiteApprovedRuleStore(ApprovedRuleStore):

@@ -554,7 +554,8 @@ def test_release_docs_describe_current_feature_version():
     assert "## 1.32.0 - 2026-08-10" in release
     assert "## 1.34.0 - 2026-08-13" in release
     assert "## 1.36.1 - 2026-09-01" in release
-    assert "当前版本：`1.37.2`" in readme
+    assert "当前版本：`1.38.0`" in readme
+    assert "## 1.37.3 - 2026-09-11" in release
     assert "## 1.24.0 - 2026-07-22" in release
     assert "## 1.24.1 - 2026-07-22" in release
     assert "## 1.24.2 - 2026-07-22" in release
@@ -689,16 +690,20 @@ def test_review_workbench_preserves_queue_request_safety_and_dirty_drafts():
     source = (FRONTEND / "src" / "app.js").read_text(encoding="utf-8")
 
     for marker in (
-        'featureApprovals: function (cursor)',
-        'next_cursor',
+        'featureApprovals: function (after, selectedKey)',
+        'next_review_key',
         'const approvalRequestSequence = useRef(0);',
-        'const requestId = approvalRequestSequence.current + 1;',
-        'approvalRequestSequence.current = requestId;',
-        'if (requestId !== approvalRequestSequence.current) return page;',
+        'const requestId = ++approvalRequestSequence.current;',
         'if (requestId !== approvalRequestSequence.current) return value;',
-        'do {',
-        'cursor = page.next_cursor || "";',
-        'const requested = new URLSearchParams(window.location.search).get("review_key") || "";',
+        'mode === "more" ? approvalQueue.next_review_key : null',
+        'createReviewSubmissionQueue',
+        'reviewSubmissionLabel',
+        'review-save-feedback',
+        'beforeunload',
+        'const currentReview = reviewNavigation.current;',
+        'props.loading && groups.length === 0',
+        'onDismissFailed: dismissFailedReview',
+        'active < 2',
         'setSelectedReviewKey(function (current)',
         'const draftIdentity = useRef("");',
         'reviewDirty',
@@ -706,7 +711,7 @@ def test_review_workbench_preserves_queue_request_safety_and_dirty_drafts():
         'h("select", { value: draft.importance',
         'candidate_state_conflict',
         'candidate_not_found',
-        'auto_resolved_count',
+        'reviewSender.current.submit',
     ):
         assert marker in source
 
@@ -770,3 +775,20 @@ def test_review_workbench_bundles_are_identical():
     django_css = Path("src/logrisk_django/static/logrisk/assets/app.css").read_bytes()
     assert source_css == dist_css
     assert source_css == django_css
+
+
+def test_background_review_submission_queue_behavior():
+    import shutil
+    import subprocess
+    import pytest
+
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("Node is only needed for the optional JavaScript regression check")
+    subprocess.run([node, "tests/frontend_review_queue.cjs"], check=True, capture_output=True, text=True)
+    source = (FRONTEND / "src" / "app.js").read_text(encoding="utf-8")
+    workspace = source[source.index('view === "review" && h("section"'):]
+    assert 'reviewNotice && h(' not in workspace
+    save = source[source.index('    function saveReview(changes) {'):source.index('    function retry(entityId)')]
+    assert "loadApprovalQueue" not in save
+    assert "await" not in save

@@ -1292,7 +1292,7 @@ def test_unresolved_identity_is_stable_after_persistence_and_repeated_reads():
         "title": "未解析证据", "components": ["kubelet"],
         "template_hashes": ["unknown-a"],
         "source_templates": [{"template_hash": "unknown-a", "component": "kubelet",
-                              "template": "StopContainer failed: context deadline exceeded"}],
+                              "template": "Unclassified runtime operation failed"}],
     }
     original = approval_identity(feature)
     assert original["semantic_safe"] is False

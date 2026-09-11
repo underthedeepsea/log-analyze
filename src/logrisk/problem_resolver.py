@@ -102,6 +102,14 @@ _CONCRETE_CODES = frozenset({
     "kubernetes.runtime.container_stats_failure",
     "kubernetes.runtime.exec_process_still_running",
     "kubernetes.runtime.filesystem_stats_path_missing",
+    "kubernetes.runtime.container_stop_timeout",
+    "kubernetes.runtime.memory_limit_invalid",
+    "kubernetes.runtime.resource_update_busy",
+    "kubernetes.runtime.container_removal_in_progress",
+    "kubernetes.runtime.sandbox_stop_failure",
+    "kubernetes.kubelet.manifest_path_missing",
+    "kubernetes.pod.prestop_hook_failure",
+    "linux.cgroup.device_missing",
     "kubernetes.volume.subpath_cleanup_failure",
     "kubernetes.volume.unmount_failure",
     "linux.memory.oom",
@@ -368,6 +376,59 @@ def _template_matches(source: Mapping[str, Any]) -> list[_Match]:
     text = unicodedata.normalize("NFKC", _combined_template_text(source)).lower()
     matches: list[_Match] = []
     cni = _cni_context(text)
+
+    # Match explicit failed operations; a resource/configuration word alone is
+    # not evidence of exhaustion or a failed operation.
+    if re.search(r"stopcontainer|killcontainer|container.{0,100}termination\s+failed", text) and re.search(
+        r"failed|error", text
+    ) and re.search(r"context\s+deadline\s+exceeded|operation\s+timeout", text):
+        matches.append(_Match(
+            "kubernetes.runtime.container_stop_timeout", "selected_template_pattern", "high",
+            "container_stop_timeout_v1",
+        ))
+    if re.search(r"createcontainer|container\s+start\s+failed", text) and re.search(
+        r"error.{0,80}minimum\s+memory\s+limit\s+allowed\s+is", text
+    ):
+        matches.append(_Match(
+            "kubernetes.runtime.memory_limit_invalid", "selected_template_pattern", "high",
+            "memory_limit_invalid_v1",
+        ))
+    if re.search(r"updatecontainerresources|failed\s+to\s+update\s+container", text) and re.search(
+        r"failed\s+to\s+write[^\n]+device\s+or\s+resource\s+busy", text
+    ):
+        matches.append(_Match(
+            "kubernetes.runtime.resource_update_busy", "selected_template_pattern", "high",
+            "resource_update_busy_v1",
+        ))
+    if re.search(r"removecontainer[^\n]+failed", text) and re.search(
+        r"removal\s+of\s+container[^\n]+already\s+in\s+progress", text
+    ):
+        matches.append(_Match(
+            "kubernetes.runtime.container_removal_in_progress", "selected_template_pattern", "high",
+            "container_removal_in_progress_v1",
+        ))
+    if re.search(r"failed\s+to\s+stop\s+sandbox\b", text):
+        matches.append(_Match(
+            "kubernetes.runtime.sandbox_stop_failure", "selected_template_pattern", "high",
+            "sandbox_stop_failure_v1",
+        ))
+    if re.search(r"unable\s+to\s+read\s+config\s+path\s+[\"']?/etc/kubernetes/manifests[\"']?"
+                 r"\s+path\s+does\s+not\s+exist", text):
+        matches.append(_Match(
+            "kubernetes.kubelet.manifest_path_missing", "selected_template_pattern", "high",
+            "manifest_path_missing_v1",
+        ))
+    if re.search(r"prestop\s+hook\s+for\s+container[^\n]+failed\s+command", text):
+        matches.append(_Match(
+            "kubernetes.pod.prestop_hook_failure", "selected_template_pattern", "high",
+            "prestop_hook_failure_v1",
+        ))
+    if re.search(r"readstring\s+failed\s+to\s+read[^\n]+(?:<k8s_cgroup>|/sys/fs/cgroup/)"
+                 r"[^\n]+no\s+such\s+device", text):
+        matches.append(_Match(
+            "linux.cgroup.device_missing", "selected_template_pattern", "high",
+            "cgroup_device_missing_v1",
+        ))
 
     if re.search(r"workload[-_ ]?endpoint(?:\s+<\*>)?\s*(?:was\s+)?(?:not found|does not exist)|"
                  r'workloadendpoint\.crd\.projectcalico\.org\s+"[^"\n]+"\s+(?:not found|does not exist)|'

@@ -453,6 +453,13 @@ def _is_legacy_feature(feature: Dict[str, Any], identity: Dict[str, Any]) -> boo
         return True
     if version == _V2_SCHEMA_VERSION:
         return False
+    if (
+        isinstance(feature.get("problem_resolution"), dict)
+        and feature.get("match_mode") in {"semantic", "template_set"}
+    ):
+        # Modern candidates retain historical physical keys for audit. Their
+        # freshly derived evidence identity, not that old key, controls reuse.
+        return False
     key = str(feature.get("approval_key") or "").strip()
     canonical_key = str(feature.get("canonical_approval_key") or "").strip()
     return bool(key and key != identity["approval_key"] and canonical_key != identity["approval_key"])

@@ -11,6 +11,7 @@ from logrisk.approved_rules import (
     RuleFormat,
     RuleNormalizationSource,
     classify_rule,
+    has_v2_identity_markers,
     hydrate_persisted_rule,
     normalize_legacy_rule_version,
     public_rule,
@@ -76,6 +77,49 @@ class RuleGovernanceRepository:
                 (rule_id,),
             ).fetchone()
         return self._rule(row) if row else None
+
+    def repair_legacy_import(self, rule_id: str, *, operator: str) -> dict[str, Any]:
+        """Explicitly repair the format stamp introduced by migration 0004.
+
+        An incomplete V2 rule alone is not proof of a legacy approval. Require
+        the unchanged system-migration snapshot; retain it as version history.
+        """
+        current = self.get_rule(rule_id)
+        with self.database.connect() as connection:
+            row = connection.execute(
+                "SELECT rule_json, change_type, operator FROM rule_versions "
+                "WHERE rule_id=? AND version=1", (rule_id,),
+            ).fetchone()
+        previous = json.loads(row["rule_json"]) if row else {}
+        identity_fields = (
+            "rule_id", "signature", "feature_type", "template_signatures", "components",
+            "approved_at", "lineage",
+        )
+        if (
+            not current or not row
+            or current.get("schema_version") != "approved_rule_v2"
+            or current.get("current_version") != 1
+            or row["change_type"] != "legacy_import"
+            or row["operator"] != "system-migration"
+            or previous.get("schema_version") != "approved_rule_v2"
+            or has_v2_identity_markers(current) or has_v2_identity_markers(previous)
+            or not current.get("template_signatures") or not current.get("components")
+            or not all(current.get(key) == previous.get(key) for key in identity_fields)
+            or set(classify_rule(current).integrity_errors) != {
+                "approval_key_missing", "match_mode_missing_or_invalid", "problem_code_missing",
+            }
+        ):
+            raise RuleGovernanceError(
+                "没有匹配的原始迁移记录，不能将损坏的 V2 规则恢复为 V1",
+                code="legacy_repair_not_proven", status_code=409,
+            )
+        repaired = public_rule(current)
+        repaired.update({"schema_version": "approved_rule_v1", "approval_key": None, "problem_code": None})
+        return self.commit_version(
+            repaired, expected_version=1, change_type="legacy_format_repaired",
+            reason="依据未变更的 0004 迁移快照恢复 V1 格式；保留原审批范围与历史版本",
+            operator=operator, created_at=_now(),
+        )
 
     def commit_version(
         self,

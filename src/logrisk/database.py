@@ -386,7 +386,11 @@ class PostgresConnection:
 
     def execute(self, sql: str, parameters: Sequence[Any] | None = None) -> PostgresCursor:
         cursor = self._connection.cursor()
-        cursor.execute(qmark_to_pyformat(sql), tuple(parameters or ()))
+        if parameters is None:
+            # Unparameterized migration SQL may contain PostgreSQL JSON ? operators.
+            cursor.execute(sql)
+        else:
+            cursor.execute(qmark_to_pyformat(sql), tuple(parameters))
         return PostgresCursor(cursor)
 
     def executemany(self, sql: str, parameters: Sequence[Sequence[Any]]) -> None:

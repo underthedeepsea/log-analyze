@@ -4,11 +4,11 @@
   <img src="frontend/logo/logrisk-app-icon-orange-v2.png" width="112" alt="LOGRISK 应用图标" />
 </p>
 
-当前版本：`1.38.0`。完整变更记录见 [`releas.md`](releas.md)。
+当前版本：`1.38.1`。完整变更记录见 [`releas.md`](releas.md)。
 
 人工审批支持连续操作：点击批准或驳回后，条目立即变绿并显示“保存中”，数据库确认后变为“已保存”；当前面板保留，可继续选择下一组。保存失败保留提交内容并可重试；有未确认提交时请保留页面，关闭或刷新浏览器会提示。列表中的“刷新”会重新获取待审批队列并移除已保存条目，“加载更多”继续读取后续组。审批身份和规则复用范围仍按脱敏证据确定。
 
-PostgreSQL 部署升级到 1.38.0 时，应先通过 `python manage.py logrisk_migrate --json` 显式应用 `0022_approval_queue_performance.sql` 索引迁移，再更新服务；Django/Airflow 不会自动迁移。批量审批只更新命中候选、分组状态和审计事件，完整任务快照不再逐条回写。
+PostgreSQL 部署升级到 1.38.1 时，应先通过 `python manage.py logrisk_migrate --json` 显式应用待执行迁移（包括 `0022_approval_queue_performance.sql` 索引与 `0023_approval_transactions.sql` 审批事务表），再更新服务；Django/Airflow 不会自动迁移。批量审批只更新命中候选、分组状态和审计事件，完整任务快照不再逐条回写。审批携带版本与请求幂等键，冲突保留草稿并展示最新决定；新候选审批和已批准规则健康复审分别展示。Kafka 默认关闭，各部署实例独立配置；读取本批高水位后结束，未探测连接时明确显示“未检查”。
 
 
 新生成的日志候选按已识别语义拆分，未解析证据单独保留待人工复核；日志命中次数按各自所选模板计算。审批页区分结构校验与语义证据完整性。历史候选和审批状态不会自动重写。

@@ -7,6 +7,7 @@ from .errors import AgenticError
 
 
 FORBIDDEN_KEYS = frozenset({
+    "raw", "raw_record", "raw_records", "raw_samples", "log_stream", "raw_stream",
     "samples", "raw_sample", "raw_log", "raw_logs", "raw_message", "message", "api_key", "token",
     "password", "secret", "dsn", "authorization", "cookie",
 })
@@ -20,6 +21,7 @@ class AgentToolContext:
     allowed_tools: frozenset[str]
     actor: str
     request_id: str
+    evidence_hash: str | None = None
 
 
 @dataclass(frozen=True)
@@ -34,8 +36,17 @@ class AgentTool:
 
 
 class ToolRegistry:
-    def __init__(self) -> None:
+    def __init__(self, *, evidence_loader: Callable[[AgentToolContext], dict[str, Any]] | None = None) -> None:
         self._tools: dict[str, AgentTool] = {}
+        self._evidence_loader = evidence_loader
+
+    def current_evidence_hash(self, context: AgentToolContext) -> str | None:
+        if self._evidence_loader is None:
+            return context.evidence_hash
+        from .artifacts import canonical_fingerprint
+        evidence = self._evidence_loader(context)
+        _reject_sensitive(evidence)
+        return canonical_fingerprint(evidence)
 
     def register(
         self,

@@ -1,4 +1,4 @@
-schema_version: 21
+schema_version: 23
 database: logrisk
 description: LOGRISK 双模式运行时数据字典；SQLite 是默认本地实现，PostgreSQL 用于显式配置的外部生产部署。
 authoritative_ddl:
@@ -490,6 +490,16 @@ tables:
     foreign_keys: {workflow_run_id: agent_workflow_runs.workflow_run_id ON DELETE CASCADE}
     constraints: 同一 Run 的 sequence 唯一且单调递增；workflow_run_id/idempotency_key 联合唯一
     columns: {event_id: 事件标识, workflow_run_id: 工作流 Run 标识, sequence: 事件序号, event_type: 事件类型, node_id: 可选节点标识, attributes_json: 脱敏属性, idempotency_key: 控制操作幂等键, created_at: 创建时间, schema_version: 结构版本}
+  approval_identity_locks:
+    description: 审批、登记与全量任务保存共用的事务锁；先登记锁再排序 identity 锁
+    primary_key: approval_key
+    columns: {approval_key: 稳定审批标识或登记锁, created_at: 创建时间}
+  approval_decisions:
+    description: 已提交审批决定与请求幂等响应；与规则、候选、组和审批审计共用事务
+    primary_key: decision_id
+    constraints: request_key/actor_scope 联合唯一；与任务删除独立保留
+    indexes: ["idx_approval_decisions_candidate(candidate_id, created_at)"]
+    columns: {decision_id: 决定标识, request_key: 客户端请求幂等标识, actor_scope: 可信主体范围, payload_hash: 请求摘要, candidate_id: 候选标识, before_version: 审批前候选更新时间, result_json: 已提交脱敏响应, created_at: 决定时间}
 postgres_type_mapping:
   TEXT: text
   TEXT_identifier: text

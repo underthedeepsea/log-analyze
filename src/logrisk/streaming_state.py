@@ -97,6 +97,14 @@ class StreamingStateRepository:
     def mark_running(self, task_id: str) -> dict[str, Any]:
         return self._update_task(task_id, status="running", stage="READING", event_type="task_started")
 
+    def count_active_tasks(self, *, source_kind: str) -> int:
+        with self.database.connect() as connection:
+            row = connection.execute(
+                "SELECT COUNT(*) FROM streaming_tasks WHERE source_kind=? AND status IN ('queued', 'running')",
+                (source_kind,),
+            ).fetchone()
+        return int(row[0])
+
     def claim_task(self, task_id: str) -> dict[str, Any]:
         now = utc_now()
         with self.database.transaction() as connection:

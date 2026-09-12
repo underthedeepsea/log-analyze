@@ -7,6 +7,7 @@ from logrisk.problem_resolver import resolve_problem
 
 
 IMPORTANCE_LEVELS = {"critical", "high", "medium", "low"}
+EVALUATOR_VERSION = "feature_output_v1"
 FORBIDDEN_CLAIMS = (
     "根因是", "原因是", "可能由于", "建议重启", "应该扩容", "建议扩容",
     "应该检查", "修复方法", "处理建议", "处置建议", "影响范围",

@@ -126,6 +126,7 @@ urlpatterns = [
     path("api/ai-harness/model-profiles", model_profiles),
     path("api/ai-harness/prompts/<str:prompt_id>", prompt_detail),
     path("api/health", core_read, {"endpoint": "health"}),
+    path("api/streaming/sources", core_read, {"endpoint": "streaming/sources"}),
     path("api/runtime/readiness", core_read, {"endpoint": "runtime/readiness"}),
     path("api/runtime/health", core_read, {"endpoint": "runtime/health"}),
     path("api/runtime/airflow", core_read, {"endpoint": "runtime/airflow"}),

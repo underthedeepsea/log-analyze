@@ -7,6 +7,7 @@ from typing import Any, Mapping
 from urllib.parse import urlparse
 
 from logrisk.application import ApplicationConfig
+from logrisk.incremental_sources import IncrementalSourceError, parse_kafka_enabled
 
 
 class LogriskSettingsError(ValueError):
@@ -33,6 +34,7 @@ _ALLOWED = {
     "runtime_config_path",
     "agentic_enabled",
     "agent_workflows_enabled",
+    "kafka_enabled",
 }
 
 
@@ -57,6 +59,7 @@ class LogriskConfig:
     agentic_enabled: bool = False
     agent_workflows_enabled: bool = False
     runtime_config_path: Path | None = None
+    kafka_enabled: bool = False
 
     @classmethod
     def from_django_settings(cls, django_settings: Any) -> "LogriskConfig":
@@ -106,6 +109,10 @@ class LogriskConfig:
         if agent_workflows_enabled and not agentic_enabled:
             raise LogriskSettingsError("agent_workflows_enabled 需要同时启用 agentic_enabled")
         runtime_config_path = _path(raw["runtime_config_path"], "runtime_config_path") if raw.get("runtime_config_path") else None
+        try:
+            kafka_enabled = parse_kafka_enabled(raw.get("kafka_enabled", os.getenv("LOGRISK_KAFKA_ENABLED")))
+        except IncrementalSourceError as exc:
+            raise LogriskSettingsError(str(exc)) from exc
         return cls(
             project_root=project_root,
             state_root=state_root,
@@ -126,6 +133,7 @@ class LogriskConfig:
             agentic_enabled=agentic_enabled,
             agent_workflows_enabled=agent_workflows_enabled,
             runtime_config_path=runtime_config_path,
+            kafka_enabled=kafka_enabled,
         )
 
     def application_config(self) -> ApplicationConfig:
@@ -148,6 +156,7 @@ class LogriskConfig:
             migrate_database=False,
             agentic_enabled=self.agentic_enabled,
             agent_workflows_enabled=self.agent_workflows_enabled,
+            kafka_enabled=self.kafka_enabled,
         )
 
     def public_dict(self) -> dict[str, Any]:
@@ -166,6 +175,7 @@ class LogriskConfig:
             "write_roles": list(self.write_roles),
             "agentic_enabled": self.agentic_enabled,
             "agent_workflows_enabled": self.agent_workflows_enabled,
+            "kafka_enabled": self.kafka_enabled,
         }
 
 

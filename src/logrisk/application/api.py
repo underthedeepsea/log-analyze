@@ -36,6 +36,8 @@ class ApiFacade:
         self.service_resolver = service_resolver
 
     def dispatch_read(self, path: str, query: Mapping[str, Any] | None = None) -> ApiResult | None:
+        if path == "/api/streaming/sources":
+            return ApiResult(200, {"sources": self.container.source_capabilities()})
         if path == "/api/health":
             return self.health()
         if path == "/api/runtime/readiness":
@@ -195,6 +197,14 @@ class ApiFacade:
         body = self._service("runtime_service", self.container.runtime_service).readiness(
             airflow=self._service("airflow_readiness", None)
         )
+        try:
+            kafka = self.container.source_capabilities()["kafka"]
+        except Exception:
+            # Readiness must remain readable when the task-count query fails.
+            kafka = {"status": "unavailable", "enabled": self.container.config.kafka_enabled,
+                     "configured": None, "dependency_ready": None, "connection_check": "not_checked", "active_tasks": None}
+            body.update({"ready": False, "status": "not_ready"})
+        body.setdefault("dependencies", {})["kafka"] = kafka
         return ApiResult(200 if body["ready"] else 503, body)
 
     def model_profiles(self) -> ApiResult:
@@ -959,17 +969,25 @@ class ApiFacade:
         identity: RequestIdentity,
     ) -> ApiResult:
         self._require_write(identity)
+        changes = dict(payload)
+        review_options = {"actor_scope": f"{identity.source}:{identity.actor or 'local'}"}
+        if "request_key" in changes or "expected_updated_at" in changes:
+            review_options.update({
+                "request_key": changes.pop("request_key", None),
+                "expected_updated_at": changes.pop("expected_updated_at", None),
+            })
         feature = self._service("feature_jobs", self.container.feature_jobs).update_feature(
-            str(job_id), str(candidate_id), dict(payload)
+            str(job_id), str(candidate_id), changes, **review_options,
         )
         status = str(feature.get("status") or "pending")
-        self._audit(
-            "feature.approved" if status == "approved" else "feature.reviewed",
-            "feature_candidate",
-            identity,
-            resource_id=str(candidate_id),
-            attributes={"job_id": str(job_id), "status": status},
-        )
+        if not feature.get("idempotent_replay"):
+            self._audit(
+                "feature.approved" if status == "approved" else "feature.reviewed",
+                "feature_candidate",
+                identity,
+                resource_id=str(candidate_id),
+                attributes={"job_id": str(job_id), "status": status},
+            )
         return ApiResult(200, feature)
 
     def export_approved(self, job_id: str, identity: RequestIdentity) -> ApiResult:

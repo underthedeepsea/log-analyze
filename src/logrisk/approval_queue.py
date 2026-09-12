@@ -63,6 +63,9 @@ _REPRESENTATIVE_FIELDS = frozenset({
     "lineage",
     "created_at",
     "updated_at",
+    "decision_version",
+    "reopen_reason",
+    "matched_rule_id",
     "job_created_at",
     "job_status",
     "problem_resolution",
@@ -240,6 +243,10 @@ def build_review_groups(candidates: list[Mapping[str, Any]]) -> list[dict[str, A
         )
         result.append({
             "review_key": review_key,
+            "queue_kind": "new_candidate",
+            "reopen_reason": representative.get("reopen_reason"),
+            "matched_rule_id": representative.get("matched_rule_id"),
+            "decision_version": representative.get("decision_version") or representative.get("updated_at"),
             "problem_code": identity["problem_code"],
             "match_mode": identity["match_mode"],
             "resolution_confidence": identity["resolution_confidence"],

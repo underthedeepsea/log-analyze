@@ -1,10 +1,68 @@
 from __future__ import annotations
 
+import pytest
+
 from logrisk.database import SQLiteDatabase
-from logrisk.incremental_sources import SourceCursor, SourceDescriptor, SourceRecord
+from logrisk.incremental_sources import (
+    IncrementalSourceError,
+    KafkaIncrementalSource,
+    SourceCursor,
+    SourceDescriptor,
+    SourceRecord,
+    parse_kafka_enabled,
+    register_kafka_consumer_adapter,
+    source_capabilities,
+    unregister_kafka_consumer_adapter,
+)
 from logrisk.kafka_adapter import KafkaPythonConsumerAdapter, decode_kafka_value
 from logrisk.large_file_pipeline import run_incremental_pipeline
 from logrisk.streaming_state import StreamingStateRepository
+
+
+@pytest.mark.parametrize("value", [None, False, 0, "", "false", "FALSE", " false ", "0", "no", "off"])
+def test_kafka_opt_in_parses_disabled_values(value):
+    assert parse_kafka_enabled(value) is False
+
+
+@pytest.mark.parametrize("value", [True, 1, "true", " TRUE ", "1", "yes", "on"])
+def test_kafka_opt_in_parses_enabled_values(value):
+    assert parse_kafka_enabled(value) is True
+
+
+@pytest.mark.parametrize("value", ["maybe", 2, 0.0, [], {}])
+def test_kafka_opt_in_rejects_ambiguous_values(value):
+    with pytest.raises(IncrementalSourceError, match="kafka_enabled"):
+        parse_kafka_enabled(value)
+
+
+def test_explicit_source_registry_never_uses_legacy_global_adapter():
+    adapter = KafkaPythonConsumerAdapter(lambda **kwargs: pytest.fail("Consumer must not start"))
+    register_kafka_consumer_adapter(adapter)
+    try:
+        isolated = KafkaIncrementalSource({"adapter_id": adapter.adapter_id}, adapters={})
+        with pytest.raises(IncrementalSourceError, match="未注册"):
+            isolated.read(SourceCursor.empty())
+        with pytest.raises(IncrementalSourceError, match="未注册"):
+            isolated.commit(SourceCursor.empty())
+        assert source_capabilities({})["kafka"]["enabled"] is False
+    finally:
+        unregister_kafka_consumer_adapter(adapter.adapter_id)
+
+
+def test_kafka_status_reports_local_dependency_without_broker_probe(monkeypatch):
+    monkeypatch.setattr("logrisk.kafka_adapter.find_spec", lambda name: None)
+    adapter = KafkaPythonConsumerAdapter()
+    monkeypatch.setattr(adapter, "_new_consumer", lambda *args: pytest.fail("Consumer must not start"))
+    status = source_capabilities({adapter.adapter_id: adapter}, enabled=True)["kafka"]
+
+    assert status["configured"] is True
+    assert status["enabled"] is True
+    assert status["dependency_ready"] is False
+    assert status["connection_check"] == "not_checked"
+    assert status["active_tasks"] == 0
+    assert status["consumption_mode"] == "bounded_high_water"
+    assert "读取本批高水位后结束" in status["reason"]
+    assert "online" not in status
 
 
 class FakeIncrementalSource:
@@ -87,8 +145,10 @@ def test_kafka_python_adapter_reads_to_high_water_mark_and_commits_next_offset(m
             if self.polled:
                 return {}
             self.polled = True
-            self.next_offset = 2
-            return {self.partition: [Message(0, b'{"message":"one"}'), Message(1, b"two")]}
+            self.next_offset = 3
+            return {self.partition: [
+                Message(0, b'{"message":"one"}'), Message(1, b"two"), Message(2, b"beyond high water"),
+            ]}
 
         def position(self, partition):
             return self.next_offset
@@ -113,7 +173,7 @@ def test_kafka_python_adapter_reads_to_high_water_mark_and_commits_next_offset(m
     remaining = list(records)
 
     assert first.record == {"message": "one"}
-    assert remaining[0].record == {"message": "two"}
+    assert [item.record for item in remaining] == [{"message": "two"}]
     assert first.next_cursor.value["high_water"] == {"0": 2}
     assert len(first.next_cursor.value["bootstrap_fingerprint"]) == 64
     assert consumers[0].kwargs["request_timeout_ms"] > consumers[0].kwargs["session_timeout_ms"]

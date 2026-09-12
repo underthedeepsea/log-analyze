@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 
 import django
+import pytest
 from django.core.management import call_command
 from django.test import Client, override_settings
 
@@ -26,6 +27,67 @@ def _config(tmp_path: Path, resolver: str) -> dict[str, object]:
         "identity_resolver": resolver,
         "write_roles": ["logrisk:operator"],
     }
+
+
+@pytest.mark.parametrize("explicit, environment, expected", [
+    (None, None, False),
+    (None, "false", False),
+    (None, "true", True),
+    (False, "true", False),
+    ("false", "true", False),
+    ("true", "false", True),
+])
+def test_django_kafka_config_uses_explicit_setting_before_environment(tmp_path, monkeypatch, explicit, environment, expected):
+    from logrisk_django.service_factory import get_config
+
+    if environment is None:
+        monkeypatch.delenv("LOGRISK_KAFKA_ENABLED", raising=False)
+    else:
+        monkeypatch.setenv("LOGRISK_KAFKA_ENABLED", environment)
+    raw = _config(tmp_path, "tests.django_test_project.resolver.OperatorIdentityResolver")
+    if explicit is not None:
+        raw["kafka_enabled"] = explicit
+    with override_settings(LOGRISK=raw):
+        config = get_config()
+    assert config.kafka_enabled is expected
+    assert config.application_config().kafka_enabled is expected
+    assert config.public_dict()["kafka_enabled"] is expected
+
+
+def test_django_kafka_config_rejects_invalid_flag(tmp_path):
+    from logrisk_django.service_factory import get_config
+    from logrisk_django.settings import LogriskSettingsError
+
+    raw = _config(tmp_path, "tests.django_test_project.resolver.OperatorIdentityResolver")
+    with override_settings(LOGRISK={**raw, "kafka_enabled": "maybe"}):
+        with pytest.raises(LogriskSettingsError, match="kafka_enabled"):
+            get_config()
+
+
+def test_django_kafka_sources_and_readiness_use_cached_container_without_connecting(tmp_path, monkeypatch):
+    from logrisk.kafka_adapter import KafkaPythonConsumerAdapter
+    from logrisk_django import service_factory
+
+    monkeypatch.setattr(KafkaPythonConsumerAdapter, "_new_consumer", lambda *args: pytest.fail("No Broker connection"))
+    monkeypatch.setattr(service_factory, "get_airflow_readiness", lambda: {"ready": True})
+    for enabled in (True, False):
+        raw = _config(tmp_path / str(enabled), "tests.django_test_project.resolver.OperatorIdentityResolver")
+        with override_settings(LOGRISK={**raw, "kafka_enabled": enabled}):
+            service_factory.clear_cached_container()
+            try:
+                call_command("logrisk_migrate", "--json")
+                sources = Client().get("/api/streaming/sources")
+                readiness = Client().get("/api/runtime/readiness")
+                assert sources.status_code == 200
+                assert readiness.status_code == 200
+                kafka = sources.json()["sources"]["kafka"]
+                assert kafka["enabled"] is enabled
+                assert kafka["configured"] is enabled
+                assert kafka["connection_check"] == "not_checked"
+                assert kafka["active_tasks"] == 0
+                assert readiness.json()["dependencies"]["kafka"] == kafka
+            finally:
+                service_factory.clear_cached_container()
 
 
 def test_django_model_and_prompt_configuration_writes_are_governed(tmp_path) -> None:

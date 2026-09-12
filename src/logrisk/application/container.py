@@ -5,7 +5,7 @@ import json
 import os
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
@@ -33,8 +33,11 @@ from logrisk.feature_extractor_ollama import FEATURE_RESPONSE_SCHEMA, _validate_
 from logrisk.feature_jobs import FeatureJobError, FeatureJobManager
 from logrisk.incremental_sources import (
     FileIncrementalSource,
+    IncrementalSourceError,
+    KafkaConsumerAdapter,
     KafkaIncrementalSource,
-    register_kafka_consumer_adapter,
+    parse_kafka_enabled,
+    source_capabilities,
 )
 from logrisk.input_jobs import InputJobConfig
 from logrisk.knowledge_packages.service import KnowledgePackageService
@@ -104,6 +107,9 @@ class ApplicationConfig:
     agent_workflows_enabled: bool = False
     kafka_enabled: bool = False
 
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "kafka_enabled", parse_kafka_enabled(self.kafka_enabled))
+
     @classmethod
     def for_test(cls, *, project_root: str | Path, state_root: str | Path) -> "ApplicationConfig":
         root = Path(project_root).resolve()
@@ -156,6 +162,19 @@ class ApplicationContainer:
     input_analyzer_accepts_config: bool = True
     run_input_job: Callable[[str], None] | None = None
     run_kafka_task: Callable[[str, dict[str, str]], None] | None = None
+    kafka_adapters: dict[str, KafkaConsumerAdapter] = field(default_factory=dict)
+
+    def source_capabilities(self) -> dict[str, dict[str, Any]]:
+        return source_capabilities(
+            self.kafka_adapters,
+            enabled=self.config.kafka_enabled,
+            active_tasks=self.streaming_state.count_active_tasks(source_kind="kafka"),
+        )
+
+    def kafka_source(self, configuration: dict[str, Any]) -> KafkaIncrementalSource:
+        if not self.config.kafka_enabled:
+            raise IncrementalSourceError("Kafka 消费适配器未启用，无法启动消费")
+        return KafkaIncrementalSource(configuration, adapters=self.kafka_adapters)
 
     def recover_agent_runs(self, submit: Callable[[str], None] | None = None) -> list[str]:
         """Recover persisted local Agent runs only when the feature is explicitly enabled."""
@@ -440,8 +459,10 @@ def build_application_container(
         InputJobConfig(output_dir=output_root / "uploads", artifact_store=artifact_store), database
     )
     streaming_state = StreamingStateRepository(database)
+    kafka_adapters: dict[str, KafkaConsumerAdapter] = {}
     if config.kafka_enabled:
-        register_kafka_consumer_adapter(KafkaPythonConsumerAdapter())
+        adapter = KafkaPythonConsumerAdapter()
+        kafka_adapters[adapter.adapter_id] = adapter
     if config.interrupt_streaming_tasks:
         streaming_state.interrupt_running_tasks()
     release_readiness = ReleaseReadinessService(
@@ -488,6 +509,7 @@ def build_application_container(
         agent_runs=agent_runs,
         agent_workflows=agent_workflows,
         streaming_state=streaming_state,
+        kafka_adapters=kafka_adapters,
         drain_quality=drain_quality,
         semantic_dictionaries=semantic_dictionaries,
         risk_semantics=risk_semantics,
@@ -606,7 +628,7 @@ def build_application_container(
             })
 
     def run_kafka_task(task_id: str, source_configuration: dict[str, str]) -> None:
-        source = KafkaIncrementalSource(source_configuration)
+        source = container.kafka_source(source_configuration)
         try:
             run_incremental_pipeline(
                 input_job_id=task_id,

@@ -50,6 +50,10 @@ def test_persisted_candidates_from_different_jobs_form_one_semantic_review_group
     assert groups[0]["occurrence_count"] == 7
     assert groups[0]["affected_entity_count"] == 2
     assert groups[0]["review_key"] == "semantic:kubernetes.cni.ip_exhaustion"
+    assert groups[0]["queue_kind"] == "new_candidate"
+    assert groups[0]["reopen_reason"] is None
+    assert groups[0]["matched_rule_id"] is None
+    assert "decision_version" in groups[0]
 
 
 def test_facade_restores_pending_queue_after_application_rebuild(tmp_path):

@@ -848,6 +848,12 @@ class ApprovedRuleStore:
         self.path = Path(path)
         self.clock = clock
 
+    def _guard(self) -> Any:
+        return _PROCESS_LOCK
+
+    def _save_rule_locked(self, rule: Dict[str, Any], rules: list[Dict[str, Any]]) -> None:
+        self._write_locked(rules)
+
     def _read_locked(self) -> list[Dict[str, Any]]:
         if not self.path.exists():
             return []
@@ -882,13 +888,13 @@ class ApprovedRuleStore:
             raise ApprovedRuleError(f"批准规则库写入失败: {exc}") from exc
 
     def list_rules(self) -> list[Dict[str, Any]]:
-        with _PROCESS_LOCK:
+        with self._guard():
             return [public_rule(rule) for rule in self._read_locked()]
 
     def load_legacy_file(self) -> list[Dict[str, Any]]:
         """Load a known legacy file without implicitly rewriting it."""
 
-        with _PROCESS_LOCK:
+        with self._guard():
             return [
                 normalize_legacy_rule_version(rule, source=RuleNormalizationSource.LEGACY_FILE)
                 for rule in self._read_locked()
@@ -903,7 +909,7 @@ class ApprovedRuleStore:
             feature.get("source_templates") or [],
         )
         now = self.clock()
-        with _PROCESS_LOCK:
+        with self._guard():
             rules = self._read_locked()
             classified = [(rule, classify_rule(rule)) for rule in rules]
             incoming_keys = {
@@ -955,7 +961,7 @@ class ApprovedRuleStore:
                 existing = _preferred_rule([
                     rule for rule in active
                     if classify_rule(rule).kind == RuleFormat.LEGACY_V1
-                    and _legacy_feature_matches(rule, feature, entity)
+                    and _legacy_feature_matches(rule, feature)
                 ])
                 if existing is not None:
                     return copy.deepcopy(existing)
@@ -1052,11 +1058,11 @@ class ApprovedRuleStore:
             else:
                 rules.append(rule)
             rules.sort(key=lambda item: str(item.get("rule_id")))
-            self._write_locked(rules)
+            self._save_rule_locked(rule, rules)
             return public_rule(rule)
 
     def match_entity(self, entity: Dict[str, Any]) -> list[Dict[str, Any]]:
-        with _PROCESS_LOCK:
+        with self._guard():
             matches = []
             semantic_matches: dict[str, list[Dict[str, Any]]] = {}
             for rule in self._read_locked():
@@ -1086,7 +1092,7 @@ class ApprovedRuleStore:
         if isinstance(feature.get("evaluator_result"), dict) and feature["evaluator_result"].get("passed") is False:
             return []
         identity = approval_identity(feature, entity)
-        with _PROCESS_LOCK:
+        with self._guard():
             rules = [
                 rule for rule in self._read_locked()
                 if _is_active(rule)
@@ -1129,7 +1135,7 @@ class ApprovedRuleStore:
         entity_id: str | None = None,
         cluster: str | None = None,
     ) -> Dict[str, Any]:
-        with _PROCESS_LOCK:
+        with self._guard():
             rules = self._read_locked()
             rule = next((item for item in rules if item.get("rule_id") == rule_id), None)
             if rule is None:

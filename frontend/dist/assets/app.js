@@ -482,14 +482,14 @@
         Promise.resolve().then(function () { return send(entry); }).then(function (result) {
           states[key] = Object.assign({}, entry, { phase: "saved", result: result });
         }, function (reason) {
-          states[key] = Object.assign({}, entry, { phase: "error", error: reason });
+          states[key] = Object.assign({}, entry, { phase: reason && reason.status === 409 ? "conflict" : "error", error: reason, latest: reason && reason.latest });
         }).finally(function () { active -= 1; publish(); pump(); });
       }
     }
     return {
       submit: function (key, entry) {
         if (states[key] && states[key].phase !== "error") return false;
-        states[key] = Object.assign({}, entry, { phase: "queued" });
+        states[key] = Object.assign({}, entry, { request_key: entry.request_key || "review-" + crypto.randomUUID(), phase: "queued" });
         waiting.push(key);
         publish();
         pump();
@@ -497,15 +497,22 @@
       },
       retry: function (key) { return states[key] && states[key].phase === "error" && this.submit(key, states[key]); },
       editFailed: function (key) {
-        if (!states[key] || states[key].phase !== "error") return false;
+        if (!states[key] || !["error", "conflict"].includes(states[key].phase)) return false;
         delete states[key];
         publish();
         return true;
       },
       confirm: function (key, feature) {
         const entry = states[key];
-        if (!entry || entry.phase !== "error" || !["approved", "rejected"].includes(feature.status)) return;
-        states[key] = Object.assign({}, entry, { phase: "saved", verified: true, changes: Object.assign({}, entry.changes, feature), result: feature });
+        if (!entry || !["error", "conflict"].includes(entry.phase)) return;
+        const sameDecision = ["approved", "rejected"].includes(feature.status) && Object.keys(entry.changes).every(function (field) {
+          return field === "review_scope" || JSON.stringify(entry.changes[field]) === JSON.stringify(feature[field]);
+        });
+        if (sameDecision && entry.phase !== "conflict") {
+          states[key] = Object.assign({}, entry, { phase: "saved", verified: true, result: feature });
+        } else if (["approved", "rejected"].includes(feature.status) || entry.phase === "conflict" || feature.updated_at !== entry.representative.updated_at) {
+          states[key] = Object.assign({}, entry, { phase: "conflict", latest: feature });
+        }
         publish();
       },
       hasUnfinished: function () { return Object.values(states).some(function (entry) { return entry.phase !== "saved"; }); },
@@ -518,6 +525,7 @@
 
   function reviewSubmissionLabel(entry) {
     if (!entry) return "可连续审批，提交后在后台保存";
+    if (entry.phase === "conflict") return "审批冲突 · 草稿已保留";
     if (entry.phase === "error") return "保存未确认";
     const action = entry.changes.status === "approved" ? "批准" : "驳回";
     return (entry.verified ? "服务器已" : "") + action + (entry.phase === "saved" ? " · 已保存" : " · 保存中…");
@@ -526,7 +534,7 @@
   function ReviewGroupList(props) {
     const groups = props.groups || [];
     return h("section", { className: "surface approval-feature-list" },
-      h("div", { className: "surface-head" }, h("b", null, "审批 Review Group"), h("div", { className: "review-group-head-meta" }, (props.totalGroups || 0) + " 组 · " + (props.totalCandidates || 0) + " 个候选", h("button", { type: "button", className: "secondary-button review-refresh-button", disabled: props.refreshing || props.saving, onClick: props.onRefresh }, props.refreshing ? "刷新中…" : "刷新"))),
+      h("div", { className: "surface-head" }, h("b", null, "新候选审批"), h("div", { className: "review-group-head-meta" }, (props.totalGroups || 0) + " 组 · " + (props.totalCandidates || 0) + " 个候选", h("button", { type: "button", className: "secondary-button review-refresh-button", disabled: props.refreshing || props.saving, onClick: props.onRefresh }, props.refreshing ? "刷新中…" : "刷新"))),
       h("div", { className: "feature-list" },
         props.loading && groups.length === 0 && h("div", { className: "empty-state" }, "正在加载持久化审批队列…"),
         !props.loading && groups.length === 0 && h("div", { className: "empty-state" }, "暂无待审批特征"),
@@ -625,6 +633,7 @@
     const draftIdentity = useRef("");
     const selectedTemplate = props.selectedTemplate || {};
     const locked = !!props.submission || props.loading;
+    const decidedStatus = props.feature && ["approved", "rejected"].includes(props.feature.status) ? props.feature.status : "";
     const featureIdentity = props.feature ? (props.feature.candidate_id || props.feature.approval_key || "") + (props.submission && props.submission.verified ? ":verified" : "") : "";
     useEffect(function () {
       if (!featureIdentity) {
@@ -636,7 +645,7 @@
       }
       if (draftIdentity.current === featureIdentity) return;
       draftIdentity.current = featureIdentity;
-      setDraft(props.submission ? Object.assign({}, props.submission.changes, { tags: props.submission.changes.tags.join(", ") }) : reviewDraftFromFeature(props.feature, props.selectedTemplate));
+      setDraft(props.submission ? Object.assign({}, props.submission.changes, { tags: (props.submission.changes.tags || []).join(", ") }) : reviewDraftFromFeature(props.feature, props.selectedTemplate));
       setDirty(false);
       props.onDirtyChange && props.onDirtyChange(false);
     }, [featureIdentity]);
@@ -656,7 +665,7 @@
         props.onDirtyChange && props.onDirtyChange(false);
       }
     }
-    return h("section", { className: "surface review-editor" + (props.submission ? " review-" + props.submission.phase : "") }, h("div", { className: "surface-head" }, h("div", null, h("b", null, "人工审批"), h("span", null, props.feature.origin === "approved_rule" ? "来自批准规则库" : "来自模型 + Drain3")), h("span", { className: "review-dirty-indicator " + (dirty ? "dirty" : "clean") }, dirty ? "有未保存更改" : "草稿已同步")), h("div", { className: "review-save-feedback", role: "status", "aria-live": "polite" }, reviewSubmissionLabel(props.submission), props.submission && props.submission.phase === "error" && h(React.Fragment, null, h("span", null, props.failureMessage), h("button", { className: "text-button", onClick: props.onRetry }, "重试保存"), h("button", { className: "text-button", onClick: function () { setDirty(true); props.onEditFailed(); } }, "修改后重试"), h("button", { className: "text-button", onClick: props.onDismissFailed }, "移出本次列表"))), h("div", { className: "editor-body" }, field("特征标题", "title"), field("特征摘要（所选模板证据）", "summary", "textarea"), h("label", null, "重要性", h("select", { value: draft.importance, disabled: locked, onChange: function (event) { setField("importance", event.target.value); } }, ["critical", "high", "medium", "low"].map(function (level) { return h("option", { key: level, value: level }, level); }))), field("标签（逗号分隔）", "tags"), field("审批备注", "reviewer_note", "textarea"), h("div", { className: "fact-box" }, "执行模型：", props.feature.model || "—", h("br"), "Provider：", props.feature.provider || "—", h("br"), "Model Profile：", props.feature.model_profile_id || "—", h("br"), "Prompt：", props.feature.prompt_id || "—", h("br"), "Job：", props.feature.job_id || "—", h("br"), "Trace：", props.feature.trace_id || "—", h("br"), "审批身份：", props.feature.approval_key || "—"), h("div", { className: "fact-box" }, "当前证据模板：", selectedTemplate.template_hash || "—", h("br"), "组件 " + (selectedTemplate.component || "—") + " · 类别 " + (selectedTemplate.category || "—") + " · 次数 " + (selectedTemplate.count || 0), h("br"), selectedTemplate.template || "暂无模板文本"), h("div", { className: "fact-box" }, featureQualityLabel(props.feature), h("br"), "Evaluator Score：" + (props.feature.evaluator_result && props.feature.evaluator_result.score != null ? props.feature.evaluator_result.score : "—"), h("br"), "实体 " + (props.feature.entity && props.feature.entity.id || "") + " · 风险分 " + props.feature.risk_score + " · 日志命中 " + props.feature.occurrence_count + " 次", h("br"), props.feature.trace_id ? "来源 " + (props.feature.prompt_id || "feature_extract_v3_compact_strict_json_en") + " · " + (props.feature.model || "—") + " · " + props.feature.trace_id : "来源：历史数据 / 未记录 Trace"), props.feature.trace_id && h("button", { className: "text-button trace-link", onClick: function () { props.onOpenTrace(props.feature.trace_id); } }, "查看 AI Trace"), h("div", { className: "editor-actions" }, h("button", { className: "reject-button", disabled: locked, onClick: function () { save("rejected"); } }, "驳回"), h("button", { className: "primary-button", disabled: locked, onClick: function () { save("approved"); } }, "批准并写入规则库"))));
+    return h("section", { className: "surface review-editor" + (props.submission ? " review-" + props.submission.phase : "") }, h("div", { className: "surface-head" }, h("div", null, h("b", null, "人工审批"), h("span", null, props.feature.origin === "approved_rule" ? "来自批准规则库" : "来自模型 + Drain3")), h("span", { className: "review-dirty-indicator " + (dirty ? "dirty" : "clean") }, dirty ? "有未保存更改" : "草稿已同步")), h("div", { className: "review-save-feedback", role: "status", "aria-live": "polite" }, !props.submission && decidedStatus ? "该候选已" + (decidedStatus === "approved" ? "批准" : "驳回") + "，可编辑内容，不能反向更改审批决定。" : reviewSubmissionLabel(props.submission), props.submission && ["error", "conflict"].includes(props.submission.phase) && h(React.Fragment, null, h("span", null, props.failureMessage), props.submission.latest && h("span", { className: "review-latest-decision" }, "服务器最新决定：" + ({ approved: "已批准", rejected: "已驳回", pending: "待审批" }[props.submission.latest.status] || props.submission.latest.status) + " · " + (props.submission.latest.title || "") + " · " + timeText(props.submission.latest.updated_at)), props.submission.phase === "error" && h("button", { className: "text-button", onClick: props.onRetry }, "重试保存"), h("button", { className: "text-button", disabled: props.submission.phase === "conflict" && !props.submission.latest, onClick: function () { setDirty(true); props.onEditFailed(); } }, props.submission.phase === "conflict" ? "基于最新版本编辑" : "修改后重试"), h("button", { className: "text-button", onClick: props.onDismissFailed }, "移出本次列表"))), h("div", { className: "editor-body" }, field("特征标题", "title"), field("特征摘要（所选模板证据）", "summary", "textarea"), h("label", null, "重要性", h("select", { value: draft.importance, disabled: locked, onChange: function (event) { setField("importance", event.target.value); } }, ["critical", "high", "medium", "low"].map(function (level) { return h("option", { key: level, value: level }, level); }))), field("标签（逗号分隔）", "tags"), field("审批备注", "reviewer_note", "textarea"), h("div", { className: "fact-box" }, "执行模型：", props.feature.model || "—", h("br"), "Provider：", props.feature.provider || "—", h("br"), "Model Profile：", props.feature.model_profile_id || "—", h("br"), "Prompt：", props.feature.prompt_id || "—", h("br"), "Job：", props.feature.job_id || "—", h("br"), "Trace：", props.feature.trace_id || "—", h("br"), "审批身份：", props.feature.approval_key || "—"), h("div", { className: "fact-box" }, "当前证据模板：", selectedTemplate.template_hash || "—", h("br"), "组件 " + (selectedTemplate.component || "—") + " · 类别 " + (selectedTemplate.category || "—") + " · 次数 " + (selectedTemplate.count || 0), h("br"), selectedTemplate.template || "暂无模板文本"), h("div", { className: "fact-box" }, featureQualityLabel(props.feature), h("br"), "Evaluator Score：" + (props.feature.evaluator_result && props.feature.evaluator_result.score != null ? props.feature.evaluator_result.score : "—"), h("br"), "实体 " + (props.feature.entity && props.feature.entity.id || "") + " · 风险分 " + props.feature.risk_score + " · 日志命中 " + props.feature.occurrence_count + " 次", h("br"), props.feature.trace_id ? "来源 " + (props.feature.prompt_id || "feature_extract_v3_compact_strict_json_en") + " · " + (props.feature.model || "—") + " · " + props.feature.trace_id : "来源：历史数据 / 未记录 Trace"), props.feature.trace_id && h("button", { className: "text-button trace-link", onClick: function () { props.onOpenTrace(props.feature.trace_id); } }, "查看 AI Trace"), h("div", { className: "editor-actions" }, h("button", { className: "reject-button", disabled: locked || decidedStatus === "approved", onClick: function () { save("rejected"); } }, "驳回"), h("button", { className: "primary-button", disabled: locked || decidedStatus === "rejected", onClick: function () { save("approved"); } }, "批准并写入规则库"))));
   }
 
   function PromptManagement(props) {
@@ -1102,13 +1111,13 @@
       h("section", { className: "rule-governance-metrics" },
         h("div", null, h("span", null, "规则资产"), h("b", null, props.rules.length), h("small", null, "全部人工批准规则")),
         h("div", null, h("span", null, "启用中"), h("b", null, props.rules.filter(function (rule) { return rule.status === "active"; }).length), h("small", null, "参与特征匹配")),
-        h("div", null, h("span", null, "待复审"), h("b", null, props.reviewQueue && props.reviewQueue.total != null ? props.reviewQueue.total : risky), h("small", null, "健康度或复审异常")),
+        h("div", null, h("span", null, "规则健康复审"), h("b", null, props.reviewQueue && props.reviewQueue.total != null ? props.reviewQueue.total : risky), h("small", null, "健康度或复审异常")),
         h("div", null, h("span", null, "30 天命中"), h("b", null, totalHits), h("small", null, "规则复用事件"))),
       failure && h("section", { className: "rule-diagnostic" }, h("div", null, h("b", null, "规则治理请求失败"), h("span", null, failure.message), h("code", null, (failure.code || "unknown") + (failure.request_id ? " · " + failure.request_id : ""))), h("button", { className: "secondary-button", onClick: copyDiagnostic }, "复制诊断信息")),
       h("div", { className: "rule-governance-layout" },
         h("section", { className: "surface rule-catalog" },
           h("div", { className: "surface-head" }, h("div", null, h("b", null, "批准规则库"), h("span", null, "状态筛选与规则健康度")), h("span", null, visible.length + " 条")),
-          h("div", { className: "rule-status-filters" }, [["all", "全部"], ["review", "待复审"], ["active", "启用"], ["under_review", "复审中"], ["disabled", "停用"], ["deprecated", "废弃"], ["archived", "归档"]].map(function (item) { return h("button", { key: item[0], className: statusFilter === item[0] ? "active" : "", onClick: function () { setStatusFilter(item[0]); } }, item[1]); })),
+          h("div", { className: "rule-status-filters" }, [["all", "全部"], ["review", "已批准规则健康复审"], ["active", "启用"], ["under_review", "复审中"], ["disabled", "停用"], ["deprecated", "废弃"], ["archived", "归档"]].map(function (item) { return h("button", { key: item[0], className: statusFilter === item[0] ? "active" : "", onClick: function () { setStatusFilter(item[0]); } }, item[1]); })),
           props.loading && h("div", { className: "empty-state compact" }, "正在加载规则资产…"),
           !props.loading && visible.length === 0 && h("div", { className: "empty-state" }, props.rules.length ? "当前筛选条件下没有规则" : "批准首条特征后建立规则资产库"),
           h("div", { className: "rule-catalog-list" }, visible.map(function (rule) {
@@ -1547,7 +1556,7 @@
         h("button", { className: "secondary-button", onClick: props.onRefresh }, "刷新状态")),
       h("section", { className: "streaming-source-grid" },
         h("article", { className: "surface" }, h("span", { className: "eyebrow" }, "FILE SOURCE"), h("h3", null, "文件增量来源"), h("p", null, "按文件身份、字节 Offset 和锁定的 Drain3 配置恢复；文件被替换或配置变化时停止恢复。"), h("span", { className: "status-chip active" }, sources.file && sources.file.resume_supported ? "支持恢复" : "加载中")),
-        h("article", { className: "surface kafka-source-card" }, h("span", { className: "eyebrow" }, "KAFKA SOURCE"), h("h3", null, "Kafka 消费接口"), h("p", null, "Kafka 默认关闭；启用内置适配器后按 Topic、Consumer Group 和分区 Offset 流式消费，每批最多 10,000 条。"), h("span", { className: "status-chip " + (sources.kafka && sources.kafka.enabled ? "active" : "disabled") }, sources.kafka && sources.kafka.enabled ? "适配器已注册" : "默认关闭"))),
+        h("article", { className: "surface kafka-source-card" }, h("span", { className: "eyebrow" }, "KAFKA SOURCE"), h("h3", null, "Kafka 消费接口"), h("p", null, "Kafka 默认关闭；启用内置适配器后按 Topic、Consumer Group 和分区 Offset 流式消费，每批最多 10,000 条，读取本批高水位后结束。"), h("span", { className: "status-chip " + (sources.kafka && sources.kafka.enabled ? "active" : "disabled") }, sources.kafka && sources.kafka.enabled ? "适配器已注册" : "默认关闭"), h("small", null, "本地依赖：" + (sources.kafka && typeof sources.kafka.dependency_ready === "boolean" ? (sources.kafka.dependency_ready ? "就绪" : "未就绪") : "未知") + " · 连接：未检查 · 活动批次：" + (sources.kafka && sources.kafka.active_tasks != null ? sources.kafka.active_tasks : "—")))),
       h("section", { className: "surface streaming-task-table" }, h("div", { className: "surface-head" }, h("div", null, h("b", null, "流水线任务时间线"), h("span", null, "恢复只从最后一次成功提交的 Checkpoint 开始")), h("span", null, tasks.length + " 条")),
         !tasks.length && h("div", { className: "empty-state compact" }, "暂无流式任务。上传超过 10MB 的日志后会自动创建任务。"),
         tasks.map(function (task) { const cursor = task.cursor && task.cursor.value || {}; return h("article", { key: task.task_id }, h("div", null, h("b", null, task.task_id), h("small", null, (task.source && task.source.kind || "file") + " · " + timeText(task.updated_at))), h("span", { className: "status-chip " + task.status }, statusText(task)), h("div", { className: "streaming-task-progress" }, h("span", null, "窗口 " + (task.windows_committed || 0)), h("span", null, "Offset " + cursorText(cursor))), h("div", { className: "streaming-task-actions" }, task.error && h("small", null, task.error), ["failed", "interrupted"].includes(task.status) && h("button", { className: "secondary-button", disabled: working === task.task_id, onClick: function () { resume(task.task_id); } }, working === task.task_id ? "恢复中…" : "从 Checkpoint 恢复"))); })),
@@ -2114,8 +2123,21 @@
     const reviewNavigation = useRef(null);
     reviewNavigation.current = { view: view, dirty: reviewDirty, key: selectedReviewKey, firstKey: (approvalQueue.items[0] || {}).review_key || "" };
     const reviewSender = useRef(null);
-    if (!reviewSender.current) reviewSender.current = createReviewSubmissionQueue(function (entry) {
-      return api.update(entry.representative.job_id, entry.representative.candidate_id, entry.changes);
+    if (!reviewSender.current) reviewSender.current = createReviewSubmissionQueue(async function (entry) {
+      try {
+        return await api.update(entry.representative.job_id, entry.representative.candidate_id, Object.assign({}, entry.changes, {
+          expected_updated_at: entry.representative.updated_at, request_key: entry.request_key,
+        }));
+      } catch (reason) {
+        if (reason.status === 409) {
+          try {
+            const job = await api.job(entry.representative.job_id);
+            const features = Array.isArray(job.features) ? job.features : Object.values(job.features || {});
+            reason.latest = features.find(function (feature) { return feature.candidate_id === entry.representative.candidate_id; });
+          } catch (_) { /* Preserve the conflict and draft if the latest decision is unavailable. */ }
+        }
+        throw reason;
+      }
     }, setReviewSubmissions);
     const reviewSaving = Object.values(reviewSubmissions).some(function (entry) { return entry.phase === "queued" || entry.phase === "saving"; });
     useEffect(function () {
@@ -2216,7 +2238,7 @@
         if (value.selected_group && !items.some(function (item) { return item.review_key === value.selected_group.review_key; })) items.push(value.selected_group);
         if (mode !== "more") {
           reviewSender.current.clearSaved();
-          const failed = Object.keys(reviewSubmissions).filter(function (key) { return reviewSubmissions[key].phase === "error"; });
+          const failed = Object.keys(reviewSubmissions).filter(function (key) { return ["error", "conflict"].includes(reviewSubmissions[key].phase); });
           const jobIds = Array.from(new Set(failed.map(function (key) { return reviewSubmissions[key].representative.job_id; })));
           for (const id of jobIds) {
             try {
@@ -2233,7 +2255,7 @@
         if (requestId !== approvalRequestSequence.current) return value;
         // Keep failed submissions visible so a refresh cannot discard their draft.
         Object.keys(reviewSubmissions).forEach(function (key) {
-          if (reviewSubmissions[key].phase === "error" && !items.some(function (item) { return item.review_key === key; })) items.unshift(reviewSubmissions[key].group);
+          if (["error", "conflict"].includes(reviewSubmissions[key].phase) && !items.some(function (item) { return item.review_key === key; })) items.unshift(reviewSubmissions[key].group);
         });
         setApprovalQueue(Object.assign({}, value, { items: items }));
         return value;
@@ -2418,6 +2440,17 @@
       if (reason && (reason.code === "candidate_not_found" || reason.status === 404)) return "该候选已不存在，请刷新审批队列。";
       return reason && reason.message || "审批保存失败，请稍后重试。";
     }
+    function editFailedReview() {
+      const entry = reviewSubmissions[selectedReviewKey];
+      if (entry && entry.latest) {
+        setApprovalQueue(function (current) {
+          return Object.assign({}, current, { items: current.items.map(function (group) {
+            return group.review_key === selectedReviewKey ? Object.assign({}, group, { representative: entry.latest }) : group;
+          }) });
+        });
+      }
+      if (reviewSender.current.editFailed(selectedReviewKey)) setReviewDirty(true);
+    }
     function dismissFailedReview() {
       if (!reviewSender.current.editFailed(selectedReviewKey)) return;
       setReviewDirty(false);
@@ -2502,7 +2535,7 @@
             onRefresh: function () { return loadApprovalQueue({ mode: "refresh" }).catch(function () {}); },
           }),
           h(FeatureEvidence, { feature: selectedRepresentative, onSelectTemplate: setSelectedTemplate }),
-          h(ReviewEditor, { feature: selectedRepresentative, submission: reviewSubmissions[selectedReviewKey], onDismissFailed: dismissFailedReview, loading: approvalRefreshing || approvalInitialLoading, failureMessage: reviewFailureMessage(reviewSubmissions[selectedReviewKey] && reviewSubmissions[selectedReviewKey].error), onEditFailed: function () { if (reviewSender.current.editFailed(selectedReviewKey)) setReviewDirty(true); }, onRetry: function () { reviewSender.current.retry(selectedReviewKey); }, selectedTemplate: selectedTemplate, onSave: saveReview, onOpenTrace: openTrace, onDirtyChange: setReviewDirty })),
+          h(ReviewEditor, { feature: selectedRepresentative, submission: reviewSubmissions[selectedReviewKey], onDismissFailed: dismissFailedReview, loading: approvalRefreshing || approvalInitialLoading, failureMessage: reviewFailureMessage(reviewSubmissions[selectedReviewKey] && reviewSubmissions[selectedReviewKey].error), onEditFailed: editFailedReview, onRetry: function () { reviewSender.current.retry(selectedReviewKey); }, selectedTemplate: selectedTemplate, onSave: saveReview, onOpenTrace: openTrace, onDirtyChange: setReviewDirty })),
         view === "rules" && h(RuleLibrary, { rules: rules, reviewQueue: ruleReviewQueue, loading: ruleLoading, focusRuleId: ruleFocus, onOpenTrace: openTrace, onChanged: loadRules }),
         view === "nodeRisks" && h(NodeRiskPage, { catalog: nodeRiskCatalog, selected: selectedNodeRisk, onRefresh: loadNodeRisks, onSelect: function (item) { selectNodeRisk(item).catch(function (reason) { setError(reason.message); }); }, onEvent: function (eventId, action) { changeNodeEvent(eventId, action).catch(function (reason) { setError(reason.message); }); } }),
         view === "multiSource" && h(MultiSourcePage, { data: multiSourceData, onRefresh: function () { loadMultiSource().catch(function () {}); }, onSelect: function (entity) { selectMultiSourceEntity(entity).catch(function (reason) { setError(reason.message); }); }, onRule: function (rule, enabled) { changeMultiSourceRule(rule, enabled).catch(function (reason) { setError(reason.message); }); } }),

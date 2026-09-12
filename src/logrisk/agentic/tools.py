@@ -1,36 +1,53 @@
 from __future__ import annotations
 
+import copy
 from typing import Any
 
-from logrisk.ai_harness.evaluator import evaluate_feature_output
+from logrisk.ai_harness.evaluator import EVALUATOR_VERSION, evaluate_feature_output
 
-from .tool_registry import AgentToolContext, ToolRegistry
+from .artifacts import canonical_fingerprint
+from .errors import AgenticError
+from .tool_registry import AgentToolContext, ToolRegistry, _reject_sensitive
 
 
 def build_agent_tool_registry(feature_jobs: Any, rule_governance: Any, knowledge_packages: Any) -> ToolRegistry:
-    registry = ToolRegistry()
+    def load_evidence(context: AgentToolContext) -> dict[str, Any]:
+        value = feature_jobs.get_agent_evidence(context.source_job_id, context.entity_id)
+        _reject_sensitive(value)
+        if context.evidence_hash and canonical_fingerprint(value) != context.evidence_hash:
+            raise AgenticError("Run Evidence 已变化，需要重新校验", code="agent_evidence_changed")
+        return value
+
+    registry = ToolRegistry(evidence_loader=load_evidence)
 
     def evidence(arguments: dict[str, Any], context: AgentToolContext) -> dict[str, Any]:
         if str(arguments["job_id"]) != context.source_job_id or str(arguments["entity_id"]) != context.entity_id:
-            from .errors import AgenticError
             raise AgenticError("工具请求超出当前 Run 实体边界", code="tool_scope_violation", status_code=403)
-        return feature_jobs.get_agent_evidence(context.source_job_id, context.entity_id)
+        return load_evidence(context)
 
     def approved_rules(arguments: dict[str, Any], context: AgentToolContext) -> dict[str, Any]:
-        page = rule_governance.list_rules(status="active", page=1, page_size=100)
         components = set(map(str, arguments.get("components") or []))
         hashes = set(map(str, arguments.get("template_hashes") or []))
         items = []
-        for rule in page.get("items") or []:
-            signatures = rule.get("template_signatures") or []
-            rule_hashes = {str(item.get("template_hash") or item.get("template_fingerprint") or "") for item in signatures}
-            rule_components = {str(item.get("component") or "") for item in signatures}
-            if (not hashes or hashes & rule_hashes) and (not components or components & rule_components):
-                items.append({
-                    "rule_id": rule.get("rule_id"), "title": rule.get("title"), "feature_type": rule.get("feature_type"),
-                    "status": rule.get("status"), "template_signatures": signatures,
-                })
-        return {"items": items}
+        page_number, total, scanned = 1, 0, 0
+        while True:
+            page = rule_governance.list_rules(status="active", page=page_number, page_size=100)
+            rows = page.get("items") or []
+            total = int((page.get("pagination") or {}).get("total", scanned + len(rows)))
+            for rule in rows:
+                signatures = rule.get("template_signatures") or []
+                rule_hashes = {str(item.get("template_hash") or item.get("template_fingerprint") or "") for item in signatures}
+                rule_components = {str(item.get("component") or "") for item in signatures}
+                if (not hashes or hashes & rule_hashes) and (not components or components & rule_components):
+                    items.append({
+                        "rule_id": rule.get("rule_id"), "title": rule.get("title"), "feature_type": rule.get("feature_type"),
+                        "status": rule.get("status"), "template_signatures": signatures,
+                    })
+            scanned += len(rows)
+            if not rows or scanned >= total:
+                break
+            page_number += 1
+        return {"items": items, "total": total, "matched": len(items), "truncated": scanned < total}
 
     def assets(arguments: dict[str, Any], context: AgentToolContext) -> dict[str, Any]:
         items = []
@@ -49,14 +66,23 @@ def build_agent_tool_registry(feature_jobs: Any, rule_governance: Any, knowledge
         return {"items": items}
 
     def evaluate(arguments: dict[str, Any], context: AgentToolContext) -> dict[str, Any]:
-        evidence_value = feature_jobs.get_agent_evidence(context.source_job_id, context.entity_id)
+        evidence_value = load_evidence(context)
+        feature = copy.deepcopy(arguments["feature"])
         entity = {
             "entity_id": evidence_value["entity"].get("id"),
             "entity_type": evidence_value["entity"].get("type"),
         }
-        return evaluate_feature_output(feature=arguments["feature"], entity=entity, evidence=evidence_value)
+        result = evaluate_feature_output(feature=feature, entity=entity, evidence=evidence_value)
+        # Only Evaluator diagnostics use this alias; arbitrary message fields remain forbidden.
+        result["rule_results"] = [
+            {("detail" if key == "message" else key): value for key, value in row.items()}
+            for row in result["rule_results"]
+        ]
+        return {**result, "feature": feature, "fingerprint": canonical_fingerprint(feature),
+                "evidence_hash": canonical_fingerprint(evidence_value), "evaluator_version": EVALUATOR_VERSION}
 
     def register_candidate(arguments: dict[str, Any], context: AgentToolContext) -> dict[str, Any]:
+        load_evidence(context)
         return feature_jobs.register_agent_candidate(
             context.source_job_id, context.entity_id, arguments["feature"], run_id=context.run_id
         )

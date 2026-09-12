@@ -4,12 +4,14 @@ import copy
 import hashlib
 import json
 import uuid
+from contextlib import nullcontext
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
 from logrisk.ai_harness.trace_logger import AITraceLogger
-from logrisk.approval_dedup import group_id_for_key, same_approval_identity
+from logrisk.approval_dedup import approval_identity, group_id_for_key, same_approval_identity
+from logrisk.approval_service import approval_transaction
 from logrisk.approved_rules import (
     ApprovedRuleStore,
     ApprovedRuleError,
@@ -18,6 +20,7 @@ from logrisk.approved_rules import (
     classify_rule,
     hydrate_persisted_rule,
     public_rule,
+    rule_matches_feature,
 )
 from logrisk.database import Database, SQLiteDatabase, utc_now
 from logrisk.feature_jobs import (
@@ -45,7 +48,22 @@ def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
 
 
-class SQLiteFeatureJobStore:
+class _ApprovalTransactionStore:
+    connection: Any = None
+
+    def bind(self, connection: Any) -> Any:
+        bound = copy.copy(self)
+        bound.connection = connection
+        return bound
+
+    def _connect(self) -> Any:
+        return nullcontext(self.connection) if self.connection is not None else self.database.connect()
+
+    def _transaction(self) -> Any:
+        return approval_transaction(self.database, self.connection)
+
+
+class SQLiteFeatureJobStore(_ApprovalTransactionStore):
     def __init__(self, database: Database) -> None:
         self.database = database
 
@@ -112,6 +130,7 @@ class SQLiteFeatureJobStore:
         now: str,
         *,
         for_update: bool = False,
+        rule_store: Any = None,
     ) -> dict[str, Any]:
         candidate_id = str(candidate.get("candidate_id") or "")
         if not candidate_id:
@@ -136,6 +155,16 @@ class SQLiteFeatureJobStore:
             if existing is not None
             else copy.deepcopy(candidate)
         )
+        if existing is None and merged.get("status") == "approved" and merged.get("resolution_type") in {"rule_matched", "group_matched"}:
+            merged.update({"status": "pending", "approved_at": None, "rule_id": None,
+                           "resolved_rule_id": None, "resolution_type": "manual"})
+        if merged.get("status") == "pending" and rule_store is not None:
+            matches = rule_store.match_feature(merged)
+            if matches:
+                rule = matches[0]
+                merged.update({"status": "approved", "approved_at": rule.get("approved_at") or now,
+                               "resolved_rule_id": rule["rule_id"], "rule_id": rule["rule_id"],
+                               "resolution_type": "group_matched"})
         merged["candidate_id"] = candidate_id
         unchanged = (
             existing is not None
@@ -176,7 +205,9 @@ class SQLiteFeatureJobStore:
         )
         snapshot = {key: copy.deepcopy(value) for key, value in safe_job.items() if key not in {"condition", "events"}}
         now = utc_now()
-        with self.database.transaction() as connection:
+        with self._transaction() as connection:
+            with approval_transaction(self.database, connection, [approval_identity(item)["approval_key"] for item in (safe_job.get("features") or {}).values() if isinstance(item, dict)]):
+                pass
             connection.execute(
                 "INSERT INTO feature_jobs(job_id, status, model_profile_id, connection_snapshot_json, profile_snapshot_json, "
                 "job_json, created_at, completed_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
@@ -212,6 +243,7 @@ class SQLiteFeatureJobStore:
                     candidate,
                     now,
                     for_update=getattr(self.database, "provider", "sqlite") == "postgres",
+                    rule_store=SQLiteApprovedRuleStore(self.database).bind(connection),
                 )
             if persisted_features:
                 snapshot["features"] = persisted_features
@@ -305,12 +337,12 @@ class SQLiteFeatureJobStore:
         return job
 
     def load(self) -> list[dict[str, Any]]:
-        with self.database.connect() as connection:
+        with self._connect() as connection:
             rows = connection.execute("SELECT job_id, job_json FROM feature_jobs ORDER BY created_at").fetchall()
             return [self._load_job_row(connection, row) for row in rows]
 
     def load_job(self, job_id: str) -> dict[str, Any] | None:
-        with self.database.connect() as connection:
+        with self._connect() as connection:
             row = connection.execute(
                 "SELECT job_id, job_json FROM feature_jobs WHERE job_id=?", (str(job_id),)
             ).fetchone()
@@ -329,7 +361,7 @@ class SQLiteFeatureJobStore:
         if job_id is not None:
             query += " AND c.job_id=?"
             parameters.append(str(job_id))
-        with self.database.connect() as connection:
+        with self._connect() as connection:
             row = connection.execute(query, parameters).fetchone()
             return next(iter(self._candidates_from_rows(connection, [row])), None) if row else None
 
@@ -341,7 +373,7 @@ class SQLiteFeatureJobStore:
         candidate_id = str(candidate.get("candidate_id") or "")
         if not candidate_id:
             raise FeatureJobError("候选特征缺少 candidate_id")
-        with self.database.transaction() as connection:
+        with self._transaction() as connection:
             job = connection.execute(
                 "SELECT 1 FROM feature_jobs WHERE job_id=?", (str(job_id),)
             ).fetchone()
@@ -353,6 +385,7 @@ class SQLiteFeatureJobStore:
                 {**copy.deepcopy(candidate), "candidate_id": candidate_id},
                 utc_now(),
                 for_update=getattr(self.database, "provider", "sqlite") == "postgres",
+                    rule_store=SQLiteApprovedRuleStore(self.database).bind(connection),
             )
             row = connection.execute(
                 "SELECT c.candidate_id, c.job_id, c.entity_id, c.status, c.approval_key, c.problem_code, "
@@ -372,7 +405,6 @@ class SQLiteFeatureJobStore:
         expected_status: str,
         job_id: str | None = None,
         expected_updated_at: Any | None = None,
-        allow_terminal_rollback: bool = False,
     ) -> dict[str, Any]:
         if not isinstance(changes, dict):
             raise FeatureJobError(
@@ -382,7 +414,7 @@ class SQLiteFeatureJobStore:
             )
         _validate_candidate_review_changes(changes)
         candidate_id = str(candidate_id)
-        with self.database.transaction() as connection:
+        with self._transaction() as connection:
             query = (
                 "SELECT c.candidate_id, c.job_id, c.entity_id, c.status, c.approval_key, c.problem_code, "
                 "c.approval_group_id, c.resolved_rule_id, c.resolution_type, c.candidate_json, c.created_at, c.updated_at "
@@ -402,8 +434,7 @@ class SQLiteFeatureJobStore:
             current_status = current.get("status")
             requested_status = changes.get("status")
             if current_status in {"approved", "rejected"} and requested_status is not None and requested_status != current_status:
-                if not (allow_terminal_rollback and current_status == expected_status and requested_status == "pending"):
-                    raise self._candidate_state_conflict()
+                raise self._candidate_state_conflict()
             if expected_updated_at is not None and current.get("updated_at") != expected_updated_at:
                 raise self._candidate_state_conflict()
             if current_status != expected_status:
@@ -453,24 +484,6 @@ class SQLiteFeatureJobStore:
             loaded = next(iter(self._candidates_from_rows(connection, [updated_row])), None) if updated_row else None
             return loaded if loaded is not None else updated
 
-    def rollback_candidate_review_state(
-        self,
-        candidate_id: str,
-        changes: dict[str, Any],
-        *,
-        expected_status: str,
-        expected_updated_at: Any,
-        job_id: str | None = None,
-    ) -> dict[str, Any]:
-        return self.update_candidate_review_state(
-            candidate_id,
-            changes,
-            expected_status=expected_status,
-            job_id=job_id,
-            expected_updated_at=expected_updated_at,
-            allow_terminal_rollback=True,
-        )
-
     def list_candidates(
         self, status: str | None = None, limit: int | None = None
     ) -> list[dict[str, Any]]:
@@ -487,7 +500,7 @@ class SQLiteFeatureJobStore:
         if limit is not None:
             query += " LIMIT ?"
             parameters.append(max(1, int(limit)))
-        with self.database.connect() as connection:
+        with self._connect() as connection:
             rows = connection.execute(query, parameters).fetchall()
             return self._candidates_from_rows(connection, rows)
 
@@ -526,7 +539,7 @@ class SQLiteFeatureJobStore:
 
     def append_review_event(self, event: dict[str, Any]) -> dict[str, Any]:
         value = _sanitize_feature_payload(event)
-        with self.database.transaction() as connection:
+        with self._transaction() as connection:
             suffix = " FOR UPDATE" if getattr(self.database, "provider", "sqlite") == "postgres" else ""
             connection.execute("SELECT job_id FROM feature_jobs WHERE job_id=?" + suffix, (value["job_id"],)).fetchone()
             self._append_review_events(connection, value["job_id"], [value])
@@ -536,8 +549,15 @@ class SQLiteFeatureJobStore:
         """Settle matching pending rows and their audit events in one transaction."""
         if status not in {"approved", "rejected"}:
             raise ValueError("Invalid review resolution")
+        if self.connection is None:
+            with self._transaction() as connection:
+                return self.bind(connection).resolve_pending_identity(reference, status=status)
         # Recompute identities from evidence: persisted physical keys may be stale.
-        matches = [item for item in self.list_candidates(status="pending") if same_approval_identity(item, reference)]
+        def matches_reference(item: dict[str, Any]) -> bool:
+            return (rule_matches_feature(reference, item) if status == "approved"
+                    else same_approval_identity(item, reference))
+
+        matches = [item for item in self.list_candidates(status="pending") if matches_reference(item)]
         updated: list[dict[str, Any]] = []
         events_by_job: dict[str, list[dict[str, Any]]] = {}
         group_keys: set[str] = set()
@@ -546,9 +566,9 @@ class SQLiteFeatureJobStore:
             return {"candidates": updated, "events": events_by_job, "groups": group_count}
         now = utc_now()
         rule_id = reference.get("rule_id") if status == "approved" else None
-        with self.database.transaction() as connection:
+        with self._transaction() as connection:
             suffix = " FOR UPDATE" if getattr(self.database, "provider", "sqlite") == "postgres" else ""
-            # Lock parents first, then candidates, consistently with generated-candidate saves.
+            # Registry/identity locks precede parents and sorted candidates on every write path.
             for job_id in sorted({str(item["job_id"]) for item in matches}):
                 connection.execute("SELECT job_id FROM feature_jobs WHERE job_id=?" + suffix, (job_id,)).fetchone()
             ids = sorted(str(item["candidate_id"]) for item in matches)
@@ -561,7 +581,7 @@ class SQLiteFeatureJobStore:
                 updates = []
                 for row in rows:
                     feature = self._candidate_from_row(row)
-                    if feature is None or not same_approval_identity(feature, reference):
+                    if feature is None or not matches_reference(feature):
                         continue
                     feature.update({
                         "status": status,
@@ -604,17 +624,28 @@ class SQLiteFeatureJobStore:
         return {"candidates": updated, "events": events_by_job, "groups": group_count}
 
 
-class SQLiteApprovedRuleStore(ApprovedRuleStore):
+class SQLiteApprovedRuleStore(_ApprovalTransactionStore, ApprovedRuleStore):
     def __init__(self, database: SQLiteDatabase, clock: Callable[[], str] = utc_now) -> None:
         self.database = database
         self.clock = clock
 
+    def _guard(self) -> Any:
+        return nullcontext()
+
+    def upsert_feature(self, feature: dict[str, Any]) -> dict[str, Any]:
+        with self._transaction() as connection:
+            return super(SQLiteApprovedRuleStore, self.bind(connection)).upsert_feature(feature)
+
+    def _save_rule_locked(self, rule: dict[str, Any], rules: list[dict[str, Any]]) -> None:
+        self._write_locked([rule])
+
     def _read_locked(self) -> list[dict[str, Any]]:
-        with self.database.connect() as connection:
+        with self._connect() as connection:
             rows = connection.execute(
                 "SELECT rule_id, signature, feature_type, rule_json, status, current_version, next_review_at, schema_version, approved_at, updated_at, "
                 "problem_code, approval_key "
                 "FROM approved_rules ORDER BY rule_id"
+                + (" FOR UPDATE" if self.connection is not None and self.database.provider == "postgres" else "")
             )
             rules = []
             for row in rows:
@@ -639,7 +670,7 @@ class SQLiteApprovedRuleStore(ApprovedRuleStore):
             return rules
 
     def _write_locked(self, rules: list[dict[str, Any]]) -> None:
-        with self.database.transaction() as connection:
+        with self._transaction() as connection:
             for rule in rules:
                 persisted = public_rule(rule)
                 schema_version = str(persisted.get("schema_version") or "").strip()
@@ -702,7 +733,7 @@ class SQLiteApprovedRuleStore(ApprovedRuleStore):
         loses increments from concurrent workers.
         """
         rule_id = str(rule_id)
-        with self.database.transaction() as connection:
+        with self._transaction() as connection:
             query = (
                 "SELECT rule_id, signature, feature_type, rule_json, status, current_version, next_review_at, "
                 "schema_version, approved_at, updated_at, problem_code, approval_key "
@@ -751,7 +782,7 @@ class SQLiteApprovedRuleStore(ApprovedRuleStore):
         return persisted
 
 
-class SQLiteApprovalGroupStore:
+class SQLiteApprovalGroupStore(_ApprovalTransactionStore):
     """Durable Approval Group metadata for both supported database providers."""
 
     def __init__(self, database: Any, clock: Callable[[], str] = utc_now) -> None:
@@ -783,14 +814,14 @@ class SQLiteApprovalGroupStore:
         return group
 
     def get_by_key(self, approval_key: str) -> dict[str, Any] | None:
-        with self.database.connect() as connection:
+        with self._connect() as connection:
             row = connection.execute(
                 "SELECT * FROM approval_groups WHERE approval_key=?", (str(approval_key),)
             ).fetchone()
         return self._row_to_group(row) if row else None
 
     def get_by_id(self, approval_group_id: str) -> dict[str, Any] | None:
-        with self.database.connect() as connection:
+        with self._connect() as connection:
             row = connection.execute(
                 "SELECT * FROM approval_groups WHERE approval_group_id=?", (str(approval_group_id),)
             ).fetchone()
@@ -803,7 +834,7 @@ class SQLiteApprovalGroupStore:
             query += " WHERE status=?"
             parameters = (status,)
         query += " ORDER BY created_at, approval_group_id"
-        with self.database.connect() as connection:
+        with self._connect() as connection:
             rows = connection.execute(query, parameters).fetchall()
         return [self._row_to_group(row) for row in rows]
 
@@ -812,7 +843,7 @@ class SQLiteApprovalGroupStore:
         value.setdefault("approval_group_id", group_id_for_key(str(value["approval_key"])))
         value.setdefault("created_at", self.clock())
         value["updated_at"] = value.get("updated_at") or self.clock()
-        with self.database.transaction() as connection:
+        with self._transaction() as connection:
             query = "SELECT * FROM approval_groups WHERE approval_key=?"
             if getattr(self.database, "provider", "sqlite") == "postgres":
                 query += " FOR UPDATE"
@@ -856,7 +887,7 @@ class SQLiteApprovalGroupStore:
         return self._row_to_group(row)
 
     def has_candidate(self, candidate_id: str) -> bool:
-        with self.database.connect() as connection:
+        with self._connect() as connection:
             row = connection.execute(
                 "SELECT 1 FROM approval_group_candidates WHERE candidate_id=?", (str(candidate_id),)
             ).fetchone()
@@ -864,7 +895,7 @@ class SQLiteApprovalGroupStore:
 
     def attach_candidate(self, approval_group_id: str, candidate_id: str, **metadata: Any) -> None:
         now = self.clock()
-        with self.database.transaction() as connection:
+        with self._transaction() as connection:
             row = connection.execute(
                 "SELECT approval_group_id FROM approval_group_candidates WHERE candidate_id=?", (str(candidate_id),)
             ).fetchone()
@@ -883,7 +914,7 @@ class SQLiteApprovalGroupStore:
             )
 
     def candidate_group_id(self, candidate_id: str) -> str | None:
-        with self.database.connect() as connection:
+        with self._connect() as connection:
             row = connection.execute(
                 "SELECT approval_group_id FROM approval_group_candidates WHERE candidate_id=?", (str(candidate_id),)
             ).fetchone()

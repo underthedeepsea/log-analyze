@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from logrisk.ai_harness.evaluator import EVALUATOR_VERSION
+from logrisk.agentic.artifacts import canonical_fingerprint
 from logrisk.agentic.models import AgentPlan, AgentRunRequest, AgentStepPlan
 from logrisk.agentic.planner import FakeAgentPlanner
 from logrisk.agentic.repository import AgentRepository
@@ -40,7 +42,11 @@ def _runtime(tmp_path, plan: AgentPlan, *, registered: list[dict] | None = None)
     )
     registry.register(
         name="evaluate_candidate", description="校验", required_arguments=("feature",),
-        handler=lambda arguments, context: {"passed": True, "feature": arguments["feature"]},
+        handler=lambda arguments, context: {
+            "passed": True, "feature": arguments["feature"],
+            "fingerprint": canonical_fingerprint(arguments["feature"]),
+            "evidence_hash": context.evidence_hash, "evaluator_version": EVALUATOR_VERSION,
+        },
     )
     registry.register(
         name="register_feature_candidate", description="登记", required_arguments=("feature",), writes_candidate=True,
@@ -65,7 +71,7 @@ def test_runtime_executes_plan_and_stops_at_human_gate(tmp_path):
     assert [step["status"] for step in result["steps"]] == ["completed", "completed", "completed"]
     assert result["used_tool_calls"] == 3
     assert registered == [FEATURE]
-    assert {item["artifact_type"] for item in result["artifacts"]} == {"evaluation", "candidate"}
+    assert {item["artifact_type"] for item in result["artifacts"]} == {"evidence_assessment_v1", "evaluation", "candidate"}
 
 
 def test_runtime_blocks_candidate_registration_without_passed_evaluation(tmp_path):

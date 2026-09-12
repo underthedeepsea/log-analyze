@@ -6,6 +6,7 @@ import os
 import re
 import threading
 from collections.abc import Iterator, Mapping
+from importlib.util import find_spec
 from typing import Any, Callable
 
 from logrisk.incremental_sources import IncrementalSourceError, SourceCursor, SourceRecord
@@ -37,6 +38,11 @@ class KafkaPythonConsumerAdapter:
         self._consumer_factory = consumer_factory
         self._consumers: dict[int, Any] = {}
         self._lock = threading.Lock()
+
+    @property
+    def dependency_ready(self) -> bool:
+        """Inspect the local dependency only; never create a Consumer or probe a Broker."""
+        return self._consumer_factory is not None or find_spec("kafka") is not None
 
     def read(
         self,

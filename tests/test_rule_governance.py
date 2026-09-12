@@ -41,6 +41,18 @@ def governed_rule(tmp_path):
     return database, store, service, rule
 
 
+def test_health_review_queue_is_explicit_and_read_only(tmp_path):
+    database, store, service, rule = governed_rule(tmp_path)
+    before = store.list_rules()
+    queue = service.review_queue()
+    item = queue["items"][0]
+    assert item["queue_kind"] == "rule_health_review"
+    assert item["reopen_reason"] == "30 天无命中"
+    assert item["matched_rule_id"] == rule["rule_id"]
+    assert item["decision_version"] == 1
+    assert store.list_rules() == before
+
+
 def test_status_change_is_versioned_and_disabled_rule_stops_matching(tmp_path):
     database, store, service, rule = governed_rule(tmp_path)
 

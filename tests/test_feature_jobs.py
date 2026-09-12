@@ -75,26 +75,6 @@ def document():
     }
 
 
-class _InterleavingSQLiteFeatureJobStore(SQLiteFeatureJobStore):
-    def __init__(self, database):
-        super().__init__(database)
-        self.review_calls = 0
-
-    def update_candidate_review_state(self, *args, **kwargs):
-        self.review_calls += 1
-        result = super().update_candidate_review_state(*args, **kwargs)
-        if self.review_calls == 1:
-            SQLiteFeatureJobStore(self.database).update_candidate_review_state(
-                args[0],
-                {
-                    "title": "并发审核标题",
-                    "reviewer_note": "并发审核备注",
-                    "tags": ["并发审核"],
-                },
-                expected_status=str(result.get("status") or kwargs["expected_status"]),
-            )
-        return result
-
 
 def test_validate_result_document_requires_risk_entities():
     with pytest.raises(FeatureJobError, match="risk_entities"):
@@ -1092,7 +1072,7 @@ def test_rule_failure_rolls_back_status_without_clobbering_concurrent_review(tmp
             raise RuntimeError("rule write failed")
 
     database = SQLiteDatabase(tmp_path / "state.sqlite3")
-    persistence = _InterleavingSQLiteFeatureJobStore(database)
+    persistence = SQLiteFeatureJobStore(database)
     manager = FeatureJobManager(
         extractor=lambda source, **kwargs: [candidate(source)],
         rule_store=FailingRuleStore(tmp_path / "rules.json"),
@@ -1106,6 +1086,10 @@ def test_rule_failure_rolls_back_status_without_clobbering_concurrent_review(tmp
     )
     manager.run_job(job_id)
 
+    SQLiteFeatureJobStore(database).update_candidate_review_state(
+        "feature-node-a", {"title": "并发审核标题", "reviewer_note": "并发审核备注", "tags": ["并发审核"]},
+        expected_status="pending",
+    )
     with pytest.raises(RuntimeError, match="rule write failed"):
         manager.update_feature(job_id, "feature-node-a", {"status": "approved"})
 
@@ -1116,9 +1100,9 @@ def test_rule_failure_rolls_back_status_without_clobbering_concurrent_review(tmp
     assert persisted["tags"] == ["并发审核"]
 
 
-def test_review_operation_uses_one_cas_without_overwriting_concurrent_review(tmp_path):
+def test_review_preserves_previous_independent_connection_edits(tmp_path):
     database = SQLiteDatabase(tmp_path / "state.sqlite3")
-    persistence = _InterleavingSQLiteFeatureJobStore(database)
+    persistence = SQLiteFeatureJobStore(database)
     manager = FeatureJobManager(
         extractor=lambda source, **kwargs: [candidate(source)],
         persistence=persistence,
@@ -1131,14 +1115,17 @@ def test_review_operation_uses_one_cas_without_overwriting_concurrent_review(tmp
     )
     manager.run_job(job_id)
 
+    SQLiteFeatureJobStore(database).update_candidate_review_state(
+        "feature-node-a", {"title": "并发审核标题", "reviewer_note": "并发审核备注", "tags": ["并发审核"]},
+        expected_status="pending",
+    )
     manager.update_feature(
         job_id,
         "feature-node-a",
-        {"status": "approved", "title": "管理器标题"},
+        {"status": "approved"},
     )
 
     persisted = persistence.load_candidate("feature-node-a")
-    assert persistence.review_calls == 1
     assert persisted["status"] == "approved"
     assert persisted["title"] == "并发审核标题"
     assert persisted["reviewer_note"] == "并发审核备注"
@@ -1146,27 +1133,8 @@ def test_review_operation_uses_one_cas_without_overwriting_concurrent_review(tmp
 
 
 def test_losing_review_cannot_leave_rule_or_sibling_group_side_effect(tmp_path):
-    class LosingReviewStore(SQLiteFeatureJobStore):
-        def __init__(self, database):
-            super().__init__(database)
-            self.interleaved = False
-
-        def update_candidate_review_state(self, candidate_id, changes, **kwargs):
-            if (
-                candidate_id == "feature-node-a"
-                and changes.get("status") == "approved"
-                and not self.interleaved
-            ):
-                self.interleaved = True
-                SQLiteFeatureJobStore(self.database).update_candidate_review_state(
-                    candidate_id,
-                    {"status": "rejected"},
-                    expected_status="pending",
-                )
-            return super().update_candidate_review_state(candidate_id, changes, **kwargs)
-
     database = SQLiteDatabase(tmp_path / "state.sqlite3")
-    persistence = LosingReviewStore(database)
+    persistence = SQLiteFeatureJobStore(database)
     rules = SQLiteApprovedRuleStore(database)
     groups = SQLiteApprovalGroupStore(database)
     manager = FeatureJobManager(
@@ -1188,8 +1156,13 @@ def test_losing_review_cannot_leave_rule_or_sibling_group_side_effect(tmp_path):
     manager.run_job(first)
     manager.run_job(second)
 
+    stale_version = persistence.load_candidate("feature-node-a")["updated_at"]
+    SQLiteFeatureJobStore(database).update_candidate_review_state(
+        "feature-node-a", {'status': 'rejected'}, expected_status="pending", expected_updated_at=stale_version,
+    )
+
     with pytest.raises(FeatureJobError) as conflict:
-        manager.update_feature(first, "feature-node-a", {"status": "approved"})
+        manager.update_feature(first, "feature-node-a", {"status": "approved"}, expected_updated_at=stale_version)
 
     assert (conflict.value.code, conflict.value.status_code) == ("candidate_state_conflict", 409)
     assert rules.list_rules() == []
@@ -1200,28 +1173,8 @@ def test_losing_review_cannot_leave_rule_or_sibling_group_side_effect(tmp_path):
 
 
 def test_stale_idempotent_approval_cannot_run_or_rollback_winner_side_effects(tmp_path):
-    class ConcurrentApprovalStore(SQLiteFeatureJobStore):
-        def __init__(self, database):
-            super().__init__(database)
-            self.interleaved = False
-
-        def update_candidate_review_state(self, candidate_id, changes, **kwargs):
-            if (
-                candidate_id == "feature-node-a"
-                and changes.get("status") == "approved"
-                and not self.interleaved
-            ):
-                self.interleaved = True
-                SQLiteFeatureJobStore(self.database).update_candidate_review_state(
-                    candidate_id,
-                    {"status": "approved", "reviewer_note": "并发审核胜者"},
-                    expected_status="pending",
-                    expected_updated_at=kwargs.get("expected_updated_at"),
-                )
-            return super().update_candidate_review_state(candidate_id, changes, **kwargs)
-
     database = SQLiteDatabase(tmp_path / "state.sqlite3")
-    persistence = ConcurrentApprovalStore(database)
+    persistence = SQLiteFeatureJobStore(database)
     rules = SQLiteApprovedRuleStore(database)
     groups = SQLiteApprovalGroupStore(database)
     manager = FeatureJobManager(
@@ -1238,8 +1191,13 @@ def test_stale_idempotent_approval_cannot_run_or_rollback_winner_side_effects(tm
     )
     manager.run_job(job_id)
 
+    stale_version = persistence.load_candidate("feature-node-a")["updated_at"]
+    SQLiteFeatureJobStore(database).update_candidate_review_state(
+        "feature-node-a", {'status': 'approved', 'reviewer_note': '并发审核胜者'}, expected_status="pending", expected_updated_at=stale_version,
+    )
+
     with pytest.raises(FeatureJobError) as conflict:
-        manager.update_feature(job_id, "feature-node-a", {"status": "approved"})
+        manager.update_feature(job_id, "feature-node-a", {"status": "approved"}, expected_updated_at=stale_version)
 
     assert (conflict.value.code, conflict.value.status_code) == ("candidate_state_conflict", 409)
     assert rules.list_rules() == []

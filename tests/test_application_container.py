@@ -2,8 +2,54 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+@pytest.mark.parametrize("enabled_first", [True, False])
+def test_kafka_containers_isolate_opt_in_and_count_only_active_kafka_tasks(tmp_path, monkeypatch, enabled_first):
+    from dataclasses import replace
+    from logrisk.application.container import ApplicationConfig, build_application_container
+    from logrisk.incremental_sources import IncrementalSourceError, SourceDescriptor, source_capabilities
+    from logrisk.kafka_adapter import KafkaPythonConsumerAdapter
+
+    monkeypatch.setattr(KafkaPythonConsumerAdapter, "_new_consumer", lambda *args: pytest.fail("No Broker connection"))
+    containers = {}
+    for enabled in (enabled_first, not enabled_first):
+        config = replace(
+            ApplicationConfig.for_test(project_root=PROJECT_ROOT, state_root=tmp_path / str(enabled)),
+            kafka_enabled="true" if enabled else "false",
+        )
+        containers[enabled] = build_application_container(config)
+    enabled, disabled = containers[True], containers[False]
+    assert enabled.config.kafka_enabled is True
+    assert disabled.config.kafka_enabled is False
+    assert enabled.source_capabilities()["kafka"]["enabled"] is True
+    assert disabled.source_capabilities()["kafka"]["registered_adapter_ids"] == []
+    assert "kafka-python" not in source_capabilities()["kafka"]["registered_adapter_ids"]
+    with pytest.raises(IncrementalSourceError, match="未启用"):
+        disabled.kafka_source({"adapter_id": "kafka-python"})
+
+    repository = enabled.streaming_state
+    for index, status in enumerate(("queued", "running", "completed", "failed", "interrupted")):
+        task = repository.create_or_load(
+            descriptor=SourceDescriptor("kafka", {}, {}), config_hash="hash", task_id=f"kafka_{index}"
+        )
+        if status == "running":
+            repository.mark_running(task["task_id"])
+        elif status == "completed":
+            repository.mark_completed(task["task_id"])
+        elif status == "failed":
+            repository.mark_failed(task["task_id"], "safe failure")
+        elif status == "interrupted":
+            repository.mark_interrupted(task["task_id"])
+    repository.create_or_load(descriptor=SourceDescriptor("file", {}, {}), config_hash="hash")
+    status = enabled.source_capabilities()["kafka"]
+    assert status["active_tasks"] == 2
+    assert status["connection_check"] == "not_checked"
+    assert disabled.source_capabilities()["kafka"]["active_tasks"] == 0
 
 
 def test_application_container_builds_shared_services_without_starting_http(tmp_path) -> None:

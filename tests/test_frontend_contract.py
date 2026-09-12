@@ -346,7 +346,7 @@ def test_rule_lifecycle_governance_ui_contract():
         "/feedback",
         "/rollback",
         "规则生命周期治理",
-        "待复审",
+        "已批准规则健康复审",
         "ruleReviewQueue",
         "规则健康度",
         "7 天命中",
@@ -554,7 +554,7 @@ def test_release_docs_describe_current_feature_version():
     assert "## 1.32.0 - 2026-08-10" in release
     assert "## 1.34.0 - 2026-08-13" in release
     assert "## 1.36.1 - 2026-09-01" in release
-    assert "当前版本：`1.38.0`" in readme
+    assert "当前版本：`1.38.1`" in readme
     assert "## 1.37.3 - 2026-09-11" in release
     assert "## 1.24.0 - 2026-07-22" in release
     assert "## 1.24.1 - 2026-07-22" in release

@@ -87,6 +87,23 @@ class KafkaConsumerAdapter(Protocol):
 _KAFKA_ADAPTERS: dict[str, KafkaConsumerAdapter] = {}
 
 
+def parse_kafka_enabled(value: Any) -> bool:
+    """Parse the opt-in flag consistently without truthy string coercion."""
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int) and value in {0, 1}:
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"", "0", "false", "no", "off"}:
+            return False
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+    raise IncrementalSourceError("kafka_enabled 必须是布尔值或 true/false、1/0、yes/no、on/off")
+
+
 def register_kafka_consumer_adapter(adapter: KafkaConsumerAdapter) -> None:
     """Register a reviewed in-process adapter without importing Kafka libraries here."""
 
@@ -211,7 +228,14 @@ class FileIncrementalSource:
 class KafkaIncrementalSource:
     """Incremental Kafka source backed by an explicitly registered adapter."""
 
-    def __init__(self, configuration: Mapping[str, Any]) -> None:
+    def __init__(
+        self,
+        configuration: Mapping[str, Any],
+        *,
+        adapters: Mapping[str, KafkaConsumerAdapter] | None = None,
+    ) -> None:
+        # Legacy internal callers may still register explicitly; runtimes always inject their own registry.
+        self.adapters = _KAFKA_ADAPTERS if adapters is None else adapters
         self.configuration = {
             "adapter_id": str(configuration.get("adapter_id") or ""),
             "topic": str(configuration.get("topic") or ""),
@@ -230,7 +254,7 @@ class KafkaIncrementalSource:
 
     def read(self, cursor: SourceCursor) -> Iterator[SourceRecord]:
         adapter_id = self.configuration["adapter_id"]
-        adapter = _KAFKA_ADAPTERS.get(adapter_id)
+        adapter = self.adapters.get(adapter_id)
         if adapter is None:
             raise IncrementalSourceError("Kafka 消费适配器未注册，无法启动消费")
         if cursor.kind not in {"", "kafka"}:
@@ -239,7 +263,7 @@ class KafkaIncrementalSource:
 
     def commit(self, cursor: SourceCursor) -> None:
         adapter_id = self.configuration["adapter_id"]
-        adapter = _KAFKA_ADAPTERS.get(adapter_id)
+        adapter = self.adapters.get(adapter_id)
         if adapter is None:
             raise IncrementalSourceError("Kafka 消费适配器未注册，无法提交消费位点")
         if cursor.kind not in {"", "kafka"}:
@@ -250,14 +274,28 @@ class KafkaIncrementalSource:
         commit(self.configuration, cursor)
 
 
-def source_capabilities() -> dict[str, dict[str, Any]]:
-    registered = sorted(_KAFKA_ADAPTERS)
+def source_capabilities(
+    adapters: Mapping[str, KafkaConsumerAdapter] | None = None,
+    *,
+    enabled: bool | None = None,
+    active_tasks: int = 0,
+) -> dict[str, dict[str, Any]]:
+    adapters = _KAFKA_ADAPTERS if adapters is None else adapters
+    registered = sorted(adapters)
+    kafka_enabled = bool(registered) if enabled is None else enabled
     return {
         "file": {"enabled": True, "resume_supported": True},
         "kafka": {
-            "enabled": bool(registered),
+            "configured": bool(registered),
+            "enabled": kafka_enabled,
+            "dependency_ready": bool(registered) and all(
+                getattr(adapter, "dependency_ready", True) is True for adapter in adapters.values()
+            ),
+            "connection_check": "not_checked",
+            "active_tasks": active_tasks,
+            "consumption_mode": "bounded_high_water",
             "resume_supported": True,
-            "reason": "Kafka 消费适配器未注册" if not registered else "Kafka 适配器已注册；仅允许内部受控任务启动器调用",
+            "reason": "Kafka 消费适配器未注册" if not registered else "Kafka 适配器已注册；Broker 连接未检查；读取本批高水位后结束",
             "required_fields": ["adapter_id", "topic", "consumer_group", "bootstrap_env"],
             "registered_adapter_ids": registered,
         },

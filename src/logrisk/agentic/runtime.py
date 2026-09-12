@@ -1,10 +1,12 @@
 from __future__ import annotations
 
-import hashlib
-import json
 import time
+from dataclasses import replace
 from typing import Any, Callable
 
+from logrisk.ai_harness.evaluator import EVALUATOR_VERSION
+
+from .artifacts import READ_ARTIFACT_TYPES, canonical_fingerprint, read_tool_artifact
 from .errors import AgenticError
 from .planner import AgentPlanner
 from .repository import AgentRepository
@@ -12,7 +14,20 @@ from .tool_registry import AgentToolContext, ToolRegistry
 
 
 def _fingerprint(feature: Any) -> str:
-    return hashlib.sha256(json.dumps(feature, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+    return canonical_fingerprint(feature)
+
+
+def _evaluation_fingerprint(output: dict[str, Any], evidence_hash: str | None) -> str | None:
+    feature = output.get("feature")
+    fingerprint = _fingerprint(feature) if isinstance(feature, dict) else None
+    if (
+        output.get("passed") is True and fingerprint
+        and output.get("fingerprint") == fingerprint
+        and output.get("evidence_hash") == evidence_hash
+        and output.get("evaluator_version") == EVALUATOR_VERSION
+    ):
+        return fingerprint
+    return None
 
 
 class AgentRuntime:
@@ -47,13 +62,15 @@ class AgentRuntime:
                 run_id=run_id, source_job_id=run["source_job_id"], entity_id=run["entity_id"],
                 allowed_tools=frozenset(run["allowed_tools"]), actor=run["actor"], request_id=run["request_id"],
             )
+            evidence_hash = self.tools.current_evidence_hash(context)
+            context = replace(context, evidence_hash=evidence_hash or _fingerprint(run["locked_snapshot"].get("evidence_summary") or {}))
             passed_evaluations: set[str] = set()
             for item in run["artifacts"]:
                 if item["artifact_type"] != "evaluation" or not item["payload"].get("passed"):
                     continue
-                evaluated = item["payload"].get("feature")
-                if evaluated is not None and item.get("fingerprint") == _fingerprint(evaluated):
-                    passed_evaluations.add(str(item["fingerprint"]))
+                fingerprint = _evaluation_fingerprint(item["payload"], context.evidence_hash)
+                if fingerprint and item.get("fingerprint") == fingerprint:
+                    passed_evaluations.add(fingerprint)
             for step in run["steps"]:
                 current = self.repository.get_run(run_id)
                 if current["status"] in {"paused", "cancelled"}:
@@ -69,6 +86,8 @@ class AgentRuntime:
                 fingerprint = _fingerprint(feature) if feature is not None else None
                 if tool.writes_candidate and fingerprint not in passed_evaluations:
                     raise AgenticError("Candidate 必须先通过确定性 Evaluator", code="human_gate_bypass")
+                if tool.writes_candidate:
+                    self.tools.current_evidence_hash(context)
                 started_step = self.repository.start_step(run_id, step["step_id"])
                 output: dict[str, Any] | None = None
                 for retry_index in range(2):
@@ -114,17 +133,14 @@ class AgentRuntime:
                     self.repository.finish_step(run_id, step["step_id"], status="failed", error_code="agent_timeout", error_summary="Agent Run 超时")
                     self.repository.append_event(run_id, "tool_call_failed", {"step_id": step["step_id"], "tool_name": step["tool_name"], "error_code": "agent_timeout"})
                     raise AgenticError("Agent Run 超时", code="agent_timeout")
-                self.repository.record_tool_call(
+                call = self.repository.record_tool_call(
                     run_id, step["step_id"], step["tool_name"], step["arguments"], status="completed",
                     idempotency_key=call_key, cost_units=tool.cost_units, result=output,
                     latency_ms=int((self.monotonic() - call_started) * 1000),
                 )
-                self.repository.finish_step(run_id, step["step_id"], status="completed", result_summary=output)
-                self.repository.append_event(run_id, "tool_call_completed", {"step_id": step["step_id"], "tool_name": step["tool_name"]})
                 if step["tool_name"] == "evaluate_candidate":
-                    evaluated = output.get("feature")
-                    evaluated_fingerprint = _fingerprint(evaluated) if evaluated is not None else None
-                    if output.get("passed") and fingerprint and evaluated_fingerprint == fingerprint:
+                    evaluated_fingerprint = _evaluation_fingerprint(output, context.evidence_hash)
+                    if fingerprint and evaluated_fingerprint == fingerprint:
                         passed_evaluations.add(fingerprint)
                     self.repository.add_artifact(
                         run_id, "evaluation", output, step_id=step["step_id"],
@@ -132,6 +148,15 @@ class AgentRuntime:
                     )
                 elif tool.writes_candidate:
                     self.repository.add_artifact(run_id, "candidate", output, step_id=step["step_id"], fingerprint=fingerprint)
+                elif step["tool_name"] in READ_ARTIFACT_TYPES:
+                    payload = read_tool_artifact(
+                        run_id=run_id, source_job_id=context.source_job_id, entity_id=context.entity_id,
+                        tool_name=step["tool_name"], tool_call_id=call["tool_call_id"],
+                        evidence_hash=str(context.evidence_hash), output=output,
+                    )
+                    self.repository.add_artifact(run_id, READ_ARTIFACT_TYPES[step["tool_name"]], payload, step_id=step["step_id"])
+                self.repository.finish_step(run_id, step["step_id"], status="completed", result_summary=output)
+                self.repository.append_event(run_id, "tool_call_completed", {"step_id": step["step_id"], "tool_name": step["tool_name"]})
             return self.repository.transition(run_id, "awaiting_human", allowed_from={"running"})
         except Exception as exc:
             code = getattr(exc, "code", "agent_run_failed")

@@ -116,13 +116,14 @@ def test_tool_registry_rejects_unlisted_tool_and_unknown_arguments():
         )
 
 
-def test_tool_registry_rejects_sensitive_result_fields():
+@pytest.mark.parametrize("field", ["raw", "raw_record", "raw_records", "raw_samples", "log_stream", "raw_stream", "samples", "raw_sample", "raw_log", "raw_logs", "raw_message", "message", "api_key"])
+def test_tool_registry_rejects_sensitive_result_fields(field):
     registry = ToolRegistry()
     registry.register(
         name="unsafe",
         description="测试",
         required_arguments=(),
-        handler=lambda arguments, context: {"nested": {"raw_log": "secret"}},
+        handler=lambda arguments, context: {"nested": {field: "secret"}},
     )
     context = AgentToolContext(
         run_id="run-1",

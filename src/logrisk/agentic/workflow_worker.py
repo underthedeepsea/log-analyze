@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from .artifacts import dependency_artifacts
 from .errors import AgenticError
 from .models import AgentRunRequest
 from .tool_registry import _reject_sensitive
@@ -18,12 +19,8 @@ class WorkflowWorker:
         node = next(item for item in run["nodes"] if item["node_id"] == node_id)
         attempt = int(node["attempt"])
         key = f"workflow:{workflow_run_id}:{node_id}:{attempt}"
-        dependency_artifacts = {
-            item["node_id"]: dict(item.get("result_summary") or {})
-            for item in run["nodes"] if item["node_id"] in node["dependencies"]
-        }
         evidence_summary = dict(run["locked_snapshot"].get("evidence_summary") or {})
-        evidence_summary["dependency_artifacts"] = dependency_artifacts
+        evidence_summary["dependency_artifacts"] = dependency_artifacts(run["nodes"], node["dependencies"])
         _reject_sensitive(evidence_summary)
         runtime_snapshot = run["locked_snapshot"]
         runtime_keys = ("profile_snapshot", "connection_snapshot", "prompt_id", "prompt_sha256")

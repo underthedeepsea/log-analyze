@@ -485,7 +485,11 @@ class RuleGovernanceService:
         for rule in self.repository.list_rules():
             health = self.health(rule)
             if health["review_reasons"]:
-                items.append(dict(public_rule(rule), health=health, review_reasons=health["review_reasons"]))
+                items.append(dict(
+                    public_rule(rule), health=health, review_reasons=health["review_reasons"],
+                    queue_kind="rule_health_review", reopen_reason="；".join(health["review_reasons"]),
+                    matched_rule_id=rule["rule_id"], decision_version=rule["current_version"],
+                ))
         items.sort(key=lambda item: (item["health"]["score"], item["updated_at"]))
         return {"schema_version": "rule_review_queue_v1", "items": items, "total": len(items)}
 

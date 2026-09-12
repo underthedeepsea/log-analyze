@@ -13,7 +13,7 @@ from logrisk.ai_harness.model_profile import ModelProfileRegistry
 from logrisk.ai_harness.trace_logger import AITraceLogger
 from logrisk.feature_jobs import FeatureJobManager
 from logrisk.incremental_sources import SourceCursor, SourceRecord, register_kafka_consumer_adapter, unregister_kafka_consumer_adapter
-from pipeline.dashboard_server import build_server, parse_args
+from pipeline.dashboard_server import APP_VERSION, build_server, parse_args
 
 
 def entity(entity_id="node-a", score=90):
@@ -63,7 +63,7 @@ def candidate(source):
 
 
 @pytest.fixture
-def dashboard(tmp_path):
+def dashboard_server(tmp_path, request):
     frontend = tmp_path / "dist" / "index.html"
     frontend.parent.mkdir()
     frontend.write_text("<!doctype html><title>Feature Dashboard</title>", encoding="utf-8")
@@ -86,6 +86,7 @@ def dashboard(tmp_path):
             "top_templates": [],
         },
         database_path=tmp_path / "state" / "logrisk.sqlite3",
+        kafka_enabled=getattr(request, "param", False),
     )
     prompt_dir = tmp_path / "prompts"
     shutil.copytree(Path("prompts"), prompt_dir)
@@ -101,10 +102,16 @@ def dashboard(tmp_path):
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     base_url = f"http://127.0.0.1:{server.server_address[1]}"
-    yield base_url, manager
+    yield base_url, manager, server
     server.shutdown()
     server.server_close()
     thread.join(timeout=2)
+
+
+@pytest.fixture
+def dashboard(dashboard_server):
+    base_url, manager, _ = dashboard_server
+    return base_url, manager
 
 
 def request_json(url, method="GET", payload=None):
@@ -147,7 +154,7 @@ def test_database_status_and_restart_candidate_configuration_are_available(dashb
     assert saved["candidate"]["provider"] == "postgres"
     assert saved["candidate"]["password_configured"] is False
     assert saved["restart_required"] is True
-    assert health["version"] == "1.38.0"
+    assert health["version"] == APP_VERSION
     assert health["storage"] == "sqlite"
 
 
@@ -413,8 +420,9 @@ def test_streaming_routes_expose_disabled_kafka_capability(dashboard):
     assert json.load(unavailable.value)["code"] == "kafka_adapter_unavailable"
 
 
-def test_kafka_start_route_runs_registered_adapter_to_completion(dashboard):
-    base_url, _ = dashboard
+@pytest.mark.parametrize("dashboard_server", [True], indirect=True)
+def test_kafka_start_route_runs_registered_adapter_to_completion(dashboard_server):
+    base_url, _, server = dashboard_server
 
     class FakeKafkaAdapter:
         adapter_id = "dashboard-kafka"
@@ -428,7 +436,8 @@ def test_kafka_start_route_runs_registered_adapter_to_completion(dashboard):
         def commit(self, configuration, cursor):
             return None
 
-    register_kafka_consumer_adapter(FakeKafkaAdapter())
+    adapters = server.api_facade.container.kafka_adapters
+    adapters["dashboard-kafka"] = FakeKafkaAdapter()
     try:
         status, started, _ = request_json(base_url + "/api/streaming/kafka/start", "POST", {
             "adapter_id": "dashboard-kafka",
@@ -454,7 +463,7 @@ def test_kafka_start_route_runs_registered_adapter_to_completion(dashboard):
                 break
             time.sleep(0.02)
     finally:
-        unregister_kafka_consumer_adapter("dashboard-kafka")
+        adapters.pop("dashboard-kafka", None)
 
     assert status == 202
     assert started["task_id"]
@@ -466,6 +475,49 @@ def test_kafka_start_route_runs_registered_adapter_to_completion(dashboard):
     assert duplicate_status == 202
     assert duplicate["task_id"] == started["task_id"]
     assert len(tasks["tasks"]) == 1
+
+
+def test_disabled_dashboard_rejects_globally_registered_adapter(dashboard):
+    base_url, _ = dashboard
+
+    class FakeKafkaAdapter:
+        adapter_id = "legacy-kafka"
+
+        def read(self, configuration, cursor):
+            pytest.fail("Disabled server must not read Kafka")
+
+        def commit(self, configuration, cursor):
+            pytest.fail("Disabled server must not commit Kafka")
+
+    register_kafka_consumer_adapter(FakeKafkaAdapter())
+    try:
+        _, sources, _ = request_json(base_url + "/api/streaming/sources")
+        with pytest.raises(HTTPError) as unavailable:
+            request_json(base_url + "/api/streaming/kafka/start", "POST", {
+                "adapter_id": "legacy-kafka", "topic": "logs", "consumer_group": "test",
+            })
+    finally:
+        unregister_kafka_consumer_adapter("legacy-kafka")
+    assert sources["sources"]["kafka"]["enabled"] is False
+    assert sources["sources"]["kafka"]["registered_adapter_ids"] == []
+    assert unavailable.value.code == 422
+
+
+@pytest.mark.parametrize("explicit, environment, expected", [
+    (None, None, False), (None, "false", False), (None, "true", True),
+    (False, "true", False), ("false", "true", False), ("true", "false", True),
+])
+def test_dashboard_kafka_setting_precedes_environment(tmp_path, monkeypatch, explicit, environment, expected):
+    if environment is None:
+        monkeypatch.delenv("LOGRISK_KAFKA_ENABLED", raising=False)
+    else:
+        monkeypatch.setenv("LOGRISK_KAFKA_ENABLED", environment)
+    server = build_server("127.0.0.1", 0, state_root=tmp_path, kafka_enabled=explicit)
+    try:
+        assert server.source_capabilities()["kafka"]["enabled"] is expected
+        assert server.source_capabilities()["kafka"]["connection_check"] == "not_checked"
+    finally:
+        server.server_close()
 
 
 def test_rule_list_route(dashboard):

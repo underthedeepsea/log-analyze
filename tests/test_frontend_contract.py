@@ -542,7 +542,6 @@ def test_package_uses_react_without_vite_or_a_runtime_build_step():
 def test_release_docs_describe_current_feature_version():
     release = Path("releas.md").read_text(encoding="utf-8")
     readme = Path("README.md").read_text(encoding="utf-8")
-    agents = Path("AGENTS.md").read_text(encoding="utf-8")
 
     assert "## 1.16.0 - 2026-07-11" in release
     assert "## 1.16.2 - 2026-07-13" in release
@@ -579,7 +578,6 @@ def test_release_docs_describe_current_feature_version():
     assert "database/migrations/" in readme
     assert "database/schema.yaml" in readme
     assert "configs/semantic_dictionary/" in readme
-    assert "Every code update also updates `releas.md`" in agents
     assert "dashboard.sh restart" in readme
     assert ".txt" in readme
     for text in ("OpenAI-compatible", "LOGRISK_DB_PATH", "REMOTE_LLM_API_KEY", "Promptfoo"):

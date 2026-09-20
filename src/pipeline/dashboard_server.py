@@ -831,7 +831,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 return
             match = re.fullmatch(r"/api/input-jobs/([A-Za-z0-9_-]+)/result", path)
             if match:
-                result = self.server.input_jobs.get_result(match.group(1))  # type: ignore[attr-defined]
+                result = self.server.input_jobs.get_result_page(match.group(1),cursor=query.get("cursor",[None])[0],limit=int(query.get("limit",["100"])[0]),collection=query.get("collection",["entities"])[0],window_key=query.get("window_key",[None])[0])  # type: ignore[attr-defined]
                 self._json(HTTPStatus.OK, {"result_path": str(self.server.input_jobs.result_path(match.group(1))), "result": result})  # type: ignore[attr-defined]
                 return
             if path == "/api/streaming/tasks":
@@ -859,7 +859,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 return
             match = re.fullmatch(r"/api/jobs/([a-f0-9]+)", path)
             if match:
-                self._json(HTTPStatus.OK, self.server.manager.get_job(match.group(1)))  # type: ignore[attr-defined]
+                self._json(HTTPStatus.OK, self.server.manager.get_job(match.group(1), cursor=query.get("cursor", [None])[0]))  # type: ignore[attr-defined]
                 return
             match = re.fullmatch(r"/api/jobs/([a-f0-9]+)/events", path)
             if match:

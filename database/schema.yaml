@@ -1,4 +1,4 @@
-schema_version: 23
+schema_version: 26
 database: logrisk
 description: LOGRISK 双模式运行时数据字典；SQLite 是默认本地实现，PostgreSQL 用于显式配置的外部生产部署。
 authoritative_ddl:
@@ -206,7 +206,7 @@ tables:
     primary_key: correlation_id
     foreign_keys: {rule_id: multi_source_rules.rule_id}
     indexes: [idx_multi_source_correlation_entity(primary_entity_key, window_start DESC)]
-    columns: {correlation_id: 稳定关联摘要, rule_id: 命中规则, rule_version: 命中时版本, cluster: 集群, primary_entity_key: 主实体键, window_start: 关联开始, window_end: 关联结束, confidence: 规则确定置信度, risk_score: 关联最高风险分, source_families_json: 来源族集合, schema_version: 结构版本, created_at: 创建时间, updated_at: 更新时间}
+    columns: {correlation_id: 稳定关联摘要, rule_id: 命中规则, rule_version: 命中时版本, cluster: 集群, primary_entity_key: 兼容旧响应的代表实体键, window_start: 关联开始, window_end: 关联结束, confidence: 规则确定置信度, risk_score: 关联最高风险分, source_families_json: 来源族集合, edges_json: 不丢失的合法观察边, group_scope: shared_entity/edge_connected 解释范围, partial: 是否因候选预算截断, schema_version: 结构版本, created_at: 创建时间, updated_at: 更新时间}
   multi_source_correlation_items:
     description: 关联证据链与脱敏观察的有序成员关系
     primary_key: [correlation_id, observation_id]
@@ -245,7 +245,13 @@ tables:
     description: 已原子提交的增量窗口；相同 task/window 只能提交一次
     primary_key: [task_id, window_id]
     foreign_keys: {task_id: streaming_tasks.task_id ON DELETE CASCADE}
-    columns: {task_id: 流式任务标识, window_id: 稳定窗口标识, cursor_json: 本窗口提交后的来源游标, summary_json: 窗口聚合摘要, committed_at: 提交时间}
+    columns: {task_id: 流式任务标识, window_id: 稳定窗口标识, cursor_json: 本窗口提交后的来源游标, summary_json: 窗口聚合摘要, committed_at: 提交时间, payload_hash: 游标/完整窗口/摘要的规范摘要, state_manifest_json: 与本批游标同事务绑定的 miner generation manifest（TEXT 可空；旧行不回填）}
+  streaming_batch_windows:
+    description: 已提交批次的完整脱敏窗口事实；恢复和最终归约不依赖进程内历史列表
+    primary_key: [task_id, window_id, item_index]
+    foreign_keys: {task_id: streaming_tasks.task_id ON DELETE CASCADE, "[task_id, window_id]": streaming_window_commits.[task_id, window_id] ON DELETE CASCADE}
+    indexes: [idx_streaming_batch_windows_iteration(task_id, window_id, item_index)]
+    columns: {task_id: 流式任务标识, window_id: 稳定批次标识, item_index: 批次内顺序, window_json: 完整脱敏窗口事实}
   unknown_template_queue:
     description: 未命中风险语义或风险规则的 Drain3 脱敏模板治理队列
     primary_key: [task_id, template_hash, window_start]
@@ -347,6 +353,7 @@ tables:
     columns: {candidate_id: 候选标识, component: 日志组件, template_hash: Drain3 模板摘要, typed_message: 脱敏模板, occurrence_count: 命中次数, first_seen: 首次出现, last_seen: 最近出现, status: 候选状态, candidate_json: 候选上下文}
   node_risk_events:
     description: 节点确定性风险事件台账；event_count 与 occurrence_count 分离
+    revision_columns: {derivation_status: current/superseded（后者不等于人工恢复）, current_occurrence_count: 当前有效派生贡献计数（允许0）}
     primary_key: event_id
     indexes: [idx_node_risk_node_time(cluster, node_id, last_seen DESC), idx_node_risk_type_status(risk_type, status), idx_node_risk_window(dedup_key, window_start)]
     columns: {event_id: 风险事件标识, cluster: 集群, node_id: 节点, risk_domain: 风险域, risk_category: 风险类别, risk_type: 稳定风险类型, severity: 默认严重度, base_score: 规则基础分, confidence: 规则置信度, semantic_rule_id: 命中语义规则, semantic_rule_version: 命中时版本, dedup_key: 去重键, occurrence_count: 合并的日志命中次数, first_seen: 首次发生, last_seen: 最近发生, window_start: 去重窗口起点, window_end: 去重窗口终点, status: active/acknowledged/recovered, semantic_fields_json: Xid/PCI 等提取字段, evidence_refs_json: 脱敏证据引用, source_job_id: 来源任务, source_trace_id: 来源追踪, created_at: 创建时间, updated_at: 更新时间}
@@ -354,7 +361,7 @@ tables:
     description: 来源事件幂等写入账本
     primary_key: source_event_fingerprint
     foreign_keys: {event_id: node_risk_events.event_id ON DELETE CASCADE}
-    columns: {source_event_fingerprint: 来源事件摘要, event_id: 合并后的风险事件, source_job_id: 来源任务, occurrence_count: 本次写入日志数, ingested_at: 写入时间}
+    columns: {source_event_fingerprint: 来源事件摘要, event_id: 合并后的风险事件, source_job_id: 来源任务, occurrence_count: 本次写入日志数, ingested_at: 写入时间, physical_key: 稳定物理贡献键, semantic_revision: 派生语义版本, is_current: 当前有效标志, contribution_json: 脱敏贡献快照}
   node_risk_daily:
     description: 节点风险按日聚合，用于趋势和历史查询
     primary_key: [cluster, node_id, date]
@@ -500,6 +507,96 @@ tables:
     constraints: request_key/actor_scope 联合唯一；与任务删除独立保留
     indexes: ["idx_approval_decisions_candidate(candidate_id, created_at)"]
     columns: {decision_id: 决定标识, request_key: 客户端请求幂等标识, actor_scope: 可信主体范围, payload_hash: 请求摘要, candidate_id: 候选标识, before_version: 审批前候选更新时间, result_json: 已提交脱敏响应, created_at: 决定时间}
+  operational_sources:
+    description: 按环境、作用域和不可变来源身份登记的运行台账来源；不保存路径、内容或凭据
+    primary_key: source_id
+    constraints: source_id 为 source_identity 四字段规范 JSON 的 SHA256；删除受内部台账引用保护
+    indexes: ["uq_operational_sources_identity(environment, scope_key, source_kind, identity_digest)"]
+    columns: {source_id: 规范来源身份摘要, environment: 环境, scope_key: 明确来源作用域, source_kind: file/kafka 等来源类型, identity_digest: 完整来源内容或配置摘要, created_at: 登记时间}
+  operational_ingestion_batches:
+    description: 已接受输入窗口的幂等收据；ranges_json 只保存分区和半开区间
+    primary_key: batch_id
+    foreign_keys: {source_id: operational_sources.source_id ON DELETE RESTRICT}
+    constraints: input_job_id/checkpoint_key 联合唯一；provenance 为 verified/reported；不保存原始记录
+    indexes: ["uq_operational_ingestion_batches_receipt(input_job_id, checkpoint_key)"]
+    columns: {batch_id: 确定性窗口收据标识, source_id: 来源, input_job_id: 输入任务引用, checkpoint_key: 检查点窗口键, parser_version: 解析器版本, ranges_json: 分区半开区间, actual_count: 本窗口实际记录数, newly_ingested_count: 首次纳入来源并集的记录数, provenance: verified/reported, committed_at: 收据提交时间}
+  operational_source_ranges:
+    description: 来源 ingested/covered 区间并集碎片；不枚举单条记录并保留活动归属
+    primary_key: range_id
+    foreign_keys: {source_id: operational_sources.source_id ON DELETE RESTRICT}
+    indexes: ["idx_operational_source_ranges_lookup(source_id, kind, partition_key, start_position, end_position)", "idx_operational_source_ranges_activity(kind, first_event_at)"]
+    constraints: 半开区间 [start_position,end_position)；同一来源、类型和分区内由仓储保持不重叠
+    columns: {range_id: 区间标识, source_id: 来源, kind: ingested/covered, partition_key: 分区或空文件分区, start_position: 起始位置, end_position: 结束位置（不含）, first_event_at: 首次活动时间, origin_id: 收据或分析根引用}
+  operational_analysis_runs:
+    description: 一次用户分析操作的冻结根；工作量按成功根的 proven input_count 结算一次
+    primary_key: analysis_run_id
+    foreign_keys: {source_id: operational_sources.source_id ON DELETE RESTRICT, parent_run_id: operational_analysis_runs.analysis_run_id ON DELETE RESTRICT}
+    indexes: ["idx_operational_analysis_runs_completed(environment, scope_key, completed_at, analysis_run_id)", "idx_operational_analysis_runs_created(environment, created_at, analysis_run_id)"]
+    constraints: (environment, request_key) 幂等唯一；status 为 pending/running/partial/completed/failed/cancelled；完成根不可变
+    columns: {analysis_run_id: 分析根 UUID, environment: 环境, scope_key: 来源作用域, request_key: 创建请求幂等键, input_job_id: 输入任务引用, source_id: 单一来源快捷引用, parent_run_id: 显式重分析来源根, provenance: verified/reported/unverified-input, status: 根状态, expected_members: 冻结专家成员数, input_count: 可验证输入记录数, reported_input_count: 未验证申报记录数, created_at: 创建时间, updated_at: 更新时间, completed_at: 完成时间, settled_at: 结算时间}
+  operational_analysis_ranges:
+    description: 分析根冻结的规范化输入区间；用于覆盖率并集查询，不依赖 JSON 解析
+    primary_key: [analysis_run_id, source_id, partition_key, start_position, end_position]
+    foreign_keys: {analysis_run_id: operational_analysis_runs.analysis_run_id ON DELETE RESTRICT, source_id: operational_sources.source_id ON DELETE RESTRICT}
+    indexes: ["idx_operational_analysis_ranges_lookup(source_id, partition_key, start_position, end_position)"]
+    constraints: 根、来源和分区内的半开区间不重叠且不可变
+    columns: {analysis_run_id: 分析根, source_id: 来源, partition_key: 分区, start_position: 起始位置, end_position: 结束位置（不含）}
+  operational_analysis_members:
+    description: 分析根冻结的逻辑专家或 input-only 成员；重试更新同一成员
+    primary_key: member_id
+    foreign_keys: {analysis_run_id: operational_analysis_runs.analysis_run_id ON DELETE RESTRICT}
+    indexes: ["idx_operational_analysis_members_root_status(analysis_run_id, status)"]
+    constraints: status 为 pending/running/partial/completed/failed/cancelled；feature_job_id 仅为可比较绑定引用，不形成脆弱外键
+    columns: {member_id: 稳定成员标识, analysis_run_id: 分析根, feature_job_id: 绑定特征任务引用, status: 成员状态, created_at: 登记时间, updated_at: 更新时间}
+  operational_physical_calls:
+    description: Provider 或 Agent 工具的实际物理尝试；不保存 Prompt、响应、原始错误、选项或凭据
+    primary_key: call_id
+    foreign_keys: {analysis_run_id: operational_analysis_runs.analysis_run_id ON DELETE RESTRICT}
+    indexes: ["uq_operational_physical_calls_attempt(environment, logical_call_id, attempt_index)", "idx_operational_physical_calls_started(environment, scope_key, started_at, call_id)", "idx_operational_physical_calls_root_kind(analysis_run_id, call_kind)", "idx_operational_physical_calls_provider_model(provider, model, started_at)"]
+    constraints: call_kind 为 provider/agent_tool；started_at 为空的 prepared 行不计为已调度；usage_quality 为 known/partial/unknown/invalid；invalid_usage 使用布尔值
+    columns: {call_id: 物理尝试标识, analysis_run_id: 分析根, logical_call_id: 逻辑调用标识, attempt_index: 尝试序号, environment: 环境, scope_key: 作用域, call_kind: provider/agent_tool, provider: Provider 名, model: 模型名, tool_name: 工具名, caller_kind: 调用方类型, caller_id: 调用方引用, status: prepared/started/succeeded/failed/unknown, prepared_at: 准备时间, started_at: 开始时间, finished_at: 结束时间, input_tokens: 输入 Token, output_tokens: 输出 Token, total_tokens: 总 Token, cached_input_tokens: 缓存输入子集, reasoning_tokens: 推理输出子集, usage_quality: 使用量质量, invalid_usage: 使用量是否含非法字段, error_code: 稳定脱敏错误码, provenance: 账本来源可信度, metadata_contract: Provider 元数据契约}
+  operational_backfill_items:
+    description: 历史台账导入逐项幂等检查点；不保存第二份旧快照
+    primary_key: item_key
+    constraints: status 和 reason_code 为脱敏导入结果；同一来源摘要改变时必须报告冲突
+    columns: {item_key: kind+legacy primary key, source_digest: 输入摘要, status: 处理状态, reason_code: 稳定原因码, updated_at: 更新时间}
+  node_risk_projection_revisions:
+    description: 贡献事务内标记的节点投影修订；revision 大于 projected_revision 时由批处理或读取补偿
+    primary_key: [cluster, node_id]
+    columns: {cluster: 集群, node_id: 节点, revision: 事实修订, projected_revision: CAS 已投影修订, updated_at: 事实更新时间}
+  node_risk_score_samples:
+    description: 按实际评估时间保存的不可变评分样本；历史缺少样本时不推测分数
+    primary_key: sample_id
+    columns: {sample_id: 样本标识, cluster: 集群, node_id: 节点, revision: 事实修订, assessed_at: 评估时间, overall_score: 当时评分}
+  approval_candidate_projection:
+    description: 同事务维护的 canonical 审批轻投影；SQL keyset 页与独立 SQL 指标避免读取全部候选 JSON
+    primary_key: candidate_id
+    foreign_keys: {candidate_id: feature_candidates.candidate_id ON DELETE CASCADE}
+    columns: {candidate_id: 候选, review_key: 稳定规范分组键, status: 状态, semantic_safe: 安全语义, ambiguous: 歧义标记, importance_rank: 重要度, risk_score: 风险分, created_at: 代表排序时间, entity_key: 实体, occurrence_count: 次数, first_seen: 首次, last_seen: 末次, group_json: 脱敏单候选轻摘要}
+  approval_projection_state:
+    description: 显式重建时原子切换的投影 generation；审批状态变化不失效游标
+    primary_key: singleton
+    columns: {singleton: 单例键, generation: 投影版本}
+  streaming_result_generations:
+    description: 来源水位及规则hash绑定的可恢复结果归约代次；ready才可消费
+    primary_key: [task_id, generation]
+    columns: {task_id: 任务, generation: 代次, status: building/ready, rules_hash: 规则摘要, frontier_json: 源水位, after_window: 已提交批次进度, after_item: 批内进度, summary_json: SQL精确统计}
+  streaming_result_windows:
+    description: 规范语义key归约后的完整窗口核心；全部无界成员在成员表
+    primary_key: [task_id, generation, window_key]
+    columns: {task_id: 任务, generation: 代次, window_key: 规范key摘要, canonical_key: 哈希碰撞校验, entity_key: 原五元组实体窗口, count: 全贡献次数, score: 完整计数评分, core_json: 核心字段}
+  streaming_result_window_members:
+    description: 窗口成员及语义分布；分页返回不静默截断
+    primary_key: [task_id, generation, window_key, kind, member_key]
+    columns: {task_id: 任务, generation: 代次, window_key: 窗口, kind: 成员类型, member_key: 值摘要, value_json: 脱敏成员, count: 频次}
+  streaming_result_entities:
+    description: 完整风险实体分页投影；top模板引用有界
+    primary_key: [task_id, generation, entity_key]
+    columns: {task_id: 任务, generation: 代次, entity_key: 实体窗口规范key, entity_id: 现有审批collapse身份, score: 分数, level: 等级, entity_json: 实体核心}
+  streaming_feature_entities:
+    description: 沿用现有collapse规则生成的审批来源；FeatureJob存引用并按当前实体加载
+    primary_key: [task_id, generation, entity_id]
+    columns: {task_id: 任务, generation: 代次, entity_id: 实体, source_json: 完整脱敏审批来源}
 postgres_type_mapping:
   TEXT: text
   TEXT_identifier: text

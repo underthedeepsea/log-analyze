@@ -201,20 +201,20 @@ def test_queue_paginates_groups_after_full_candidate_enumeration():
     facade = ApiFacade(SimpleNamespace(feature_jobs=source), version="1.36.1")
 
     first = facade.feature_approvals({"status": "pending", "page_size": "2"})
-    second = facade.feature_approvals({"status": "pending", "page_size": "2", "cursor": "2"})
+    second = facade.feature_approvals({"status": "pending", "page_size": "2", "cursor": first.body["next_cursor"]})
 
     assert source.limits == [None, None]
     assert first.body["total_groups"] == 101
     assert first.body["total_candidates"] == 101
     assert len(first.body["items"]) == 2
-    assert first.body["next_cursor"] == "2"
+    assert first.body["next_cursor"] and first.body["next_cursor"] != first.body["next_review_key"]
     expected_keys = sorted(
         f"approval:{approval_identity(candidate)['approval_key']}"
         for candidate in candidates
     )
     assert [item["review_key"] for item in first.body["items"]] == expected_keys[:2]
     assert [item["review_key"] for item in second.body["items"]] == expected_keys[2:4]
-    assert second.body["next_cursor"] == "4"
+    assert second.body["next_cursor"] and second.body["next_cursor"] != second.body["next_review_key"]
     assert first.body["metrics"]["logrisk_approval_candidates_total"] == 101
     assert first.body["metrics"]["logrisk_approval_fallback_candidates"] == 101
 

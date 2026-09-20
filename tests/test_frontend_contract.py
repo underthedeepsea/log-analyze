@@ -59,6 +59,17 @@ def test_runtime_backend_address_contract():
     assert (FRONTEND / "dist" / "config.js").is_file()
 
 
+def test_large_result_preview_is_not_presented_as_complete():
+    source = source_text()
+    for text in (
+        "result.complete === false",
+        "result.next_cursor",
+        "total_risk_entities",
+        "完整结果由服务器引用处理",
+    ):
+        assert text in source
+
+
 def test_runtime_center_contract():
     source = source_text()
     for value in (
@@ -568,7 +579,7 @@ def test_release_docs_describe_current_feature_version():
     assert "database/migrations/" in readme
     assert "database/schema.yaml" in readme
     assert "configs/semantic_dictionary/" in readme
-    assert "Every code update must also update `releas.md`" in agents
+    assert "Every code update also updates `releas.md`" in agents
     assert "dashboard.sh restart" in readme
     assert ".txt" in readme
     for text in ("OpenAI-compatible", "LOGRISK_DB_PATH", "REMOTE_LLM_API_KEY", "Promptfoo"):
@@ -690,12 +701,12 @@ def test_review_workbench_preserves_queue_request_safety_and_dirty_drafts():
     source = (FRONTEND / "src" / "app.js").read_text(encoding="utf-8")
 
     for marker in (
-        'featureApprovals: function (after, selectedKey)',
-        'next_review_key',
+        'featureApprovals: function (cursor, selectedKey)',
+        'next_cursor',
         'const approvalRequestSequence = useRef(0);',
         'const requestId = ++approvalRequestSequence.current;',
         'if (requestId !== approvalRequestSequence.current) return value;',
-        'mode === "more" ? approvalQueue.next_review_key : null',
+        'mode === "more" ? approvalQueue.next_cursor : null',
         'createReviewSubmissionQueue',
         'reviewSubmissionLabel',
         'review-save-feedback',

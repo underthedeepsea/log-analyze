@@ -109,9 +109,22 @@ def table_snapshot(database):
                               "approval_group_candidates", "feature_job_events")}
 
 
-def test_reclassification_is_atomic_idempotent_and_repeats_reuse_after_restart(tmp_path):
+@pytest.mark.parametrize("paged", [False, True])
+def test_reclassification_is_atomic_idempotent_and_repeats_reuse_after_restart(tmp_path, paged):
     database, manager, job_id = seeded_manager(tmp_path)
     original = manager.get_job(job_id)["features"][0]
+    if paged:
+        # Exercise the normalized paged representation with the same historical
+        # candidate and entity facts, without changing the repair workload.
+        with database.transaction() as connection:
+            snapshot = json.loads(connection.execute(
+                "SELECT job_json FROM feature_jobs WHERE job_id=?", (job_id,)
+            ).fetchone()[0])
+            snapshot["entities_paged"] = True
+            for key in ("entities", "features", "events"):
+                snapshot.pop(key, None)
+            connection.execute("UPDATE feature_jobs SET job_json=? WHERE job_id=?",
+                               (json.dumps(snapshot), job_id))
     before = table_snapshot(database)
     preview = repair_pending_candidates(database)
     assert preview["candidates_reclassified"] == 1 and preview["candidates_added"] == 1
@@ -128,6 +141,16 @@ def test_reclassification_is_atomic_idempotent_and_repeats_reuse_after_restart(t
     with database.connect() as connection:
         assert not connection.execute("PRAGMA foreign_key_check").fetchall()
         assert connection.execute("SELECT COUNT(*) FROM approval_group_candidates").fetchone()[0] == 2
+        if paged:
+            snapshot = json.loads(connection.execute(
+                "SELECT job_json FROM feature_jobs WHERE job_id=?", (job_id,)
+            ).fetchone()[0])
+            assert snapshot["entities_paged"] is True
+            assert not {"entities", "features", "events"}.intersection(snapshot)
+            entity = json.loads(connection.execute(
+                "SELECT entity_json FROM feature_job_entities WHERE job_id=?", (job_id,)
+            ).fetchone()[0])
+            assert set(entity["feature_ids"]) == set(repaired)
     rules = SQLiteApprovedRuleStore(database)
     groups = SQLiteApprovalGroupStore(database)
     def extractor(current, **_):

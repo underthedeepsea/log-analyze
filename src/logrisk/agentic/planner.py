@@ -6,6 +6,7 @@ import re
 from typing import Any, Protocol
 
 from logrisk.ai_harness.model_client import ModelClient
+from logrisk.ai_harness.usage_accounting import run_model_attempt
 
 from .errors import AgenticError
 from .models import AgentPlan, AgentStepPlan
@@ -105,12 +106,24 @@ class ModelAgentPlanner:
         prompt_content: str,
         timeout: float,
         options: dict[str, Any] | None = None,
+        ledger_repository: Any | None = None,
+        analysis_run_id: str | None = None,
+        environment: str | None = None,
+        scope_key: str | None = None,
+        caller_id: str | None = None,
+        logical_call_id: str | None = None,
     ) -> None:
         self.model_client = model_client
         self.model = model
         self.prompt_content = prompt_content
         self.timeout = float(timeout)
         self.options = dict(options or {})
+        self.ledger_repository = ledger_repository
+        self.analysis_run_id = analysis_run_id
+        self.environment = environment
+        self.scope_key = scope_key
+        self.caller_id = caller_id
+        self.logical_call_id = logical_call_id
 
     def plan(self, *, goal: str, evidence_summary: dict[str, Any], tool_descriptions: list[dict[str, Any]], max_steps: int) -> AgentPlan:
         payload = {
@@ -120,7 +133,8 @@ class ModelAgentPlanner:
             "max_steps": int(max_steps),
         }
         try:
-            output = self.model_client.generate_json(
+            output = run_model_attempt(
+                self.model_client,
                 [
                     {"role": "system", "content": self.prompt_content},
                     {"role": "user", "content": json.dumps(payload, ensure_ascii=False, separators=(",", ":"))},
@@ -129,6 +143,14 @@ class ModelAgentPlanner:
                 model=self.model,
                 timeout=self.timeout,
                 options=self.options,
+                ledger_repository=self.ledger_repository,
+                analysis_run_id=self.analysis_run_id,
+                environment=self.environment,
+                scope_key=self.scope_key,
+                provider=getattr(self.model_client, "provider", None),
+                caller_kind="agent_planner",
+                caller_id=self.caller_id,
+                logical_call_id=self.logical_call_id,
             )
             plan = _parse_plan(output)
         except AgenticError:

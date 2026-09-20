@@ -21,6 +21,7 @@ from logrisk.ai_harness.model_profile import ModelProfile, ModelProfileRegistry
 from logrisk.ai_harness.prompt_registry import PromptRegistry, PromptTemplate
 from logrisk.ai_harness.providers.ollama import OllamaModelClient
 from logrisk.ai_harness.trace_logger import AITraceLogger
+from logrisk.ai_harness.usage_accounting import mark_model_validation, public_usage, reset_client_metadata, run_model_attempt
 from logrisk.feature_semantic_partition import partition_feature_by_semantics
 
 
@@ -285,6 +286,11 @@ def _request_features(
     provider: str = "ollama",
     prompt_template: PromptTemplate | None = None,
     connection_snapshot: dict[str, Any] | None = None,
+    ledger_repository: Any | None = None,
+    analysis_run_id: str | None = None,
+    analysis_member_id: str | None = None,
+    environment: str = "production",
+    scope_key: str = "default",
 ) -> tuple[list[Dict[str, Any]], list[Dict[str, Any]], str | None, Dict[str, Any], bool, Dict[str, Any]]:
     prompt = prompt_template or PROMPT_REGISTRY.load(prompt_id)
     if model_profile:
@@ -315,15 +321,42 @@ def _request_features(
     cache_hit = False
     client = model_client or OllamaModelClient(base_url)
     model_output = AI_CACHE.get(signature) if cache_enabled else None
+    call_usage: dict[str, Any] = {}
     if model_output is None:
         try:
-            model_output = client.generate_json(
+            caller_id = analysis_member_id or job_id or str(entity.get("entity_id") or "unknown")
+            request_id = hashlib.sha256(
+                json.dumps(
+                    {
+                        "caller": caller_id,
+                        "entity": entity.get("entity_id"),
+                        "entity_type": entity.get("entity_type"),
+                        "evidence_hash": evidence_hash(evidence),
+                        "provider": provider,
+                        "model": model,
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            model_output = run_model_attempt(
+                client,
                 messages,
                 FEATURE_RESPONSE_SCHEMA,
                 model=model,
                 timeout=timeout,
                 options=model_options,
+                ledger_repository=ledger_repository,
+                analysis_run_id=analysis_run_id,
+                environment=environment,
+                scope_key=scope_key,
+                provider=provider,
+                caller_kind="feature_extractor",
+                caller_id=caller_id,
+                logical_call_id=f"feature_extractor:{request_id}",
             )
+            call_usage = public_usage(client)
         except ModelClientError as exc:
             _write_trace(
                 prompt=prompt,
@@ -339,13 +372,17 @@ def _request_features(
                 model_profile=model_profile,
                 evidence_meta=evidence_meta,
                 model_options=model_options,
+                usage=public_usage(client),
+                connection_snapshot=connection_snapshot,
             )
             raise FeatureExtractionError(str(exc)) from exc
     else:
         cache_hit = True
-        # ponytail: cache stores model JSON only; validation/evaluator still run below.
+        # The cache stores model JSON only; validation/evaluator still run below.
 
     if not isinstance(model_output, dict) or not isinstance(model_output.get("features"), list):
+        if not cache_hit:
+            mark_model_validation("invalid")
         _write_trace(
             prompt=prompt,
             evidence=evidence,
@@ -360,6 +397,8 @@ def _request_features(
             model_profile=model_profile,
             evidence_meta=evidence_meta,
             model_options=model_options,
+            usage=call_usage,
+            connection_snapshot=connection_snapshot,
         )
         raise FeatureExtractionError("模型特征响应缺少 features 数组")
 
@@ -372,6 +411,8 @@ def _request_features(
         features = [_validate_model_feature(feature, known_hashes) for feature in model_output["features"]]
         _validate_unique_template_assignments(features)
     except FeatureExtractionError as exc:
+        if not cache_hit:
+            mark_model_validation("invalid")
         _write_trace(
             prompt=prompt,
             evidence=evidence,
@@ -386,6 +427,8 @@ def _request_features(
             model_profile=model_profile,
             evidence_meta=evidence_meta,
             model_options=model_options,
+            usage=call_usage,
+            connection_snapshot=connection_snapshot,
         )
         raise
     evaluator_results = [
@@ -401,6 +444,8 @@ def _request_features(
         "rule_results": [rule for result in evaluator_results for rule in result.get("rule_results", [])],
     }
     if failed_evaluations:
+        if not cache_hit:
+            mark_model_validation("evaluator_failed")
         _write_trace(
             prompt=prompt,
             evidence=evidence,
@@ -416,8 +461,12 @@ def _request_features(
             model_profile=model_profile,
             evidence_meta=evidence_meta,
             model_options=model_options,
+            usage=call_usage,
+            connection_snapshot=connection_snapshot,
         )
         raise FeatureExtractionError("Evaluator 拦截模型输出: " + (evaluator_summary["errors"][0] if evaluator_summary["errors"] else "质量门禁未通过"))
+    if not cache_hit:
+        mark_model_validation("valid")
     trace_id = _write_trace(
         prompt=prompt,
         evidence=evidence,
@@ -433,7 +482,7 @@ def _request_features(
         model_profile=model_profile,
         evidence_meta=evidence_meta,
         model_options=model_options,
-        usage=dict(getattr(client, "last_metadata", {}).get("usage") or {}),
+        usage=call_usage,
         connection_snapshot=connection_snapshot,
     )
     if cache_enabled and not cache_hit:
@@ -463,6 +512,11 @@ def extract_features_for_entity(
     connection_snapshot: dict[str, Any] | None = None,
     prompt_snapshot: Mapping[str, Any] | None = None,
     profile_snapshot: Mapping[str, Any] | None = None,
+    ledger_repository: Any | None = None,
+    analysis_run_id: str | None = None,
+    analysis_member_id: str | None = None,
+    environment: str = "production",
+    scope_key: str = "default",
 ) -> list[Dict[str, Any]]:
     if profile_snapshot is not None:
         if not isinstance(profile_snapshot, Mapping):
@@ -511,6 +565,11 @@ def extract_features_for_entity(
         provider,
         prompt_template,
         connection_snapshot,
+        ledger_repository,
+        analysis_run_id,
+        analysis_member_id,
+        environment,
+        scope_key,
     )
     attached = [
         (_attach_source_facts(entity, child, model_name, provider), request_evaluator_result)
@@ -578,6 +637,11 @@ def generate_feature_candidates(
     profile_config_path: str | Path | None = None,
     provider: str = "ollama",
     model_profile: ModelProfile | None = None,
+    ledger_repository: Any | None = None,
+    analysis_run_id: str | None = None,
+    analysis_member_id: str | None = None,
+    environment: str = "production",
+    scope_key: str = "default",
 ) -> list[Dict[str, Any]]:
     results = []
     for entity in entities:
@@ -596,5 +660,10 @@ def generate_feature_candidates(
             profile_config_path,
             provider,
             model_profile,
+            ledger_repository=ledger_repository,
+            analysis_run_id=analysis_run_id,
+            analysis_member_id=analysis_member_id,
+            environment=environment,
+            scope_key=scope_key,
         ))
     return results

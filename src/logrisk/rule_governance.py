@@ -68,6 +68,51 @@ class RuleGovernanceRepository:
             ).fetchall()
         return [self._rule(row) for row in rows]
 
+    def list_rules_page(self, *, status: str | None, page: int, page_size: int) -> tuple[list[dict[str, Any]], int]:
+        where = " WHERE status=?" if status else ""
+        parameters: list[Any] = [status] if status else []
+        with self.database.connect() as connection:
+            total = int(connection.execute("SELECT COUNT(*) FROM approved_rules" + where, parameters).fetchone()[0])
+            rows = connection.execute(
+                "SELECT rule_id, signature, feature_type, rule_json, status, current_version, next_review_at, schema_version, "
+                "approved_at, updated_at, problem_code, approval_key FROM approved_rules" + where
+                + " ORDER BY updated_at DESC, rule_id LIMIT ? OFFSET ?",
+                [*parameters, page_size, (page - 1) * page_size],
+            ).fetchall()
+        return [self._rule(row) for row in rows], total
+
+    def activity_many(self, rule_ids: list[str], *, since_7d: str, since_30d: str) -> dict[str, dict[str, Any]]:
+        if not rule_ids:
+            return {}
+        placeholders = ",".join("?" for _ in rule_ids)
+        result = {rule_id: {
+            "hits_7d": 0, "hits_30d": 0, "last_hit_at": None, "cluster_count_30d": 0,
+            "feedback_count_30d": 0, "false_positive_count_30d": 0,
+        } for rule_id in rule_ids}
+        with self.database.connect() as connection:
+            reuse = connection.execute(
+                f"SELECT rule_id, SUM(CASE WHEN reused_at>=? THEN 1 ELSE 0 END) AS hits_7d, COUNT(*) AS hits_30d, "
+                f"MAX(reused_at) AS last_hit_at, COUNT(DISTINCT cluster) AS cluster_count FROM rule_reuse_events "
+                f"WHERE rule_id IN ({placeholders}) AND reused_at>=? GROUP BY rule_id",
+                [since_7d, *rule_ids, since_30d],
+            ).fetchall()
+            feedback = connection.execute(
+                f"SELECT rule_id, COUNT(*) AS total, SUM(CASE WHEN outcome='false_positive' THEN 1 ELSE 0 END) AS false_positives "
+                f"FROM rule_feedback WHERE rule_id IN ({placeholders}) AND created_at>=? GROUP BY rule_id",
+                [*rule_ids, since_30d],
+            ).fetchall()
+        for row in reuse:
+            result[str(row["rule_id"])].update({
+                "hits_7d": int(row["hits_7d"] or 0), "hits_30d": int(row["hits_30d"] or 0),
+                "last_hit_at": row["last_hit_at"], "cluster_count_30d": int(row["cluster_count"] or 0),
+            })
+        for row in feedback:
+            result[str(row["rule_id"])].update({
+                "feedback_count_30d": int(row["total"] or 0),
+                "false_positive_count_30d": int(row["false_positives"] or 0),
+            })
+        return result
+
     def get_rule(self, rule_id: str) -> dict[str, Any] | None:
         with self.database.connect() as connection:
             row = connection.execute(
@@ -299,9 +344,9 @@ class RuleGovernanceService:
             raise RuleGovernanceError("规则不存在", code="rule_not_found", status_code=404)
         return rule
 
-    def health(self, rule: dict[str, Any]) -> dict[str, Any]:
+    def health(self, rule: dict[str, Any], activity: dict[str, Any] | None = None) -> dict[str, Any]:
         now = datetime.fromisoformat(self.clock())
-        activity = self.repository.activity(
+        activity = activity or self.repository.activity(
             rule["rule_id"],
             since_7d=(now - timedelta(days=7)).isoformat(),
             since_30d=(now - timedelta(days=30)).isoformat(),
@@ -337,18 +382,62 @@ class RuleGovernanceService:
             "review_reasons": reasons,
         }
 
+    def find_active_rules_by_evidence(
+        self,
+        hashes: set[str],
+        components: set[str],
+        *,
+        scope: str | None = None,
+        cursor: str | None = None,
+        limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        """Return active rules without building UI health projections."""
+
+        matched: list[dict[str, Any]] = []
+        for rule in self.repository.list_rules():
+            if rule.get("status") != "active":
+                continue
+            signatures = rule.get("template_signatures") or []
+            rule_hashes = {
+                str(value)
+                for signature in signatures
+                if isinstance(signature, dict)
+                for value in (signature.get("template_hash"), signature.get("template_fingerprint"))
+                if value
+            }
+            rule_components = set(map(str, rule.get("components") or [])) | {
+                str(signature.get("component"))
+                for signature in signatures
+                if isinstance(signature, dict) and signature.get("component")
+            }
+            rule_scope = str(rule.get("scope") or rule.get("cluster") or "")
+            if scope and rule_scope and rule_scope != scope:
+                continue
+            if hashes and not hashes.intersection(rule_hashes):
+                continue
+            if components and not components.intersection(rule_components):
+                continue
+            matched.append(rule)
+            if len(matched) >= max(1, min(int(limit), 1000)):
+                break
+        return matched
+
     def list_rules(self, *, status: str | None = None, page: int = 1, page_size: int = 50) -> dict[str, Any]:
         if status and status not in RULE_STATUSES:
             raise RuleGovernanceError("规则状态无效")
         if page < 1 or page_size < 1 or page_size > 100:
             raise RuleGovernanceError("分页参数无效")
-        items = [rule for rule in self.repository.list_rules() if not status or rule["status"] == status]
-        enriched = [dict(public_rule(rule), health=self.health(rule)) for rule in items]
-        start = (page - 1) * page_size
+        items, total = self.repository.list_rules_page(status=status, page=page, page_size=page_size)
+        now = datetime.fromisoformat(self.clock())
+        activities = self.repository.activity_many(
+            [str(rule["rule_id"]) for rule in items],
+            since_7d=(now - timedelta(days=7)).isoformat(), since_30d=(now - timedelta(days=30)).isoformat(),
+        )
+        enriched = [dict(public_rule(rule), health=self.health(rule, activities.get(str(rule["rule_id"])))) for rule in items]
         return {
             "schema_version": "rule_asset_list_v1",
-            "items": enriched[start:start + page_size],
-            "pagination": {"page": page, "page_size": page_size, "total": len(enriched)},
+            "items": enriched,
+            "pagination": {"page": page, "page_size": page_size, "total": total},
         }
 
     def get_rule(self, rule_id: str) -> dict[str, Any]:

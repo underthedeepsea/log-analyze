@@ -5,6 +5,7 @@ from typing import Any
 
 from django.http import HttpRequest, JsonResponse, StreamingHttpResponse
 from django.views.decorators.http import require_GET, require_POST
+from logrisk.feature_jobs import FeatureJobError
 
 from logrisk.orchestration import AirflowOrchestratorError, InputOrchestrationConflict, OrchestrationConflict
 from logrisk_django.service_factory import (
@@ -65,9 +66,11 @@ def create_job(request: HttpRequest) -> JsonResponse:
 
 
 @require_GET
-def job_detail(_request: HttpRequest, job_id: str) -> JsonResponse:
+def job_detail(request: HttpRequest, job_id: str) -> JsonResponse:
     try:
-        result = get_facade().feature_job(job_id)
+        result = get_facade().feature_job(job_id, cursor=request.GET.get("cursor"))
+    except FeatureJobError as exc:
+        return _error(getattr(exc, "status_code", 404), getattr(exc, "code", "feature_job_not_found"), _safe_message(exc))
     except (KeyError, ValueError) as exc:
         return _error(404, "feature_job_not_found", _safe_message(exc))
     return JsonResponse(dict(result.body), status=result.status, json_dumps_params={"ensure_ascii": False})

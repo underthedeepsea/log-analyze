@@ -273,6 +273,46 @@ def split_sql_statements(sql: str) -> list[str]:
     return statements
 
 
+def split_sqlite_statements(sql: str) -> list[str]:
+    """Split SQLite scripts with the engine's own completeness parser.
+
+    ``sqlite3.complete_statement`` understands trigger bodies and quoted
+    semicolons, unlike delimiter splitting.  Explicit transaction markers are
+    owned by ``SQLiteDatabase.migrate`` and are therefore omitted.
+    """
+
+    statements: list[str] = []
+    buffer = ""
+    for character in sql:
+        buffer += character
+        if character != ";" or not sqlite3.complete_statement(buffer):
+            continue
+        statement = buffer.strip()
+        buffer = ""
+        if not statement:
+            continue
+        normalized = re.sub(r"^(?:--[^\n]*\n|/\*.*?\*/\s*)*", "", statement, flags=re.DOTALL).strip()
+        command = normalized.rstrip(";").strip().upper()
+        if command in {"BEGIN", "BEGIN IMMEDIATE", "BEGIN EXCLUSIVE", "COMMIT", "END", "ROLLBACK"}:
+            continue
+        if command.startswith("PRAGMA FOREIGN_KEYS"):
+            continue
+        statements.append(statement)
+    if buffer.strip():
+        raise sqlite3.OperationalError("SQLite migration contains an incomplete statement")
+    return statements
+
+
+class ClosingSQLiteConnection(sqlite3.Connection):
+    """An owned SQLite connection whose context exit also releases the FD."""
+
+    def __exit__(self, exc_type: Any, exc_value: Any, traceback: Any) -> bool:
+        try:
+            return bool(super().__exit__(exc_type, exc_value, traceback))
+        finally:
+            self.close()
+
+
 class SQLiteDatabase:
     provider = "sqlite"
 
@@ -285,7 +325,7 @@ class SQLiteDatabase:
             self.migrate()
 
     def connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path, timeout=5.0)
+        connection = sqlite3.connect(self.path, timeout=5.0, factory=ClosingSQLiteConnection)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA busy_timeout = 5000")
@@ -307,7 +347,8 @@ class SQLiteDatabase:
             connection.close()
 
     def migrate(self) -> None:
-        with self.connect() as connection:
+        connection = self.connect()
+        try:
             connection.execute(
                 "CREATE TABLE IF NOT EXISTS schema_migrations ("
                 "version TEXT PRIMARY KEY, name TEXT NOT NULL, sha256 TEXT NOT NULL, applied_at TEXT NOT NULL)"
@@ -321,14 +362,33 @@ class SQLiteDatabase:
                     if applied[version] != digest:
                         raise RuntimeError(f"数据库迁移文件已被修改: {path.name}")
                     continue
-                connection.executescript(sql)
-                if version == "0018":
-                    _backfill_continuous_learning_datasets(connection)
-                connection.execute(
-                    "INSERT INTO schema_migrations(version, name, sha256, applied_at) VALUES (?, ?, ?, ?)",
-                    (version, path.name, digest, utc_now()),
-                )
+                foreign_keys_off = bool(re.search(r"^\s*PRAGMA\s+foreign_keys\s*=\s*OFF\s*;", sql, re.IGNORECASE | re.MULTILINE))
+                try:
+                    connection.commit()
+                    if foreign_keys_off:
+                        connection.execute("PRAGMA foreign_keys = OFF")
+                    connection.execute("BEGIN IMMEDIATE")
+                    for statement in split_sqlite_statements(sql):
+                        connection.execute(statement)
+                    if version == "0018":
+                        _backfill_continuous_learning_datasets(connection)
+                    if version == "0028":
+                        from logrisk.approval_projection import rebuild_projection
+                        rebuild_projection(connection)
+                    connection.execute(
+                        "INSERT INTO schema_migrations(version, name, sha256, applied_at) VALUES (?, ?, ?, ?)",
+                        (version, path.name, digest, utc_now()),
+                    )
+                    connection.commit()
+                except Exception:
+                    connection.rollback()
+                    raise
+                finally:
+                    if foreign_keys_off:
+                        connection.execute("PRAGMA foreign_keys = ON")
             connection.commit()
+        finally:
+            connection.close()
 
 
 class RowRecord(dict[str, Any]):
@@ -354,7 +414,8 @@ class PostgresCursor:
 
     def __iter__(self) -> Iterator[RowRecord]:
         """Match sqlite3 cursors used by the existing stores."""
-        return iter(self.fetchall())
+        for row in self._cursor:
+            yield RowRecord({key: _normalise_postgres_value(value) for key, value in row.items()})
 
     @property
     def rowcount(self) -> int:
@@ -478,6 +539,9 @@ class PostgresDatabase:
                 connection.executescript(sql)
                 if version == "0018":
                     _backfill_continuous_learning_datasets(connection)
+                if version == "0028":
+                    from logrisk.approval_projection import rebuild_projection
+                    rebuild_projection(connection)
                 connection.execute(
                     "INSERT INTO schema_migrations(version, name, sha256, applied_at) VALUES (?, ?, ?, ?)",
                     (version, path.name, digest, utc_now()),

@@ -105,6 +105,10 @@ class KafkaPythonConsumerAdapter:
                                 },
                                 "bootstrap_fingerprint": bootstrap_fingerprint,
                             }),
+                            metadata={
+                                "partition": int(getattr(message, "partition", partition.partition)),
+                                "offset": int(message.offset),
+                            },
                         )
                 if all(consumer.position(partition) >= end_offsets[partition] for partition in partitions):
                     break

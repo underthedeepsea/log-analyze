@@ -124,6 +124,6 @@ def test_large_file_pipeline_resumes_from_checkpoint_for_appended_file_data(tmp_
         resume_task_id=task_id,
     )
 
-    assert resumed["summary"]["total_raw_logs"] == 1
+    assert resumed["summary"]["total_raw_logs"] == 2
     assert repository.get_task(task_id)["cursor"]["value"]["offset"] == source.stat().st_size
     assert len(repository.list_commits(task_id)) == 2

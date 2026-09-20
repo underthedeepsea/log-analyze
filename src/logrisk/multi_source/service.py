@@ -88,7 +88,8 @@ class MultiSourceService:
         risk_entities: list[Mapping[str, Any]],
         *,
         source_job_id: str | None,
-    ) -> dict[str, int]:
+        correlate: bool = True,
+    ) -> dict[str, Any]:
         if not self.enabled:
             return {"observations": 0, "correlations": 0, "unroutable": 0}
         saved = 0
@@ -109,9 +110,23 @@ class MultiSourceService:
                     continue
                 entity_keys = [str(item["entity_key"]) for item in route["entities"]]
                 cluster = str(route["primary_entity"]["cluster"])
-                window_start = str(template.get("window_start") or entity.get("window_start"))
-                window_end = str(template.get("window_end") or entity.get("window_end"))
-                if not window_start or not window_end or not template.get("template_hash"):
+                raw_window_start = template.get("window_start") or entity.get("window_start")
+                raw_window_end = template.get("window_end") or entity.get("window_end")
+                if (
+                    not raw_window_start
+                    or not raw_window_end
+                    or str(raw_window_start).strip().lower() == "unknown"
+                    or str(raw_window_end).strip().lower() == "unknown"
+                    or not template.get("template_hash")
+                ):
+                    unroutable += 1
+                    continue
+                window_start = str(raw_window_start)
+                window_end = str(raw_window_end)
+                try:
+                    value = datetime.fromisoformat(window_start.replace("Z", "+00:00"))
+                    datetime.fromisoformat(window_end.replace("Z", "+00:00"))
+                except ValueError:
                     unroutable += 1
                     continue
                 observation = {
@@ -135,24 +150,26 @@ class MultiSourceService:
                 self.repository.save_observation(observation)
                 saved += 1
                 clusters.add(cluster)
-                value = datetime.fromisoformat(window_start.replace("Z", "+00:00"))
                 earliest = value if earliest is None else min(earliest, value)
 
+        correlations=self.correlate_clusters(clusters,earliest.isoformat() if earliest else None) if correlate else 0
+        result = {"observations": saved, "correlations": correlations, "unroutable": unroutable}
+        if not correlate:
+            result.update({"clusters": sorted(clusters), "earliest": earliest.isoformat() if earliest else None})
+        return result
+
+    def correlate_clusters(self,clusters: set[str],earliest: str | None) -> int:
         correlation_ids: set[str] = set()
         stored_rules = self.repository.list_rules()["items"]
         maximum_gap = max((int(rule.get("max_gap_seconds") or 0) for rule in stored_rules), default=0)
-        since = (earliest - timedelta(seconds=maximum_gap)).isoformat() if earliest else ""
+        since = (datetime.fromisoformat(earliest) - timedelta(seconds=maximum_gap)).isoformat() if earliest else ""
         for cluster in clusters:
             candidates = self.repository.recent_observations(cluster=cluster, since=since)
             for stored_rule in stored_rules:
                 for correlation in correlate_observations(candidates, stored_rule):
                     self.repository.save_correlation(correlation)
                     correlation_ids.add(str(correlation["correlation_id"]))
-        return {
-            "observations": saved,
-            "correlations": len(correlation_ids),
-            "unroutable": unroutable,
-        }
+        return len(correlation_ids)
 
     def summary(self) -> dict[str, Any]:
         return self.repository.summary()

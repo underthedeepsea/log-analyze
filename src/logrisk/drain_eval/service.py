@@ -12,7 +12,7 @@ from logrisk.drain_eval.config_store import DrainConfigStore
 from logrisk.drain_eval.dataset import DatasetStore, atomic_json
 from logrisk.drain_eval.downstream_metrics import evaluate_downstream
 from logrisk.drain_eval.labeled_metrics import evaluate_labeled
-from logrisk.drain_eval.schema import DrainQualityError, now_iso, require_object
+from logrisk.drain_eval.schema import DrainQualityError, now_iso, require_object, validate_prediction
 from logrisk.drain_eval.stability import evaluate_stability
 from logrisk.drain_eval.template_store import TemplateStore
 from logrisk.drain_eval.tuner import grid_candidates, rank_candidates
@@ -35,7 +35,14 @@ class DrainQualityService:
         predictions = source.get("predictions")
         if not isinstance(predictions, list):
             raise DrainQualityError("predictions 必须是数组")
-        by_id = {str(item.get("record_id")): item for item in predictions if isinstance(item, dict)}
+        validated_predictions = [validate_prediction(item) for item in predictions]
+        prediction_ids = [item["record_id"] for item in validated_predictions]
+        if len(set(prediction_ids)) != len(prediction_ids):
+            raise DrainQualityError("prediction record_id 不允许重复")
+        gold_ids = {str(item["record_id"]) for item in dataset["records"]}
+        if set(prediction_ids) != gold_ids:
+            raise DrainQualityError("prediction record_id 必须与 Dataset 完全一致")
+        by_id = {item["record_id"]: item for item in validated_predictions}
         rows: list[dict[str, Any]] = []
         for gold in dataset["records"]:
             prediction = by_id.get(gold["record_id"])
@@ -52,7 +59,7 @@ class DrainQualityService:
             } for row in rows]),
             "stability": evaluate_stability(source.get("stability_runs") or [predictions]),
             "downstream": evaluate_downstream(source.get("expected_downstream"), source.get("actual_downstream")),
-            "performance": dict(source.get("performance") or {}),
+            "performance": {},
         }
         summary = {
             "schema_version": "drain_eval_run_v1",
@@ -63,6 +70,9 @@ class DrainQualityService:
             "config_version": source.get("config_version"),
             "config_hash": source.get("config_hash"),
             "status": "completed",
+            "provenance": "reference",
+            "runner_evidence": None,
+            "completed_at": None,
             "progress": 1.0,
             "error": None,
             "metrics": metrics,
@@ -87,31 +97,7 @@ class DrainQualityService:
         )
 
     def publish_config(self, config_id: str, version: int, payload: Any) -> dict[str, Any]:
-        source = require_object(payload)
-        if source.get("confirmed") is not True:
-            raise DrainQualityError("配置发布需要人工确认")
-        run_id = str(source.get("eval_run_id") or "")
-        if not run_id:
-            raise DrainQualityError("配置发布必须关联评测任务")
-        try:
-            run = self.get_eval_run(run_id)
-        except DrainQualityError as exc:
-            raise DrainQualityError("关联评测任务不存在") from exc
-        snapshot = self.configs.get_version(config_id, version)
-        if run.get("status") != "completed":
-            raise DrainQualityError("关联评测任务尚未完成")
-        if run.get("config_id") != config_id or int(run.get("config_version") or 0) != int(version) or run.get("config_hash") != snapshot["content_hash"]:
-            raise DrainQualityError("评测任务与候选配置版本不匹配")
-        metrics = run.get("metrics") or {}
-        labeled = metrics.get("labeled") or {}
-        downstream = metrics.get("downstream") or {}
-        if not (
-            float(downstream.get("critical_risk_recall", 0)) >= 1.0
-            and float(labeled.get("over_merge_rate", 1)) <= 0.02
-            and float(downstream.get("normal_log_false_positive_rate", 1)) <= 0.02
-        ):
-            raise DrainQualityError("评测质量门槛未通过，禁止发布")
-        return self.configs.publish(config_id, version, source)
+        raise DrainQualityError("trusted_runner_unavailable: reference 评测不能发布配置；尚未提供可信服务端 runner")
 
     def create_tune_run(self, payload: Any) -> dict[str, Any]:
         source = require_object(payload)
@@ -122,15 +108,18 @@ class DrainQualityService:
             raise DrainQualityError("candidates 必须是数组")
         now = now_iso()
         run_id = f"tune_{uuid.uuid4().hex[:16]}"
-        ranked = rank_candidates(results)
+        ranked = []
         summary = {
             "schema_version": "drain_tune_run_v1",
             "run_id": run_id,
-            "status": "completed",
-            "progress": 1.0,
+            "status": "not_executed",
+            "progress": 0.0,
+            "provenance": "reference",
+            "completed_at": None,
             "error": None,
             "dataset_id": source.get("dataset_id"),
-            "candidate_count": len(ranked),
+            "candidate_count": len(results),
+            "reference_candidates": results,
             "ranked_candidates": ranked,
             "created_at": now,
             "updated_at": now,
@@ -202,7 +191,7 @@ class DrainQualityService:
         return dict(profile, status=status, updated_at=event["created_at"])
 
     def promote_profile(self, profile_id: str, payload: Any) -> dict[str, Any]:
-        return self._change_profile(profile_id, payload, "promoted")
+        raise DrainQualityError("trusted_runner_unavailable: 旧版 Profile 不能绕过服务端评测发布")
 
     def rollback_profile(self, profile_id: str, payload: Any) -> dict[str, Any]:
         return self._change_profile(profile_id, payload, "rolled_back")

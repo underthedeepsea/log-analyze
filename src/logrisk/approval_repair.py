@@ -159,6 +159,8 @@ def repair_pending_candidates(database: Database, *, apply: bool = False) -> dic
                     "INSERT INTO approval_group_candidates(approval_group_id, candidate_id, job_id, entity_id, created_at) "
                     "VALUES (?, ?, ?, ?, ?)", (group_id, child["candidate_id"], row["job_id"], row["entity_id"], now),
                 )
+                from logrisk.approval_projection import update_projection
+                update_projection(connection,dict(child,job_id=row["job_id"],status="pending"))
         for group_id in affected_groups:
             group = dict(connection.execute("SELECT * FROM approval_groups WHERE approval_group_id=?", (group_id,)).fetchone())
             members = [json.loads(row[0]) for row in connection.execute(
@@ -197,9 +199,15 @@ def repair_pending_candidates(database: Database, *, apply: bool = False) -> dic
                 entity["feature_ids"] = [child for cid in entity.get("feature_ids", []) for child in expansions.get(cid, [cid])]
                 connection.execute("UPDATE feature_job_entities SET entity_json=?, updated_at=? WHERE job_id=? AND entity_id=?",
                                    (json.dumps(entity, ensure_ascii=False), now, job_id, row["entity_id"]))
-            row = connection.execute("SELECT job_id, job_json FROM feature_jobs WHERE job_id=?", (job_id,)).fetchone()
-            job = SQLiteFeatureJobStore._load_job_row(connection, row)
+            job = SQLiteFeatureJobStore(database).bind(connection).load_job(job_id)
+            if job is None:
+                raise ValueError("修复任务不存在，修复已回滚")
             job.pop("events", None)
+            if job.get("entities_paged"):
+                # The normalized rows above are authoritative. Runtime paging
+                # collections must never enter the persisted metadata snapshot.
+                job.pop("entities", None)
+                job.pop("features", None)
             connection.execute("UPDATE feature_jobs SET job_json=?, updated_at=? WHERE job_id=?",
                                (json.dumps(job, ensure_ascii=False), now, job_id))
             sequence = connection.execute("SELECT COALESCE(MAX(sequence), 0)+1 FROM feature_job_events WHERE job_id=?", (job_id,)).fetchone()[0]

@@ -212,9 +212,11 @@ def test_kafka_checkpoint_retries_external_commit_before_reading_next_batch(tmp_
         def __init__(self):
             super().__init__()
             self.fail_next_commit = True
+            self.read_offsets = []
 
         def read(self, cursor):
             offset = int((cursor.value or {}).get("offset") or 0)
+            self.read_offsets.append(offset)
             return iter(self.records[offset:])
 
         def commit(self, cursor):
@@ -252,7 +254,10 @@ def test_kafka_checkpoint_retries_external_commit_before_reading_next_batch(tmp_
 
     resumed = run_incremental_pipeline(**arguments, resume_task_id=task_id)
 
-    assert resumed["summary"]["total_raw_logs"] == 1
+    # Final results include the committed prefix as well as the resumed suffix.
+    assert resumed["summary"]["total_raw_logs"] == 2
+    assert source.read_offsets == [0, 1]
+    assert resumed["risk_entities"][0]["top_templates"][0]["count"] == 2
     assert source.commits == [
         {"kind": "kafka", "value": {"partition": 0, "offset": 1}},
         {"kind": "kafka", "value": {"partition": 0, "offset": 2}},

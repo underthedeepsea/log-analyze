@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import multiprocessing
 import os
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +32,8 @@ def mine_partition_file(
             )
             target.write(json.dumps(event, ensure_ascii=False, separators=(",", ":")) + "\n")
             count += 1
+    for miner in manager._miners.values():
+        miner.save_state("batch committed snapshot")
     return {"output_path": output_path, "record_count": count}
 
 
@@ -48,6 +50,7 @@ def mine_spooled_partitions(
     process_start_method: str = "spawn",
     parameter_extraction_mode: str = "off",
     progress_callback=None,
+    executor: Any | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     root = Path(spool_dir)
     event_dir = root.parent / "template_events"
@@ -55,7 +58,7 @@ def mine_spooled_partitions(
     partitions = manifest["partitions"]
     available = max(1, (os.cpu_count() or 1) - max(0, reserve_cpu_cores))
     worker_count = min(max(1, requested_workers), max(1, max_workers), available, len(partitions)) if partitions else 0
-    results = []
+    ordered_results: list[dict[str, Any] | None] = [None] * len(partitions)
     tasks = []
     for partition in partitions:
         key = partition["partition_key"]
@@ -68,18 +71,49 @@ def mine_spooled_partitions(
             parameter_extraction_mode,
         ))
     if worker_count > 1:
-        with ProcessPoolExecutor(max_workers=worker_count, mp_context=multiprocessing.get_context(process_start_method)) as executor:
-            futures = [executor.submit(mine_partition_file, *task) for task in tasks]
-            for index, future in enumerate(as_completed(futures), start=1):
-                results.append(future.result())
-                if progress_callback:
-                    progress_callback(index, len(tasks))
+        owned_executor = executor is None
+        active_executor = executor or ProcessPoolExecutor(
+            max_workers=worker_count, mp_context=multiprocessing.get_context(process_start_method)
+        )
+        mining_error: BaseException | None = None
+        try:
+            pending_tasks = iter(enumerate(tasks))
+            futures: dict[Any, int] = {}
+            completed = 0
+            while True:
+                while len(futures) < worker_count * 2:
+                    indexed_task = next(pending_tasks, None)
+                    if indexed_task is None:
+                        break
+                    index, task = indexed_task
+                    futures[active_executor.submit(mine_partition_file, *task)] = index
+                if not futures:
+                    break
+                done, _ = wait(futures, return_when=FIRST_COMPLETED)
+                for future in done:
+                    index = futures.pop(future)
+                    ordered_results[index] = future.result()
+                    completed += 1
+                    if progress_callback:
+                        progress_callback(completed, len(tasks))
+        except BaseException as exc:
+            mining_error = exc
+            raise
+        finally:
+            if owned_executor:
+                try:
+                    active_executor.shutdown(wait=True, cancel_futures=True)
+                except BaseException as cleanup_error:
+                    if mining_error is None:
+                        raise
+                    setattr(mining_error, "_logrisk_cleanup_error", type(cleanup_error).__name__)
     else:
         for index, task in enumerate(tasks, start=1):
-            results.append(mine_partition_file(*task))
+            ordered_results[index - 1] = mine_partition_file(*task)
             if progress_callback:
                 progress_callback(index, len(tasks))
 
+    results = [result for result in ordered_results if result is not None]
     aggregator = TemplateEventAggregator(window_seconds=window_seconds)
     for result in results:
         with Path(result["output_path"]).open("r", encoding="utf-8") as handle:

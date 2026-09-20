@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Mapping, Protocol
+from typing import Any, Callable, Mapping, Protocol
 
 
 @dataclass(frozen=True)
@@ -34,6 +34,15 @@ class ExtensionRequest:
     model: str
     timeout: float
     options: dict[str, Any]
+    attempt_reporter: Callable[[Mapping[str, Any] | None], None] | None = None
+
+
+@dataclass(frozen=True)
+class ExtensionResponse:
+    """Optional structured adapter response carrying supplier usage."""
+
+    content: str
+    usage: Mapping[str, Any] | None = None
 
 
 class ExtensionAdapter(Protocol):
@@ -47,5 +56,5 @@ class ExtensionAdapter(Protocol):
     def check_connection(self, connection: Mapping[str, Any]) -> dict[str, Any]:
         ...
 
-    def generate_content(self, request: ExtensionRequest) -> str:
+    def generate_content(self, request: ExtensionRequest) -> str | ExtensionResponse:
         ...

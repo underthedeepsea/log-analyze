@@ -4,7 +4,8 @@ import os
 from typing import Any, Mapping
 
 from logrisk.ai_harness.model_client import ModelClientError, parse_content_json
-from logrisk.ai_harness.providers.extensions.base import ExtensionRequest
+from logrisk.ai_harness.providers.extensions.base import ExtensionRequest, ExtensionResponse
+from logrisk.ai_harness.usage_accounting import usage_metadata
 from logrisk.ai_harness.providers.extensions.registry import get_extension_adapter
 
 
@@ -19,6 +20,11 @@ def redact_model_error(text: str, credential_values: list[str]) -> str:
 
 class ExtensionModelClient:
     """Common model contract around one explicitly registered private adapter."""
+
+    provider = "extension"
+    # Private adapters may retry inside one invocation; without a callback we
+    # cannot claim one durable row per supplier attempt.
+    metadata_contract = "legacy-single-invocation"
 
     def __init__(self, connection: Mapping[str, Any]) -> None:
         self.connection = dict(connection)
@@ -49,6 +55,7 @@ class ExtensionModelClient:
         timeout: float,
         options: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        self.last_metadata = {}
         request_options = dict(options or {})
         mode = str(request_options.get("structured_output_mode", "json_schema"))
         if mode not in self.adapter.descriptor.supported_output_modes:
@@ -63,7 +70,24 @@ class ExtensionModelClient:
         )
         try:
             self.adapter.validate_connection(self.connection)
-            content = self.adapter.generate_content(request)
+            response = self.adapter.generate_content(request)
+            if isinstance(response, ExtensionResponse):
+                content = response.content
+                self.last_metadata = {
+                    **usage_metadata(response.usage),
+                    "metadata_contract": self.metadata_contract,
+                }
+            else:
+                # Legacy string adapters expose no supplier usage.  Keep the
+                # invocation visible while leaving token fields unknown.
+                content = response
+                self.last_metadata = {
+                    "usage": {},
+                    "raw_usage": {},
+                    "usage_quality": "unknown",
+                    "invalid_usage": False,
+                    "metadata_contract": self.metadata_contract,
+                }
         except Exception as exc:
             raise self._error(exc) from exc
         try:

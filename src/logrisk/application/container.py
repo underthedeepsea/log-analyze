@@ -583,6 +583,7 @@ def build_application_container(
             container.input_jobs.write_job(input_job_id, job)
         job.update({"status": "running", "stage": "reading", "started_at": utc_now()})
         container.input_jobs.write_job(input_job_id, job)
+        input_completed = False
         try:
             result = run_large_file_pipeline(
                 input_job_id=input_job_id,
@@ -603,6 +604,7 @@ def build_application_container(
             container.input_jobs.write_result(input_job_id, result)
             job.update({"status": "completed", "stage": "completed", "completed_at": utc_now(), "error": None})
             container.input_jobs.write_job(input_job_id, job)
+            input_completed = True
             container.input_jobs.write_progress(input_job_id, {
                 "input_job_id": input_job_id,
                 "status": "completed",
@@ -610,22 +612,34 @@ def build_application_container(
                 "progress": 1.0,
                 "risk_entities": len(result.get("risk_entities") or []),
             })
-        except Exception as exc:
-            if job.get("streaming_task_id"):
-                container.streaming_state.mark_failed(
-                    job["streaming_task_id"],
-                    str(exc),
-                    conflict=isinstance(exc, StreamingConflictError),
-                )
-            job.update({"status": "failed", "stage": "failed", "completed_at": utc_now(), "error": str(exc)})
-            container.input_jobs.write_job(input_job_id, job)
-            container.input_jobs.write_progress(input_job_id, {
-                "input_job_id": input_job_id,
-                "status": "failed",
-                "stage": "failed",
-                "progress": 1.0,
-                "error": str(exc),
-            })
+        except StreamingTaskBusyError:
+            # Another Worker owns the streaming lease and the shared input-job
+            # status. This invocation must not publish a terminal state.
+            return
+        except BaseException as exc:
+            if input_completed:
+                if not isinstance(exc, Exception):
+                    raise
+                return
+            message = str(exc).strip() or type(exc).__name__
+            interrupted = not isinstance(exc, Exception)
+            terminal_status = "interrupted" if interrupted else "failed"
+            job.update({"status": terminal_status, "stage": "failed", "completed_at": utc_now(), "error": message})
+            try:
+                container.input_jobs.write_job(input_job_id, job)
+                container.input_jobs.write_progress(input_job_id, {
+                    "input_job_id": input_job_id,
+                    "status": terminal_status,
+                    "stage": "failed",
+                    "progress": 1.0,
+                    "error": message,
+                })
+            except BaseException as state_error:
+                if interrupted:
+                    raise exc.with_traceback(exc.__traceback__) from state_error
+                raise
+            if interrupted:
+                raise
 
     def run_kafka_task(task_id: str, source_configuration: dict[str, str]) -> None:
         source = container.kafka_source(source_configuration)
@@ -647,10 +661,10 @@ def build_application_container(
             )
         except StreamingTaskBusyError:
             return
-        except Exception:
-            task = container.streaming_state.get_task(task_id)
-            if task.get("status") not in {"failed", "conflict", "completed"}:
-                container.streaming_state.mark_failed(task_id, "Kafka 流式任务执行失败")
+        except BaseException:
+            # run_incremental_pipeline owns the lease-aware terminal update.
+            # A wrapper must never borrow the current lease and stop a newer
+            # Worker that may already have resumed the task.
             raise
 
     container.govern_drain_result = govern_drain_result

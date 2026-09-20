@@ -58,7 +58,7 @@ def test_failed_pipeline_resumes_only_uncommitted_windows(tmp_path):
     )
 
     assert resumed["summary"]["streaming_resumed"] is True
-    assert resumed["summary"]["total_raw_logs"] == 1
+    assert resumed["summary"]["total_raw_logs"] == 2
     assert resumed["summary"]["streaming_windows_newly_committed"] == 1
     assert resumed["summary"]["streaming_windows_committed"] == 2
     assert failing.get_task(task_id)["status"] == "completed"

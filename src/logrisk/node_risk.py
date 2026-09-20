@@ -76,7 +76,15 @@ class NodeRiskService:
             or hashlib.sha256(str(source_record.get("message_core") or "").encode("utf-8")).hexdigest()
         )
         source_window = source_record.get("window_start") or source_record.get("timestamp") or ""
-        text = "|".join((str(source_job_id or ""), str(source_id), str(source_window), event["semantic_rule_id"], event["risk_type"]))
+        source_batch = source_record.get("source_batch_id") or source_record.get("batch_id") or ""
+        semantic_revision = source_record.get("semantic_revision") or event.get("semantic_rule_version") or ""
+        text = "|".join((
+            str(source_record.get("cluster") or "default"),
+            str(source_record.get("node") or source_record.get("host") or source_record.get("hostname") or ""),
+            str(source_job_id or ""), str(source_batch), str(source_id), str(source_window),
+            _json(semantic_revision) if isinstance(semantic_revision, (dict, list)) else str(semantic_revision),
+            event["semantic_rule_id"], event["risk_type"],
+        ))
         return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
     @staticmethod
@@ -94,6 +102,10 @@ class NodeRiskService:
     @staticmethod
     def _event(row: Any) -> dict[str, Any]:
         item = dict(row)
+        if item.get("current_occurrence_count") is not None:
+            item["occurrence_count"] = int(item["current_occurrence_count"])
+        if item.get("derivation_status") == "superseded":
+            item["status"] = "superseded"
         item["semantic_fields"] = json.loads(item.pop("semantic_fields_json"))
         item["evidence_refs"] = json.loads(item.pop("evidence_refs_json"))
         return item
@@ -106,6 +118,7 @@ class NodeRiskService:
         source_job_id: str | None = None,
         source_trace_id: str | None = None,
         occurrence_count: int = 1,
+        _recalculate: bool = True,
     ) -> dict[str, Any]:
         if not semantic_event or semantic_event.get("risk_type") == "unknown.unclassified":
             raise NodeRiskError("只有已分类风险语义可以写入节点台账")
@@ -116,10 +129,24 @@ class NodeRiskService:
         count = int(occurrence_count)
         if count <= 0:
             raise NodeRiskError("occurrence_count 必须大于 0")
-        timestamp = _parse(source_record.get("timestamp"), _parse(self.clock()))
+        source_batch = source_record.get("source_batch_id") or source_record.get("batch_id") or ""
+        timestamp_value = source_record.get("timestamp") or source_record.get("window_start") or source_record.get("first_seen")
+        if not timestamp_value:
+            raise NodeRiskError("节点风险事件缺少可信事件时间")
+        try:
+            timestamp = _parse(str(timestamp_value))
+        except (TypeError, ValueError) as exc:
+            raise NodeRiskError("节点风险事件时间无效") from exc
         window_seconds = int((semantic_event.get("dedup") or {}).get("window_seconds") or 300)
         window_start, window_end = _floor_window(timestamp, window_seconds)
         fingerprint = self._fingerprint(semantic_event, source_record, source_job_id)
+        namespace = source_record.get("source_namespace")
+        source_item = source_record.get("source_item_id") or source_record.get("raw_log_id") or source_record.get("template_instance_hash")
+        physical_key = None
+        revision = _json(source_record.get("semantic_revision") or semantic_event.get("semantic_rule_version") or "")
+        if namespace and source_batch and source_item is not None:
+            physical_key = hashlib.sha256(_json([namespace,source_batch,source_record.get("window_start") or window_start,source_item]).encode()).hexdigest()
+            fingerprint = hashlib.sha256(_json([physical_key,revision]).encode()).hexdigest()
         dedup_key = self._dedup_key(semantic_event, source_record)
         now = self.clock()
         evidence_refs = sorted({
@@ -135,17 +162,42 @@ class NodeRiskService:
                 row = connection.execute("SELECT * FROM node_risk_events WHERE event_id=?", (replay["event_id"],)).fetchone()
                 result = self._event(row)
             else:
+                previous = None
+                if physical_key:
+                    previous = connection.execute(
+                        "SELECT * FROM node_risk_ingestions WHERE physical_key=? AND is_current=1", (physical_key,)
+                    ).fetchone()
+                    if previous is not None:
+                        expected = source_record.get("expected_current_revision")
+                        if expected is None or _json(expected) != previous["semantic_revision"]:
+                            raise NodeRiskError("语义贡献修订已变化，需要 expected_current_revision",code="node_risk_revision_conflict",status_code=409)
+                        changed = connection.execute(
+                            "UPDATE node_risk_ingestions SET is_current=0 WHERE source_event_fingerprint=? AND is_current=1",
+                            (previous["source_event_fingerprint"],),
+                        )
+                        if changed.rowcount != 1:
+                            raise NodeRiskError("语义贡献修订已变化",code="node_risk_revision_conflict",status_code=409)
                 existing = connection.execute(
                     "SELECT * FROM node_risk_events WHERE dedup_key=? AND window_start=?", (dedup_key, window_start)
                 ).fetchone()
                 if existing:
+                    reopens = existing["status"] == "recovered" and timestamp > _parse(existing["recovered_at"])
+                    next_status = "active" if reopens else existing["status"]
                     merged_refs = sorted(set(json.loads(existing["evidence_refs_json"])) | set(evidence_refs))
                     connection.execute(
-                        "UPDATE node_risk_events SET occurrence_count=occurrence_count+?, last_seen=?, evidence_refs_json=?, "
-                        "updated_at=?, source_job_id=COALESCE(source_job_id, ?) WHERE event_id=?",
-                        (count, timestamp.isoformat(), _json(merged_refs), now, source_job_id, existing["event_id"]),
+                        "UPDATE node_risk_events SET occurrence_count=occurrence_count+?, first_seen=?, last_seen=?, evidence_refs_json=?, "
+                        "status=?, recovered_at=?, updated_at=?, source_job_id=COALESCE(source_job_id, ?) WHERE event_id=?",
+                        (count, min(_parse(existing["first_seen"]), timestamp).isoformat(),
+                         max(_parse(existing["last_seen"]), timestamp).isoformat(), _json(merged_refs),
+                         next_status, None if reopens else existing["recovered_at"], now, source_job_id, existing["event_id"]),
                     )
                     event_id = existing["event_id"]
+                    if reopens:
+                        connection.execute(
+                            "INSERT INTO node_risk_audit_events(audit_id, event_id, event_type, event_json, operator, created_at) "
+                            "VALUES (?, ?, 'reopened', ?, 'system-ingest', ?)",
+                            (f"node-audit-{uuid.uuid4().hex}", event_id, _json({"source_batch_id": source_batch}), now),
+                        )
                 else:
                     event_id = f"node-risk-{uuid.uuid4().hex}"
                     connection.execute(
@@ -165,13 +217,124 @@ class NodeRiskService:
                         ),
                     )
                 connection.execute(
-                    "INSERT INTO node_risk_ingestions(source_event_fingerprint, event_id, source_job_id, occurrence_count, ingested_at) "
-                    "VALUES (?, ?, ?, ?, ?)", (fingerprint, event_id, source_job_id, count, now),
+                    "INSERT INTO node_risk_ingestions(source_event_fingerprint, event_id, source_job_id, occurrence_count, ingested_at,physical_key,semantic_revision,contribution_json) "
+                    "VALUES (?, ?, ?, ?, ?,?,?,?)", (fingerprint, event_id, source_job_id, count, now,physical_key,revision,
+                    _json({"timestamp":timestamp.isoformat(),"severity":semantic_event["severity"],"base_score":semantic_event["base_score"],"confidence":semantic_event["confidence"],"evidence_refs":evidence_refs})),
                 )
+                if previous is not None or (existing is not None and existing["derivation_status"] == "superseded"):
+                    self._refresh_event_contributions(connection,event_id)
+                else:
+                    connection.execute("UPDATE node_risk_events SET current_occurrence_count=occurrence_count WHERE event_id=?",(event_id,))
+                if previous is not None:
+                    self._refresh_event_contributions(connection,previous["event_id"])
+                    previous_event = connection.execute("SELECT cluster,node_id FROM node_risk_events WHERE event_id=?",(previous["event_id"],)).fetchone()
+                    self._mark_dirty(connection,previous_event["cluster"],previous_event["node_id"],now)
+                    connection.execute(
+                        "INSERT INTO node_risk_audit_events(audit_id,event_id,event_type,event_json,operator,created_at) VALUES (?,?,'revision_replaced',?,'system-ingest',?)",
+                        (uuid.uuid4().hex,event_id,_json({"physical_key":physical_key,"previous_revision":previous["semantic_revision"],"revision":revision}),now),
+                    )
                 row = connection.execute("SELECT * FROM node_risk_events WHERE event_id=?", (event_id,)).fetchone()
                 result = self._event(row)
-        self.recalculate(cluster, node_id)
+                self._mark_dirty(connection, cluster, node_id, now)
+        if _recalculate and not replay:
+            self.recalculate(cluster, node_id)
         return result
+
+    @staticmethod
+    def _refresh_event_contributions(connection: Any, event_id: str) -> None:
+        rows = connection.execute(
+            "SELECT occurrence_count,contribution_json FROM node_risk_ingestions WHERE event_id=? AND is_current=1",(event_id,)
+        ).fetchall()
+        count = sum(int(row["occurrence_count"]) for row in rows)
+        if not rows:
+            connection.execute("UPDATE node_risk_events SET current_occurrence_count=0,derivation_status='superseded' WHERE event_id=?",(event_id,))
+            return
+        values = [json.loads(row["contribution_json"]) for row in rows if row["contribution_json"]]
+        connection.execute("UPDATE node_risk_events SET occurrence_count=?,current_occurrence_count=?,derivation_status='current' WHERE event_id=?",(count,count,event_id))
+        if len(values) != len(rows):
+            return  # Legacy contributions have no defensible semantic snapshot.
+        rank = {"low":1,"medium":2,"high":3,"critical":4}
+        severity = max((value["severity"] for value in values),key=lambda item:rank.get(item,0))
+        connection.execute(
+            "UPDATE node_risk_events SET first_seen=?,last_seen=?,severity=?,base_score=?,confidence=?,evidence_refs_json=? WHERE event_id=?",
+            (min(value["timestamp"] for value in values),max(value["timestamp"] for value in values),severity,
+             max(float(value["base_score"]) for value in values),max(float(value["confidence"]) for value in values),
+             _json(sorted({ref for value in values for ref in value["evidence_refs"]})),event_id),
+        )
+
+    @staticmethod
+    def _mark_dirty(connection: Any, cluster: str, node_id: str, now: str) -> None:
+        connection.execute(
+            "INSERT INTO node_risk_projection_revisions(cluster,node_id,revision,projected_revision,updated_at) "
+            "VALUES (?,?,1,0,?) ON CONFLICT(cluster,node_id) DO UPDATE SET "
+            "revision=node_risk_projection_revisions.revision+1,updated_at=excluded.updated_at",
+            (cluster, node_id, now),
+        )
+
+    def refresh_dirty(self, cluster: str | None = None, node_id: str | None = None) -> None:
+        query = "SELECT cluster,node_id FROM node_risk_projection_revisions WHERE revision>projected_revision"
+        params: list[Any] = []
+        if cluster is not None:
+            query += " AND cluster=?"
+            params.append(cluster)
+        if node_id is not None:
+            query += " AND node_id=?"
+            params.append(node_id)
+        with self.database.connect() as connection:
+            rows = connection.execute(query, params).fetchall()
+        for row in rows:
+            self.recalculate(row["cluster"], row["node_id"])
+
+    def committed_ingestion_count(self, windows: list[dict[str, Any]], *, semantic_revision: Any) -> int | None:
+        """Count proven successful effects, including idempotently replayed facts.
+
+        Legacy windows without the physical identity cannot prove this count.
+        A failed/partial ingest contributes only its durable successful rows.
+        """
+        total = 0
+        with self.database.connect() as connection:
+            for window in windows:
+                event = window.get("risk_semantic")
+                if not event or window.get("entity_type") != "node":
+                    continue
+                namespace = window.get("source_namespace")
+                batch = window.get("source_batch_id")
+                item = window.get("source_item_id") or window.get("raw_log_id") or window.get("template_instance_hash")
+                if not namespace or not batch or item is None or not window.get("window_start"):
+                    return None
+                physical_key = hashlib.sha256(_json([namespace, batch, window["window_start"], item]).encode()).hexdigest()
+                revision = _json(semantic_revision or event.get("semantic_rule_version") or "")
+                fingerprint = hashlib.sha256(_json([physical_key, revision]).encode()).hexdigest()
+                row = connection.execute(
+                    "SELECT occurrence_count FROM node_risk_ingestions WHERE source_event_fingerprint=?",
+                    (fingerprint,),
+                ).fetchone()
+                if row is not None:
+                    total += int(row[0])
+        return total
+
+    def ingest_batch(self, contributions: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Persist a committed batch and refresh each affected node once."""
+
+        results: list[dict[str, Any]] = []
+        dirty: set[tuple[str, str]] = set()
+        for contribution in contributions:
+            source_record = dict(contribution["source_record"])
+            results.append(self.ingest(
+                contribution["semantic_event"], source_record=source_record,
+                source_job_id=contribution.get("source_job_id"),
+                source_trace_id=contribution.get("source_trace_id"),
+                occurrence_count=int(contribution.get("occurrence_count") or 1),
+                _recalculate=False,
+            ))
+            dirty.add((
+                str(source_record.get("cluster") or "default"),
+                str(source_record.get("node") or source_record.get("host") or source_record.get("hostname") or ""),
+            ))
+        for cluster, node_id in sorted(dirty):
+            if node_id:
+                self.refresh_dirty(cluster, node_id)
+        return results
 
     def _events(self, cluster: str, node_id: str, *, since: str | None = None) -> list[dict[str, Any]]:
         query = "SELECT * FROM node_risk_events WHERE cluster=? AND node_id=?"
@@ -185,6 +348,7 @@ class NodeRiskService:
         return [self._event(row) for row in rows]
 
     def _statistics(self, events: list[dict[str, Any]], now: datetime) -> dict[str, Any]:
+        events = [event for event in events if event["status"] != "superseded"]
         def recent(days: int) -> list[dict[str, Any]]:
             threshold = now - timedelta(days=days)
             return [event for event in events if _parse(event["last_seen"]) >= threshold]
@@ -239,9 +403,16 @@ class NodeRiskService:
         reasons = []
         forced_level = None
         for override in self.config.get("hard_overrides") or []:
-            if any(event["risk_type"] == override.get("risk_type") and event["status"] == override.get("status") for event in active):
+            if any(
+                event["risk_type"] == override.get("risk_type")
+                and event["status"] in {"active", "acknowledged"}
+                and override.get("status") in {"active", "acknowledged"}
+                for event in active
+            ):
                 score = max(score, float(override["minimum_score"]))
-                forced_level = override["force_level"]
+                candidate_level = override["force_level"]
+                if forced_level is None or severity_points.get(candidate_level,0) > severity_points.get(forced_level,0):
+                    forced_level = candidate_level
                 reasons.append(str(override["reason"]))
         if active and not reasons:
             primary = max(active, key=lambda event: (severity_points.get(event["severity"], 0), event["last_seen"]))
@@ -263,9 +434,23 @@ class NodeRiskService:
 
     def recalculate(self, cluster: str, node_id: str) -> dict[str, Any]:
         now = _parse(self.clock())
-        events = self._events(cluster, node_id, since=(now - timedelta(days=30)).isoformat())
+        with self.database.connect() as connection:
+            revision_row = connection.execute(
+                "SELECT revision FROM node_risk_projection_revisions WHERE cluster=? AND node_id=?", (cluster, node_id)
+            ).fetchone()
+        revision = int(revision_row[0]) if revision_row else 0
+        with self.database.connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM node_risk_events WHERE cluster=? AND node_id=? "
+                "AND (status IN ('active','acknowledged') OR last_seen>=?)",
+                (cluster, node_id, (now - timedelta(days=30)).isoformat()),
+            ).fetchall()
+        events = [self._event(row) for row in rows]
         if not events:
-            raise NodeRiskError("节点风险不存在", code="node_risk_not_found", status_code=404)
+            with self.database.connect() as connection:
+                exists = connection.execute("SELECT 1 FROM node_risk_events WHERE cluster=? AND node_id=? LIMIT 1", (cluster,node_id)).fetchone()
+            if not exists:
+                raise NodeRiskError("节点风险不存在", code="node_risk_not_found", status_code=404)
         statistics = self._statistics(events, now)
         score = self._score(events, statistics, now)
         with self.database.connect() as connection:
@@ -277,7 +462,7 @@ class NodeRiskService:
         if previous is not None:
             difference = score["overall_score"] - float(previous["max_overall_score"])
             score["trend"] = "rising" if difference >= 10 else ("falling" if difference <= -10 else "stable")
-        latest = max(event["last_seen"] for event in events)
+        latest = max((event["last_seen"] for event in events), default=None)
         snapshot = {
             "schema_version": "node_risk_snapshot_v1", "cluster": cluster, "node_id": node_id,
             **score, **{key: statistics[key] for key in (
@@ -287,6 +472,17 @@ class NodeRiskService:
             "latest_risk_at": latest, "calculated_at": now.isoformat(),
         }
         with self.database.transaction() as connection:
+            if revision_row:
+                changed = connection.execute(
+                    "UPDATE node_risk_projection_revisions SET projected_revision=? WHERE cluster=? AND node_id=? AND revision=?",
+                    (revision, cluster, node_id, revision),
+                )
+                if changed.rowcount != 1:
+                    raise NodeRiskError("节点投影版本已变化", code="node_risk_projection_conflict", status_code=409)
+            connection.execute(
+                "INSERT INTO node_risk_score_samples(sample_id,cluster,node_id,revision,assessed_at,overall_score) VALUES (?,?,?,?,?,?)",
+                (uuid.uuid4().hex, cluster, node_id, revision, now.isoformat(), score["overall_score"]),
+            )
             connection.execute(
                 "INSERT INTO node_risk_snapshots(cluster, node_id, overall_score, overall_level, confidence, trend, "
                 "active_event_count, event_count_24h, event_count_7d, event_count_30d, occurrence_count_24h, "
@@ -312,12 +508,21 @@ class NodeRiskService:
     def _refresh_daily(self, cluster: str, node_id: str, events: list[dict[str, Any]], overall_score: float, now: datetime) -> None:
         grouped: dict[str, list[dict[str, Any]]] = {}
         for event in events:
+            if event["status"] == "superseded":
+                continue
             grouped.setdefault(_parse(event["last_seen"]).date().isoformat(), []).append(event)
+        grouped.setdefault(now.date().isoformat(), [])
         with self.database.transaction() as connection:
             for day, items in grouped.items():
                 severity = Counter(item["severity"] for item in items)
                 domains = Counter(item["risk_domain"] for item in items)
                 types = Counter(item["risk_type"] for item in items)
+                event_peak = max((float(item["base_score"]) for item in items), default=0.0)
+                sample = connection.execute(
+                    "SELECT MAX(overall_score) FROM node_risk_score_samples WHERE cluster=? AND node_id=? AND assessed_at>=? AND assessed_at<?",
+                    (cluster, node_id, day, (_parse(day) + timedelta(days=1)).date().isoformat()),
+                ).fetchone()
+                daily_overall_peak = float(sample[0]) if sample[0] is not None else 0.0
                 connection.execute(
                     "INSERT INTO node_risk_daily(cluster, node_id, date, event_count, occurrence_count, "
                     "distinct_risk_types, critical_count, high_count, medium_count, low_count, active_count, recovered_count, "
@@ -326,14 +531,15 @@ class NodeRiskService:
                     "ON CONFLICT(cluster, node_id, date) DO UPDATE SET event_count=excluded.event_count, occurrence_count=excluded.occurrence_count, "
                     "distinct_risk_types=excluded.distinct_risk_types, critical_count=excluded.critical_count, high_count=excluded.high_count, "
                     "medium_count=excluded.medium_count, low_count=excluded.low_count, active_count=excluded.active_count, recovered_count=excluded.recovered_count, "
-                    "max_event_score=excluded.max_event_score, max_overall_score=excluded.max_overall_score, latest_risk_at=excluded.latest_risk_at, "
+                    "max_event_score=MAX(node_risk_daily.max_event_score, excluded.max_event_score), "
+                    "max_overall_score=MAX(node_risk_daily.max_overall_score, excluded.max_overall_score), latest_risk_at=excluded.latest_risk_at, "
                     "domain_distribution_json=excluded.domain_distribution_json, type_distribution_json=excluded.type_distribution_json, updated_at=excluded.updated_at",
                     (
                         cluster, node_id, day, len(items), sum(int(item["occurrence_count"]) for item in items),
                         len(types), severity["critical"], severity["high"], severity["medium"], severity["low"],
                         sum(item["status"] in {"active", "acknowledged"} for item in items),
-                        sum(item["status"] == "recovered" for item in items), max(float(item["base_score"]) for item in items),
-                        overall_score, max(item["last_seen"] for item in items), _json(domains), _json(types), now.isoformat(),
+                        sum(item["status"] == "recovered" for item in items), event_peak,
+                        daily_overall_peak, max((item["last_seen"] for item in items), default=None), _json(domains), _json(types), now.isoformat(),
                     ),
                 )
 
@@ -346,6 +552,7 @@ class NodeRiskService:
         return item
 
     def get_node(self, cluster: str, node_id: str) -> dict[str, Any]:
+        self.refresh_dirty(cluster, node_id)
         with self.database.connect() as connection:
             row = connection.execute(
                 "SELECT * FROM node_risk_snapshots WHERE cluster=? AND node_id=?", (cluster, node_id)
@@ -377,6 +584,7 @@ class NodeRiskService:
 
     def list_nodes(self, *, cluster: str | None = None, level: str | None = None, domain: str | None = None, trend: str | None = None,
                    search: str | None = None, active_only: bool = False, page: int = 1, page_size: int = 50) -> dict[str, Any]:
+        self.refresh_dirty(cluster)
         if page < 1 or page_size < 1 or page_size > 100:
             raise NodeRiskError("分页参数无效")
         query = "SELECT * FROM node_risk_snapshots"
@@ -416,7 +624,14 @@ class NodeRiskService:
                 "SELECT * FROM node_risk_daily WHERE cluster=? AND node_id=? ORDER BY date DESC LIMIT 90",
                 (cluster, node_id),
             ).fetchall()
+            samples = connection.execute(
+                "SELECT SUBSTR(assessed_at,1,10) AS day,MAX(overall_score) AS peak FROM node_risk_score_samples "
+                "WHERE cluster=? AND node_id=? GROUP BY SUBSTR(assessed_at,1,10)", (cluster,node_id),
+            ).fetchall()
+        peaks = {row["day"]: row["peak"] for row in samples}
         return [dict(row) | {
+            "max_overall_score": peaks.get(row["date"]),
+            "score_quality": "observed" if row["date"] in peaks else "uncertain",
             "domain_distribution": json.loads(row["domain_distribution_json"]),
             "type_distribution": json.loads(row["type_distribution_json"]),
         } for row in rows]
@@ -425,13 +640,13 @@ class NodeRiskService:
         events = self._events(cluster, node_id)
         return [{"time": item["first_seen"], "event_type": "first_seen", "event_id": item["event_id"], "risk_type": item["risk_type"], "status": item["status"]} for item in events]
 
-    def acknowledge_event(self, event_id: str, *, operator: str, reason: str) -> dict[str, Any]:
-        return self._transition_event(event_id, "acknowledged", operator=operator, reason=reason)
+    def acknowledge_event(self, event_id: str, *, operator: str, reason: str, expected_updated_at: str | None = None) -> dict[str, Any]:
+        return self._transition_event(event_id, "acknowledged", operator=operator, reason=reason, expected_updated_at=expected_updated_at)
 
-    def recover_event(self, event_id: str, *, operator: str, reason: str) -> dict[str, Any]:
-        return self._transition_event(event_id, "recovered", operator=operator, reason=reason)
+    def recover_event(self, event_id: str, *, operator: str, reason: str, expected_updated_at: str | None = None) -> dict[str, Any]:
+        return self._transition_event(event_id, "recovered", operator=operator, reason=reason, expected_updated_at=expected_updated_at)
 
-    def _transition_event(self, event_id: str, status: str, *, operator: str, reason: str) -> dict[str, Any]:
+    def _transition_event(self, event_id: str, status: str, *, operator: str, reason: str, expected_updated_at: str | None) -> dict[str, Any]:
         if not str(operator).strip() or not str(reason).strip():
             raise NodeRiskError("事件操作需要操作人和原因")
         now = self.clock()
@@ -439,16 +654,31 @@ class NodeRiskService:
             row = connection.execute("SELECT * FROM node_risk_events WHERE event_id=?", (event_id,)).fetchone()
             if row is None:
                 raise NodeRiskError("风险事件不存在", code="node_risk_event_not_found", status_code=404)
+            if expected_updated_at is not None and str(row["updated_at"]) != str(expected_updated_at):
+                raise NodeRiskError("风险事件版本已变化", code="node_risk_version_conflict", status_code=409)
+            if row["status"] == status:
+                return self._event(row)
+            if row["status"] == "recovered":
+                raise NodeRiskError("已恢复事件不能重新知悉", code="node_risk_state_conflict", status_code=409)
             if status == "recovered":
-                connection.execute("UPDATE node_risk_events SET status='recovered', recovered_at=?, updated_at=? WHERE event_id=?", (now, now, event_id))
+                changed = connection.execute(
+                    "UPDATE node_risk_events SET status='recovered', recovered_at=?, updated_at=? WHERE event_id=? AND updated_at=?",
+                    (now, now, event_id, row["updated_at"]),
+                )
             else:
-                connection.execute("UPDATE node_risk_events SET status='acknowledged', acknowledged_at=?, acknowledged_by=?, updated_at=? WHERE event_id=?", (now, operator, now, event_id))
+                changed = connection.execute(
+                    "UPDATE node_risk_events SET status='acknowledged', acknowledged_at=?, acknowledged_by=?, updated_at=? WHERE event_id=? AND updated_at=?",
+                    (now, operator, now, event_id, row["updated_at"]),
+                )
+            if changed.rowcount != 1:
+                raise NodeRiskError("风险事件版本已变化", code="node_risk_version_conflict", status_code=409)
             connection.execute(
                 "INSERT INTO node_risk_audit_events(audit_id, event_id, event_type, event_json, operator, created_at) "
                 "VALUES (?, ?, ?, ?, ?, ?)",
                 (f"node-audit-{uuid.uuid4().hex}", event_id, status, _json({"reason": reason}), operator, now),
             )
             cluster, node_id = row["cluster"], row["node_id"]
+            self._mark_dirty(connection, cluster, node_id, now)
         self.recalculate(cluster, node_id)
         with self.database.connect() as connection:
             return self._event(connection.execute("SELECT * FROM node_risk_events WHERE event_id=?", (event_id,)).fetchone())

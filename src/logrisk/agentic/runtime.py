@@ -5,6 +5,7 @@ from dataclasses import replace
 from typing import Any, Callable
 
 from logrisk.ai_harness.evaluator import EVALUATOR_VERSION
+from logrisk.ai_harness.usage_accounting import run_agent_tool_attempt, usage_context
 
 from .artifacts import READ_ARTIFACT_TYPES, canonical_fingerprint, read_tool_artifact
 from .errors import AgenticError
@@ -31,11 +32,34 @@ def _evaluation_fingerprint(output: dict[str, Any], evidence_hash: str | None) -
 
 
 class AgentRuntime:
-    def __init__(self, repository: AgentRepository, planner: AgentPlanner | Callable[[dict[str, Any]], AgentPlanner], tools: ToolRegistry, *, monotonic=time.monotonic) -> None:
+    def __init__(
+        self,
+        repository: AgentRepository,
+        planner: AgentPlanner | Callable[[dict[str, Any]], AgentPlanner],
+        tools: ToolRegistry,
+        *,
+        monotonic=time.monotonic,
+        ledger_repository: Any | None = None,
+        analysis_run_id: str | None = None,
+        environment: str | None = None,
+        scope_key: str | None = None,
+    ) -> None:
         self.repository = repository
         self.planner = planner
         self.tools = tools
         self.monotonic = monotonic
+        self.ledger_repository = ledger_repository
+        self.analysis_run_id = analysis_run_id
+        self.environment = environment
+        self.scope_key = scope_key
+
+    def _usage_context(self, run: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "ledger_repository": self.ledger_repository,
+            "analysis_run_id": run.get("analysis_run_id") or self.analysis_run_id,
+            "environment": run.get("environment") or self.environment or "production",
+            "scope_key": run.get("scope_key") or self.scope_key or "default",
+        }
 
     def execute(self, run_id: str) -> dict[str, Any]:
         run = self.repository.get_run(run_id)
@@ -48,12 +72,13 @@ class AgentRuntime:
                     run = self.repository.transition(run_id, "planning", allowed_from={"queued"})
                 snapshot = run["locked_snapshot"]
                 planner = self.planner(run) if callable(self.planner) and not hasattr(self.planner, "plan") else self.planner
-                plan = planner.plan(
-                    goal=str(snapshot.get("goal") or "提取可审批日志特征"),
-                    evidence_summary=dict(snapshot.get("evidence_summary") or {}),
-                    tool_descriptions=self.tools.describe(frozenset(run["allowed_tools"])),
-                    max_steps=int(run["max_steps"]),
-                )
+                with usage_context(**self._usage_context(run)):
+                    plan = planner.plan(
+                        goal=str(snapshot.get("goal") or "提取可审批日志特征"),
+                        evidence_summary=dict(snapshot.get("evidence_summary") or {}),
+                        tool_descriptions=self.tools.describe(frozenset(run["allowed_tools"])),
+                        max_steps=int(run["max_steps"]),
+                    )
                 run = self.repository.replace_plan(run_id, plan)
                 self.repository.append_event(run_id, "plan_created", {"step_count": len(plan.steps)})
             if run["status"] != "running":
@@ -108,7 +133,16 @@ class AgentRuntime:
                     call_started = self.monotonic()
                     self.repository.append_event(run_id, "tool_call_started", {"step_id": step["step_id"], "tool_name": step["tool_name"], "attempt": retry_index + 1})
                     try:
-                        output = self.tools.execute(step["tool_name"], step["arguments"], context)
+                        usage_args = self._usage_context(latest)
+                        output = run_agent_tool_attempt(
+                            lambda: self.tools.execute(step["tool_name"], step["arguments"], context),
+                            **usage_args,
+                            logical_call_id=f"agent_tool:{run_id}:{step['step_id']}:{started_step['attempt']}",
+                            attempt_index=retry_index,
+                            tool_name=step["tool_name"],
+                            caller_kind="agent_runtime",
+                            caller_id=run_id,
+                        )
                         break
                     except Exception as exc:
                         code = getattr(exc, "code", "tool_failed")

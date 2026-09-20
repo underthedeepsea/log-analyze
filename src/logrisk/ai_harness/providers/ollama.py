@@ -8,9 +8,13 @@ from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 from logrisk.ai_harness.model_client import ModelClientError, parse_content_json
+from logrisk.ai_harness.usage_accounting import usage_metadata
 
 
 class OllamaModelClient:
+    provider = "ollama"
+    metadata_contract = "v1"
+
     def __init__(
         self,
         base_url: str,
@@ -74,15 +78,11 @@ class OllamaModelClient:
 
         try:
             payload = json.loads(raw_response)
-            input_tokens = int(payload.get("prompt_eval_count") or 0)
-            output_tokens = int(payload.get("eval_count") or 0)
-            self.last_metadata = {
-                "usage": {
-                    "input_tokens": input_tokens,
-                    "output_tokens": output_tokens,
-                    "total_tokens": input_tokens + output_tokens,
+            if isinstance(payload, dict):
+                self.last_metadata = {
+                    **usage_metadata(payload),
+                    "metadata_contract": self.metadata_contract,
                 }
-            }
             message = payload["message"]
             content = message["content"]
             if not str(content).strip() and message.get("thinking") and payload.get("done_reason") == "length":

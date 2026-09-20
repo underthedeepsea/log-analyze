@@ -596,7 +596,8 @@ class StreamingStateRepository:
             totals[key] = None
         for key in invalid:
             totals[key] = None
-        if method_unknown:
+        # Invalid historical methods must not be overwritten by a known-method branch.
+        if method_unknown or "process_start_method" in invalid:
             totals["process_start_method"] = "unknown"
         elif len(methods) > 1:
             totals["process_start_method"] = "mixed"

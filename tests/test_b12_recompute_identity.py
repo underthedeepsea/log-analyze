@@ -131,7 +131,10 @@ def test_registered_recompute_rejects_snapshot_rewrite_before_dispatch(tmp_path,
     saved = container.input_jobs.get_job(fresh["input_job_id"])
     assert saved["status"] == "failed"
     assert "输入文件完整内容已变化" in saved["error"]
-    assert container.streaming_state.get_task(fresh["streaming_task_id"])["status"] == "failed"
+    stream_task = container.streaming_state.get_task(fresh["streaming_task_id"])
+    assert stream_task["status"] == "conflict"
+    assert stream_task["stage"] == "CONFLICT"
+    assert "输入文件完整内容已变化" in stream_task["error"]
     assert container.streaming_state.list_commits(fresh["streaming_task_id"]) == []
     assert not container.input_jobs.result_path(fresh["input_job_id"]).exists()
     assert reads == []

@@ -103,4 +103,7 @@ def test_summary_preserves_unknown_and_reduces_start_methods(tmp_path):
     )
     summary = subject.committed_summary(task["task_id"])
     assert "parallel" in summary["unknown_fields"]
-    assert summary["parallel"] is None
+    # A known True proves any=True; missing batch evidence remains visible.
+    assert summary["parallel"] is True
+    assert summary["completeness"] == "legacy_partial"
+    assert "parallel" not in summary["invalid_fields"]

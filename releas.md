@@ -6,10 +6,11 @@
 - 仅修复 Bug 时提升最后一位，例如 `1.2.0 → 1.2.1`；
 - 每次代码更新必须同步更新本文件。
 
-## 1.39.1 - 未发布（开发中）
+## 1.39.2 - 2026-09-20
 
 ### Fixed
 
+- B12 PR #41 定点修复三值摘要合同：已有合法 True 时保留 any=True 并继续披露历史缺值；非法历史启动方式不再被已知方法覆盖；重算快照身份冲突分别保留外层 InputJob failed 与底层 StreamingTask conflict 语义，并补充摘要真值表回归。
 - B12 恢复合同闭环：按页核验 committed prefix 的 cursor、批次、窗口与历史 payload hash；结果 generation 绑定前缀摘要、租约和当前前沿，只有 ready 且仍匹配的结果才能完成任务。批摘要改为版本化严格类型并区分业务完整性、执行统计 unknown、manifest 历史及 miner 可恢复性。
 - PostgreSQL task claim 使用行锁与状态 CAS；pipeline 只使用 claim/clear 返回的新 task 快照。节点副作用 fresh/resume 共用错误策略和持久身份，保留实际成功数并单列 partial delivery；恢复不再用当前语义修订覆盖历史窗口。
 - 显式 recompute 对可信完整摘要或首尾已覆盖全文件的小来源开放；大文件弱身份拒绝。非共享来源复制到 fsync 的受控快照，注册应用入口创建可调度新任务，并默认隔离全局节点及多来源副作用。修正 B12 回归中的多来源表名并补齐前缀、重算和非空关联合同测试。

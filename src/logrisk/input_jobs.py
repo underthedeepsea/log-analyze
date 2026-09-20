@@ -5,6 +5,7 @@ import time
 import uuid
 import base64
 import os
+import shutil
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -31,6 +32,7 @@ class InputJobStore:
         source_path: str,
         drain_config: dict[str, Any] | None = None,
         semantic_snapshot: dict[str, Any] | None = None,
+        initial_status: str = "queued",
     ) -> dict[str, Any]:
         input_job_id = "input_job_" + uuid.uuid4().hex
         self.root(input_job_id).mkdir(parents=True, exist_ok=False)
@@ -41,8 +43,8 @@ class InputJobStore:
             "upload_id": upload_id,
             "filename": filename,
             "source_path": source_reference,
-            "status": "queued",
-            "stage": "queued",
+            "status": initial_status,
+            "stage": initial_status,
             "created_at": now,
             "started_at": None,
             "completed_at": None,
@@ -61,7 +63,12 @@ class InputJobStore:
             job["semantic_dictionary_snapshot"] = semantic_snapshot
             job["semantic_dictionary_versions"] = semantic_snapshot.get("versions", {})
         self.write_job(input_job_id, job)
-        self.write_progress(input_job_id, {"input_job_id": input_job_id, "status": "queued", "stage": "queued", "progress": 0.0})
+        self.write_progress(input_job_id, {
+            "input_job_id": input_job_id,
+            "status": initial_status,
+            "stage": initial_status,
+            "progress": 0.0,
+        })
         return job
 
     def root(self, input_job_id: str) -> Path:
@@ -70,7 +77,9 @@ class InputJobStore:
     def create_recompute(self, input_job_id: str, *, streaming_repository: Any) -> dict[str, Any]:
         """Explicitly create a fresh file run; never turn ordinary resume into replay."""
         import hashlib
-        from logrisk.incremental_sources import FileIncrementalSource, IncrementalSourceError
+        from logrisk.incremental_sources import (
+            FileIncrementalSource, IncrementalSourceError, RecomputeSourceIdentityError,
+        )
         old = self.get_job(input_job_id)
         task = streaming_repository.get_task(str(old.get("streaming_task_id") or ""))
         if task.get("status") == "running":
@@ -89,19 +98,76 @@ class InputJobStore:
         if any(identity.get(key) != expected.get(key) for key in
                ("size_bytes", "mtime_ns", "head_sha256", "tail_sha256")):
             raise IncrementalSourceError("原始文件快照已变化，不能创建重算副本")
+        if expected.get("identity_digest"):
+            if source.content_digest() != expected["identity_digest"]:
+                raise IncrementalSourceError("原始文件完整摘要已变化，不能创建重算副本")
+            verification_method = "historical_content_digest"
+        elif int(expected.get("size_bytes") or 0) <= 2 * FileIncrementalSource._FINGERPRINT_BYTES:
+            verification_method = "complete_head_tail_coverage"
+        else:
+            raise RecomputeSourceIdentityError(
+                "历史来源仅有首尾指纹且未覆盖全部字节，不能证明仍是原始快照"
+            )
         config_path = Path(old.get("drain_config_path") or Path(__file__).parents[2] / "configs" / "drain3_recommended.ini")
         if hashlib.sha256(config_path.read_bytes()).hexdigest() != task["config_hash"]:
             raise ValueError("原始 Drain3 配置已变化，不能创建重算副本")
-        job = self.create(upload_id=old["upload_id"], filename=old["filename"], source_path=str(source_path),
-                          semantic_snapshot=old.get("semantic_dictionary_snapshot"))
-        fresh = streaming_repository.create_or_load(descriptor=source.descriptor(), config_hash=task["config_hash"])
-        streaming_repository.attach_input_job(fresh["task_id"], job["input_job_id"])
-        for key in ("drain_config_id", "drain_config_version", "drain_config_hash", "drain_config_path"):
-            if key in old:
-                job[key] = old[key]
-        job.update(streaming_task_id=fresh["task_id"], recompute_of=input_job_id, recompute_of_streaming_task=task["task_id"])
-        self.write_job(job["input_job_id"], job)
-        return job
+        job = self.create(
+            upload_id=old["upload_id"], filename=old["filename"], source_path=str(source_path),
+            semantic_snapshot=old.get("semantic_dictionary_snapshot"), initial_status="building",
+        )
+        fresh = None
+        try:
+            verified_path = source_path
+            if self.config.artifact_store is None:
+                snapshot_dir = self.root(job["input_job_id"]) / "source_snapshot"
+                snapshot_dir.mkdir(parents=True, exist_ok=False)
+                verified_path = snapshot_dir / Path(old["filename"]).name
+                with source_path.open("rb") as source_stream, verified_path.open("xb") as target_stream:
+                    shutil.copyfileobj(source_stream, target_stream, length=1024 * 1024)
+                    target_stream.flush()
+                    os.fsync(target_stream.fileno())
+                if source.content_digest() != FileIncrementalSource(verified_path).content_digest():
+                    raise IncrementalSourceError("来源在受控快照复制期间发生变化")
+                job["source_path"] = str(verified_path)
+            verified_source = FileIncrementalSource(
+                verified_path,
+                filename=old["filename"],
+                immutable_identity=True,
+                environment=expected.get("environment", "production"),
+                scope_key=expected.get("scope_key", "default"),
+            )
+            verified_descriptor = verified_source.descriptor()
+            fresh = streaming_repository.create_or_load(
+                descriptor=verified_descriptor, config_hash=task["config_hash"]
+            )
+            streaming_repository.attach_input_job(fresh["task_id"], job["input_job_id"])
+            for key in ("drain_config_id", "drain_config_version", "drain_config_hash", "drain_config_path"):
+                if key in old:
+                    job[key] = old[key]
+            job.update(
+                status="queued", stage="queued", streaming_task_id=fresh["task_id"],
+                recompute_of=input_job_id, recompute_of_streaming_task=task["task_id"],
+                recompute_source_verification=verification_method,
+                side_effect_policy="isolated_recompute",
+            )
+            self.write_job(job["input_job_id"], job)
+            self.write_progress(job["input_job_id"], {
+                "input_job_id": job["input_job_id"], "status": "queued", "stage": "queued", "progress": 0.0,
+            })
+            return job
+        except BaseException as exc:
+            if fresh is not None:
+                try:
+                    streaming_repository.mark_failed(fresh["task_id"], "重算任务创建未完成")
+                except BaseException:
+                    pass
+            job.update(status="failed", stage="failed", error=str(exc), completed_at=self._now())
+            self.write_job(job["input_job_id"], job)
+            self.write_progress(job["input_job_id"], {
+                "input_job_id": job["input_job_id"], "status": "failed", "stage": "failed",
+                "progress": 1.0, "error": str(exc),
+            })
+            raise
 
     def job_path(self, input_job_id: str) -> Path:
         return self.root(input_job_id) / "job.json"

@@ -285,7 +285,7 @@ class NodeRiskService:
         for row in rows:
             self.recalculate(row["cluster"], row["node_id"])
 
-    def committed_ingestion_count(self, windows: list[dict[str, Any]], *, semantic_revision: Any) -> int | None:
+    def committed_ingestion_count(self, windows: list[dict[str, Any]], *, semantic_revision: Any = None) -> int | None:
         """Count proven successful effects, including idempotently replayed facts.
 
         Legacy windows without the physical identity cannot prove this count.
@@ -303,7 +303,13 @@ class NodeRiskService:
                 if not namespace or not batch or item is None or not window.get("window_start"):
                     return None
                 physical_key = hashlib.sha256(_json([namespace, batch, window["window_start"], item]).encode()).hexdigest()
-                revision = _json(semantic_revision or event.get("semantic_rule_version") or "")
+                revision = _json(
+                    window.get("semantic_revision")
+                    or window.get("semantic_dictionary_versions")
+                    or semantic_revision
+                    or event.get("semantic_rule_version")
+                    or ""
+                )
                 fingerprint = hashlib.sha256(_json([physical_key, revision]).encode()).hexdigest()
                 row = connection.execute(
                     "SELECT occurrence_count FROM node_risk_ingestions WHERE source_event_fingerprint=?",

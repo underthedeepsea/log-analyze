@@ -27,21 +27,46 @@ class StreamingResultRepository:
     def __init__(self,database: Any):
         self.database = database
 
-    def build(self,task_id: str,rules: dict[str,Any]) -> dict[str,Any]:
+    def build(
+        self,
+        task_id: str,
+        rules: dict[str,Any],
+        *,
+        prefix_evidence: Any | None = None,
+        lease_token: str = "",
+    ) -> dict[str,Any]:
         from logrisk.large_file_pipeline import _merge_template_windows
         from logrisk.streaming_state import StreamingStateRepository
-        StreamingStateRepository(self.database).require_complete_prefix(task_id)
-        rules_hash = _digest({"rules": rules, "reducer_version": 1})
+        evidence = prefix_evidence or StreamingStateRepository(self.database).require_complete_prefix(task_id)
+        rules_hash = _digest({"rules": rules, "reducer_version": 1, "prefix_digest": evidence.evidence_digest})
         with self.database.transaction() as connection:
-            task = connection.execute("SELECT cursor_json FROM streaming_tasks WHERE task_id=?",(task_id,)).fetchone()
+            lock = " FOR UPDATE" if getattr(self.database,"provider","sqlite") == "postgres" else ""
+            task = connection.execute(
+                "SELECT cursor_json,task_json FROM streaming_tasks WHERE task_id=?" + lock,(task_id,)
+            ).fetchone()
             if task is None:
                 raise KeyError(f"Streaming task not found: {task_id}")
-            raw_frontier = task[0]
+            task_payload = json.loads(task["task_json"]) if isinstance(task["task_json"],str) else task["task_json"]
+            if lease_token and (
+                task_payload.get("status") != "running"
+                or str(task_payload.get("lease_token") or "") != str(lease_token)
+            ):
+                raise ValueError("结果构建前任务租约变化")
+            raw_frontier = task["cursor_json"]
             frontier = _json(json.loads(raw_frontier) if isinstance(raw_frontier, str) else raw_frontier)
-            old = connection.execute("SELECT * FROM streaming_result_generations WHERE task_id=? AND rules_hash=? AND frontier_json=? ORDER BY generation LIMIT 1",(task_id,rules_hash,frontier)).fetchone()
+            old = connection.execute(
+                "SELECT * FROM streaming_result_generations WHERE task_id=? AND rules_hash=? AND frontier_json=? "
+                "ORDER BY generation LIMIT 1" + lock,(task_id,rules_hash,frontier)
+            ).fetchone()
             if old:
                 generation = old["generation"]
                 if old["status"] == "ready":
+                    ready_summary = json.loads(old["summary_json"]) if old["summary_json"] else {}
+                    ready_summary["_integrity"] = evidence.integrity(lease_token=lease_token)
+                    connection.execute(
+                        "UPDATE streaming_result_generations SET summary_json=? WHERE task_id=? AND generation=?",
+                        (_json(ready_summary),task_id,generation),
+                    )
                     return {"task_id":task_id,"generation":generation}
                 after = (old["after_window"],int(old["after_item"]))
             else:
@@ -100,13 +125,29 @@ class StreamingResultRepository:
                     connection.execute("INSERT INTO streaming_result_entities(task_id,generation,entity_key,score,level,entity_id,entity_json) VALUES (?,?,?,?,?,?,?) ON CONFLICT(task_id,generation,entity_key) DO UPDATE SET score=excluded.score,level=excluded.level,entity_json=excluded.entity_json",(task_id,generation,key["entity_key"],score,level_of(score),eid,_json(entity)))
                 after_entity = keys[-1]["entity_key"]
         with self.database.transaction() as connection:
-            raw_current = connection.execute("SELECT cursor_json FROM streaming_tasks WHERE task_id=?",(task_id,)).fetchone()[0]
+            lock = " FOR UPDATE" if getattr(self.database,"provider","sqlite") == "postgres" else ""
+            task_row = connection.execute(
+                "SELECT cursor_json,task_json FROM streaming_tasks WHERE task_id=?" + lock,(task_id,)
+            ).fetchone()
+            raw_current = task_row["cursor_json"]
             current = _json(json.loads(raw_current) if isinstance(raw_current, str) else raw_current)
             if current != frontier:
                 raise ValueError("结果构建期间来源水位变化")
+            task_payload = json.loads(task_row["task_json"]) if isinstance(task_row["task_json"],str) else task_row["task_json"]
+            if lease_token and (
+                task_payload.get("status") != "running"
+                or str(task_payload.get("lease_token") or "") != str(lease_token)
+            ):
+                raise ValueError("结果构建期间任务租约变化")
+            commit_count = connection.execute(
+                "SELECT COUNT(*) FROM streaming_window_commits WHERE task_id=?",(task_id,)
+            ).fetchone()[0]
+            if int(commit_count) != evidence.committed_batches:
+                raise ValueError("结果构建期间提交批次数变化")
             counts = connection.execute("SELECT COUNT(*) AS windows,COALESCE(SUM(count),0) AS records FROM streaming_result_windows WHERE task_id=? AND generation=?",(task_id,generation)).fetchone()
             summary = dict(counts)
             summary.update(dict(connection.execute("SELECT COUNT(*) AS entities,COALESCE(SUM(CASE WHEN level='critical' THEN 1 ELSE 0 END),0) AS critical,COALESCE(SUM(CASE WHEN level='high' THEN 1 ELSE 0 END),0) AS high FROM streaming_result_entities WHERE task_id=? AND generation=?",(task_id,generation)).fetchone()))
+            summary["_integrity"] = evidence.integrity(lease_token=lease_token)
             connection.execute("UPDATE streaming_result_generations SET status='ready',summary_json=? WHERE task_id=? AND generation=?",(_json(summary),task_id,generation))
         return {"task_id":task_id,"generation":generation}
 

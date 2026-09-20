@@ -13,6 +13,10 @@ class IncrementalSourceError(ValueError):
     """A source error that is safe to show in the Dashboard."""
 
 
+class RecomputeSourceIdentityError(IncrementalSourceError):
+    code = "RECOMPUTE_SOURCE_IDENTITY_UNVERIFIABLE"
+
+
 @dataclass(frozen=True)
 class SourceCursor:
     kind: str

@@ -10,13 +10,13 @@
   <img src="frontend/logo/logrisk-app-icon-orange-v2.png" width="112" alt="LOGRISK 应用图标" />
 </p>
 
-当前版本：`1.38.1`。完整变更记录见 [`releas.md`](releas.md)。
+当前版本：`1.39.1`。完整变更记录见 [`releas.md`](releas.md)。
 
 开发中审计修复：审批列表使用 canonical 数据库轻投影和不受前页审批影响的 opaque cursor；新增迁移 0027（节点投影修订与真实评分样本）与 0028（审批投影）。节点当前状态可补偿未完成投影，历史没有评分样本时显示 uncertain；流式恢复校验已提交 miner generation 的 SHA-256 manifest。
 
 人工审批支持连续操作：点击批准或驳回后，条目立即变绿并显示“保存中”，数据库确认后变为“已保存”；当前面板保留，可继续选择下一组。保存失败保留提交内容并可重试；有未确认提交时请保留页面，关闭或刷新浏览器会提示。列表中的“刷新”会重新获取待审批队列并移除已保存条目，“加载更多”继续读取后续组。审批身份和规则复用范围仍按脱敏证据确定。
 
-PostgreSQL 部署升级到 1.38.1 时，应先通过 `python manage.py logrisk_migrate --json` 显式应用待执行迁移（包括 `0022_approval_queue_performance.sql` 索引与 `0023_approval_transactions.sql` 审批事务表），再更新服务；Django/Airflow 不会自动迁移。批量审批只更新命中候选、分组状态和审计事件，完整任务快照不再逐条回写。审批携带版本与请求幂等键，冲突保留草稿并展示最新决定；新候选审批和已批准规则健康复审分别展示。Kafka 默认关闭，各部署实例独立配置；读取本批高水位后结束，未探测连接时明确显示“未检查”。
+PostgreSQL 部署升级到 1.39.1 时，应先通过 `python manage.py logrisk_migrate --json` 显式应用待执行迁移，再更新服务；Django/Airflow 不会自动迁移。批量审批只更新命中候选、分组状态和审计事件，完整任务快照不再逐条回写。审批携带版本与请求幂等键，冲突保留草稿并展示最新决定；新候选审批和已批准规则健康复审分别展示。Kafka 默认关闭，各部署实例独立配置；读取本批高水位后结束，未探测连接时明确显示“未检查”。
 
 
 新生成的日志候选按已识别语义拆分，未解析证据单独保留待人工复核；日志命中次数按各自所选模板计算。审批页区分结构校验与语义证据完整性。历史候选和审批状态不会自动重写。
@@ -121,7 +121,7 @@ python3 -m pipeline.manual_import_pipeline \
 
 ### 可恢复处理与 Kafka 来源
 
-开发中 B12：旧 checkpoint 缺少完整前缀事实会以 `failed` 和 `legacy_partial` 错误停止，普通恢复不会自动重算。受控调用 `container.input_jobs.create_recompute(old_input_job_id, streaming_repository=container.streaming_state)` 可为仍存在且身份/快照/配置一致的 file/upload 来源创建新 input job 和空游标 streaming task，再通过现有 `container.run_input_job(new_job["input_job_id"])` 执行；此入口未增加页面按钮或 Kafka 重放。新 Run 使用独立 miner generation，旧任务与证据保留。0031 保存每批的状态 manifest；旧统计缺字段显示 `streaming_summary_completeness=legacy_partial`，无法证明的节点成功数为 null。
+B12 恢复会在读取、派生、结果投影和完成发布前核对 committed batch、窗口、payload hash、cursor 前沿及 ready result generation。无法证明的旧前缀以稳定错误码 `STREAMING_PREFIX_INCOMPLETE` 失败，普通恢复不会自动重算。注册入口 `container.create_recompute_input_job(old_input_job_id)` 只接受仍可证明原始快照的 file/upload；大于 128 KiB 且历史没有完整摘要的弱身份来源返回 `RECOMPUTE_SOURCE_IDENTITY_UNVERIFIABLE`。新 Run 使用受控来源快照、空 cursor、独立 miner generation，并默认隔离节点台账和多来源全局副作用；之后由 `container.run_input_job(new_job["input_job_id"])` 执行。旧任务、批次和结果证据保持不变，Kafka 不支持重算。
 
 “流式处理”工作区会显示大文件任务的来源、Drain3 配置摘要、最后成功 Checkpoint、提交批次和脱敏未知模板队列。文件任务同时受记录数、序列化字节数和分区 writer 数量预算约束；每个批次在 Drain3 模板化、语义/规则判定后，以单个数据库事务提交完整脱敏窗口、未知模板、摘要和字节 Offset。服务重启会将运行中任务标记为中断，恢复会从全部已提交批次重建结果；只有人工点击“从 Checkpoint 恢复”才会继续。文件身份、内容前缀、批次 payload 或 Drain3 配置变化会标记为冲突，不能静默重读、回退游标或跳过数据。大结果以服务端结果引用和 opaque cursor 分页；界面明确显示当前预览数与精确总数，后续特征任务会在服务端消费完整投影，不会把预览页当作全部实体。
 

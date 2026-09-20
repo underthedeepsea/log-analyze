@@ -16,7 +16,7 @@ from logrisk.multi_source.repository import MultiSourceRepository
 from logrisk.multi_source.service import MultiSourceService
 from logrisk.node_risk import NodeRiskError, NodeRiskService
 from logrisk.streaming_results import StreamingResultRepository
-from logrisk.streaming_state import StreamingIncompleteError, StreamingStateRepository
+from logrisk.streaming_state import StreamingConflictError, StreamingIncompleteError, StreamingStateRepository
 
 
 class Classified:
@@ -105,10 +105,10 @@ def test_three_batches_resume_matches_baseline_and_replays_effects_once(tmp_path
     assert len(repository.list_commits(task_id)) == 3
     with repository.database.connect() as connection:
         assert connection.execute("SELECT SUM(occurrence_count) FROM node_risk_ingestions").fetchone()[0] == 12
-        resumed_observations = connection.execute("SELECT COUNT(*) FROM source_observations").fetchone()[0]
+        resumed_observations = connection.execute("SELECT COUNT(*) FROM multi_source_observations").fetchone()[0]
         manifests = connection.execute("SELECT state_manifest_json FROM streaming_window_commits ORDER BY committed_at, window_id").fetchall()
     with baseline_repo.database.connect() as connection:
-        assert resumed_observations == connection.execute("SELECT COUNT(*) FROM source_observations").fetchone()[0]
+        assert resumed_observations == connection.execute("SELECT COUNT(*) FROM multi_source_observations").fetchone()[0]
     assert len({json.loads(row[0])["generation"] for row in manifests}) == 3
     if boundary in {"after_last_batch", "after_effects_before_finalize"}:
         assert result["summary"]["invocation"]["records_parsed"] == 0
@@ -206,7 +206,14 @@ def test_legacy_fails_before_read_effects_projection_and_explicit_recompute(tmp_
     new_task = repo.get_task(fresh["streaming_task_id"])
     assert new_task["cursor"] == SourceCursor.empty().to_dict()
     assert "miner_generation" not in new_task
-    result = run_large_file_pipeline(**dict(arguments(source, tmp_path / "fresh", repo), input_job_id=fresh["input_job_id"]), resume_task_id=fresh["streaming_task_id"])
+    fresh_arguments = dict(
+        arguments(source, tmp_path / "fresh", repo),
+        input_job_id=fresh["input_job_id"], node_risks=None, multi_source=None,
+    )
+    with pytest.raises(StreamingConflictError, match="输入文件身份已变化"):
+        run_large_file_pipeline(**fresh_arguments, resume_task_id=fresh["streaming_task_id"])
+    fresh_arguments["input_path"] = store.resolve_source_path(fresh)
+    result = run_large_file_pipeline(**fresh_arguments, resume_task_id=fresh["streaming_task_id"])
     assert result["summary"]["total_raw_logs"] == 12
     assert repo.list_commits(task["task_id"]) == ["legacy"]
     assert store.get_job(old["input_job_id"]) == old
@@ -235,5 +242,9 @@ def test_node_count_reports_successful_rows_after_partial_effect_failure(tmp_pat
     result = run_large_file_pipeline(**kwargs)
     assert result["summary"]["risk_semantic_matches"] == 12
     assert result["summary"]["node_risk_ingestions"] == 8
+    assert result["summary"]["node_risk_delivery"] == {
+        "policy": "best_effort", "eligible_occurrences": 12,
+        "succeeded_occurrences": 8, "unresolved_occurrences": 4, "status": "partial",
+    }
     with repo.database.connect() as connection:
         assert connection.execute("SELECT SUM(occurrence_count) FROM node_risk_ingestions").fetchone()[0] == 8

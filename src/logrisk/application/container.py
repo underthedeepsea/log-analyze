@@ -161,6 +161,7 @@ class ApplicationContainer:
     input_analyzer: Callable[..., dict[str, Any]] | None = None
     input_analyzer_accepts_config: bool = True
     run_input_job: Callable[[str], None] | None = None
+    create_recompute_input_job: Callable[[str], dict[str, Any]] | None = None
     run_kafka_task: Callable[[str, dict[str, str]], None] | None = None
     kafka_adapters: dict[str, KafkaConsumerAdapter] = field(default_factory=dict)
 
@@ -595,8 +596,8 @@ def build_application_container(
                 progress_callback=lambda progress: container.input_jobs.write_progress(input_job_id, progress),
                 semantic_snapshot=job.get("semantic_dictionary_snapshot"),
                 risk_semantics=container.risk_semantics,
-                node_risks=container.node_risks,
-                multi_source=container.multi_source,
+                node_risks=(None if job.get("side_effect_policy") == "isolated_recompute" else container.node_risks),
+                multi_source=(None if job.get("side_effect_policy") == "isolated_recompute" else container.multi_source),
                 streaming_repository=container.streaming_state,
                 resume_task_id=job["streaming_task_id"],
             )
@@ -667,10 +668,18 @@ def build_application_container(
             # Worker that may already have resumed the task.
             raise
 
+    def create_recompute_input_job(input_job_id: str) -> dict[str, Any]:
+        """Registered application entry for an explicit, isolated B12 recompute."""
+
+        return container.input_jobs.create_recompute(
+            input_job_id, streaming_repository=container.streaming_state,
+        )
+
     container.govern_drain_result = govern_drain_result
     container.input_analyzer = input_analyzer or default_input_analyzer
     container.input_analyzer_accepts_config = input_analyzer is None
     container.run_input_job = run_input_job
+    container.create_recompute_input_job = create_recompute_input_job
     container.run_kafka_task = run_kafka_task
     return container
 

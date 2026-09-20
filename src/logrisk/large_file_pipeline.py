@@ -139,37 +139,42 @@ def run_incremental_pipeline(
             streaming_repository.ledger_repository = ledger_repository
         elif streaming_repository.ledger_repository is not ledger_repository:
             raise StreamingConflictError("流式任务与 operational ledger Provider 不一致")
-    source_descriptor = source.descriptor()
     source_cursor = SourceCursor.empty()
     streaming_resumed = False
     if resume_task_id:
         streaming_task = streaming_repository.get_task(resume_task_id)
         previous_status = str(streaming_task.get("status") or "")
-        if streaming_task.get("config_hash") != config_hash:
-            streaming_repository.mark_failed(resume_task_id, "Drain3 配置已变化，不能继续恢复", conflict=True)
-            raise StreamingConflictError("Drain3 配置已变化，不能继续恢复")
-        try:
-            source.validate_descriptor(streaming_task.get("source") or {})
-        except IncrementalSourceError as exc:
-            streaming_repository.mark_failed(resume_task_id, str(exc), conflict=True)
-            raise StreamingConflictError(str(exc)) from exc
-        source_cursor = SourceCursor.from_dict(streaming_task.get("cursor"))
-        streaming_resumed = bool(
-            source_cursor.value
-            or previous_status in {"failed", "interrupted", "conflict"}
-        )
+        if isinstance(source, FileIncrementalSource) and (
+            ((streaming_task.get("source") or {}).get("identity") or {}).get("identity_digest")
+        ):
+            source.immutable_identity = True
     else:
+        streaming_task = None
+        previous_status = ""
+    source_descriptor = source.descriptor()
+    if streaming_task is None:
         streaming_task = streaming_repository.create_or_load(
             descriptor=source_descriptor,
             config_hash=config_hash,
         )
-        source_cursor = SourceCursor.from_dict(streaming_task.get("cursor"))
+        previous_status = str(streaming_task.get("status") or "")
     task_id = str(streaming_task["task_id"])
     # A failed claim does not establish ownership, so it must never publish a
     # terminal state for a task that may belong to another Worker.
     streaming_task = streaming_repository.claim_task(task_id)
     lease_token = str(streaming_task.get("lease_token") or "")
     try:
+        if streaming_task.get("config_hash") != config_hash:
+            raise StreamingConflictError("Drain3 配置已变化，不能继续恢复")
+        try:
+            source.validate_descriptor(streaming_task.get("source") or {})
+        except IncrementalSourceError as exc:
+            raise StreamingConflictError(str(exc)) from exc
+        source_cursor = SourceCursor.from_dict(streaming_task.get("cursor"))
+        streaming_resumed = bool(
+            source_cursor.value
+            or previous_status in {"failed", "interrupted", "conflict"}
+        )
         streaming_repository.require_complete_prefix(task_id)
         pending_external_commit = SourceCursor.from_dict(streaming_task.get("pending_external_commit"))
         if pending_external_commit.value:
@@ -218,6 +223,11 @@ def run_incremental_pipeline(
                 error=_exception_text(exc),
                 interrupted=interrupted,
                 conflict=isinstance(exc, StreamingConflictError),
+                error_details=(
+                    getattr(exc, "details", None)
+                    if getattr(exc, "details", None) is not None
+                    else ({"error_code": getattr(exc, "code")} if getattr(exc, "code", None) else None)
+                ),
             )
         except BaseException:
             # The original business/cancellation exception is the caller's
@@ -690,6 +700,42 @@ def _run_checkpointed_source_batches(
             matched += int(window.get("count") or 1)
         return matched
 
+    def node_contributions(windows: list[dict[str, Any]], batch_id: str | None = None) -> list[dict[str, Any]]:
+        contributions = []
+        for window in windows:
+            semantic_event = window.get("risk_semantic")
+            if not semantic_event or window.get("entity_type") != "node":
+                continue
+            source_record = dict(
+                window,
+                node=window.get("entity_id"),
+                source_batch_id=window.get("source_batch_id") or batch_id,
+                semantic_revision=(
+                    window.get("semantic_revision")
+                    or window.get("semantic_dictionary_versions")
+                    or semantic_event.get("semantic_rule_version")
+                ),
+            )
+            contributions.append({
+                "semantic_event": semantic_event,
+                "source_record": source_record,
+                "source_job_id": input_job_id,
+                "occurrence_count": int(window.get("count") or 1),
+            })
+        return contributions
+
+    def deliver_node_effects(windows: list[dict[str, Any]], batch_id: str | None = None) -> None:
+        if node_risks is None:
+            return
+        contributions = node_contributions(windows, batch_id)
+        if not contributions:
+            return
+        try:
+            node_risks.ingest_batch(contributions)
+        except NodeRiskError as exc:
+            if exc.code != "invalid_node_risk_request":
+                raise
+
     def process_batch(
         batch: list[dict[str, Any]],
         checkpoint: SourceCursor,
@@ -752,7 +798,14 @@ def _run_checkpointed_source_batches(
         window_id = f"{source_kind}-cursor:{cursor_hash}"
         namespace = hashlib.sha256(json.dumps(source_descriptor.to_dict(),sort_keys=True).encode()).hexdigest()
         for index,window in enumerate(template_windows):
-            window.update(source_namespace=namespace,source_item_id=str(index))
+            window.update(
+                source_namespace=namespace,
+                source_item_id=str(index),
+                semantic_revision=(
+                    (semantic_snapshot or {}).get("versions")
+                    or (window.get("risk_semantic") or {}).get("semantic_rule_version")
+                ),
+            )
         generation = seal_generation(generation_dir)
         committed = streaming_repository.commit_window(
             str(streaming_task["task_id"]),
@@ -761,6 +814,7 @@ def _run_checkpointed_source_batches(
             templates=unknown,
             windows=template_windows,
             summary={
+                "summary_schema_version": 2,
                 "record_count": len(batch),
                 "template_count": len(template_windows),
                 "unknown_template_count": len(unknown),
@@ -770,6 +824,9 @@ def _run_checkpointed_source_batches(
                 "worker_count": int(mining["worker_count"]),
                 "parallel": bool(mining["parallel"]),
                 "node_risk_enabled": node_risks is not None,
+                "process_start_method": (
+                    str(mining["process_start_method"]) if mining["parallel"] else "not_applicable"
+                ),
             },
             ledger_batch=(
                 {
@@ -790,34 +847,13 @@ def _run_checkpointed_source_batches(
             expected_cursor=streaming_task.get("cursor"),
         )
         source.commit(checkpoint)
-        streaming_repository.clear_pending_external_commit(
+        streaming_task = streaming_repository.clear_pending_external_commit(
             str(streaming_task["task_id"]), checkpoint, expected_lease_token=lease_token,
         )
         if committed:
             newly_committed += 1
             unknown_template_count += len(unknown)
-            streaming_task["windows_committed"] = int(streaming_task.get("windows_committed") or 0) + 1
-            if node_risks is not None:
-                contributions = []
-                for window in template_windows:
-                    semantic_event = window.get("risk_semantic")
-                    if not semantic_event or window.get("entity_type") != "node":
-                        continue
-                    source_record = dict(
-                        window, node=window.get("entity_id"), source_batch_id=window_id,
-                        semantic_revision=(semantic_snapshot or {}).get("versions") or {},
-                    )
-                    contributions.append({
-                        "semantic_event": semantic_event, "source_record": source_record,
-                        "source_job_id": input_job_id,
-                        "occurrence_count": int(window.get("count") or 1),
-                    })
-                if contributions:
-                    try:
-                        node_risks.ingest_batch(contributions)
-                        node_risk_ingestions += sum(int(item["occurrence_count"]) for item in contributions)
-                    except NodeRiskError:
-                        pass
+            deliver_node_effects(template_windows, window_id)
         if ledger_repository is not None:
             receipt_ids.append(ingestion_batch_id(input_job_id, window_id))
         update_manifest_status(batch_spool_dir, manifest, "COMPLETED")
@@ -843,9 +879,11 @@ def _run_checkpointed_source_batches(
             cursor=checkpoint,
             templates=[],
             windows=[],
-            summary={"record_count": 0, "template_count": 0, "unknown_template_count": 0,
+            summary={"summary_schema_version": 2,
+                     "record_count": 0, "template_count": 0, "unknown_template_count": 0,
                      "risk_semantic_matches": 0, "template_event_count": 0, "partition_count": 0,
-                     "worker_count": 0, "parallel": False, "node_risk_enabled": node_risks is not None},
+                     "worker_count": 0, "parallel": False, "node_risk_enabled": node_risks is not None,
+                     "process_start_method": "not_applicable"},
             ledger_batch={
                 "batch_id": ingestion_batch_id(input_job_id, window_id),
                 "source": ledger_source,
@@ -860,12 +898,11 @@ def _run_checkpointed_source_batches(
             expected_cursor=streaming_task.get("cursor"),
         )
         source.commit(checkpoint)
-        streaming_repository.clear_pending_external_commit(
+        streaming_task = streaming_repository.clear_pending_external_commit(
             str(streaming_task["task_id"]), checkpoint, expected_lease_token=lease_token,
         )
         if committed:
             newly_committed += 1
-            streaming_task["windows_committed"] = int(streaming_task.get("windows_committed") or 0) + 1
         receipt_ids.append(ingestion_batch_id(input_job_id, window_id))
 
     def flush(
@@ -912,13 +949,7 @@ def _run_checkpointed_source_batches(
                 restored = streaming_repository.iter_committed_windows(str(streaming_task["task_id"]), after_key=after_key, limit=250)
                 if not restored:
                     break
-                contributions = [{
-                    "semantic_event": window["risk_semantic"],
-                    "source_record": dict(window, node=window.get("entity_id"), semantic_revision=(semantic_snapshot or {}).get("versions") or {}),
-                    "source_job_id": input_job_id, "occurrence_count": int(window.get("count") or 1),
-                } for window in restored if window.get("risk_semantic") and window.get("entity_type") == "node"]
-                if contributions:
-                    node_risks.ingest_batch(contributions)
+                deliver_node_effects(restored)
                 last = restored[-1]
                 after_key = (str(last["source_batch_id"]), int(last["_commit_item_index"]))
         for item in source.read(source_cursor):
@@ -975,7 +1006,12 @@ def _run_checkpointed_source_batches(
 
     from logrisk.streaming_results import StreamingResultRepository
     result_repository = StreamingResultRepository(streaming_repository.database)
-    result_ref = result_repository.build(str(streaming_task["task_id"]),rules)
+    prefix_evidence = streaming_repository.require_complete_prefix(str(streaming_task["task_id"]))
+    result_ref = result_repository.build(
+        str(streaming_task["task_id"]), rules,
+        prefix_evidence=prefix_evidence,
+        lease_token=lease_token,
+    )
     result_totals = result_repository.summary(result_ref)
     first_page = result_repository.entities(result_ref)
     top_templates = result_repository.top_windows(result_ref)
@@ -986,24 +1022,47 @@ def _run_checkpointed_source_batches(
     parsed = int(committed_totals.get("record_count") or 0)
     unknown_template_count = committed_totals["unknown_template_count"]
     semantic_matches = committed_totals["risk_semantic_matches"]
-    for field in ("template_event_count", "partition_count", "worker_count", "parallel"):
+    for field in ("template_event_count", "partition_count", "worker_count", "parallel", "process_start_method"):
         mining_totals[field] = committed_totals[field]
     node_risk_ingestions = 0
+    node_risk_eligible: int | None = 0
     if node_risks is not None:
         after_key = None
         while True:
             restored = streaming_repository.iter_committed_windows(str(streaming_task["task_id"]), after_key=after_key, limit=250)
             if not restored:
                 break
-            count = node_risks.committed_ingestion_count(restored, semantic_revision=(semantic_snapshot or {}).get("versions") or {})
+            node_risk_eligible += sum(
+                int(item.get("count") or 1)
+                for item in restored
+                if item.get("risk_semantic") and item.get("entity_type") == "node"
+            )
+            count = node_risks.committed_ingestion_count(restored, semantic_revision=None)
             if count is None:
                 node_risk_ingestions = None
+                node_risk_eligible = None
                 break
             node_risk_ingestions += count
             last = restored[-1]
             after_key = (str(last["source_batch_id"]), int(last["_commit_item_index"]))
     elif committed_totals["node_risk_enabled"] is not False:
         node_risk_ingestions = None
+        node_risk_eligible = None
+    node_delivery = {
+        "policy": "best_effort",
+        "eligible_occurrences": node_risk_eligible,
+        "succeeded_occurrences": node_risk_ingestions,
+        "unresolved_occurrences": (
+            None
+            if node_risk_eligible is None or node_risk_ingestions is None
+            else max(0, node_risk_eligible - node_risk_ingestions)
+        ),
+        "status": (
+            "unknown"
+            if node_risk_eligible is None or node_risk_ingestions is None
+            else ("complete" if node_risk_eligible == node_risk_ingestions else "partial")
+        ),
+    }
     multi_source_result = {"observations":0,"correlations":0,"unroutable":0}
     if multi_source:
         page = first_page
@@ -1046,6 +1105,7 @@ def _run_checkpointed_source_batches(
             "semantic_dictionary_versions": (semantic_snapshot or {}).get("versions", {}),
             "risk_semantic_matches": semantic_matches,
             "node_risk_ingestions": node_risk_ingestions,
+            "node_risk_delivery": node_delivery,
             "multi_source": multi_source_result,
             "streaming_task_id": streaming_task["task_id"],
             "streaming_resumed": streaming_resumed,
@@ -1072,9 +1132,12 @@ def _run_checkpointed_source_batches(
         str(streaming_task["task_id"]),
         _safe_streaming_result(result),
         expected_lease_token=lease_token,
+        result_reference=result_ref,
     )
     streaming_task = streaming_repository.complete_claim(
-        str(streaming_task["task_id"]), lease_token
+        str(streaming_task["task_id"]), lease_token,
+        result_reference=result_ref,
+        prefix_evidence=prefix_evidence,
     )
     emit("completed", 1.0)
     return result

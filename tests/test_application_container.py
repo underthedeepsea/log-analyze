@@ -42,7 +42,7 @@ def test_kafka_containers_isolate_opt_in_and_count_only_active_kafka_tasks(tmp_p
         if status == "running":
             repository.mark_running(task["task_id"])
         elif status == "completed":
-            repository.mark_completed(task["task_id"])
+            repository._update_task(task["task_id"], status="completed", stage="COMPLETED", event_type="test_completed")
         elif status == "failed":
             repository.mark_failed(task["task_id"], "safe failure")
         elif status == "interrupted":
@@ -70,6 +70,38 @@ def test_application_container_builds_shared_services_without_starting_http(tmp_
     assert container.runtime_service is not None
     assert container.release_readiness is not None
     assert container.artifact_store.root == (tmp_path / "state").resolve()
+
+
+def test_registered_recompute_entry_creates_an_isolated_schedulable_job(tmp_path) -> None:
+    from logrisk.application.container import ApplicationConfig, build_application_container
+
+    container = build_application_container(
+        ApplicationConfig.for_test(project_root=PROJECT_ROOT, state_root=tmp_path / "state")
+    )
+    payload = b"safe recompute fixture\n"
+    upload = container.upload_store.create(filename="recompute.log", size_bytes=len(payload))
+    container.upload_store.append_chunk(upload_id=upload["upload_id"], index=0, data=payload)
+    completed = container.upload_store.complete(upload_id=upload["upload_id"])
+    source = container.artifact_store.resolve(completed["artifact_relative_path"])
+    old = container.input_jobs.create(
+        upload_id=upload["upload_id"], filename=source.name, source_path=str(source),
+    )
+    from logrisk.incremental_sources import FileIncrementalSource
+    import hashlib
+
+    task = container.streaming_state.create_or_load(
+        descriptor=FileIncrementalSource(source, filename=source.name).descriptor(),
+        config_hash=hashlib.sha256((PROJECT_ROOT / "configs/drain3_recommended.ini").read_bytes()).hexdigest(),
+    )
+    container.streaming_state.attach_input_job(task["task_id"], old["input_job_id"])
+    old["streaming_task_id"] = task["task_id"]
+    container.input_jobs.write_job(old["input_job_id"], old)
+
+    fresh = container.create_recompute_input_job(old["input_job_id"])
+
+    assert fresh["status"] == "queued"
+    assert fresh["side_effect_policy"] == "isolated_recompute"
+    assert container.run_input_job is not None
 
 
 def test_input_job_cancellation_closes_both_input_and_streaming_states(tmp_path, monkeypatch) -> None:
@@ -165,7 +197,9 @@ def test_completed_input_job_is_not_downgraded_by_notification_cancellation(tmp_
 
     def complete_pipeline(**kwargs):
         task = container.streaming_state.claim_task(kwargs["resume_task_id"])
-        container.streaming_state.complete_claim(task["task_id"], task["lease_token"])
+        container.streaming_state._update_task(
+            task["task_id"], status="completed", stage="COMPLETED", event_type="test_completed",
+        )
         return {"summary": {}, "risk_entities": [], "top_templates": []}
 
     interruption = asyncio.CancelledError()

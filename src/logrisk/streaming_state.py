@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import uuid
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Mapping
 
@@ -24,6 +25,40 @@ class StreamingTaskBusyError(StreamingStateError):
 
 class StreamingIncompleteError(StreamingStateError):
     """Committed prefix evidence is missing and cannot be resumed safely."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str = "STREAMING_PREFIX_INCOMPLETE",
+        details: Mapping[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.code = code
+        self.details = {"error_code": code, **dict(details or {})}
+
+
+@dataclass(frozen=True)
+class PrefixEvidence:
+    task_id: str
+    frontier: dict[str, Any]
+    committed_batches: int
+    record_count: int
+    result_completeness: str
+    manifest_history: str
+    summary_unknown_fields: tuple[str, ...]
+    summary_invalid_fields: tuple[str, ...]
+    evidence_digest: str
+
+    def integrity(self, *, lease_token: str) -> dict[str, Any]:
+        return {
+            "task_id": self.task_id,
+            "frontier": self.frontier,
+            "commit_count": self.committed_batches,
+            "record_count": self.record_count,
+            "prefix_digest": self.evidence_digest,
+            "lease_token": str(lease_token),
+        }
 
 
 _RAW_LOG_KEYS = {"raw_sample", "samples", "message", "content", "raw_log", "log_line"}
@@ -114,20 +149,27 @@ class StreamingStateRepository:
     def claim_task(self, task_id: str) -> dict[str, Any]:
         now = utc_now()
         with self.database.transaction() as connection:
-            row = connection.execute("SELECT task_json FROM streaming_tasks WHERE task_id=?", (task_id,)).fetchone()
+            lock = " FOR UPDATE" if getattr(self.database, "provider", "sqlite") == "postgres" else ""
+            row = connection.execute(
+                "SELECT status,task_json FROM streaming_tasks WHERE task_id=?" + lock, (task_id,)
+            ).fetchone()
             if row is None:
                 raise KeyError(f"Streaming task not found: {task_id}")
-            task = _decode_json(row[0])
-            if task.get("status") == "running":
+            task = _decode_json(row["task_json"])
+            previous_status = str(row["status"] or task.get("status") or "")
+            if previous_status == "running" or task.get("status") == "running":
                 raise StreamingTaskBusyError("流式任务已被其他 Worker 占用")
             task.update({
                 "status": "running", "stage": "READING", "error": None,
                 "lease_token": uuid.uuid4().hex, "updated_at": now,
             })
-            connection.execute(
-                "UPDATE streaming_tasks SET status='running', stage='READING', task_json=?, updated_at=? WHERE task_id=?",
-                (_json(task), now, task_id),
+            updated = connection.execute(
+                "UPDATE streaming_tasks SET status='running', stage='READING', task_json=?, updated_at=? "
+                "WHERE task_id=? AND status=?",
+                (_json(task), now, task_id, previous_status),
             )
+            if updated.rowcount != 1:
+                raise StreamingTaskBusyError("流式任务已被其他 Worker 占用")
             self._append_event(connection, task_id, "task_claimed", {}, now)
         return task
 
@@ -179,7 +221,7 @@ class StreamingStateRepository:
         return task
 
     def mark_completed(self, task_id: str) -> dict[str, Any]:
-        return self._update_task(task_id, status="completed", stage="COMPLETED", event_type="task_completed")
+        raise StreamingIncompleteError("流式任务只能在完整结果代次核验后完成")
 
     def mark_failed(self, task_id: str, error: str, *, conflict: bool = False) -> dict[str, Any]:
         return self._update_task(
@@ -201,6 +243,7 @@ class StreamingStateRepository:
         error: str,
         interrupted: bool = False,
         conflict: bool = False,
+        error_details: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Publish a claimed task's terminal error without overwriting a new owner."""
         now = utc_now()
@@ -221,14 +264,26 @@ class StreamingStateRepository:
             else:
                 status, stage, event_type = "failed", "FAILED", "task_failed"
             task.update({"status": status, "stage": stage, "error": error, "updated_at": now})
+            if error_details is not None:
+                task["error_details"] = dict(error_details)
             connection.execute(
                 "UPDATE streaming_tasks SET status=?, stage=?, task_json=?, updated_at=? WHERE task_id=?",
                 (status, stage, _json(task), now, str(task_id)),
             )
-            self._append_event(connection, str(task_id), event_type, {"error": error}, now)
+            event = {"error": error}
+            if error_details is not None:
+                event["details"] = dict(error_details)
+            self._append_event(connection, str(task_id), event_type, event, now)
         return task
 
-    def complete_claim(self, task_id: str, lease_token: str) -> dict[str, Any]:
+    def complete_claim(
+        self,
+        task_id: str,
+        lease_token: str,
+        *,
+        result_reference: Mapping[str, Any] | None = None,
+        prefix_evidence: PrefixEvidence | None = None,
+    ) -> dict[str, Any]:
         """Complete only the still-running lease that produced the result."""
         now = utc_now()
         with self.database.transaction() as connection:
@@ -241,6 +296,34 @@ class StreamingStateRepository:
             task = _decode_json(row[0])
             if task.get("status") != "running" or str(task.get("lease_token") or "") != str(lease_token):
                 raise StreamingConflictError("流式任务租约已变化，迟到 Worker 不能完成任务")
+            if result_reference is None or prefix_evidence is None:
+                raise StreamingIncompleteError("任务缺少结果完整性证据，不能完成")
+            reference = dict(result_reference)
+            saved_reference = dict(
+                task.get("result_reference") or (task.get("result") or {}).get("result_ref") or {}
+            )
+            if saved_reference != reference or reference.get("task_id") != str(task_id):
+                raise StreamingIncompleteError("结果引用尚未绑定到当前任务")
+            generation_lock = " FOR UPDATE" if getattr(self.database, "provider", "sqlite") == "postgres" else ""
+            generation = connection.execute(
+                "SELECT status,frontier_json,summary_json FROM streaming_result_generations "
+                "WHERE task_id=? AND generation=?" + generation_lock,
+                (str(task_id), str(reference.get("generation") or "")),
+            ).fetchone()
+            if generation is None or generation["status"] != "ready":
+                raise StreamingIncompleteError("结果代次尚未就绪")
+            frontier = _decode_json(generation["frontier_json"])
+            if frontier != task.get("cursor") or frontier != prefix_evidence.frontier:
+                raise StreamingIncompleteError("结果代次与当前提交前沿不一致")
+            generation_summary = _decode_json(generation["summary_json"])
+            expected_integrity = prefix_evidence.integrity(lease_token=lease_token)
+            if generation_summary.get("_integrity") != expected_integrity:
+                raise StreamingIncompleteError("结果完整性证据与当前任务不一致")
+            commit_count = connection.execute(
+                "SELECT COUNT(*) FROM streaming_window_commits WHERE task_id=?", (str(task_id),)
+            ).fetchone()[0]
+            if int(commit_count) != prefix_evidence.committed_batches:
+                raise StreamingIncompleteError("完成任务前已提交批次数发生变化")
             task.update({"status": "completed", "stage": "COMPLETED", "error": None, "updated_at": now})
             connection.execute(
                 "UPDATE streaming_tasks SET status='completed', stage='COMPLETED', task_json=?, updated_at=? WHERE task_id=?",
@@ -295,6 +378,7 @@ class StreamingStateRepository:
         result: Mapping[str, Any],
         *,
         expected_lease_token: str | None = None,
+        result_reference: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         safe_result = dict(result)
         _reject_raw_fields(safe_result)
@@ -313,6 +397,8 @@ class StreamingStateRepository:
             ):
                 raise StreamingConflictError("流式任务租约已变化，迟到 Worker 不能保存结果")
             task["result"] = safe_result
+            if result_reference is not None:
+                task["result_reference"] = dict(result_reference)
             task["updated_at"] = now
             connection.execute(
                 "UPDATE streaming_tasks SET task_json=?, updated_at=? WHERE task_id=?",
@@ -341,6 +427,7 @@ class StreamingStateRepository:
         sanitized_templates = [_safe_template(item) for item in templates]
         sanitized_windows = [_safe_window(item) for item in (windows if windows is not None else templates)]
         commit_summary = dict(summary or {})
+        _validate_new_summary(commit_summary)
         payload_hash = _payload_hash(cursor_value, sanitized_windows, commit_summary)
         now = utc_now()
         with self.database.transaction() as connection:
@@ -349,7 +436,10 @@ class StreamingStateRepository:
             if task_row is None:
                 raise KeyError(f"Streaming task not found: {task_id}")
             task = _decode_json(task_row[0])
-            if fencing_token is not None and str(task.get("lease_token") or "") != str(fencing_token):
+            if fencing_token is not None and (
+                task.get("status") != "running"
+                or str(task.get("lease_token") or "") != str(fencing_token)
+            ):
                 raise StreamingConflictError("流式任务租约已变化，迟到 Worker 不能提交")
             if self.ledger_repository is not None and ledger_batch is None:
                 raise StreamingStateError("启用 operational ledger 时窗口缺少 ingestion receipt")
@@ -460,47 +550,179 @@ class StreamingStateRepository:
     def committed_summary(self, task_id: str) -> dict[str, Any]:
         sums = ("record_count", "template_count", "unknown_template_count", "risk_semantic_matches",
                 "template_event_count", "partition_count")
-        required = (*sums, "worker_count", "parallel", "node_risk_enabled")
+        required = (*sums, "worker_count", "parallel", "node_risk_enabled", "process_start_method")
         totals: dict[str, Any] = {key: 0 for key in sums}
         totals.update(worker_count=0, parallel=False, node_risk_enabled=False)
         missing: set[str] = set()
+        invalid: set[str] = set()
+        methods: set[str] = set()
+        method_unknown = False
         with self.database.connect() as connection:
             rows = connection.execute(
                 "SELECT summary_json FROM streaming_window_commits WHERE task_id=?", (task_id,)
             )
             for row in rows:
                 summary = _decode_json(row[0])
-                missing.update(key for key in required if key not in summary)
+                missing.update(key for key in required if key not in summary or summary.get(key) is None)
                 for key in sums:
-                    totals[key] += int(summary.get(key) or 0)
-                totals["worker_count"] = max(totals["worker_count"], int(summary.get("worker_count") or 0))
+                    value = summary.get(key)
+                    if _is_nonnegative_int(value):
+                        totals[key] += value
+                    elif value is not None:
+                        invalid.add(key)
+                workers = summary.get("worker_count")
+                if _is_nonnegative_int(workers):
+                    totals["worker_count"] = max(totals["worker_count"], workers)
+                elif workers is not None:
+                    invalid.add("worker_count")
                 for key in ("parallel", "node_risk_enabled"):
-                    totals[key] = bool(totals[key] or summary.get(key))
+                    value = summary.get(key)
+                    if isinstance(value, bool):
+                        totals[key] = totals[key] or value
+                    elif value is not None:
+                        invalid.add(key)
+                method = summary.get("process_start_method")
+                if isinstance(method, str) and method in {"spawn", "fork", "forkserver"}:
+                    methods.add(method)
+                elif method == "not_applicable":
+                    pass
+                elif method is not None:
+                    invalid.add("process_start_method")
+                else:
+                    method_unknown = True
         for key in missing:
+            if key in {"parallel", "node_risk_enabled"} and totals[key] is True:
+                continue
             totals[key] = None
-        totals["completeness"] = "legacy_partial" if missing else "complete"
+        for key in invalid:
+            totals[key] = None
+        if method_unknown:
+            totals["process_start_method"] = "unknown"
+        elif len(methods) > 1:
+            totals["process_start_method"] = "mixed"
+        elif methods:
+            totals["process_start_method"] = next(iter(methods))
+        else:
+            totals["process_start_method"] = "not_applicable"
+        totals["unknown_fields"] = sorted(missing)
+        totals["invalid_fields"] = sorted(invalid)
+        totals["completeness"] = "legacy_partial" if missing or invalid else "complete"
         return totals
 
     def has_legacy_partial_commits(self, task_id: str) -> bool:
+        try:
+            self.require_complete_prefix(task_id)
+        except StreamingIncompleteError:
+            return True
+        return False
+
+    def require_complete_prefix(self, task_id: str) -> PrefixEvidence:
+        summary = self.committed_summary(task_id)
         with self.database.connect() as connection:
-            row = connection.execute(
-                "SELECT COUNT(*) AS legacy_count FROM streaming_window_commits "
-                "WHERE task_id=? AND payload_hash IS NULL",
-                (task_id,),
+            task_row = connection.execute(
+                "SELECT task_json FROM streaming_tasks WHERE task_id=?", (task_id,)
             ).fetchone()
-            task = connection.execute("SELECT task_json FROM streaming_tasks WHERE task_id=?", (task_id,)).fetchone()
-            summaries = connection.execute("SELECT summary_json FROM streaming_window_commits WHERE task_id=?", (task_id,))
-            records = sum(int(_decode_json(item[0]).get("record_count") or 0) for item in summaries)
-        return int(row["legacy_count"] or 0) > 0 or (
-            task is not None and int(_decode_json(task[0]).get("records_processed") or 0) != records
+            if task_row is None:
+                raise KeyError(f"Streaming task not found: {task_id}")
+            task = _decode_json(task_row[0])
+            commits = connection.execute(
+                "SELECT window_id,cursor_json,summary_json,payload_hash,state_manifest_json "
+                "FROM streaming_window_commits WHERE task_id=? ORDER BY committed_at,window_id",
+                (task_id,),
+            )
+            digest = hashlib.sha256()
+            commit_count = 0
+            record_count = 0
+            previous_cursor = SourceCursor.empty()
+            manifest_unknown = False
+            last_manifest: dict[str, Any] | None = None
+            for row in commits:
+                commit_count += 1
+                cursor = _decode_json(row["cursor_json"])
+                commit_summary = _decode_json(row["summary_json"])
+                value = commit_summary.get("record_count")
+                if not _is_nonnegative_int(value):
+                    self._raise_incomplete("批摘要缺少可信 record_count", reason="record_count")
+                record_count += value
+                if not _cursor_is_at_least(cursor, previous_cursor):
+                    self._raise_incomplete("提交批次的来源前沿不单调", reason="frontier")
+                previous_cursor = SourceCursor.from_dict(cursor)
+                payload_hash = str(row["payload_hash"] or "")
+                if not payload_hash:
+                    self._raise_incomplete("历史批次缺少 payload hash", reason="legacy_hash")
+                actual_hash, window_count = _stored_payload_hash(
+                    connection, task_id, str(row["window_id"]), cursor, commit_summary
+                )
+                if actual_hash != payload_hash:
+                    self._raise_incomplete("已提交窗口与 payload hash 不一致", reason="payload_hash")
+                template_count = commit_summary.get("template_count")
+                if _is_nonnegative_int(template_count) and template_count != window_count:
+                    self._raise_incomplete("批摘要窗口数与持久事实不一致", reason="window_count")
+                if row["state_manifest_json"] is None:
+                    manifest_unknown = True
+                    last_manifest = None
+                else:
+                    manifest = _decode_json(row["state_manifest_json"])
+                    if (
+                        not isinstance(manifest, dict)
+                        or not str(manifest.get("generation") or "")
+                        or not isinstance(manifest.get("files"), dict)
+                    ):
+                        self._raise_incomplete("批次状态 manifest 无效", reason="manifest")
+                    last_manifest = manifest
+                digest.update(str(row["window_id"]).encode("utf-8"))
+                digest.update(payload_hash.encode("ascii"))
+                digest.update(_json(cursor).encode("utf-8"))
+            task_cursor = SourceCursor.from_dict(task.get("cursor"))
+            if commit_count == 0:
+                if (
+                    task_cursor != SourceCursor.empty()
+                    or int(task.get("windows_committed") or 0) != 0
+                    or int(task.get("records_processed") or 0) != 0
+                    or task.get("pending_external_commit") is not None
+                    or task.get("miner_generation") is not None
+                ):
+                    self._raise_incomplete("无提交批次的任务包含非初始前沿", reason="cursor_only")
+            elif task_cursor.to_dict() != previous_cursor.to_dict():
+                self._raise_incomplete("任务来源前沿与最后提交批次不一致", reason="frontier")
+            if last_manifest is not None and task.get("miner_generation") != last_manifest:
+                self._raise_incomplete("任务 miner generation 与最后提交批次不一致", reason="manifest_frontier")
+            if int(task.get("windows_committed") or 0) != commit_count:
+                self._raise_incomplete("任务批次数与持久提交不一致", reason="commit_count")
+            if not _is_nonnegative_int(task.get("records_processed")) or int(task["records_processed"]) != record_count:
+                self._raise_incomplete("任务记录数与持久提交不一致", reason="record_count")
+        digest.update(_json(task_cursor.to_dict()).encode("utf-8"))
+        digest.update(str(commit_count).encode("ascii"))
+        digest.update(str(record_count).encode("ascii"))
+        return PrefixEvidence(
+            task_id=task_id,
+            frontier=task_cursor.to_dict(),
+            committed_batches=commit_count,
+            record_count=record_count,
+            result_completeness="complete",
+            manifest_history="legacy_unknown" if manifest_unknown else "bound",
+            summary_unknown_fields=tuple(summary["unknown_fields"]),
+            summary_invalid_fields=tuple(summary["invalid_fields"]),
+            evidence_digest=digest.hexdigest(),
         )
 
-    def require_complete_prefix(self, task_id: str) -> None:
-        if self.has_legacy_partial_commits(task_id):
-            raise StreamingIncompleteError(
-                "legacy_partial: 已提交前缀缺少完整事实，禁止继续读取或生成完整结果；"
-                "请在原始文件仍可验证时显式创建新 Run 重算"
-            )
+    @staticmethod
+    def _raise_incomplete(message: str, *, reason: str) -> None:
+        raise StreamingIncompleteError(
+            "legacy_partial: " + message + "；请在原始文件仍可验证时显式创建新 Run 重算",
+            details={
+                "status": "failed",
+                "error_code": "STREAMING_PREFIX_INCOMPLETE",
+                "result_authoritative": False,
+                "streaming_result_completeness": "legacy_partial",
+                "reason": reason,
+                "recovery": {
+                    "resume_allowed": False,
+                    "recommended_action": "explicit_recompute",
+                    "source_verification_required": True,
+                },
+            },
+        )
 
     def iter_committed_windows(
         self,
@@ -616,6 +838,75 @@ def _payload_hash(cursor: Mapping[str, Any], windows: list[dict[str, Any]], summ
     return hashlib.sha256(
         json.dumps(payload, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8")
     ).hexdigest()
+
+
+def _stored_payload_hash(
+    connection: Any,
+    task_id: str,
+    window_id: str,
+    cursor: Mapping[str, Any],
+    summary: Mapping[str, Any],
+) -> tuple[str, int]:
+    """Reproduce the historical payload hash without materializing a whole batch."""
+
+    digest = hashlib.sha256()
+    digest.update(b'{"cursor":')
+    digest.update(_canonical_json(dict(cursor)).encode("utf-8"))
+    digest.update(b',"summary":')
+    digest.update(_canonical_json(dict(summary)).encode("utf-8"))
+    digest.update(b',"windows":[')
+    after = -1
+    count = 0
+    while True:
+        rows = connection.execute(
+            "SELECT item_index,window_json FROM streaming_batch_windows "
+            "WHERE task_id=? AND window_id=? AND item_index>? ORDER BY item_index LIMIT 250",
+            (task_id, window_id, after),
+        ).fetchall()
+        if not rows:
+            break
+        for row in rows:
+            index = int(row["item_index"])
+            if index != count:
+                raise StreamingIncompleteError(
+                    "legacy_partial: 批次窗口 item_index 不连续",
+                    details={"error_code": "STREAMING_PREFIX_INCOMPLETE", "reason": "window_index"},
+                )
+            if count:
+                digest.update(b",")
+            digest.update(_canonical_json(_decode_json(row["window_json"])).encode("utf-8"))
+            count += 1
+            after = index
+    digest.update(b"]}")
+    return digest.hexdigest(), count
+
+
+def _is_nonnegative_int(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+
+def _canonical_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+
+
+def _validate_new_summary(summary: Mapping[str, Any]) -> None:
+    if summary.get("summary_schema_version") is None:
+        return
+    if summary.get("summary_schema_version") != 2:
+        raise StreamingStateError("批摘要 schema version 无效")
+    integer_fields = (
+        "record_count", "template_count", "unknown_template_count", "risk_semantic_matches",
+        "template_event_count", "partition_count", "worker_count",
+    )
+    for key in integer_fields:
+        if not _is_nonnegative_int(summary.get(key)):
+            raise StreamingStateError(f"批摘要 {key} 必须是非负整数")
+    for key in ("parallel", "node_risk_enabled"):
+        if not isinstance(summary.get(key), bool):
+            raise StreamingStateError(f"批摘要 {key} 必须是布尔值")
+    method = summary.get("process_start_method")
+    if method not in {"spawn", "fork", "forkserver", "not_applicable"}:
+        raise StreamingStateError("批摘要 process_start_method 无效")
 
 
 def _cursor_is_at_least(candidate: Mapping[str, Any], current: SourceCursor) -> bool:

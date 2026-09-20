@@ -28,6 +28,15 @@ def build_agent_tool_registry(feature_jobs: Any, rule_governance: Any, knowledge
     def approved_rules(arguments: dict[str, Any], context: AgentToolContext) -> dict[str, Any]:
         components = set(map(str, arguments.get("components") or []))
         hashes = set(map(str, arguments.get("template_hashes") or []))
+        finder = getattr(rule_governance, "find_active_rules_by_evidence", None)
+        if callable(finder):
+            rows = finder(hashes, components, scope=None, cursor=None, limit=500)
+            items = [{
+                "rule_id": rule.get("rule_id"), "title": rule.get("title"),
+                "feature_type": rule.get("feature_type"), "status": rule.get("status"),
+                "template_signatures": rule.get("template_signatures") or [],
+            } for rule in rows]
+            return {"items": items, "total": len(items), "matched": len(items), "truncated": False}
         items = []
         page_number, total, scanned = 1, 0, 0
         while True:
@@ -36,8 +45,15 @@ def build_agent_tool_registry(feature_jobs: Any, rule_governance: Any, knowledge
             total = int((page.get("pagination") or {}).get("total", scanned + len(rows)))
             for rule in rows:
                 signatures = rule.get("template_signatures") or []
-                rule_hashes = {str(item.get("template_hash") or item.get("template_fingerprint") or "") for item in signatures}
-                rule_components = {str(item.get("component") or "") for item in signatures}
+                rule_hashes = {
+                    str(value)
+                    for item in signatures
+                    for value in (item.get("template_hash"), item.get("template_fingerprint"))
+                    if value
+                }
+                rule_components = set(map(str, rule.get("components") or [])) | {
+                    str(item.get("component")) for item in signatures if item.get("component")
+                }
                 if (not hashes or hashes & rule_hashes) and (not components or components & rule_components):
                     items.append({
                         "rule_id": rule.get("rule_id"), "title": rule.get("title"), "feature_type": rule.get("feature_type"),

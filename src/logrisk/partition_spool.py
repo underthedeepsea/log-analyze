@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -23,10 +24,18 @@ def spool_normalized_records(
     partition_by_node: bool = True,
     progress_callback=None,
     semantic_extractor=None,
+    max_open_files: int = 64,
 ) -> dict[str, Any]:
     root = Path(spool_dir)
     root.mkdir(parents=True, exist_ok=True)
-    handles: dict[tuple[str, ...], Any] = {}
+    try:
+        import resource
+        soft_limit = int(resource.getrlimit(resource.RLIMIT_NOFILE)[0])
+    except (ImportError, AttributeError, OSError, ValueError):
+        soft_limit = 256
+    writer_budget = max(1, min(int(max_open_files), max(1, soft_limit - 32)))
+    handles: OrderedDict[tuple[str, ...], Any] = OrderedDict()
+    ever_opened: set[tuple[str, ...]] = set()
     entries: dict[tuple[str, ...], dict[str, Any]] = {}
     total = 0
     try:
@@ -39,13 +48,17 @@ def spool_normalized_records(
                 digest = hashlib.sha256("\x1f".join(key).encode("utf-8")).hexdigest()[:16]
                 partition_id = f"partition-{digest}"
                 filename = partition_id + ".jsonl"
-                handles[key] = (root / filename).open("w", encoding="utf-8")
-                entries[key] = {
-                    "partition_id": partition_id,
-                    "partition_key": list(key),
-                    "path": filename,
-                    "record_count": 0,
-                }
+                if len(handles) >= writer_budget:
+                    _, evicted = handles.popitem(last=False)
+                    evicted.close()
+                handles[key] = (root / filename).open("a" if key in ever_opened else "w", encoding="utf-8")
+                ever_opened.add(key)
+                entries.setdefault(key, {
+                    "partition_id": partition_id, "partition_key": list(key),
+                    "path": filename, "record_count": 0,
+                })
+            else:
+                handles.move_to_end(key)
             handles[key].write(json.dumps(normalized, ensure_ascii=False, separators=(",", ":")) + "\n")
             entries[key]["record_count"] += 1
             total += 1
@@ -58,6 +71,7 @@ def spool_normalized_records(
         "schema_version": "1.0",
         "status": "SPOOLING",
         "total_records": total,
+        "max_open_files": writer_budget,
         "partitions": [entries[key] for key in sorted(entries)],
     }
     _atomic_json(root / "manifest.json", manifest)

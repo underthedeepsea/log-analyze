@@ -46,7 +46,7 @@ def test_review_request_uses_trusted_actor_scope_and_does_not_reaudit_replay(tmp
         calls.append((args, kwargs))
         return {"status": "approved", "decision_id": "decision-a", "idempotent_replay": True}
 
-    facade = ApiFacade(container, version="1.38.1", service_resolver=lambda name, default: (
+    facade = ApiFacade(container, version="1.39.1", service_resolver=lambda name, default: (
         SimpleNamespace(update_feature=update) if name == "feature_jobs" else default
     ))
     identity = RequestIdentity("reviewer-a", ("logrisk:operator",), "request-a", True, "trusted_proxy", "127.0.0.1")
@@ -77,7 +77,7 @@ def test_readiness_reports_unavailable_source_status_without_exposing_storage_er
         raise DatabaseError("sensitive connection details")
 
     monkeypatch.setattr(container, "source_capabilities", unavailable)
-    response = ApiFacade(container, version="1.38.1").runtime_readiness()
+    response = ApiFacade(container, version="1.39.1").runtime_readiness()
     assert response.status == 503
     assert response.body["ready"] is False
     assert response.body["dependencies"]["kafka"]["active_tasks"] is None

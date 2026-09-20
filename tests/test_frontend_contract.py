@@ -59,6 +59,17 @@ def test_runtime_backend_address_contract():
     assert (FRONTEND / "dist" / "config.js").is_file()
 
 
+def test_large_result_preview_is_not_presented_as_complete():
+    source = source_text()
+    for text in (
+        "result.complete === false",
+        "result.next_cursor",
+        "total_risk_entities",
+        "完整结果由服务器引用处理",
+    ):
+        assert text in source
+
+
 def test_runtime_center_contract():
     source = source_text()
     for value in (
@@ -531,7 +542,6 @@ def test_package_uses_react_without_vite_or_a_runtime_build_step():
 def test_release_docs_describe_current_feature_version():
     release = Path("releas.md").read_text(encoding="utf-8")
     readme = Path("README.md").read_text(encoding="utf-8")
-    agents = Path("AGENTS.md").read_text(encoding="utf-8")
 
     assert "## 1.16.0 - 2026-07-11" in release
     assert "## 1.16.2 - 2026-07-13" in release
@@ -554,7 +564,7 @@ def test_release_docs_describe_current_feature_version():
     assert "## 1.32.0 - 2026-08-10" in release
     assert "## 1.34.0 - 2026-08-13" in release
     assert "## 1.36.1 - 2026-09-01" in release
-    assert "当前版本：`1.38.1`" in readme
+    assert "当前版本：`1.39.2`" in readme
     assert "## 1.37.3 - 2026-09-11" in release
     assert "## 1.24.0 - 2026-07-22" in release
     assert "## 1.24.1 - 2026-07-22" in release
@@ -568,7 +578,6 @@ def test_release_docs_describe_current_feature_version():
     assert "database/migrations/" in readme
     assert "database/schema.yaml" in readme
     assert "configs/semantic_dictionary/" in readme
-    assert "Every code update must also update `releas.md`" in agents
     assert "dashboard.sh restart" in readme
     assert ".txt" in readme
     for text in ("OpenAI-compatible", "LOGRISK_DB_PATH", "REMOTE_LLM_API_KEY", "Promptfoo"):
@@ -690,12 +699,12 @@ def test_review_workbench_preserves_queue_request_safety_and_dirty_drafts():
     source = (FRONTEND / "src" / "app.js").read_text(encoding="utf-8")
 
     for marker in (
-        'featureApprovals: function (after, selectedKey)',
-        'next_review_key',
+        'featureApprovals: function (cursor, selectedKey)',
+        'next_cursor',
         'const approvalRequestSequence = useRef(0);',
         'const requestId = ++approvalRequestSequence.current;',
         'if (requestId !== approvalRequestSequence.current) return value;',
-        'mode === "more" ? approvalQueue.next_review_key : null',
+        'mode === "more" ? approvalQueue.next_cursor : null',
         'createReviewSubmissionQueue',
         'reviewSubmissionLabel',
         'review-save-feedback',

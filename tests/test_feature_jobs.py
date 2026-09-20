@@ -13,6 +13,28 @@ from logrisk.processing_metrics import ProcessingMetricsStore
 from logrisk.sqlite_stores import SQLiteApprovalGroupStore, SQLiteApprovedRuleStore, SQLiteFeatureJobStore
 
 
+def test_history_cache_restores_without_bulk_load_and_evicts_passive_jobs(tmp_path, monkeypatch):
+    store = SQLiteFeatureJobStore(SQLiteDatabase(tmp_path / "history.sqlite3"))
+    manager = FeatureJobManager(auto_start=False, persistence=store)
+    old_ids = []
+    for index in range(4):
+        job_id = manager.create_job({"risk_entities": [entity(f"history-{index}", 90)]}, model="fake")
+        job = manager._jobs[job_id]
+        job["status"] = "completed"
+        store.save(job)
+        old_ids.append(job_id)
+    monkeypatch.setattr(store, "load", lambda: pytest.fail("bulk historical load"))
+    restored = FeatureJobManager(auto_start=False, persistence=store, history_cache_bytes=1)
+    assert not restored._jobs
+    active_id = restored.create_job({"risk_entities": [entity("active", 90)]}, model="fake")
+    for job_id in old_ids:
+        assert restored._job(job_id)["job_id"] == job_id
+        assert active_id not in restored._jobs
+    assert len(restored._jobs) == 1
+    assert len(restored.list_jobs()) == 5
+
+
+
 def entity(entity_id, score, log_count=2, entity_type="node"):
     return {
         "window_start": "2026-06-22T10:00:00+08:00",

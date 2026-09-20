@@ -88,7 +88,9 @@ def test_publish_and_rollback_atomically_change_active_snapshot(tmp_path):
     assert published["status"] == "published"
     assert store.active_snapshot()["content_hash"] == second["content_hash"]
 
-    rolled_back = store.rollback(candidate["config_id"], 1, {"confirmed": True, "operator": "qa"})
+    with pytest.raises(DrainQualityError):
+        store.rollback(candidate["config_id"], 1, {"confirmed": True, "operator": "qa"})
+    rolled_back = store.rollback("baseline", 1, {"confirmed": True, "operator": "qa"})
     assert rolled_back["status"] == "published"
     assert store.active_snapshot()["version"] == 1
     events = (tmp_path / "quality" / "config_events.jsonl").read_text(encoding="utf-8")

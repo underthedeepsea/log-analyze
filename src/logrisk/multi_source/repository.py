@@ -203,7 +203,7 @@ class MultiSourceRepository:
         now = utc_now()
         with self.database.transaction() as connection:
             connection.execute(
-                "INSERT INTO multi_source_correlations(correlation_id, rule_id, rule_version, cluster, primary_entity_key, window_start, window_end, confidence, risk_score, source_families_json, schema_version, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'multi_source_correlation_v1', ?, ?) ON CONFLICT(correlation_id) DO UPDATE SET window_start=excluded.window_start, window_end=excluded.window_end, confidence=excluded.confidence, risk_score=excluded.risk_score, source_families_json=excluded.source_families_json, updated_at=excluded.updated_at",
+                "INSERT INTO multi_source_correlations(correlation_id, rule_id, rule_version, cluster, primary_entity_key, window_start, window_end, confidence, risk_score, source_families_json, edges_json, group_scope, partial, schema_version, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'multi_source_correlation_v1', ?, ?) ON CONFLICT(correlation_id) DO UPDATE SET window_start=excluded.window_start, window_end=excluded.window_end, confidence=excluded.confidence, risk_score=excluded.risk_score, source_families_json=excluded.source_families_json, edges_json=excluded.edges_json, group_scope=excluded.group_scope, partial=excluded.partial, updated_at=excluded.updated_at",
                 (
                     str(correlation["correlation_id"]),
                     str(correlation["rule_id"]),
@@ -215,6 +215,9 @@ class MultiSourceRepository:
                     float(correlation["confidence"]),
                     float(correlation["risk_score"]),
                     _json(list(correlation.get("source_families") or [])),
+                    _json(list(correlation.get("edges") or [])),
+                    str(correlation.get("group_scope") or "shared_entity"),
+                    bool(correlation.get("partial")),
                     now,
                     now,
                 ),
@@ -272,10 +275,22 @@ class MultiSourceRepository:
     def entity_correlations(self, entity_key: str, *, limit: int = 100) -> list[dict[str, Any]]:
         with self.database.connect() as connection:
             rows = connection.execute(
-                "SELECT * FROM multi_source_correlations WHERE primary_entity_key=? ORDER BY window_start DESC LIMIT ?",
-                (entity_key, max(1, min(int(limit), 500))),
+                "SELECT * FROM multi_source_correlations ORDER BY window_start DESC LIMIT ?",
+                (max(1, min(int(limit) * 5, 1000)),),
             ).fetchall()
-        return [self._correlation(row) for row in rows]
+        result = []
+        for row in rows:
+            correlation = self._correlation(row)
+            edge_entities = {
+                str(value)
+                for edge in correlation.get("edges") or []
+                for value in edge.get("entity_keys") or []
+            }
+            if correlation["primary_entity_key"] == entity_key or entity_key in edge_entities:
+                result.append(correlation)
+                if len(result) >= limit:
+                    break
+        return result
 
     def summary(self) -> dict[str, Any]:
         with self.database.connect() as connection:
@@ -471,4 +486,7 @@ class MultiSourceRepository:
             "confidence": float(row["confidence"]),
             "risk_score": float(row["risk_score"]),
             "source_families": _array(row["source_families_json"]),
+            "edges": _array(row["edges_json"]),
+            "group_scope": str(row["group_scope"]),
+            "partial": bool(row["partial"]),
         }

@@ -21,6 +21,11 @@ GOLD_REQUIRED = (
     "annotation_status",
 )
 
+PREDICTION_FIELDS = frozenset({
+    "record_id", "predicted_group_id", "predicted_template",
+    "predicted_semantic_fields", "predicted_risk_type",
+})
+
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -43,6 +48,22 @@ def validate_gold_record(record: Any) -> dict[str, Any]:
         raise DrainQualityError("protected_tokens 必须是字符串数组")
     if record["annotation_status"] not in {"draft", "review", "approved", "ignored"}:
         raise DrainQualityError("annotation_status 无效")
+    return dict(record)
+
+
+def validate_prediction(record: Any) -> dict[str, Any]:
+    if not isinstance(record, dict):
+        raise DrainQualityError("prediction 必须是 JSON object")
+    extra = set(record) - PREDICTION_FIELDS
+    if extra:
+        raise DrainQualityError("预测字段不允许覆盖 Gold 或携带未知字段: " + ", ".join(sorted(extra)))
+    if not isinstance(record.get("record_id"), str) or not record["record_id"].strip():
+        raise DrainQualityError("prediction record_id 必须是非空字符串")
+    for field in ("predicted_group_id", "predicted_template"):
+        if field not in record or not isinstance(record[field], str):
+            raise DrainQualityError(f"prediction 缺少字段: {field}")
+    if "predicted_semantic_fields" in record and not isinstance(record["predicted_semantic_fields"], dict):
+        raise DrainQualityError("predicted_semantic_fields 必须是 object")
     return dict(record)
 
 

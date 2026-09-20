@@ -203,6 +203,9 @@ class LegacyStateImporter:
                     "INSERT INTO feature_candidates(candidate_id, job_id, entity_id, status, candidate_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
                     (candidate_id, job["job_id"], (candidate.get("entity") or {}).get("id"), candidate.get("status"), json.dumps(candidate, ensure_ascii=False), candidate.get("created_at") or utc_now(), utc_now()),
                 )
+                from logrisk.approval_projection import update_projection
+                persisted = connection.execute("SELECT candidate_json,status,job_id FROM feature_candidates WHERE candidate_id=?",(candidate_id,)).fetchone()
+                update_projection(connection,dict(json.loads(persisted[0]),candidate_id=candidate_id,status=persisted[1],job_id=persisted[2]))
             for event in events:
                 connection.execute(
                     "INSERT INTO feature_job_events(job_id, sequence, event_type, event_json, created_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",

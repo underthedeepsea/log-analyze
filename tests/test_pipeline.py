@@ -110,12 +110,12 @@ def test_pipeline_keeps_structural_template_and_distinct_semantic_values(tmp_pat
 def test_pipeline_classifies_xid_and_updates_node_risk_ledger(tmp_path):
     database = SQLiteDatabase(tmp_path / "state" / "logrisk.sqlite3")
     semantics = RiskSemanticService(database, "configs/risk_semantics/builtin.yaml")
-    node_risks = NodeRiskService(database, "configs/node_risk.yaml")
+    node_risks = NodeRiskService(database, "configs/node_risk.yaml", clock=lambda: "2026-07-19T12:00:00+00:00")
 
     result = analyze_records(
         records=[
-            {"message": "Jul 19 10:00:00 gpu-01 kernel: NVRM: Xid (0000:65:00): 35, Video processor exception", "raw_log_id": "xid-35"},
-            {"message": "Jul 19 10:00:01 gpu-01 kernel: NVRM: Xid (0000:65:00): 79, GPU has fallen off the bus", "raw_log_id": "xid-79"},
+            {"timestamp": "2026-07-19T10:00:00+00:00", "message": "Jul 19 10:00:00 gpu-01 kernel: NVRM: Xid (0000:65:00): 35, Video processor exception", "raw_log_id": "xid-35"},
+            {"timestamp": "2026-07-19T10:00:01+00:00", "message": "Jul 19 10:00:01 gpu-01 kernel: NVRM: Xid (0000:65:00): 79, GPU has fallen off the bus", "raw_log_id": "xid-79"},
         ],
         config_path="configs/drain3_recommended.ini",
         rules_path="configs/risk_rules.yaml",

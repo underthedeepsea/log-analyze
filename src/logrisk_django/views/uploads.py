@@ -183,9 +183,11 @@ def input_job_progress(_request: HttpRequest, input_job_id: str) -> JsonResponse
 @require_GET
 def input_job_result(_request: HttpRequest, input_job_id: str) -> JsonResponse:
     try:
-        return JsonResponse({"result": get_container().input_jobs.get_result(input_job_id)}, json_dumps_params={"ensure_ascii": False})
+        return JsonResponse({"result": get_container().input_jobs.get_result_page(input_job_id,cursor=_request.GET.get("cursor"),limit=int(_request.GET.get("limit","100")),collection=_request.GET.get("collection","entities"),window_key=_request.GET.get("window_key"))}, json_dumps_params={"ensure_ascii": False})
     except KeyError:
         return _error(404, "input_job_result_not_found", "输入任务结果尚不可用")
+    except ValueError as exc:
+        return _error(422,"invalid_result_cursor",str(exc))
 
 
 def _error(status: int, code: str, message: str) -> JsonResponse:

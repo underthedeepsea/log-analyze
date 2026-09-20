@@ -6,6 +6,56 @@
 - 仅修复 Bug 时提升最后一位，例如 `1.2.0 → 1.2.1`；
 - 每次代码更新必须同步更新本文件。
 
+## 1.39.2 - 2026-09-20
+
+### Fixed
+
+- B12 PR #41 定点修复三值摘要合同：已有合法 True 时保留 any=True 并继续披露历史缺值；非法历史启动方式不再被已知方法覆盖；重算快照身份冲突分别保留外层 InputJob failed 与底层 StreamingTask conflict 语义，并补充摘要真值表回归。
+- B12 恢复合同闭环：按页核验 committed prefix 的 cursor、批次、窗口与历史 payload hash；结果 generation 绑定前缀摘要、租约和当前前沿，只有 ready 且仍匹配的结果才能完成任务。批摘要改为版本化严格类型并区分业务完整性、执行统计 unknown、manifest 历史及 miner 可恢复性。
+- PostgreSQL task claim 使用行锁与状态 CAS；pipeline 只使用 claim/clear 返回的新 task 快照。节点副作用 fresh/resume 共用错误策略和持久身份，保留实际成功数并单列 partial delivery；恢复不再用当前语义修订覆盖历史窗口。
+- 显式 recompute 对可信完整摘要或首尾已覆盖全文件的小来源开放；大文件弱身份拒绝。非共享来源复制到 fsync 的受控快照，注册应用入口创建可调度新任务，并默认隔离全局节点及多来源副作用。修正 B12 回归中的多来源表名并补齐前缀、重算和非空关联合同测试。
+- B12 重算测试按受控快照与隔离副作用合同执行，保留原文件身份不匹配的拒绝断言；新增注册入口到实际执行的集成回归，以及快照在派发前等长改写时持久化失败、禁止结果和全局副作用的断言。验证结果另行记录，本条不宣称已验收。
+
+## 1.39.0 - 未发布（开发中）
+
+### In progress
+
+- Task 05–09 operational-ledger foundation work is present in the shared
+  working tree; shared container, API, Dashboard/Django, frontend, static
+  asset, retention, and migration integration remains pending. This entry is
+  an unpublished development record and does not claim feature acceptance.
+
+### Fixed
+
+- B12 单次人工 continuation 候选：旧 checkpoint 缺前缀时在读取、派生和投影前 failed 闭锁；InputJobStore.create_recompute 显式校验原 file/upload 快照后创建独立新任务，保留旧证据。完整批次统计按 sum/max/any 归约，节点成功数核对持久贡献，旧缺字段显示不完整。新增双 Provider 0031，将每批 manifest 与 cursor 同事务绑定，旧行保持 NULL，重复提交保留原绑定。验证结果单独记录，本条不宣称已验收。
+
+- B10 引用式 FeatureJob 的 Worker 按页执行，实体状态、候选和事件增量持久化；任务详情返回精确总数与有界预览游标，Dashboard 与 Django 共用分页提示和下一页入口。中断 Worker 可从持久化实体状态继续，审批候选仍完整保留。
+  候选审批回归使用包限定测试夹具导入，确保实际执行完整候选生成、审批持久化及已批准导出链路。
+  双 Web 分页回归按结果文档合同提供空 `risk_entities`，由服务端结果引用加载全部实体，并验证跨任务与无效游标拒绝。
+  集中修复分页容器的相邻调用契约：离线审批修复通过事务绑定 Store 加载并保持轻量快照；同身份审批复用已持久化候选/事件，避免重复缓存与回滚后残留；Agent 候选登记持久化实体关联，重启后仍可完整审批与导出。
+  独立审查加固：引用输入用 building/failed/ready 门禁，完整消费后才 queued，失败或进程中断的部分输入不可执行；实体/候选页先读取 UTF-8 长度投影，预算内再逐条取 JSON。候选、审批组、实体关联/完成状态和事件共用事务，Worker/规则复用/Agent 路径均受保护；审批回滚按实际触达任务恢复 sibling 缓存，保留活对象与 Condition。cursor 明确为绑定作用域的 keyset 位置协议，允许同域 seek，不作为授权凭证。
+  PostgreSQL 的分页字节预算先将 JSONB 显式转换为 TEXT，再用 `octet_length` 计算 UTF-8 字节，避免对 JSONB 直接调用不支持的长度函数；SQLite 继续按 BLOB 字节长度执行同一预算合同。
+  缓存淘汰后的引用任务在审批事务中按需恢复时，分页实体、候选和事件代理会在提交后重新绑定无连接 Store，避免继续持有已关闭事务连接，并覆盖审批后详情、事件及导出链路。
+
+- B07 后续修复：仅在本进程 `run_job` 执行期间或实际事件等待期间固定缓存对象，异常、超时和取消路径均释放；无等待者的被动 queued/running 缓存可按字节淘汰，并原位刷新外部 Worker 已持久化的完成状态，保留等待者对象与 Condition。
+- 历史 FeatureJob 缓存按字节淘汰并固定活跃对象，启动逐任务恢复、历史详情按需加载；结果引用经安全持久化保留，默认多源 ingest 响应保持原有三字段兼容合同。
+- 0029 将新格式节点物理贡献与语义派生版本分离，CAS 替换撤销旧贡献，历史版本重放不重新生效；0030 增加可恢复窗口/成员/实体结果投影，大结果使用引用和有界分页。引用式 FeatureJob 按稳定实体键分页创建、增量 UPSERT 与恢复，不再在内存、任务 JSON 或保存事务中全量物化并 DELETE 重写实体；界面明确区分有界预览和完整服务端结果。
+- 无可信服务端 runner 时，配置与旧 Profile 推广固定闭锁；调参候选明确 not_executed，参考评测 completed_at 为空，候选配置不可绕过发布门禁回滚激活。
+
+- AUDIT-20260916 接管补齐：审批 canonical 轻投影和可原样回传的 opaque cursor（0028）；节点 dirty revision/CAS、读取补偿与不可变评分样本（0027）；旧历史缺少评分样本显示 uncertain。迟到贡献不重开已恢复事件，重复贡献不重复刷新。
+- 流式批次使用独立 miner generation，提交前强制快照、fsync 和 SHA-256 manifest，数据库引用已提交代；恢复补偿已提交节点贡献。关联使用实体/来源/时间桶召回；同一共享模型 client 的物理调用隔离并冻结线程本地用量。
+
+- 修复 SQLite 所有连接退出上下文后未关闭、单迁移失败留下半套 DDL/数据，以及 PostgreSQL cursor wrapper 迭代时隐式 `fetchall`；SQLite 迁移现在使用引擎完整语句边界并按迁移原子提交。
+- 规则 UI 改为数据库分页和页内批量活动统计，Agent 规则检索跳过健康度投影并同时识别顶层组件、template hash 与 fingerprint；数据库 Trace 的列表、详情和当日汇总下推到 SQL。
+- 审批重放先做轻量幂等查询且回滚日志只覆盖目标及实际触达的 sibling 缓存；审批队列弃用会因集合收缩漏项的数字 cursor，统一使用稳定 Review Key。
+- 分区 spool 使用受文件描述符预算约束的 LRU writer；流式任务增加字节批次上限并在一个逻辑任务内复用 executor。SQLite/PostgreSQL 新增 `0025_streaming_batch_windows.sql`，保存完整脱敏批次窗口与 payload 摘要，恢复从全部提交事实重建且旧批次重放不再回退游标。
+- B11 进程池改为逻辑任务内惰性创建并复用；单分区批次保持纯串行，初始化失败进入任务失败状态，成功、异常和取消出口统一关闭池并取消待执行任务。多分区的 in-flight future 保持有界，异步完成结果按 manifest 分片顺序归并。
+  任务 claim 后的 pending external commit、初始化、挖掘、结果投影与完成持久化统一纳入终止边界；取消/进程退出类异常在执行器收尾后标记 interrupted，普通异常标记 failed，并按 lease 防止迟到 Worker 覆盖新任务或已完成状态。业务异常与执行器清理同时失败时保留原异常。
+  Dashboard 文件输入与 Kafka 包装层不再借用当前数据库 lease 代替底层 Worker 发布流式终态，Busy 调用不会覆盖真正 owner；文件输入取消时只同步关闭自身 input job 的 running 状态并继续传播取消信号。
+- 统一跨批窗口的次数、严重度、首末时间和语义值分布；未知事件时间不再替换为处理时钟。节点贡献绑定稳定 source batch/语义修订，知悉不降低未恢复致命风险，新贡献会重开已恢复窗口，当前开放风险不受 30 天报表范围裁剪，同批节点投影只重算一次且每日峰值不再下降。
+- 确定性多来源关联保留桥接图中的合法边并显式标记预算截断；双 Provider 新增 `0026_correlation_edges.sql` 保存 edge/group scope/partial 投影。
+- Drain 评测预测采用字段白名单并拒绝重复或未知 record ID，外部导入统一标记 reference 且不能发布；没有 critical 正例不再以空分母通过。模型失败、校验失败、缺失用量和应用缓存继续复用现有 `operational_physical_calls` 与 request-local 用量出口，不建立第二套总账。
+
 ## 1.38.1 - 2026-09-13
 
 ### Fixed

@@ -9,9 +9,13 @@ from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 from logrisk.ai_harness.model_client import ModelClientError, parse_content_json
+from logrisk.ai_harness.usage_accounting import usage_metadata
 
 
 class OpenAICompatibleModelClient:
+    provider = "openai_compatible"
+    metadata_contract = "v1"
+
     def __init__(self, base_url: str, *, api_key_env: str, opener: Callable[..., Any] | None = None) -> None:
         self.base_url = self._validate_base_url(base_url)
         self.api_key_env = api_key_env
@@ -75,14 +79,12 @@ class OpenAICompatibleModelClient:
             raise ModelClientError(f"无法连接远端模型: {exc}", raw_output=str(exc)) from exc
         try:
             payload = json.loads(raw_response)
-            usage = payload.get("usage") or {}
-            self.last_metadata = {
-                "usage": {
-                    "input_tokens": int(usage.get("prompt_tokens") or 0),
-                    "output_tokens": int(usage.get("completion_tokens") or 0),
-                    "total_tokens": int(usage.get("total_tokens") or 0),
+            usage = payload.get("usage") if isinstance(payload, dict) else None
+            if isinstance(payload, dict):
+                self.last_metadata = {
+                    **usage_metadata(usage if isinstance(usage, dict) else None),
+                    "metadata_contract": self.metadata_contract,
                 }
-            }
             return parse_content_json(payload["choices"][0]["message"]["content"])
         except (json.JSONDecodeError, UnicodeDecodeError, KeyError, IndexError, TypeError) as exc:
             raw = raw_response.decode("utf-8", errors="replace")

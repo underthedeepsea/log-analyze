@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import base64
 import fcntl
 import hashlib
 import inspect
@@ -202,7 +203,7 @@ class FeatureJobFileStore:
 
     @contextmanager
     def _process_lock(self):
-        # ponytail: one root-wide lock keeps file CAS cross-process safe; use per-job locks if throughput requires it.
+        # One root-wide lock keeps file CAS cross-process safe; use per-job locks if throughput requires it.
         self.root.mkdir(parents=True, exist_ok=True)
         with (self.root / ".feature_jobs.lock").open("a+", encoding="utf-8") as handle:
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
@@ -310,10 +311,31 @@ class FeatureJobFileStore:
 
     def load_job(self, job_id: str) -> Dict[str, Any] | None:
         target = str(job_id)
-        for job in self.load():
-            if str(job.get("job_id")) == target:
-                return job
-        return None
+        root = self.root.resolve()
+        path = (root / target / "snapshot.json").resolve()
+        if path.parent.parent != root or not path.is_file():
+            return None
+        try:
+            job = _sanitize_job_payload(json.loads(path.read_text(encoding="utf-8")))
+            if str(job.get("job_id")) != target:
+                return None
+            events_path = path.with_name("events.jsonl")
+            job["events"] = []
+            if events_path.exists():
+                with events_path.open(encoding="utf-8") as stream:
+                    job["events"] = [_sanitize_feature_payload(json.loads(line)) for line in stream if line.strip()]
+            return job
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+            return None
+
+    def job_ids(self) -> list[str]:
+        return [path.parent.name for path in sorted(self.root.glob("*/snapshot.json"), reverse=True)]
+
+    def iter_jobs(self):
+        for job_id in self.job_ids():
+            job = self.load_job(job_id)
+            if job is not None:
+                yield job
 
     def load_candidate(
         self, candidate_id: str, job_id: str | None = None
@@ -707,6 +729,12 @@ class FeatureJobManager:
         interrupt_on_restore: bool = True,
         approval_group_store: Any | None = None,
         prompt_resolver: Callable[[str], Mapping[str, Any]] | None = None,
+        ledger_repository: Any | None = None,
+        analysis_run_id: str | None = None,
+        analysis_member_id: str | None = None,
+        environment: str = "production",
+        scope_key: str = "default",
+        history_cache_bytes: int = 32 * 1024 * 1024,
     ) -> None:
         self.extractor = extractor
         self.rule_store = rule_store
@@ -718,7 +746,16 @@ class FeatureJobManager:
         self.interrupt_on_restore = bool(interrupt_on_restore)
         self.approval_group_store = approval_group_store if approval_group_store is not None else InMemoryApprovalGroupStore()
         self.prompt_resolver = prompt_resolver
+        self.ledger_repository = ledger_repository
+        self.analysis_run_id = str(analysis_run_id) if analysis_run_id else None
+        self.analysis_member_id = str(analysis_member_id) if analysis_member_id else None
+        self.environment = str(environment or "production")
+        self.scope_key = str(scope_key or "default")
         self._jobs: Dict[str, Dict[str, Any]] = {}
+        self._active_job_counts: Dict[str, int] = {}
+        self._event_waiter_counts: Dict[str, int] = {}
+        self.history_cache_bytes = max(0, int(history_cache_bytes))
+        self._job_ledgers: Dict[str, Any] = {}
         self._lock = threading.RLock()
         from logrisk.approval_service import ApprovalService
         self.approval_service = ApprovalService(self)
@@ -727,18 +764,23 @@ class FeatureJobManager:
     def _restore_jobs(self) -> None:
         if not self.persistence:
             return
-        for job in self.persistence.load():
+        iterator = getattr(self.persistence, "iter_jobs", self.persistence.load)
+        for job in iterator():
             condition = threading.Condition(self._lock)
             job["condition"] = condition
             job.setdefault("events", [])
             job.setdefault("processed_samples", [])
             job["started_monotonic"] = self.monotonic()
             interrupted = self.interrupt_on_restore and job.get("status") in {"queued", "running"}
-            if self.interrupt_on_restore:
+            input_incomplete = (job.get("input_build") or {}).get("status") in {"building", "failed"}
+            if self.interrupt_on_restore and not input_incomplete:
                 for record in job.get("entities", []):
                     if record.get("status") in {"queued", "running"}:
                         record["status"] = "interrupted"
                         record["error"] = "服务重启中断，需人工重试"
+                        if job.get("entities_paged"):
+                            job["entities"].remember([record])
+                            self.persistence.save(job)
                         interrupted = True
             if interrupted:
                 job["status"] = "interrupted"
@@ -750,34 +792,44 @@ class FeatureJobManager:
                     "job_id": job["job_id"],
                 })
             self._jobs[str(job["job_id"])] = job
+            self._validate_restored_analysis_context(job)
             if interrupted:
                 self.persistence.save(job)
-        with self._lock:
-            changed_jobs: set[str] = set()
-            for job in self._jobs.values():
-                if self._rebuild_approval_groups_locked(job):
-                    changed_jobs.add(str(job["job_id"]))
-            for job in self._jobs.values():
-                for candidate_id, feature, record in self._review_candidates_locked(job):
-                    if feature.get("status") != "pending":
-                        continue
-                    source = record.get("source") or {}
-                    matches = []
-                    if self.rule_store:
-                        match_feature = getattr(self.rule_store, "match_feature", None)
-                        if callable(match_feature):
-                            matches = match_feature(feature, source)
-                        if not matches:
-                            matches = self.rule_store.match_entity(source)
-                    for rule in matches[:1]:
-                        resolved_rule = copy.deepcopy(rule)
-                        if not resolved_rule.get("approval_key"):
-                            resolved_rule.update(approval_identity(resolved_rule, source))
-                        self._reconcile_pending_candidates_locked(resolved_rule)
-                        break
-            for job in self._jobs.values():
-                if str(job["job_id"]) in changed_jobs:
-                    self.persistence.save(job)
+            if job.get("entities_paged"):
+                # Referenced jobs register candidates transactionally as they are created.
+                if isinstance(self.approval_group_store, InMemoryApprovalGroupStore):
+                    from logrisk.sqlite_stores import SQLiteApprovalGroupStore
+                    self.approval_group_store = SQLiteApprovalGroupStore(self.persistence.database)
+                self._trim_history_locked()
+                continue
+            if self._rebuild_approval_groups_locked(job):
+                self.persistence.save(job)
+            for _, feature, record in self._review_candidates_locked(job):
+                if feature.get("status") != "pending" or not self.rule_store:
+                    continue
+                source = self._record_source(record)
+                matcher = getattr(self.rule_store, "match_feature", None)
+                matches = matcher(feature, source) if callable(matcher) else []
+                matches = matches or self.rule_store.match_entity(source)
+                if matches:
+                    rule = copy.deepcopy(matches[0])
+                    if not rule.get("approval_key"):
+                        rule.update(approval_identity(rule, source))
+                    with self._lock:
+                        self._reconcile_pending_candidates_locked(rule)
+            self._trim_history_locked()
+
+    def _validate_restored_analysis_context(self, job: Dict[str, Any]) -> None:
+        """Load the existing root for a persisted job without creating one."""
+
+        root_id = job.get("analysis_run_id")
+        member_id = job.get("analysis_member_id")
+        if self.ledger_repository is None or not root_id or not member_id:
+            return
+        root = self.ledger_repository.get_analysis_run(str(root_id))
+        members = root.get("members") if isinstance(root, dict) else []
+        if not any(str(item.get("member_id")) == str(member_id) for item in (members or []) if isinstance(item, dict)):
+            raise FeatureJobError("已持久化任务引用了不存在的分析成员")
 
     def _hydrate_persisted_job_locked(self, persisted: Dict[str, Any]) -> Dict[str, Any]:
         job = copy.deepcopy(persisted)
@@ -858,6 +910,11 @@ class FeatureJobManager:
         provider: str = "ollama",
         connection_snapshot: dict[str, Any] | None = None,
         profile_snapshot: dict[str, Any] | None = None,
+        ledger_repository: Any | None = None,
+        analysis_run_id: str | None = None,
+        analysis_member_id: str | None = None,
+        environment: str | None = None,
+        scope_key: str | None = None,
     ) -> str:
         validate_result_document(document)
         if not isinstance(model, str) or not model.strip():
@@ -872,14 +929,24 @@ class FeatureJobManager:
             raise FeatureJobError("自动重试次数必须是非负整数")
 
         job_id = uuid.uuid4().hex
-        records = []
-        initial_matches: list[tuple[Dict[str, Any], list[Dict[str, Any]]]] = []
+        effective_ledger = ledger_repository if ledger_repository is not None else self.ledger_repository
+        effective_run_id = str(analysis_run_id) if analysis_run_id else self.analysis_run_id
+        effective_member_id = str(analysis_member_id) if analysis_member_id else self.analysis_member_id
+        effective_environment = str(environment or self.environment)
+        effective_scope = str(scope_key or self.scope_key)
+        if (effective_run_id is None) != (effective_member_id is None):
+            raise FeatureJobError("analysis_run_id 与 analysis_member_id 必须同时提供")
         started_monotonic = self.monotonic()
         processed_samples: list[tuple[float, int]] = []
-        sources = [
-            _sanitize_feature_payload(source)
-            for source in _collapse_risk_entities(document["risk_entities"])
-        ]
+        reference = document.get("result_ref")
+        if reference:
+            from logrisk.streaming_results import StreamingResultRepository
+            database = getattr(self.persistence, "database", None)
+            if database is None:
+                raise FeatureJobError("引用式结果需要数据库持久化")
+            sources = StreamingResultRepository(database).feature_sources(reference)
+        else:
+            sources = [_sanitize_feature_payload(source) for source in _collapse_risk_entities(document["risk_entities"])]
         source_summary = _sanitize_feature_payload(document.get("summary") or {})
         safe_connection_snapshot = _sanitize_feature_payload(connection_snapshot) if connection_snapshot else None
         safe_profile_snapshot = _sanitize_feature_payload(profile_snapshot) if profile_snapshot else None
@@ -897,81 +964,177 @@ class FeatureJobManager:
             )
             if prompt_snapshot["prompt_id"] != resolved_prompt_id:
                 raise FeatureJobError("Prompt 快照 ID 不匹配")
-        for source in sorted(
-            sources,
-            key=lambda item: float(item.get("risk_score") or 0),
-            reverse=True,
-        ):
-            score = float(source.get("risk_score") or 0)
-            matches = self.rule_store.match_entity(source) if self.rule_store and score >= min_score else []
-            record = {
-                "entity_id": str(source.get("entity_id")),
-                "entity_type": source.get("entity_type"),
-                "cluster": source.get("cluster"),
-                "window_start": source.get("window_start"),
-                "window_end": source.get("window_end"),
-                "risk_score": score,
-                "risk_level": source.get("risk_level"),
-                "log_count": _entity_log_count(source),
-                "affected_entities": copy.deepcopy(source.get("affected_entities") or []),
-                "status": "rule_matched" if matches else ("queued" if score >= min_score else "skipped"),
-                "error": None,
-                "feature_ids": [],
-                "matched_rule_ids": [str(rule.get("rule_id")) for rule in matches],
-                "llm_counted": False,
-                "cache_hit": False,
-                "source": copy.deepcopy(source),
-            }
-            if matches:
-                initial_matches.append((record, matches))
-                processed_samples.append((started_monotonic, record["log_count"]))
-            records.append(record)
-
+        paged_factory = getattr(self.persistence, "entity_collection", None)
+        paged_appender = getattr(self.persistence, "append_entities", None)
+        if reference and (not callable(paged_factory) or not callable(paged_appender)):
+            raise FeatureJobError("引用式结果需要分页实体持久化")
+        records = paged_factory(job_id) if reference else []
+        initial_matches: list[tuple[Dict[str, Any], list[Dict[str, Any]]]] = []
         condition = threading.Condition(self._lock)
+        job = {
+            "job_id": job_id,
+            "status": "building" if reference else "queued",
+            "created_at": _now(),
+            "completed_at": None,
+            "model": model.strip(),
+            "provider": str(provider or "ollama"),
+            "base_url": base_url,
+            "timeout": float(timeout),
+            "prompt_id": resolved_prompt_id,
+            "prompt_snapshot": prompt_snapshot,
+            "model_profile_id": model_profile_id,
+            "connection_snapshot": safe_connection_snapshot,
+            "profile_snapshot": safe_profile_snapshot,
+            "cache_enabled": _cache_enabled_default() if cache_enabled is None else bool(cache_enabled),
+            "retry_count": normalized_retry_count,
+            "min_score": float(min_score),
+            "source_summary": {
+                **source_summary,
+                "feature_job_entity_count": len(records),
+            },
+            "entities": records,
+            "entities_paged": bool(reference),
+            "features": {},
+            "events": [],
+            "started_monotonic": started_monotonic,
+            "processed_samples": processed_samples,
+            "condition": condition,
+            "analysis_run_id": effective_run_id,
+            "analysis_member_id": effective_member_id,
+            "environment": effective_environment,
+            "scope_key": effective_scope,
+        }
+        if reference:
+            job["input_build"] = {"status": "building", "result_ref": copy.deepcopy(reference)}
+            self.persistence.paged_runtime(job)
+            if isinstance(self.approval_group_store, InMemoryApprovalGroupStore):
+                from logrisk.sqlite_stores import SQLiteApprovalGroupStore
+                self.approval_group_store = SQLiteApprovalGroupStore(self.persistence.database)
         with self._lock:
-            self._jobs[job_id] = {
-                "job_id": job_id,
-                "status": "queued",
-                "created_at": _now(),
-                "completed_at": None,
-                "model": model.strip(),
-                "provider": str(provider or "ollama"),
-                "base_url": base_url,
-                "timeout": float(timeout),
-                "prompt_id": resolved_prompt_id,
-                "prompt_snapshot": prompt_snapshot,
-                "model_profile_id": model_profile_id,
-                "connection_snapshot": safe_connection_snapshot,
-                "profile_snapshot": safe_profile_snapshot,
-                "cache_enabled": _cache_enabled_default() if cache_enabled is None else bool(cache_enabled),
-                "retry_count": normalized_retry_count,
-                "min_score": float(min_score),
-                "source_summary": {
-                    **source_summary,
-                    "feature_job_entity_count": len(sources),
-                },
-                "entities": records,
-                "features": {},
-                "events": [],
-                "started_monotonic": started_monotonic,
-                "processed_samples": processed_samples,
-                "condition": condition,
-            }
-            self._emit_locked(self._jobs[job_id], "job_created")
-            for record, matches in initial_matches:
-                self._apply_rule_matches_locked(self._jobs[job_id], record, matches)
-            for record in records:
-                if record["status"] == "rule_matched":
-                    self._emit_locked(
-                        self._jobs[job_id],
-                        "entity_rule_matched",
-                        entity_id=record["entity_id"],
-                        rule_ids=record["matched_rule_ids"],
-                    )
+            self._jobs[job_id] = job
+            if effective_ledger is not None and effective_run_id and effective_member_id:
+                self._job_ledgers[job_id] = effective_ledger
+                effective_ledger.bind_analysis_member(effective_run_id, effective_member_id, job_id)
+            self._emit_locked(job, "job_created")
+
+        if reference:
+            # Local construction owns live objects just as a worker does. Pin
+            # them only for this call, never because a persisted status says
+            # building (another process may own that passive snapshot).
+            with self._lock:
+                self._active_job_counts[job_id] = self._active_job_counts.get(job_id, 0) + 1
+            try:
+                self._build_referenced_job(job, sources, float(min_score))
+            finally:
+                with self._lock:
+                    remaining = self._active_job_counts[job_id] - 1
+                    if remaining:
+                        self._active_job_counts[job_id] = remaining
+                    else:
+                        del self._active_job_counts[job_id]
+        else:
+            for source in sorted(sources, key=lambda item: float(item.get("risk_score") or 0), reverse=True):
+                score = float(source.get("risk_score") or 0)
+                matches = self.rule_store.match_entity(source) if self.rule_store and score >= min_score else []
+                record = self._source_record(source, float(min_score), matches)
+                records.append(record)
+                if matches:
+                    processed_samples.append((started_monotonic, record["log_count"]))
+                    initial_matches.append((record, matches))
+            with self._lock, self.approval_service._unit_of_work(job_ids={job_id}):
+                job["source_summary"]["feature_job_entity_count"] = len(records)
+                for record, matches in initial_matches:
+                    self._apply_rule_matches_locked(job, record, matches)
+                for record in records:
+                    if record["status"] == "rule_matched":
+                        self._emit_locked(
+                            job,
+                            "entity_rule_matched",
+                            entity_id=record["entity_id"],
+                            rule_ids=record["matched_rule_ids"],
+                        )
+                if self.persistence:
+                    self.persistence.save(job)
 
         if self.auto_start:
             threading.Thread(target=self.run_job, args=(job_id,), daemon=True).start()
         return job_id
+
+    @staticmethod
+    def _source_record(source: Dict[str, Any], min_score: float, matches: list[Dict[str, Any]]) -> Dict[str, Any]:
+        source_ref = source.get("_source_ref")
+        score = float(source.get("risk_score") or 0)
+        return {
+            "entity_id": str(source.get("entity_id")),
+            "entity_type": source.get("entity_type"),
+            "cluster": source.get("cluster"),
+            "window_start": source.get("window_start"),
+            "window_end": source.get("window_end"),
+            "risk_score": score,
+            "risk_level": source.get("risk_level"),
+            "log_count": _entity_log_count(source),
+            "affected_entities": copy.deepcopy(source.get("affected_entities") or []),
+            "status": "rule_matched" if matches else ("queued" if score >= min_score else "skipped"),
+            "error": None,
+            "feature_ids": [],
+            "matched_rule_ids": [str(rule.get("rule_id")) for rule in matches],
+            "llm_counted": False,
+            "cache_hit": False,
+            "source": {"_source_ref": source_ref} if source_ref else copy.deepcopy(source),
+        }
+
+    def _build_referenced_job(self, job: Dict[str, Any], sources: Any, min_score: float) -> None:
+        """Stage complete input before publishing a runnable FeatureJob.
+
+        Staging contains entities only. Rule/candidate effects are performed by
+        the published worker, so an abandoned build never exposes approvals.
+        Failed/interrupted staging is retained for diagnosis; resubmitting the
+        original reference creates a new complete job, never runs a prefix.
+        """
+        job_id = str(job["job_id"])
+        page: list[Dict[str, Any]] = []
+        page_bytes = 0
+
+        def flush() -> None:
+            nonlocal page_bytes
+            if not page:
+                return
+            with self._lock, self.approval_service._unit_of_work(job_ids={job_id}):
+                self.persistence.append_entities(job_id, page)
+                job["source_summary"]["feature_job_entity_count"] = self.persistence.entity_count(job_id)
+                self.persistence.save(job)
+            page.clear()
+            page_bytes = 0
+
+        try:
+            for source in sources:
+                record = self._source_record(source, min_score, [])
+                record_bytes = len(json.dumps(record, ensure_ascii=False).encode("utf-8"))
+                if record_bytes > 1024 * 1024:
+                    raise FeatureJobError("FeatureJob entity exceeds page byte budget")
+                if page_bytes + record_bytes > 1024 * 1024:
+                    flush()
+                page.append(record)
+                page_bytes += record_bytes
+                if len(page) >= 100:
+                    flush()
+            flush()
+            with self._lock, self.approval_service._unit_of_work(job_ids={job_id}):
+                job["input_build"]["status"] = "ready"
+                job["status"] = "queued"
+                self._emit_locked(job, "job_input_ready")
+        except Exception:
+            with self._lock:
+                job["input_build"]["status"] = "failed"
+                job["status"] = "failed"
+                self._emit_locked(job, "job_input_failed")
+            raise
+
+    @staticmethod
+    def _require_complete_input(job: Dict[str, Any]) -> None:
+        build = job.get("input_build")
+        if build and build.get("status") != "ready":
+            raise FeatureJobError("引用结果尚未完整构建，请重新创建任务", code="incomplete_job_input", status_code=409)
 
     @staticmethod
     def _feature_times(feature: Dict[str, Any], record: Dict[str, Any]) -> tuple[str | None, str | None]:
@@ -997,7 +1160,7 @@ class FeatureJobManager:
         job_id: str,
     ) -> Dict[str, Any]:
         prepared = _sanitize_feature_payload(feature)
-        identity = approval_identity(prepared, record.get("source") or {})
+        identity = approval_identity(prepared, self._record_source(record))
         prepared.update({
             "problem_code": identity["problem_code"],
             "approval_key": identity["approval_key"],
@@ -1026,7 +1189,7 @@ class FeatureJobManager:
         persist: bool = True, resolve_existing_rule: bool = True,
     ) -> tuple[Dict[str, Any], Dict[str, Any]]:
         return self.approval_service.register(
-            feature, record.get("source") or {}, job=job, record=record,
+            feature, self._record_source(record), job=job, record=record,
             persist=persist, resolve_existing_rule=resolve_existing_rule,
         )
 
@@ -1082,7 +1245,7 @@ class FeatureJobManager:
         if was_pending and resolve_existing_rule and self.rule_store:
             match_feature = getattr(self.rule_store, "match_feature", None)
             if callable(match_feature):
-                matches = match_feature(feature, record.get("source") or {})
+                matches = match_feature(feature, self._record_source(record))
                 if matches:
                     resolved_rule = matches[0]
                     feature.update({
@@ -1153,7 +1316,7 @@ class FeatureJobManager:
             and (
                 not was_pending
                 or resolved_rule is not None
-                or (group_rule is not None and rule_matches_feature(group_rule, feature, record.get("source") or {}))
+                or (group_rule is not None and rule_matches_feature(group_rule, feature, self._record_source(record)))
             )
         ):
             feature.update({
@@ -1198,7 +1361,7 @@ class FeatureJobManager:
         record["matched_rule_ids"] = [str(rule.get("rule_id")) for rule in matches]
         record["feature_ids"] = []
         for rule in matches:
-            feature = _feature_from_rule(rule, record["source"])
+            feature = _feature_from_rule(rule, self._record_source(record))
             feature, _ = self._register_feature_group_locked(job, record, feature)
             candidate_id = str(feature["candidate_id"])
             job["features"][candidate_id] = copy.deepcopy(feature)
@@ -1299,7 +1462,7 @@ class FeatureJobManager:
             for candidate_id, feature, record in self._review_candidates_locked(job):
                 if feature.get("status") != "pending":
                     continue
-                if not rule_matches_feature(rule, feature, record.get("source") or {}):
+                if not rule_matches_feature(rule, feature, self._record_source(record)):
                     continue
                 expected_updated_at = feature.get("updated_at")
                 feature.update({
@@ -1465,12 +1628,24 @@ class FeatureJobManager:
         for feature in result["candidates"]:
             job = self._jobs.get(str(feature["job_id"]))
             if job is not None:
-                job["features"][feature["candidate_id"]] = copy.deepcopy(feature)
+                self.approval_service.journal_job(job)
+                if job.get("entities_paged"):
+                    # Resolution already updated the database in this transaction.
+                    # Invalidate cached values instead of retaining a second copy
+                    # that could outlive a rollback or grow with the review batch.
+                    job["features"].dirty.pop(feature["candidate_id"], None)
+                else:
+                    job["features"][feature["candidate_id"]] = copy.deepcopy(feature)
         for job_id, events in result["events"].items():
             job = self._jobs.get(str(job_id))
             if job is not None:
-                job["events"].extend(copy.deepcopy(events))
-                self._record_observability_event(job, events[0]["type"], {"resolved_count": len(events)})
+                self.approval_service.journal_job(job)
+                if not job.get("entities_paged"):
+                    job["events"].extend(copy.deepcopy(events))
+                self._record_observability_event(
+                    job, events[0]["type"], {"resolved_count": len(events)},
+                    sequence=int(events[-1]["sequence"]),
+                )
                 job["condition"].notify_all()
         return result
 
@@ -1525,7 +1700,39 @@ class FeatureJobManager:
                 self._jobs[target] = job
         if job is None:
             raise FeatureJobError("任务不存在")
+        self._jobs.pop(target, None)
+        self._jobs[target] = job
+        self._trim_history_locked(protected=target)
         return job
+
+    def _trim_history_locked(self, protected: str | None = None) -> None:
+        if not self.persistence:
+            return
+        history = []
+        total = 0
+        for job_id, job in self._jobs.items():
+            if (
+                job_id in self._active_job_counts
+                or job_id in self._event_waiter_counts
+                or job_id == protected
+            ):
+                continue
+            size = len(json.dumps({key: value for key, value in job.items() if key != "condition"}, default=str, ensure_ascii=False).encode("utf-8"))
+            history.append((job_id, size))
+            total += size
+        for job_id, size in history:
+            if total <= self.history_cache_bytes:
+                break
+            self._jobs.pop(job_id, None)
+            self._job_ledgers.pop(job_id, None)
+            total -= size
+
+    def _record_source(self,record: Dict[str,Any]) -> Dict[str,Any]:
+        source=record.get("source") or {}
+        if source.get("_source_ref"):
+            from logrisk.streaming_results import StreamingResultRepository
+            return StreamingResultRepository(self.persistence.database).feature_source(source["_source_ref"])
+        return source
 
     def _emit_locked(self, job: Dict[str, Any], event_type: str, **payload: Any) -> None:
         event = {
@@ -1538,7 +1745,18 @@ class FeatureJobManager:
         append_review = getattr(self.persistence, "append_review_event", None)
         if callable(append_review) and event_type in {"feature_updated", "pending_candidate_reconciled", "candidate_group_rejected"}:
             event = append_review(event)
-        job["events"].append(event)
+        if not (job.get("entities_paged") and callable(append_review) and event_type in {"feature_updated", "pending_candidate_reconciled", "candidate_group_rejected"}):
+            job["events"].append(event)
+        if job.get("entities_paged"):
+            samples = job["processed_samples"]
+            if samples:
+                # Rates use bounded time buckets, rather than a sample per entity.
+                buckets: dict[int, int] = {}
+                for timestamp, count in samples:
+                    bucket = int(timestamp)
+                    buckets[bucket] = buckets.get(bucket, 0) + int(count)
+                cutoff = int(self.monotonic()) - 60
+                job["processed_samples"] = [(timestamp, count) for timestamp, count in buckets.items() if timestamp >= cutoff]
         self._record_observability_event(job, event_type, payload)
         if self.persistence and not (callable(append_review) and event_type in {"feature_updated", "pending_candidate_reconciled", "candidate_group_rejected"}):
             self.persistence.save(job)
@@ -1629,29 +1847,49 @@ class FeatureJobManager:
             return
 
     def run_job(self, job_id: str, only_entity_id: str | None = None) -> None:
+        target = str(job_id)
+        with self._lock:
+            self._require_complete_input(self._job(target))
+            self._active_job_counts[target] = self._active_job_counts.get(target, 0) + 1
+        try:
+            self._run_job(target, only_entity_id)
+        finally:
+            with self._lock:
+                remaining = self._active_job_counts[target] - 1
+                if remaining:
+                    self._active_job_counts[target] = remaining
+                else:
+                    del self._active_job_counts[target]
+                self._trim_history_locked()
+
+    def _run_job(self, job_id: str, only_entity_id: str | None = None) -> None:
         with self._lock:
             job = self._job(job_id)
+            self._set_analysis_member_status_locked(job, "running")
             job["status"] = "running"
             self._emit_locked(job, "job_started")
-            records = [
+            records = (
                 record
                 for record in job["entities"]
-                if record["status"] == "queued"
+                if record["status"] in ({"queued", "running"} if job.get("entities_paged") else {"queued"})
                 and (only_entity_id is None or record["entity_id"] == only_entity_id)
-            ]
+            )
 
         for record in records:
             with self._lock:
-                matches = self.rule_store.match_entity(record["source"]) if self.rule_store else []
+                if job.get("entities_paged"):
+                    job["_active_record"] = record
+                matches = self.rule_store.match_entity(self._record_source(record)) if self.rule_store else []
                 if matches:
-                    self._apply_rule_matches_locked(job, record, matches)
-                    job["processed_samples"].append((self.monotonic(), record["log_count"]))
-                    self._emit_locked(
-                        job,
-                        "entity_rule_matched",
-                        entity_id=record["entity_id"],
-                        rule_ids=record["matched_rule_ids"],
-                    )
+                    with self.approval_service._unit_of_work(job_ids={str(job_id)}):
+                        self._apply_rule_matches_locked(job, record, matches)
+                        job["processed_samples"].append((self.monotonic(), record["log_count"]))
+                        self._emit_locked(
+                            job,
+                            "entity_rule_matched",
+                            entity_id=record["entity_id"],
+                            rule_ids=record["matched_rule_ids"],
+                        )
                     continue
                 record["status"] = "running"
                 self._emit_locked(job, "entity_started", entity_id=record["entity_id"])
@@ -1661,7 +1899,7 @@ class FeatureJobManager:
                     try:
                         features = _invoke_extractor(
                             self.extractor,
-                            copy.deepcopy(record["source"]),
+                            copy.deepcopy(self._record_source(record)),
                             {
                                 "model": job["model"],
                                 "base_url": job["base_url"],
@@ -1674,6 +1912,10 @@ class FeatureJobManager:
                                 "provider": job.get("provider", "ollama"),
                                 "connection_snapshot": copy.deepcopy(job.get("connection_snapshot")),
                                 "profile_snapshot": copy.deepcopy(job.get("profile_snapshot")),
+                                "analysis_run_id": job.get("analysis_run_id"),
+                                "analysis_member_id": job.get("analysis_member_id"),
+                                "environment": job.get("environment", self.environment),
+                                "scope_key": job.get("scope_key", self.scope_key),
                             },
                         )
                         break
@@ -1698,26 +1940,27 @@ class FeatureJobManager:
                         if self.metrics_store:
                             self.metrics_store.add_llm_logs(record["log_count"])
                         record["llm_counted"] = True
-                    record["feature_ids"] = []
-                    for raw_feature in features:
-                        feature = copy.deepcopy(raw_feature)
-                        feature.setdefault("origin", job.get("provider", "ollama"))
-                        feature, _ = self._register_feature_group_locked(job, record, feature)
-                        candidate_id = str(feature["candidate_id"])
-                        job["features"][candidate_id] = copy.deepcopy(feature)
-                        feature = self._save_generated_candidate_locked(job, feature)
-                        record["feature_ids"].append(candidate_id)
-                    record["status"] = "completed"
-                    record["error"] = None
-                    job["processed_samples"].append((self.monotonic(), record["log_count"]))
-                    self._emit_locked(
-                        job,
-                        "entity_completed",
-                        entity_id=record["entity_id"],
-                        feature_count=len(features),
-                        trace_id=next((item.get("trace_id") for item in features if item.get("trace_id")), None),
-                        latency_ms=max((int(item.get("latency_ms") or 0) for item in features), default=0),
-                    )
+                    with self.approval_service._unit_of_work(job_ids={str(job_id)}):
+                        record["feature_ids"] = []
+                        for raw_feature in features:
+                            feature = copy.deepcopy(raw_feature)
+                            feature.setdefault("origin", job.get("provider", "ollama"))
+                            feature, _ = self._register_feature_group_locked(job, record, feature)
+                            candidate_id = str(feature["candidate_id"])
+                            job["features"][candidate_id] = copy.deepcopy(feature)
+                            feature = self._save_generated_candidate_locked(job, feature)
+                            record["feature_ids"].append(candidate_id)
+                        record["status"] = "completed"
+                        record["error"] = None
+                        job["processed_samples"].append((self.monotonic(), record["log_count"]))
+                        self._emit_locked(
+                            job,
+                            "entity_completed",
+                            entity_id=record["entity_id"],
+                            feature_count=len(features),
+                            trace_id=next((item.get("trace_id") for item in features if item.get("trace_id")), None),
+                            latency_ms=max((int(item.get("latency_ms") or 0) for item in features), default=0),
+                        )
             except Exception as exc:
                 with self._lock:
                     if not record["llm_counted"]:
@@ -1729,16 +1972,53 @@ class FeatureJobManager:
                     job["processed_samples"].append((self.monotonic(), record["log_count"]))
                     self._emit_locked(job, "entity_failed", entity_id=record["entity_id"], error=str(exc))
 
+        finish_status: str | None = None
         with self._lock:
-            eligible = [record for record in job["entities"] if record["status"] != "skipped"]
-            has_errors = any(record["status"] == "failed" for record in eligible)
-            still_running = any(record["status"] in {"queued", "running"} for record in eligible)
+            job.pop("_active_record", None)
+            if job.get("entities_paged"):
+                statistics = self.persistence.entity_statistics(job_id)
+                has_errors = bool(statistics.get("failed", {}).get("count"))
+                still_running = any(statistics.get(status, {}).get("count") for status in ("queued", "running"))
+            else:
+                eligible = [record for record in job["entities"] if record["status"] != "skipped"]
+                has_errors = any(record["status"] == "failed" for record in eligible)
+                still_running = any(record["status"] in {"queued", "running"} for record in eligible)
             if not still_running:
                 job["status"] = "completed_with_errors" if has_errors else "completed"
                 job["completed_at"] = _now()
                 self._emit_locked(job, "job_completed", status=job["status"])
+                finish_status = "partial" if has_errors else "completed"
+        if finish_status is not None:
+            self._finish_analysis_member(job, finish_status)
+
+    def _set_analysis_member_status_locked(self, job: Dict[str, Any], status: str) -> None:
+        ledger = self._job_ledgers.get(str(job.get("job_id"))) or self.ledger_repository
+        if ledger is None:
+            return
+        root_id = job.get("analysis_run_id")
+        member_id = job.get("analysis_member_id")
+        if root_id and member_id:
+            ledger.finish_analysis_member(str(root_id), str(member_id), status)
+
+    def _finish_analysis_member(self, job: Dict[str, Any], status: str) -> None:
+        ledger = self._job_ledgers.get(str(job.get("job_id"))) or self.ledger_repository
+        if ledger is None:
+            return
+        root_id = job.get("analysis_run_id")
+        member_id = job.get("analysis_member_id")
+        if root_id and member_id:
+            ledger.finish_analysis_member(str(root_id), str(member_id), status)
 
     def _progress_locked(self, job: Dict[str, Any]) -> Dict[str, int]:
+        if job.get("entities_paged"):
+            stats = self.persistence.entity_statistics(job["job_id"])
+            total = sum(item["count"] for status, item in stats.items() if status != "skipped")
+            completed = stats.get("completed", {}).get("count", 0)
+            matched = stats.get("rule_matched", {}).get("count", 0)
+            failed = stats.get("failed", {}).get("count", 0)
+            return {"total": total, "completed": completed + matched, "failed": failed,
+                    "percent": round((completed + matched + failed) / total * 100) if total else 100,
+                    "rule_matched": matched, "ollama_completed": completed}
         eligible = [record for record in job["entities"] if record["status"] != "skipped"]
         ollama_completed = sum(record["status"] == "completed" for record in eligible)
         rule_matched = sum(record["status"] == "rule_matched" for record in eligible)
@@ -1757,6 +2037,21 @@ class FeatureJobManager:
 
     def _log_statistics_locked(self, job: Dict[str, Any]) -> Dict[str, int | float]:
         summary = job["source_summary"]
+        if job.get("entities_paged"):
+            stats = self.persistence.entity_statistics(job["job_id"])
+            logs = lambda status: stats.get(status, {}).get("logs", 0)
+            original = int(summary.get("total_raw_logs") or sum(item["logs"] for item in stats.values()))
+            windows = int(summary.get("total_template_windows") or 0)
+            reduced = int(summary.get("drain3_reduced_logs") or max(0, original - windows))
+            return {"original_logs": original, "normalized_logs": int(summary.get("total_normalized_logs") or 0),
+                    "template_events": int(summary.get("total_template_events") or 0), "template_windows": windows,
+                    "drain3_reduced_logs": reduced, "drain3_compression_ratio_percent": float(summary.get("drain3_compression_ratio_percent", round(reduced / original * 100, 2) if original else 0) or 0),
+                    "eligible_logs": sum(item["logs"] for status, item in stats.items() if status != "skipped"),
+                    "analyzed_logs": logs("completed") + logs("rule_matched"),
+                    "pending_logs": sum(logs(status) for status in ("queued", "running", "failed")),
+                    "skipped_logs": logs("skipped"), "reused_logs": logs("rule_matched"),
+                    "ollama_logs": logs("completed") - stats.get("completed", {}).get("cache_logs", 0),
+                    "cache_hit_logs": sum(item["cache_logs"] for status, item in stats.items() if status != "skipped")}
         original = int(summary.get("total_raw_logs") or sum(record["log_count"] for record in job["entities"]))
         template_windows = int(summary.get("total_template_windows") or 0)
         reduced = int(summary.get("drain3_reduced_logs") or max(0, original - template_windows))
@@ -1805,6 +2100,19 @@ class FeatureJobManager:
         current_rate = processed_logs / elapsed if elapsed > 0 else 0.0
         rolling_duration = min(60.0, elapsed)
         rolling_rate = rolling_logs / rolling_duration if rolling_duration > 0 else 0.0
+        if job.get("entities_paged"):
+            stats = self.persistence.entity_statistics(job["job_id"])
+            cache_count = sum(item["cache_count"] for item in stats.values())
+            cache_logs = sum(item["cache_logs"] for item in stats.values())
+            matched = stats.get("rule_matched", {})
+            pending_logs = sum(stats.get(status, {}).get("logs", 0) for status in ("queued", "running"))
+            processed_logs = sum(stats.get(status, {}).get("logs", 0) for status in ("completed", "failed", "rule_matched"))
+            current_rate = processed_logs / elapsed if elapsed > 0 else 0.0
+            return {"today_llm_logs": self.metrics_store.today_llm_logs() if self.metrics_store else 0,
+                    "cache_hit_calls": cache_count, "cache_hit_logs": cache_logs,
+                    "saved_llm_calls": cache_count + matched.get("count", 0), "saved_llm_logs": cache_logs + matched.get("logs", 0),
+                    "processing_logs_per_second": round(current_rate, 2), "rolling_60s_logs_per_second": round(rolling_rate, 2),
+                    "eta_seconds": round(pending_logs / current_rate) if current_rate > 0 else (None if pending_logs else 0)}
         pending_logs = sum(
             record["log_count"]
             for record in job["entities"]
@@ -1823,14 +2131,38 @@ class FeatureJobManager:
             "eta_seconds": round(pending_logs / current_rate) if current_rate > 0 else (None if pending_logs else 0),
         }
 
-    def get_job(self, job_id: str) -> Dict[str, Any]:
+    def get_job(self, job_id: str, *, cursor: str | None = None) -> Dict[str, Any]:
         with self._lock:
             job = self._job(job_id)
+            paged = bool(job.get("entities_paged"))
+            entity_after, feature_after = "", ""
+            if cursor:
+                try:
+                    decoded = json.loads(base64.urlsafe_b64decode(cursor.encode("ascii")))
+                    if decoded["job_id"] != job_id or decoded["version"] != 1 or not paged:
+                        raise ValueError("cursor scope")
+                    entity_after, feature_after = decoded["entity"], decoded["feature"]
+                    if not isinstance(entity_after, str) or not isinstance(feature_after, str):
+                        raise ValueError("cursor keys")
+                except Exception as exc:
+                    raise FeatureJobError("无效的任务分页游标", code="invalid_cursor", status_code=400) from exc
+            records = self.persistence.load_entity_page(job_id, after=entity_after, limit=100) if paged else job["entities"]
             entities = [
                 {key: copy.deepcopy(value) for key, value in record.items() if key != "source"}
-                for record in job["entities"]
+                for record in records
             ]
+            features = self.persistence.candidate_page(job_id, after=feature_after) if paged else list(job["features"].values())
+            pagination = {}
+            if paged:
+                entity_key = str(entities[-1]["entity_id"]) if entities else entity_after
+                feature_key = str(features[-1]["candidate_id"]) if features else feature_after
+                more = bool(self.persistence.load_entity_page(job_id, after=entity_key, limit=1) or self.persistence.candidate_page(job_id, after=feature_key, limit=1))
+                next_cursor = base64.urlsafe_b64encode(json.dumps({"version": 1, "job_id": job_id, "entity": entity_key, "feature": feature_key}).encode()).decode() if more else None
+                pagination = {"schema_version": "feature_job_preview_v1", "entities_total": len(job["entities"]),
+                              "features_total": len(job["features"]), "complete": len(entities) == len(job["entities"]) and len(features) == len(job["features"]),
+                              "preview": True, "next_cursor": next_cursor}
             return {
+                **pagination,
                 "job_id": job["job_id"],
                 "status": job["status"],
                 "created_at": job["created_at"],
@@ -1849,17 +2181,18 @@ class FeatureJobManager:
                 "log_statistics": self._log_statistics_locked(job),
                 "live_metrics": self._live_metrics_locked(job),
                 "entities": entities,
-                "features": copy.deepcopy(list(job["features"].values())),
+                "features": copy.deepcopy(features),
             }
 
     def get_agent_evidence(self, job_id: str, entity_id: str) -> Dict[str, Any]:
         """Return the same sanitized template facts used by model extraction, never raw samples."""
         with self._lock:
             job = self._job(job_id)
+            self._require_complete_input(job)
             record = next((item for item in job["entities"] if item["entity_id"] == str(entity_id)), None)
             if record is None:
                 raise FeatureJobError("风险实体不存在")
-            source = record["source"]
+            source = self._record_source(record)
             return {
                 "schema_version": "1.0",
                 "entity": {
@@ -1934,8 +2267,10 @@ class FeatureJobManager:
                 if item.get("template_hash") in hashes
             ],
         }
-        with self._lock:
+        with self._lock, self.approval_service._unit_of_work(job_ids={str(job_id)}):
             job = self._job(job_id)
+            self._require_complete_input(job)
+            self.approval_service.journal_job(job)
             record = next((item for item in job["entities"] if item["entity_id"] == str(entity_id)), None)
             if record is None:
                 raise FeatureJobError("风险实体不存在")
@@ -1945,6 +2280,8 @@ class FeatureJobManager:
                 candidate = self._save_generated_candidate_locked(job, candidate)
                 if candidate["candidate_id"] not in record["feature_ids"]:
                     record["feature_ids"].append(candidate["candidate_id"])
+                if job.get("entities_paged"):
+                    job["entities"].remember([record])
                 self._emit_locked(
                     job,
                     "agent_candidate_registered",
@@ -1956,7 +2293,8 @@ class FeatureJobManager:
 
     def list_jobs(self) -> list[Dict[str, Any]]:
         with self._lock:
-            job_ids = sorted(self._jobs, key=lambda item: self._jobs[item]["created_at"], reverse=True)
+            reader = getattr(self.persistence, "job_ids", None)
+            job_ids = reader() if callable(reader) else sorted(self._jobs, key=lambda item: self._jobs[item]["created_at"], reverse=True)
         return [self.get_job(job_id) for job_id in job_ids]
 
     def refresh_from_persistence(self, job_id: str) -> None:
@@ -1973,7 +2311,7 @@ class FeatureJobManager:
             if persisted is None:
                 raise FeatureJobError("任务不存在")
             current = self._jobs.get(target)
-            if current is not None:
+            if current is not None and not persisted.get("entities_paged"):
                 current_events = len(current.get("events") or [])
                 persisted_events = len(persisted.get("events") or [])
                 if persisted_events <= current_events:
@@ -2013,7 +2351,17 @@ class FeatureJobManager:
                             )
                     else:
                         persisted_features[candidate_id] = copy.deepcopy(live_candidate)
-            self._jobs[target] = self._hydrate_persisted_job_locked(persisted)
+            if target in self._active_job_counts:
+                return
+            refreshed = self._hydrate_persisted_job_locked(persisted)
+            if current is not None:
+                refreshed["condition"] = current["condition"]
+                current.clear()
+                current.update(refreshed)
+                current["condition"].notify_all()
+            else:
+                self._jobs[target] = refreshed
+            self._trim_history_locked(protected=target)
 
     def wait_for_events(
         self,
@@ -2024,9 +2372,22 @@ class FeatureJobManager:
         with self._lock:
             job = self._job(job_id)
             if cursor >= len(job["events"]) and timeout > 0:
-                job["condition"].wait(timeout)
+                target = str(job_id)
+                self._event_waiter_counts[target] = self._event_waiter_counts.get(target, 0) + 1
+                try:
+                    job["condition"].wait(timeout)
+                    events = copy.deepcopy(job["events"][cursor:])
+                    next_cursor = int(events[-1]["sequence"]) + 1 if events else cursor
+                finally:
+                    remaining = self._event_waiter_counts[target] - 1
+                    if remaining:
+                        self._event_waiter_counts[target] = remaining
+                    else:
+                        del self._event_waiter_counts[target]
+                    self._trim_history_locked()
+                return events, next_cursor
             events = copy.deepcopy(job["events"][cursor:])
-            return events, len(job["events"])
+            return events, int(events[-1]["sequence"]) + 1 if events else cursor
 
     def list_events(self, job_id: str, limit: int = 100) -> list[Dict[str, Any]]:
         with self._lock:
@@ -2036,6 +2397,7 @@ class FeatureJobManager:
     def retry_entity(self, job_id: str, entity_id: str, start: bool = True) -> None:
         with self._lock:
             job = self._job(job_id)
+            self._require_complete_input(job)
             matches = [record for record in job["entities"] if record["entity_id"] == entity_id]
             if not matches:
                 raise FeatureJobError("风险实体不存在")
@@ -2044,8 +2406,15 @@ class FeatureJobManager:
                 raise FeatureJobError("只能重试失败或已中断的风险实体")
             record["status"] = "queued"
             record["error"] = None
+            if job.get("entities_paged"):
+                job["entities"].remember([record])
             job["status"] = "queued"
             job["completed_at"] = None
+            ledger = self._job_ledgers.get(str(job.get("job_id"))) or self.ledger_repository
+            if ledger and job.get("analysis_run_id") and job.get("analysis_member_id"):
+                ledger.finish_analysis_member(
+                    str(job["analysis_run_id"]), str(job["analysis_member_id"]), "running"
+                )
             self._emit_locked(job, "entity_queued", entity_id=entity_id)
         if start:
             threading.Thread(target=self.run_job, args=(job_id, entity_id), daemon=True).start()
@@ -2294,7 +2663,7 @@ class FeatureJobManager:
             approved_ids = {feature["candidate_id"] for feature in approved}
             nodes: Dict[tuple[str, str], Dict[str, Any]] = {}
             for record in job["entities"]:
-                source = record["source"]
+                source = self._record_source(record)
                 if source.get("entity_type") != "node":
                     continue
                 feature_ids = sorted(approved_ids.intersection(record["feature_ids"]))

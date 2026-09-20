@@ -1,14 +1,22 @@
 # 日志风险特征分析与审批系统
 
+大结果引用创建的 FeatureJob 使用数据库分页执行。`GET /api/jobs/{job_id}` 返回精确 `entities_total`、`features_total` 与最多 100 条实体/候选预览，后续页使用 `?cursor={next_cursor}`；`preview: true` 表示当前页面不是完整审批输入。Dashboard 与 Django 显示预览范围并提供下一页，完整候选通过审批队列处理。普通小结果任务保持原详情协议。
+
+引用任务先以 `building` 分页构建输入，全部实体持久化后才发布为 `queued`，规则复用在 Worker 执行时完成。背压或异常会留下不可执行的 `failed` 构建；进程中断留下的 `building` 同样禁止执行、单实体重试和 Agent 登记。可从原始完整结果引用重新创建任务，旧 staging 保留诊断，不作为完整输入。每个实体的候选、审批组、实体关联/完成状态与完成事件在同一事务提交；重启只继续未提交实体。分页在读取 JSON 前按 UTF-8 字节长度限制单页 1 MiB，单行超限明确拒绝。
+
+分页 cursor 绑定任务/结果代次和筛选条件；它是 keyset 位置描述，不是权限凭证或带签名令牌。同一作用域内可从指定排序位置继续，超出最后一项返回空页；跨任务、代次或筛选条件的 cursor 会被拒绝。客户端应原样回传服务端提供的 `next_cursor` 以完整遍历。
+
 <p align="center">
   <img src="frontend/logo/logrisk-app-icon-orange-v2.png" width="112" alt="LOGRISK 应用图标" />
 </p>
 
-当前版本：`1.38.1`。完整变更记录见 [`releas.md`](releas.md)。
+当前版本：`1.39.2`。完整变更记录见 [`releas.md`](releas.md)。
+
+开发中审计修复：审批列表使用 canonical 数据库轻投影和不受前页审批影响的 opaque cursor；新增迁移 0027（节点投影修订与真实评分样本）与 0028（审批投影）。节点当前状态可补偿未完成投影，历史没有评分样本时显示 uncertain；流式恢复校验已提交 miner generation 的 SHA-256 manifest。
 
 人工审批支持连续操作：点击批准或驳回后，条目立即变绿并显示“保存中”，数据库确认后变为“已保存”；当前面板保留，可继续选择下一组。保存失败保留提交内容并可重试；有未确认提交时请保留页面，关闭或刷新浏览器会提示。列表中的“刷新”会重新获取待审批队列并移除已保存条目，“加载更多”继续读取后续组。审批身份和规则复用范围仍按脱敏证据确定。
 
-PostgreSQL 部署升级到 1.38.1 时，应先通过 `python manage.py logrisk_migrate --json` 显式应用待执行迁移（包括 `0022_approval_queue_performance.sql` 索引与 `0023_approval_transactions.sql` 审批事务表），再更新服务；Django/Airflow 不会自动迁移。批量审批只更新命中候选、分组状态和审计事件，完整任务快照不再逐条回写。审批携带版本与请求幂等键，冲突保留草稿并展示最新决定；新候选审批和已批准规则健康复审分别展示。Kafka 默认关闭，各部署实例独立配置；读取本批高水位后结束，未探测连接时明确显示“未检查”。
+PostgreSQL 部署升级到 1.39.2 时，应先通过 `python manage.py logrisk_migrate --json` 显式应用待执行迁移，再更新服务；Django/Airflow 不会自动迁移。批量审批只更新命中候选、分组状态和审计事件，完整任务快照不再逐条回写。审批携带版本与请求幂等键，冲突保留草稿并展示最新决定；新候选审批和已批准规则健康复审分别展示。Kafka 默认关闭，各部署实例独立配置；读取本批高水位后结束，未探测连接时明确显示“未检查”。
 
 
 新生成的日志候选按已识别语义拆分，未解析证据单独保留待人工复核；日志命中次数按各自所选模板计算。审批页区分结构校验与语义证据完整性。历史候选和审批状态不会自动重写。
@@ -113,9 +121,11 @@ python3 -m pipeline.manual_import_pipeline \
 
 ### 可恢复处理与 Kafka 来源
 
-“流式处理”工作区会显示大文件任务的来源、Drain3 配置摘要、最后成功 Checkpoint、提交批次和脱敏未知模板队列。文件任务按有界记录批次处理；每个批次在 Drain3 模板化、语义/规则判定后，以单个数据库事务同时提交脱敏摘要、未知模板和字节 Offset。服务重启会将运行中任务标记为中断，只有人工点击“从 Checkpoint 恢复”才会继续。文件身份、内容前缀或 Drain3 配置变化会标记为冲突，不能静默重读或跳过数据。
+B12 恢复会在读取、派生、结果投影和完成发布前核对 committed batch、窗口、payload hash、cursor 前沿及 ready result generation。无法证明的旧前缀以稳定错误码 `STREAMING_PREFIX_INCOMPLETE` 失败，普通恢复不会自动重算。注册入口 `container.create_recompute_input_job(old_input_job_id)` 只接受仍可证明原始快照的 file/upload；大于 128 KiB 且历史没有完整摘要的弱身份来源返回 `RECOMPUTE_SOURCE_IDENTITY_UNVERIFIABLE`。新 Run 使用受控来源快照、空 cursor、独立 miner generation，并默认隔离节点台账和多来源全局副作用；之后由 `container.run_input_job(new_job["input_job_id"])` 执行。旧任务、批次和结果证据保持不变，Kafka 不支持重算。
 
-“多来源关联”工作区按 `cluster/entity_type/entity_id` 展示节点、命名空间、Pod、容器和设备。关联引擎只接受明确实体标识、`configs/multi_source.yaml` 中的人工别名和显式层级关系，并同时校验来源组合、时间窗口、计数和风险阈值。规则编辑器可维护规则名称、启停状态、来源组合、时间窗口、最低风险分、最低出现次数和置信度；保存使用乐观版本校验，规则变更只影响后续关联。不同集群永不关联，缺少可靠实体的数据保持不可路由。Drain3 仍只学习日志消息正文，实体元数据不会进入模板学习；持久化观察不包含原始日志、样例或 `message_core`。
+“流式处理”工作区会显示大文件任务的来源、Drain3 配置摘要、最后成功 Checkpoint、提交批次和脱敏未知模板队列。文件任务同时受记录数、序列化字节数和分区 writer 数量预算约束；每个批次在 Drain3 模板化、语义/规则判定后，以单个数据库事务提交完整脱敏窗口、未知模板、摘要和字节 Offset。服务重启会将运行中任务标记为中断，恢复会从全部已提交批次重建结果；只有人工点击“从 Checkpoint 恢复”才会继续。文件身份、内容前缀、批次 payload 或 Drain3 配置变化会标记为冲突，不能静默重读、回退游标或跳过数据。大结果以服务端结果引用和 opaque cursor 分页；界面明确显示当前预览数与精确总数，后续特征任务会在服务端消费完整投影，不会把预览页当作全部实体。
+
+“多来源关联”工作区按 `cluster/entity_type/entity_id` 展示节点、命名空间、Pod、容器和设备。关联引擎只接受明确实体标识、`configs/multi_source.yaml` 中的人工别名和显式层级关系，并同时校验来源组合、时间窗口、计数和风险阈值。关联结果保留每条合法边；桥接证据不要求整组共享同一个实体，超过候选预算时明确标记 `partial`，不会把截断解释为“没有关联”。规则编辑器可维护规则名称、启停状态、来源组合、时间窗口、最低风险分、最低出现次数和置信度；保存使用乐观版本校验，规则变更只影响后续关联。不同集群永不关联，缺少可靠实体或事件时间的数据保持不可路由。Drain3 仍只学习日志消息正文，实体元数据不会进入模板学习；持久化观察不包含原始日志、样例或 `message_core`。
 
 Kafka 是默认关闭的可选数据源。启用项目内置 `kafka-python` 适配器并重启 Dashboard：
 
@@ -217,7 +227,7 @@ API 导入保持两阶段确认：先 `POST /api/knowledge-packages/uploads`（�
 
 ### Drain3 配置和模板质量
 
-`configs/drain3_recommended.ini` 是只读基线，包含算法参数和脱敏规则。可在“评测中心 → 模板质量”复制候选配置、编辑完整 INI、执行配置校验、关联 Gold Dataset 评测，并人工发布或回滚。
+`configs/drain3_recommended.ini` 是只读基线，包含算法参数和脱敏规则。可在“评测中心 → 模板质量”复制候选配置、编辑完整 INI、执行配置校验、关联 Gold Dataset 参考评测。客户端导入的预测一律标记为 `reference`，即使人工确认也不能发布候选配置；当前尚无可信服务端 runner，因此配置推广保持阻断，已发布配置不受影响，既有版本仍可人工回滚。
 
 质量中心展示 Grouping F1、Over-merge、Over-split、Singleton、Wildcard 和 Churn，支持模板标注、编辑、忽略、合并、恢复、软删除和版本回滚。发布不会覆盖仓库基线，只影响之后新建的任务；运行中任务继续使用创建时锁定的版本。
 

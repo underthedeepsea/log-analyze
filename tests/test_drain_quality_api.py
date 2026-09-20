@@ -96,12 +96,12 @@ def test_profile_promotion_requires_confirmation(drain_api):
     with pytest.raises(Exception):
         request_json(drain_api + f"/api/drain-quality/profiles/{profile_id}/promote", "POST", {"confirmed": False})
 
-    status, promoted = request_json(drain_api + f"/api/drain-quality/profiles/{profile_id}/promote", "POST", {"confirmed": True, "reviewer": "operator"})
-    assert status == 200
-    assert promoted["status"] == "promoted"
+    with pytest.raises(HTTPError) as denied:
+        request_json(drain_api + f"/api/drain-quality/profiles/{profile_id}/promote", "POST", {"confirmed": True, "reviewer": "operator"})
+    assert denied.value.code == 400
 
 
-def test_config_governance_api_versions_validates_and_publishes(drain_api):
+def test_config_governance_api_versions_validates_and_blocks_reference_publish(drain_api):
     _, listing = request_json(drain_api + "/api/drain-quality/configs")
     baseline = listing["active"]
     status, candidate = request_json(drain_api + "/api/drain-quality/configs", "POST", {
@@ -151,11 +151,12 @@ def test_config_governance_api_versions_validates_and_publishes(drain_api):
         "expected_downstream": {"critical_risks": ["kernel_error"], "normal_logs": ["normal-1"]},
         "actual_downstream": {"critical_risks": ["kernel_error"], "flagged_logs": []},
     })
-    publish_status, published = request_json(
-        drain_api + f"/api/drain-quality/configs/{candidate['config_id']}/publish",
-        "POST",
-        {"version": 2, "eval_run_id": eval_run["run_id"], "confirmed": True, "operator": "qa"},
-    )
+    with pytest.raises(HTTPError) as blocked:
+        request_json(
+            drain_api + f"/api/drain-quality/configs/{candidate['config_id']}/publish",
+            "POST",
+            {"version": 2, "eval_run_id": eval_run["run_id"], "confirmed": True, "operator": "qa"},
+        )
     _, after = request_json(drain_api + "/api/drain-quality/configs")
 
     assert baseline["config_id"] == "baseline"
@@ -163,9 +164,9 @@ def test_config_governance_api_versions_validates_and_publishes(drain_api):
     assert status_saved == 201
     assert validation["valid"] is True
     assert detail["parameters"]["sim_th"] == 0.45
-    assert publish_status == 200
-    assert published["status"] == "published"
-    assert after["active"]["content_hash"] == saved["content_hash"]
+    assert blocked.value.code == 400
+    assert "runner" in json.load(blocked.value)["error"]
+    assert after["active"]["content_hash"] == baseline["content_hash"]
 
 
 def test_config_publish_rejects_missing_or_regressed_evaluation(drain_api):

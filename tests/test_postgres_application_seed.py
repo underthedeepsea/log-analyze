@@ -16,8 +16,11 @@ def test_postgres_cursor_supports_store_iteration() -> None:
     class Cursor:
         rowcount = 2
 
+        def __iter__(self):
+            return iter([{"value": "one"}, {"value": "two"}])
+
         def fetchall(self):
-            return [{"value": "one"}, {"value": "two"}]
+            raise AssertionError("iteration must not fetch all rows")
 
     assert [row["value"] for row in PostgresCursor(Cursor())] == ["one", "two"]
 

@@ -814,10 +814,10 @@ class ApiFacade:
             profile_snapshot=profile.public_dict(),
         )
 
-    def feature_job(self, job_id: str) -> ApiResult:
+    def feature_job(self, job_id: str, *, cursor: str | None = None) -> ApiResult:
         manager = self._service("feature_jobs", self.container.feature_jobs)
         manager.refresh_from_persistence(str(job_id))
-        return ApiResult(200, manager.get_job(str(job_id)))
+        return ApiResult(200, manager.get_job(str(job_id), cursor=cursor))
 
     def feature_job_events(self, job_id: str, cursor: int) -> tuple[list[dict[str, Any]], int]:
         manager = self._service("feature_jobs", self.container.feature_jobs)
@@ -828,34 +828,50 @@ class ApiFacade:
         status = self._query(query, "status") or "pending"
         page_size = max(1, min(self._integer(query, "page_size", 100), 500))
         cursor = self._query(query, "cursor")
-        if cursor is None:
-            offset = 0
-        elif cursor.isdigit():
-            offset = int(cursor)
-        else:
-            return ApiResult(422, {
-                "code": "invalid_cursor",
-                "error": "cursor 必须是非负整数偏移量",
-            })
+        manager = self._service("feature_jobs", self.container.feature_jobs)
+        projection_page = getattr(getattr(manager, "persistence", None), "approval_page", None)
+        if callable(projection_page):
+            try:
+                return ApiResult(200, projection_page(
+                    status=status, page_size=page_size, cursor=cursor,
+                    after=self._query(query,"after"), selected_key=self._query(query,"review_key"),
+                ))
+            except ValueError as exc:
+                return ApiResult(422, {"code":"invalid_cursor","error":str(exc)})
+        after = self._query(query, "after")
+        if cursor is not None:
+            import base64
+            import json
+            try:
+                decoded = json.loads(base64.urlsafe_b64decode(cursor.encode()).decode())
+                if decoded["v"] != 1 or decoded["generation"] != "memory-v1" or decoded["status"] != status:
+                    raise ValueError("invalid cursor")
+                after = str(decoded["after"])
+            except (ValueError,KeyError,TypeError,UnicodeError):
+                return ApiResult(422, {"code":"invalid_cursor","error":"审批游标无效"})
+        offset = 0
         candidates = self._service("feature_jobs", self.container.feature_jobs).list_persisted_candidates(
             status=status,
             limit=None,
         )
         groups = build_review_groups(candidates)
         metrics = approval_metrics(candidates, groups)
-        after = self._query(query, "after")
         if after:
             offset = next((index for index, group in enumerate(groups) if group["review_key"] > after), len(groups))
         page_end = offset + page_size
         selected_key = self._query(query, "review_key")
         selected_group = next((group for group in groups if group["review_key"] == selected_key), None) if selected_key else None
+        import base64
+        import json
+        next_key = groups[page_end - 1]["review_key"] if page_end < len(groups) else None
+        next_cursor = base64.urlsafe_b64encode(json.dumps({"v":1,"generation":"memory-v1","status":status,"after":next_key}).encode()).decode() if next_key else None
         return ApiResult(200, {
             "schema_version": "feature_approval_queue_v1",
             "status": status,
             "total_groups": len(groups),
             "total_candidates": sum(int(group.get("candidate_count") or 0) for group in groups),
             "metrics": metrics,
-            "next_cursor": str(page_end) if page_end < len(groups) else None,
+            "next_cursor": next_cursor,
             "next_review_key": groups[page_end - 1]["review_key"] if page_end < len(groups) else None,
             "selected_group": selected_group,
             "items": groups[offset:page_end],

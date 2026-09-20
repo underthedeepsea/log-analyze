@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Protocol
@@ -10,6 +11,10 @@ from logrisk.stream_input_parser import iter_log_records_from_file
 
 class IncrementalSourceError(ValueError):
     """A source error that is safe to show in the Dashboard."""
+
+
+class RecomputeSourceIdentityError(IncrementalSourceError):
+    code = "RECOMPUTE_SOURCE_IDENTITY_UNVERIFIABLE"
 
 
 @dataclass(frozen=True)
@@ -48,6 +53,15 @@ class SourceDescriptor:
 class SourceRecord:
     record: dict[str, Any]
     next_cursor: SourceCursor
+    # Optional, transient position metadata.  Existing two-argument callers
+    # remain valid; ingestion accounting never guesses from a high-water mark.
+    metadata: dict[str, Any] | None = None
+
+    @property
+    def position(self) -> dict[str, Any] | None:
+        """Compatibility alias for adapters that call this ``position``."""
+
+        return dict(self.metadata) if isinstance(self.metadata, Mapping) else None
 
 
 class IncrementalSource(Protocol):
@@ -132,12 +146,18 @@ class FileIncrementalSource:
         max_decompressed_bytes: int | None = None,
         max_compression_ratio: float | None = None,
         max_line_bytes: int | None = None,
+        environment: str = "production",
+        scope_key: str = "default",
+        immutable_identity: bool = False,
     ) -> None:
         self.path = Path(path)
         self.filename = filename or self.path.name
         self.max_decompressed_bytes = max_decompressed_bytes
         self.max_compression_ratio = max_compression_ratio
         self.max_line_bytes = max_line_bytes
+        self.environment = str(environment or "production")
+        self.scope_key = str(scope_key or "default")
+        self.immutable_identity = bool(immutable_identity)
 
     def descriptor(self) -> SourceDescriptor:
         return SourceDescriptor(
@@ -154,9 +174,15 @@ class FileIncrementalSource:
             raise IncrementalSourceError("输入文件解析配置已变化，不能继续恢复")
         expected = dict(descriptor.get("identity") or {})
         current = self._identity()
+        for field in ("environment", "scope_key"):
+            if field in expected and expected.get(field) != current.get(field):
+                raise IncrementalSourceError("输入文件作用域已变化，不能继续恢复")
         for field in ("path", "device", "inode"):
             if expected.get(field) != current.get(field):
                 raise IncrementalSourceError("输入文件身份已变化，不能继续恢复")
+        expected_digest = expected.get("identity_digest")
+        if expected_digest and expected_digest != current.get("identity_digest"):
+            raise IncrementalSourceError("输入文件完整内容已变化，不能继续恢复")
         previous_size = int(expected.get("size_bytes") or 0)
         if current["size_bytes"] < previous_size:
             raise IncrementalSourceError("输入文件长度已缩短，不能继续恢复")
@@ -179,6 +205,7 @@ class FileIncrementalSource:
             raise IncrementalSourceError("文件来源不能使用其他来源的 Checkpoint")
         offset = int(cursor.value.get("offset") or 0)
         line = int(cursor.value.get("line") or 1)
+        before = self._stat_snapshot()
         try:
             for record in iter_log_records_from_file(
                 self.path,
@@ -189,12 +216,20 @@ class FileIncrementalSource:
                 max_compression_ratio=self.max_compression_ratio,
                 max_line_bytes=self.max_line_bytes,
             ):
+                self._ensure_unchanged(before)
                 next_offset = int(record.pop("_byte_offset_end"))
-                next_line = int(record.get("_line_no") or line) + 1
+                line_no = int(record.get("_line_no") or line)
+                next_line = line_no + 1
                 yield SourceRecord(
                     record=record,
                     next_cursor=SourceCursor("file", {"offset": next_offset, "line": next_line}),
+                    metadata={
+                        "partition_key": "",
+                        "start": line_no,
+                        "end": line_no + 1,
+                    },
                 )
+            self._ensure_unchanged(before)
         except ValueError as exc:
             raise IncrementalSourceError(str(exc)) from exc
 
@@ -207,7 +242,7 @@ class FileIncrementalSource:
             stat = self.path.stat()
         except OSError as exc:
             raise IncrementalSourceError("输入文件不可读取") from exc
-        return {
+        identity = {
             "path": str(self.path.resolve()),
             "device": int(stat.st_dev),
             "inode": int(stat.st_ino),
@@ -216,6 +251,39 @@ class FileIncrementalSource:
             "head_sha256": self._digest_segment(0, self._FINGERPRINT_BYTES),
             "tail_sha256": self._digest_segment(max(0, stat.st_size - self._FINGERPRINT_BYTES), self._FINGERPRINT_BYTES),
         }
+        if self.immutable_identity:
+            identity.update({
+                "environment": self.environment,
+                "scope_key": self.scope_key,
+                "identity_digest": self.content_digest(),
+            })
+        return identity
+
+    def content_digest(self) -> str:
+        """Hash the complete immutable file snapshot in bounded chunks."""
+
+        before = self._stat_snapshot()
+        digest = hashlib.sha256()
+        try:
+            with self.path.open("rb") as handle:
+                while chunk := handle.read(1024 * 1024):
+                    digest.update(chunk)
+        except OSError as exc:
+            raise IncrementalSourceError("输入文件不可读取") from exc
+        self._ensure_unchanged(before)
+        return digest.hexdigest()
+
+    def _stat_snapshot(self) -> tuple[int, int, int, int]:
+        try:
+            stat = self.path.stat()
+        except OSError as exc:
+            raise IncrementalSourceError("输入文件不可读取") from exc
+        return (int(stat.st_dev), int(stat.st_ino), int(stat.st_size), int(stat.st_mtime_ns))
+
+    def _ensure_unchanged(self, before: tuple[int, int, int, int]) -> None:
+        after = self._stat_snapshot()
+        if after != before:
+            raise IncrementalSourceError("输入文件在读取期间发生变化")
 
     def _digest_segment(self, offset: int, length: int) -> str:
         digest = hashlib.sha256()
@@ -233,6 +301,8 @@ class KafkaIncrementalSource:
         configuration: Mapping[str, Any],
         *,
         adapters: Mapping[str, KafkaConsumerAdapter] | None = None,
+        environment: str = "production",
+        scope_key: str = "default",
     ) -> None:
         # Legacy internal callers may still register explicitly; runtimes always inject their own registry.
         self.adapters = _KAFKA_ADAPTERS if adapters is None else adapters
@@ -242,9 +312,29 @@ class KafkaIncrementalSource:
             "consumer_group": str(configuration.get("consumer_group") or ""),
             "bootstrap_env": str(configuration.get("bootstrap_env") or ""),
         }
+        cluster_id = str(configuration.get("cluster_id") or "").strip()
+        if cluster_id:
+            self.configuration["cluster_id"] = cluster_id
+        self.environment = str(environment or "production")
+        self.scope_key = str(scope_key or "default")
 
     def descriptor(self) -> SourceDescriptor:
-        return SourceDescriptor(kind="kafka", identity={}, configuration=dict(self.configuration))
+        cluster_id = str(self.configuration.get("cluster_id") or "")
+        topic = str(self.configuration.get("topic") or "")
+        identity: dict[str, Any] = {
+            "environment": self.environment,
+            "scope_key": self.scope_key,
+        }
+        if cluster_id and topic:
+            identity["identity_digest"] = hashlib.sha256(
+                json.dumps(
+                    {"cluster_id": cluster_id, "topic": topic},
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("utf-8")
+            ).hexdigest()
+        return SourceDescriptor(kind="kafka", identity=identity, configuration=dict(self.configuration))
 
     def validate_descriptor(self, descriptor: Mapping[str, Any]) -> None:
         if str(descriptor.get("kind") or "") != "kafka":

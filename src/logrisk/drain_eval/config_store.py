@@ -297,4 +297,19 @@ class DrainConfigStore:
 
     def rollback(self, config_id: str, version: int, payload: Any) -> dict[str, Any]:
         with self._lock:
+            snapshot = self.get_version(config_id,int(version))
+            if not (config_id == "baseline" and int(version) == 1) and not self._trusted_activation(snapshot):
+                raise DrainQualityError("回滚目标缺少可信激活审计；当前仅允许系统 baseline 版本 1")
             return self._activate(config_id, int(version), require_object(payload), "rollback")
+
+    def _trusted_activation(self, snapshot: dict[str, Any]) -> bool:
+        if not self.events_path.exists():
+            return False
+        with self.events_path.open(encoding="utf-8") as stream:
+            return any(self._matches_trusted_activation(json.loads(line),snapshot) for line in stream if line.strip())
+
+    @staticmethod
+    def _matches_trusted_activation(event: dict[str, Any], snapshot: dict[str, Any]) -> bool:
+        return (event.get("action") == "publish" and event.get("provenance") == "server-executed"
+                and bool(event.get("runner_evidence")) and event.get("config_id") == snapshot["config_id"]
+                and event.get("version") == snapshot["version"] and event.get("content_hash") == snapshot["content_hash"])

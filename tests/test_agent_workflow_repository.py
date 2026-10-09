@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import pytest
+
 from logrisk.agentic.compiler import WorkflowLimits, compile_workflow
+from logrisk.agentic.errors import AgenticError
 from logrisk.agentic.roles import build_role_registry
 from logrisk.agentic.workflow_repository import WorkflowRepository
 from logrisk.database import SQLiteDatabase
@@ -103,6 +106,28 @@ def test_repository_rejects_sensitive_evidence_summary_before_persistence(tmp_pa
         assert "敏感" in str(exc)
     else:
         raise AssertionError("sensitive evidence must be rejected")
+    assert repository.list_runs() == []
+
+
+@pytest.mark.parametrize("evidence_summary", [
+    {"source_job_id": "job-other"},
+    {"job_id": "job-other"},
+    {"entity_id": "node-other"},
+    {"entity": {"id": "node-other"}},
+])
+def test_repository_rejects_conflicting_evidence_scope_at_creation(tmp_path, evidence_summary):
+    repository = WorkflowRepository(SQLiteDatabase(tmp_path / "state.sqlite3"))
+    workflow = repository.create_workflow(_compiled(), actor="alice", idempotency_key="workflow-1")
+
+    with pytest.raises(AgenticError) as exc:
+        repository.create_run(
+            workflow["workflow_id"], source_job_id="job-1", entity_id="node-a", entity_type="node",
+            model_profile_id="qwen", prompt_id="agent_plan_v1", actor="alice", roles=("operator",),
+            request_id="req-1", idempotency_key="run-1", evidence_summary=evidence_summary,
+            runtime_snapshot=_runtime_snapshot(),
+        )
+
+    assert exc.value.code == "workflow_scope_invalid"
     assert repository.list_runs() == []
 
 

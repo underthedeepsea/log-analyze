@@ -96,7 +96,7 @@ from pipeline.manual_import_pipeline import analyze_records
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 MAX_LARGE_UPLOAD_BYTES = 500 * 1024 * 1024
 DEFAULT_MODEL = "qwen3:1.7b"
-APP_VERSION = "1.39.2"
+APP_VERSION = "1.40.0"
 
 
 class DashboardHTTPServer(ThreadingHTTPServer):
@@ -939,7 +939,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if workflow_run_match:
                 if not self.server.agent_workflows_enabled:  # type: ignore[attr-defined]
                     raise AgenticError("Agent 工作流功能未启用", code="agent_workflows_disabled", status_code=404)
-                job_id, entity_id = str(payload.get("source_job_id") or ""), str(payload.get("entity_id") or "")
+                from logrisk.agentic.models import validate_run_scope
+                job_id, entity_id = validate_run_scope(payload.get("source_job_id"), payload.get("entity_id"))
                 evidence = self.server.manager.get_agent_evidence(job_id, entity_id)  # type: ignore[attr-defined]
                 profile = self.server.model_profiles.get(payload.get("model_profile_id"))  # type: ignore[attr-defined]
                 connection = self.server.connections.get(profile.connection_id)  # type: ignore[attr-defined]
@@ -984,8 +985,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     raise AgenticError("Agent 功能未启用", code="agentic_disabled", status_code=404)
                 if not isinstance(payload, dict):
                     raise AgenticError("请求体必须是 JSON object")
-                job_id = str(payload.get("source_job_id") or "")
-                entity_id = str(payload.get("entity_id") or "")
+                from logrisk.agentic.models import validate_run_scope
+                job_id, entity_id = validate_run_scope(payload.get("source_job_id"), payload.get("entity_id"))
                 evidence = self.server.manager.get_agent_evidence(job_id, entity_id)  # type: ignore[attr-defined]
                 profile = self.server.model_profiles.get(payload.get("model_profile_id"))  # type: ignore[attr-defined]
                 connection = self.server.connections.get(profile.connection_id)  # type: ignore[attr-defined]

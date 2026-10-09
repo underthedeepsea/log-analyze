@@ -40,14 +40,53 @@ def test_model_planner_builds_only_sanitized_structured_request():
     plan = planner.plan(
         goal="检查",
         evidence_summary={"entity": {"id": "node-a"}, "template_count": 2},
-        tool_descriptions=[{"name": "get_sanitized_evidence"}],
+        tool_descriptions=[{
+            "name": "get_sanitized_evidence",
+            "argument_schema": {
+                "type": "object", "additionalProperties": False,
+                "required": ["job_id", "entity_id"],
+                "properties": {"job_id": {"type": "string"}, "entity_id": {"type": "string"}},
+            },
+        }],
         max_steps=2,
     )
 
     assert plan.goal == "检查脱敏证据"
     request = client.requests[0]
     assert request["schema"]["required"] == ["goal", "steps"]
+    pair = request["schema"]["properties"]["steps"]["items"]["oneOf"][0]
+    assert pair["properties"]["tool_name"] == {"const": "get_sanitized_evidence"}
+    assert pair["properties"]["arguments"]["required"] == ["job_id", "entity_id"]
     assert "raw_log" not in str(request["messages"])
+
+
+@pytest.mark.parametrize("feature", ["not-an-object", [], {"feature_type": "missing-fields"}])
+def test_model_planner_rejects_invalid_feature_arguments_before_plan_coercion(feature):
+    client = MockModelClient({
+        "goal": "检查脱敏证据",
+        "steps": [{"step_id": "evaluate", "tool_name": "evaluate_candidate", "arguments": {"feature": feature}}],
+    })
+    planner = ModelAgentPlanner(client, model="test", prompt_content="只输出 JSON", timeout=30)
+    feature_schema = {
+        "type": "object", "additionalProperties": False,
+        "required": ["feature_type", "tags", "selection_reason"],
+        "properties": {
+            "feature_type": {"type": "string", "minLength": 1},
+            "tags": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+            "selection_reason": {"type": "string", "minLength": 1},
+        },
+    }
+
+    with pytest.raises(AgenticError) as exc:
+        planner.plan(
+            goal="检查", evidence_summary={}, max_steps=1,
+            tool_descriptions=[{"name": "evaluate_candidate", "argument_schema": {
+                "type": "object", "additionalProperties": False, "required": ["feature"],
+                "properties": {"feature": feature_schema},
+            }}],
+        )
+
+    assert exc.value.code == "agent_plan_invalid"
 
 
 def test_fake_planner_returns_validated_copy():

@@ -7,6 +7,7 @@ from typing import Any, Callable, Mapping
 from logrisk.ai_harness.connection_check import check_model_connection
 from logrisk.application.container import ApplicationContainer
 from logrisk.approval_queue import approval_metrics, build_review_groups
+from logrisk.approval_experts import ApprovalExpertReader
 from logrisk.database import DatabaseError, PostgresDatabase
 from logrisk.database_config import database_url_from_candidate
 from logrisk.feature_extractor_ollama import FEATURE_PROMPT_ID
@@ -36,6 +37,9 @@ class ApiFacade:
         self.service_resolver = service_resolver
 
     def dispatch_read(self, path: str, query: Mapping[str, Any] | None = None) -> ApiResult | None:
+        parts = path.split("/")
+        if len(parts) == 7 and parts[:3] == ["", "api", "jobs"] and parts[4] == "features" and parts[6] == "expert-opinions":
+            return self.feature_expert_opinions(parts[3], parts[5])
         if path == "/api/streaming/sources":
             return ApiResult(200, {"sources": self.container.source_capabilities()})
         if path == "/api/health":
@@ -818,6 +822,12 @@ class ApiFacade:
         manager = self._service("feature_jobs", self.container.feature_jobs)
         manager.refresh_from_persistence(str(job_id))
         return ApiResult(200, manager.get_job(str(job_id), cursor=cursor))
+
+    def feature_expert_opinions(self, job_id: str, candidate_id: str) -> ApiResult:
+        result = ApprovalExpertReader(self.container.database).read(job_id, candidate_id)
+        if result is None:
+            return ApiResult(404, {"code": "feature_not_found", "error": "当前任务中未找到该候选特征"})
+        return ApiResult(200, result)
 
     def feature_job_events(self, job_id: str, cursor: int) -> tuple[list[dict[str, Any]], int]:
         manager = self._service("feature_jobs", self.container.feature_jobs)

@@ -4,7 +4,7 @@ from typing import Any
 
 from .artifacts import dependency_artifacts
 from .errors import AgenticError
-from .models import AgentRunRequest
+from .models import AgentRunRequest, validate_evidence_scope
 from .tool_registry import _reject_sensitive
 from .workflow_repository import WorkflowRepository
 
@@ -19,7 +19,13 @@ class WorkflowWorker:
         node = next(item for item in run["nodes"] if item["node_id"] == node_id)
         attempt = int(node["attempt"])
         key = f"workflow:{workflow_run_id}:{node_id}:{attempt}"
-        evidence_summary = dict(run["locked_snapshot"].get("evidence_summary") or {})
+        evidence_summary = run["locked_snapshot"].get("evidence_summary")
+        validate_evidence_scope(
+            evidence_summary, run["source_job_id"], run["entity_id"], code="workflow_scope_invalid",
+        )
+        evidence_summary = dict(evidence_summary)
+        evidence_summary["source_job_id"] = run["source_job_id"]
+        evidence_summary["entity_id"] = run["entity_id"]
         evidence_summary["dependency_artifacts"] = dependency_artifacts(run["nodes"], node["dependencies"])
         _reject_sensitive(evidence_summary)
         runtime_snapshot = run["locked_snapshot"]

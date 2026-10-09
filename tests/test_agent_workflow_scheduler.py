@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import threading
 import time
 
@@ -179,6 +180,32 @@ def test_recovery_replays_interrupted_node_with_same_locked_workflow(tmp_path):
     assert recovered == [run["workflow_run_id"]]
     assert result["status"] == "awaiting_human"
     assert next(node for node in result["nodes"] if node["node_id"] == "evidence")["attempt"] == 2
+
+
+@pytest.mark.parametrize("state", ["resumed", "recovered"])
+def test_worker_rejects_historical_scope_conflict_after_resume_or_recovery(tmp_path, state):
+    child = FakeChildAgentService()
+    service, run = _service(tmp_path, child)
+    snapshot = dict(run["locked_snapshot"])
+    snapshot["evidence_summary"] = {"job_id": "job-other", "entity": {"id": "node-a"}}
+    with service.repository.database.transaction() as connection:
+        connection.execute(
+            "UPDATE agent_workflow_runs SET locked_snapshot_json=? WHERE workflow_run_id=?",
+            (json.dumps(snapshot, ensure_ascii=False, separators=(",", ":")), run["workflow_run_id"]),
+        )
+    if state == "resumed":
+        service.repository.transition_run(run["workflow_run_id"], "paused", allowed_from={"queued"})
+        service.resume(run["workflow_run_id"], idempotency_key="resume-scope")
+    else:
+        service.repository.transition_run(run["workflow_run_id"], "running", allowed_from={"queued"})
+        service.repository.claim_node(run["workflow_run_id"], "evidence")
+        assert service.recover_active_runs() == [run["workflow_run_id"]]
+
+    result = service.execute_run(run["workflow_run_id"])
+
+    assert result["status"] == "failed"
+    assert result["error_code"] == "workflow_scope_invalid"
+    assert child.created == {}
 
 
 def test_workflow_rejects_sensitive_evidence_before_persistence(tmp_path):

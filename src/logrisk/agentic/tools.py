@@ -10,6 +10,43 @@ from .errors import AgenticError
 from .tool_registry import AgentToolContext, ToolRegistry, _reject_sensitive
 
 
+_NONEMPTY_STRING = {"type": "string", "minLength": 1}
+_STRING_LIST = {"type": "array", "minItems": 1, "items": _NONEMPTY_STRING}
+_OPTIONAL_STRING_LIST = {"type": "array", "items": _NONEMPTY_STRING}
+_FEATURE_PROPERTIES = {
+    "feature_type": _NONEMPTY_STRING,
+    "title": _NONEMPTY_STRING,
+    "summary": _NONEMPTY_STRING,
+    "importance": {"type": "string", "enum": ["critical", "high", "medium", "low"]},
+    "template_hashes": _STRING_LIST,
+    "components": _STRING_LIST,
+    "tags": _STRING_LIST,
+    "selection_reason": _NONEMPTY_STRING,
+    "match_mode": {"type": "string", "enum": ["semantic", "template_set"]},
+    "problem_resolution": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "confidence": _NONEMPTY_STRING,
+            "semantic_safe": {"type": "boolean"},
+            "ambiguity": {"type": "boolean"},
+            "evidence_source": _NONEMPTY_STRING,
+            "matched_rule": {"type": ["string", "null"]},
+            "supporting_codes": {"type": "array", "items": _NONEMPTY_STRING},
+            "subtype": {"type": ["string", "null"]},
+            "missing_selected_ids": {"type": "array", "items": _NONEMPTY_STRING},
+            "unresolved_selected_ids": {"type": "array", "items": _NONEMPTY_STRING},
+        },
+    },
+}
+_FEATURE_SCHEMA = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["feature_type", "title", "summary", "importance", "template_hashes", "components", "tags", "selection_reason"],
+    "properties": _FEATURE_PROPERTIES,
+}
+
+
 def build_agent_tool_registry(feature_jobs: Any, rule_governance: Any, knowledge_packages: Any) -> ToolRegistry:
     def load_evidence(context: AgentToolContext) -> dict[str, Any]:
         value = feature_jobs.get_agent_evidence(context.source_job_id, context.entity_id)
@@ -103,9 +140,9 @@ def build_agent_tool_registry(feature_jobs: Any, rule_governance: Any, knowledge
             context.source_job_id, context.entity_id, arguments["feature"], run_id=context.run_id
         )
 
-    registry.register(name="get_sanitized_evidence", description="读取风险实体的聚合脱敏 Evidence", required_arguments=("job_id", "entity_id"), handler=evidence)
-    registry.register(name="find_approved_rules", description="查询匹配的已批准规则", required_arguments=(), optional_arguments=("template_hashes", "components"), handler=approved_rules)
-    registry.register(name="inspect_knowledge_assets", description="查询已安装的知识包摘要", required_arguments=(), handler=assets)
-    registry.register(name="evaluate_candidate", description="执行确定性候选质量校验", required_arguments=("feature",), handler=evaluate)
-    registry.register(name="register_feature_candidate", description="登记等待人工审批的候选特征", required_arguments=("feature",), handler=register_candidate, writes_candidate=True)
+    registry.register(name="get_sanitized_evidence", description="读取风险实体的聚合脱敏 Evidence", required_arguments=("job_id", "entity_id"), argument_schema={"type": "object", "additionalProperties": False, "required": ["job_id", "entity_id"], "properties": {"job_id": _NONEMPTY_STRING, "entity_id": _NONEMPTY_STRING}}, handler=evidence)
+    registry.register(name="find_approved_rules", description="查询匹配的已批准规则", required_arguments=(), optional_arguments=("template_hashes", "components"), argument_schema={"type": "object", "additionalProperties": False, "properties": {"template_hashes": _OPTIONAL_STRING_LIST, "components": _OPTIONAL_STRING_LIST}}, handler=approved_rules)
+    registry.register(name="inspect_knowledge_assets", description="查询已安装的知识包摘要", required_arguments=(), argument_schema={"type": "object", "additionalProperties": False, "properties": {}}, handler=assets)
+    registry.register(name="evaluate_candidate", description="执行确定性候选质量校验", required_arguments=("feature",), argument_schema={"type": "object", "additionalProperties": False, "required": ["feature"], "properties": {"feature": _FEATURE_SCHEMA}}, handler=evaluate)
+    registry.register(name="register_feature_candidate", description="登记等待人工审批的候选特征", required_arguments=("feature",), argument_schema={"type": "object", "additionalProperties": False, "required": ["feature"], "properties": {"feature": _FEATURE_SCHEMA}}, handler=register_candidate, writes_candidate=True)
     return registry

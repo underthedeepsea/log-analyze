@@ -10,13 +10,15 @@
   <img src="frontend/logo/logrisk-app-icon-orange-v2.png" width="112" alt="LOGRISK 应用图标" />
 </p>
 
-当前版本：`1.39.2`。完整变更记录见 [`releas.md`](releas.md)。
+当前版本：`1.40.0`。完整变更记录见 [`releas.md`](releas.md)。
 
 开发中审计修复：审批列表使用 canonical 数据库轻投影和不受前页审批影响的 opaque cursor；新增迁移 0027（节点投影修订与真实评分样本）与 0028（审批投影）。节点当前状态可补偿未完成投影，历史没有评分样本时显示 uncertain；流式恢复校验已提交 miner generation 的 SHA-256 manifest。
 
+人工审批页在证据与表单上方并行展示证据、规则、特征三个专家的审批参考，每栏提供结论、关键依据、待确认事项及可展开的对应记录。摘要直接整理已保存的脱敏证据、规则查询、模型候选与确定性校验，不额外调用模型。意见绑定审批组代表候选的原始分析和依赖记录；缺失或不完整记录明确提示，不视为通过。
+
 人工审批支持连续操作：点击批准或驳回后，条目立即变绿并显示“保存中”，数据库确认后变为“已保存”；当前面板保留，可继续选择下一组。保存失败保留提交内容并可重试；有未确认提交时请保留页面，关闭或刷新浏览器会提示。列表中的“刷新”会重新获取待审批队列并移除已保存条目，“加载更多”继续读取后续组。审批身份和规则复用范围仍按脱敏证据确定。
 
-PostgreSQL 部署升级到 1.39.2 时，应先通过 `python manage.py logrisk_migrate --json` 显式应用待执行迁移，再更新服务；Django/Airflow 不会自动迁移。批量审批只更新命中候选、分组状态和审计事件，完整任务快照不再逐条回写。审批携带版本与请求幂等键，冲突保留草稿并展示最新决定；新候选审批和已批准规则健康复审分别展示。Kafka 默认关闭，各部署实例独立配置；读取本批高水位后结束，未探测连接时明确显示“未检查”。
+PostgreSQL 部署升级到 1.40.0 时，应先通过 `python manage.py logrisk_migrate --json` 显式应用待执行迁移，再更新服务；Django/Airflow 不会自动迁移。批量审批只更新命中候选、分组状态和审计事件，完整任务快照不再逐条回写。审批携带版本与请求幂等键，冲突保留草稿并展示最新决定；新候选审批和已批准规则健康复审分别展示。Kafka 默认关闭，各部署实例独立配置；读取本批高水位后结束，未探测连接时明确显示“未检查”。
 
 
 新生成的日志候选按已识别语义拆分，未解析证据单独保留待人工复核；日志命中次数按各自所选模板计算。审批页区分结构校验与语义证据完整性。历史候选和审批状态不会自动重写。
@@ -325,7 +327,7 @@ Django 写接口已覆盖模型连接/画像、Prompt、规则治理、风险语
 
 Agent 功能默认关闭。本地 Dashboard 使用 `LOGRISK_AGENTIC_ENABLED=1 bash scripts/run_dashboard.sh` 启用；Django 在 `LOGRISK` 设置中配置 `agentic_enabled: True` 与 `airflow_agent_dag_id: "logrisk_agent_run"`。页面入口位于“AI 工程 → Agent 运行”。
 
-Agent Planner 只接收实体、风险分和模板数量等脱敏摘要，随后通过白名单工具按需读取聚合 Evidence、批准规则与已安装知识资产。每个 Run 锁定模型 Profile、Provider 连接和 Prompt 内容摘要，支持暂停、继续、取消、重试和只读 Replay；步骤、工具调用、预算和审计事件写入 SQLite/PostgreSQL。`evaluate_candidate` 必须成功后才允许 `register_feature_candidate`，候选仍需进入原有人工审批流程。Agent 不会调用批准、导出、规则发布、RCA 或修复工具。
+Agent Planner 只接收实体、风险分和模板数量等脱敏摘要，以及持久化 Run 的规范化来源任务与实体标识；随后通过白名单工具按需读取聚合 Evidence、批准规则与已安装知识资产。每个允许工具同时提供严格的参数 Schema，模型计划在执行前按工具名和参数类型校验。每个 Run 锁定模型 Profile、Provider 连接和 Prompt 内容摘要，支持暂停、继续、取消、重试和只读 Replay；步骤、工具调用、预算和审计事件写入 SQLite/PostgreSQL。`evaluate_candidate` 必须成功后才允许 `register_feature_candidate`，候选仍需进入原有人工审批流程。Agent 不会调用批准、导出、规则发布、RCA 或修复工具。
 
 标准接口为 `GET/POST /api/agent-runs`、`GET /api/agent-runs/<run_id>`、`GET /events|artifacts`，以及 `POST /pause|resume|cancel|retry|replay`。除只读 Replay 外，创建和控制操作都必须携带 `Idempotency-Key` 或请求体中的 `idempotency_key`。工具临时失败只按同一锁定步骤自动重试一次，不重新规划或切换模型 Provider；服务重启会从数据库恢复排队、规划中和运行中的 Run。
 

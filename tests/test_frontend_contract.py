@@ -1,3 +1,5 @@
+import json
+import re
 from pathlib import Path
 
 
@@ -564,7 +566,12 @@ def test_release_docs_describe_current_feature_version():
     assert "## 1.32.0 - 2026-08-10" in release
     assert "## 1.34.0 - 2026-08-13" in release
     assert "## 1.36.1 - 2026-09-01" in release
-    assert "当前版本：`1.39.2`" in readme
+    version_match = re.search(r'^version = "(1\.\d+\.\d+)"$', Path("pyproject.toml").read_text(encoding="utf-8"), re.MULTILINE)
+    assert version_match is not None
+    version = version_match.group(1)
+    assert f"当前版本：`{version}`" in readme
+    assert re.search(r"^## (1\.\d+\.\d+) -", release, re.MULTILINE).group(1) == version
+    assert json.loads((FRONTEND / "package.json").read_text(encoding="utf-8"))["version"] == version
     assert "## 1.37.3 - 2026-09-11" in release
     assert "## 1.24.0 - 2026-07-22" in release
     assert "## 1.24.1 - 2026-07-22" in release

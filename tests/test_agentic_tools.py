@@ -171,6 +171,34 @@ def test_tool_registry_rejects_sensitive_argument_before_handler():
     assert called == []
 
 
+@pytest.mark.parametrize("feature", ["not-an-object", [], {"feature_type": "missing-fields"}])
+def test_typed_feature_arguments_are_rejected_before_the_handler(feature):
+    called = []
+    registry = ToolRegistry()
+    feature_schema = {
+        "type": "object", "additionalProperties": False,
+        "required": ["feature_type", "tags", "selection_reason"],
+        "properties": {
+            "feature_type": {"type": "string", "minLength": 1},
+            "tags": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}},
+            "selection_reason": {"type": "string", "minLength": 1},
+        },
+    }
+    registry.register(
+        name="evaluate_candidate", description="校验", required_arguments=("feature",),
+        argument_schema={"type": "object", "additionalProperties": False, "required": ["feature"],
+                         "properties": {"feature": feature_schema}},
+        handler=lambda arguments, context: called.append(arguments) or {"passed": True},
+    )
+    context = AgentToolContext("run-1", "job-1", "node-a", frozenset({"evaluate_candidate"}), "alice", "req-1")
+
+    with pytest.raises(AgenticError) as exc:
+        registry.execute("evaluate_candidate", {"feature": feature}, context)
+
+    assert exc.value.code == "tool_arguments_invalid"
+    assert called == []
+
+
 def test_evidence_tool_cannot_cross_the_run_entity_boundary():
     manager = FeatureJobManager(extractor=lambda source, **kwargs: [], auto_start=False)
     job_id = manager.create_job(_document(), model="qwen3.5:9b-mlx")
@@ -185,6 +213,27 @@ def test_evidence_tool_cannot_cross_the_run_entity_boundary():
     context = AgentToolContext("run-1", job_id, "node-a", frozenset({"get_sanitized_evidence"}), "alice", "req-1")
     with pytest.raises(AgenticError, match="边界"):
         registry.execute("get_sanitized_evidence", {"job_id": job_id, "entity_id": "node-b"}, context)
+
+
+def test_candidate_tool_schema_keeps_required_feature_fields_and_supported_metadata():
+    manager = FeatureJobManager(extractor=lambda source, **kwargs: [], auto_start=False)
+
+    class Rules:
+        def list_rules(self, **_kwargs): return {"items": []}
+
+    class Packages:
+        def list_packages(self): return []
+
+    descriptions = build_agent_tool_registry(manager, Rules(), Packages()).describe()
+    evaluate = next(item for item in descriptions if item["name"] == "evaluate_candidate")
+    feature = evaluate["argument_schema"]["properties"]["feature"]
+
+    assert feature["required"] == [
+        "feature_type", "title", "summary", "importance", "template_hashes",
+        "components", "tags", "selection_reason",
+    ]
+    assert feature["properties"]["match_mode"]["enum"] == ["semantic", "template_set"]
+    assert feature["properties"]["problem_resolution"]["type"] == "object"
 
 
 def test_knowledge_tool_returns_only_materialized_assets_from_installed_versions():

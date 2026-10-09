@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from logrisk.ai_harness.evaluator import EVALUATOR_VERSION
 from logrisk.agentic.artifacts import canonical_fingerprint
 from logrisk.agentic.models import AgentPlan, AgentRunRequest, AgentStepPlan
@@ -234,6 +236,32 @@ def test_service_recovery_resets_interrupted_step(tmp_path):
     assert recovered == [run["run_id"]]
     assert result["status"] == "awaiting_human"
     assert result["steps"][0]["attempt"] == 2
+
+
+@pytest.mark.parametrize("state", ["resumed", "recovered"])
+def test_preplanned_agent_run_rejects_conflicting_scope_after_resume_or_recovery(tmp_path, state):
+    plan = AgentPlan("读取", (AgentStepPlan("read", "get_sanitized_evidence", {
+        "job_id": "job-1", "entity_id": "node-a",
+    }),))
+    repository, runtime = _runtime(tmp_path, plan)
+    service = AgentService(repository, runtime)
+    run = service.create_run(_request(f"scope-{state}"), locked_snapshot={
+        "evidence_summary": {"source_job_id": "job-other", "entity": {"id": "node-a"}},
+    })
+    repository.transition(run["run_id"], "planning", allowed_from={"queued"})
+    repository.replace_plan(run["run_id"], plan)
+    if state == "resumed":
+        repository.transition(run["run_id"], "paused", allowed_from={"planning"})
+        service.resume(run["run_id"], idempotency_key=f"resume-{state}")
+    else:
+        repository.transition(run["run_id"], "running", allowed_from={"planning"})
+        repository.start_step(run["run_id"], "read")
+        assert service.recover_active_runs() == [run["run_id"]]
+
+    result = service.execute_run(run["run_id"])
+
+    assert result["status"] == "failed"
+    assert result["error_code"] == "agent_scope_invalid"
 
 
 def test_runtime_fails_closed_when_tool_budget_is_exhausted(tmp_path):

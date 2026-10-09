@@ -9,6 +9,7 @@ from logrisk.ai_harness.usage_accounting import run_agent_tool_attempt, usage_co
 
 from .artifacts import READ_ARTIFACT_TYPES, canonical_fingerprint, read_tool_artifact
 from .errors import AgenticError
+from .models import validate_evidence_scope
 from .planner import AgentPlanner
 from .repository import AgentRepository
 from .tool_registry import AgentToolContext, ToolRegistry
@@ -61,12 +62,27 @@ class AgentRuntime:
             "scope_key": run.get("scope_key") or self.scope_key or "default",
         }
 
+    @staticmethod
+    def _planner_evidence_summary(run: dict[str, Any]) -> dict[str, Any]:
+        source_job_id, entity_id = run.get("source_job_id"), run.get("entity_id")
+        snapshot = run.get("locked_snapshot") or {}
+        evidence_summary = snapshot.get("evidence_summary")
+        validate_evidence_scope(
+            evidence_summary, source_job_id, entity_id, code="agent_scope_invalid",
+        )
+        result = dict(evidence_summary)
+        # Only the model input is augmented. The persisted snapshot is immutable.
+        result["source_job_id"] = source_job_id
+        result["entity_id"] = entity_id
+        return result
+
     def execute(self, run_id: str) -> dict[str, Any]:
         run = self.repository.get_run(run_id)
         if run["status"] == "cancelled":
             return run
         started = self.monotonic()
         try:
+            planner_evidence_summary = self._planner_evidence_summary(run)
             if run["status"] == "queued" or (run["status"] == "planning" and not run["steps"]):
                 if run["status"] == "queued":
                     run = self.repository.transition(run_id, "planning", allowed_from={"queued"})
@@ -75,7 +91,7 @@ class AgentRuntime:
                 with usage_context(**self._usage_context(run)):
                     plan = planner.plan(
                         goal=str(snapshot.get("goal") or "提取可审批日志特征"),
-                        evidence_summary=dict(snapshot.get("evidence_summary") or {}),
+                        evidence_summary=planner_evidence_summary,
                         tool_descriptions=self.tools.describe(frozenset(run["allowed_tools"])),
                         max_steps=int(run["max_steps"]),
                     )

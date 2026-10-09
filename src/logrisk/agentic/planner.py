@@ -10,6 +10,7 @@ from logrisk.ai_harness.usage_accounting import run_model_attempt
 
 from .errors import AgenticError
 from .models import AgentPlan, AgentStepPlan
+from .tool_registry import validate_argument_schema
 
 
 _SENSITIVE_KEYS = frozenset({"samples", "raw_sample", "raw_log", "raw_logs", "raw_message", "message", "api_key", "token", "password", "secret", "dsn", "authorization", "cookie"})
@@ -50,6 +51,31 @@ PLAN_SCHEMA = {
 }
 
 
+def build_plan_schema(tool_descriptions: list[dict[str, Any]]) -> dict[str, Any]:
+    """Pair every permitted tool name with its own strict argument schema."""
+    pairs = []
+    for tool in tool_descriptions:
+        name = tool.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        argument_schema = tool.get("argument_schema")
+        if not isinstance(argument_schema, dict):
+            argument_schema = {"type": "object"}
+        pairs.append({
+            "type": "object",
+            "additionalProperties": False,
+            "required": ["step_id", "tool_name", "arguments"],
+            "properties": {
+                "step_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]{0,63}$"},
+                "tool_name": {"const": name},
+                "arguments": copy.deepcopy(argument_schema),
+            },
+        })
+    schema = copy.deepcopy(PLAN_SCHEMA)
+    schema["properties"]["steps"]["items"] = {"oneOf": pairs} if pairs else {"not": {}}
+    return schema
+
+
 class AgentPlanner(Protocol):
     def plan(
         self,
@@ -74,18 +100,34 @@ def validate_plan(plan: AgentPlan, *, allowed_tools: set[str], max_steps: int) -
     return plan
 
 
-def _parse_plan(value: Any) -> AgentPlan:
+def _parse_plan(value: Any, tool_descriptions: list[dict[str, Any]]) -> AgentPlan:
     if not isinstance(value, dict) or set(value) != {"goal", "steps"}:
+        raise AgenticError("模型返回了无效 Agent 计划", code="agent_plan_invalid")
+    if not isinstance(value.get("goal"), str):
         raise AgenticError("模型返回了无效 Agent 计划", code="agent_plan_invalid")
     raw_steps = value.get("steps")
     if not isinstance(raw_steps, list):
         raise AgenticError("模型返回了无效 Agent 计划", code="agent_plan_invalid")
     steps: list[AgentStepPlan] = []
+    schemas = {
+        item["name"]: item.get("argument_schema") if isinstance(item.get("argument_schema"), dict) else {"type": "object"}
+        for item in tool_descriptions
+        if isinstance(item, dict) and isinstance(item.get("name"), str)
+    }
     for item in raw_steps:
         if not isinstance(item, dict) or set(item) != {"step_id", "tool_name", "arguments"}:
             raise AgenticError("模型返回了无效 Agent 计划", code="agent_plan_invalid")
-        steps.append(AgentStepPlan(str(item["step_id"]), str(item["tool_name"]), dict(item["arguments"])))
-    return AgentPlan(str(value.get("goal") or ""), tuple(steps))
+        if not isinstance(item["step_id"], str) or not isinstance(item["tool_name"], str) or not isinstance(item["arguments"], dict):
+            raise AgenticError("模型返回了无效 Agent 计划", code="agent_plan_invalid")
+        schema = schemas.get(item["tool_name"])
+        if schema is None:
+            raise AgenticError("模型返回了未授权 Agent 工具", code="agent_plan_invalid")
+        try:
+            validate_argument_schema(item["arguments"], schema)
+        except AgenticError as exc:
+            raise AgenticError("模型返回了不符合工具契约的参数", code="agent_plan_invalid") from exc
+        steps.append(AgentStepPlan(item["step_id"], item["tool_name"], item["arguments"]))
+    return AgentPlan(value["goal"], tuple(steps))
 
 
 class FakeAgentPlanner:
@@ -139,7 +181,7 @@ class ModelAgentPlanner:
                     {"role": "system", "content": self.prompt_content},
                     {"role": "user", "content": json.dumps(payload, ensure_ascii=False, separators=(",", ":"))},
                 ],
-                PLAN_SCHEMA,
+                build_plan_schema(tool_descriptions),
                 model=self.model,
                 timeout=self.timeout,
                 options=self.options,
@@ -152,7 +194,7 @@ class ModelAgentPlanner:
                 caller_id=self.caller_id,
                 logical_call_id=self.logical_call_id,
             )
-            plan = _parse_plan(output)
+            plan = _parse_plan(output, tool_descriptions)
         except AgenticError:
             raise
         except Exception as exc:

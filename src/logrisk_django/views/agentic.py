@@ -6,6 +6,7 @@ from django.http import HttpRequest, JsonResponse
 from django.views.decorators.http import require_GET, require_POST
 
 from logrisk.agentic import AgentRunRequest, AgenticError
+from logrisk.agentic.models import validate_run_scope
 from logrisk.orchestration import AirflowOrchestratorError
 from logrisk_django.service_factory import get_agent_airflow_orchestrator, get_config, get_container
 from logrisk_django.views.access import require_django_write_access
@@ -53,7 +54,8 @@ def create_agent_run(request: HttpRequest) -> JsonResponse:
         if not isinstance(payload, dict):
             raise AgenticError("请求体必须是 JSON object")
         container = get_container()
-        evidence = container.feature_jobs.get_agent_evidence(str(payload.get("source_job_id") or ""), str(payload.get("entity_id") or ""))
+        source_job_id, entity_id = validate_run_scope(payload.get("source_job_id"), payload.get("entity_id"))
+        evidence = container.feature_jobs.get_agent_evidence(source_job_id, entity_id)
         profile = container.model_profiles.get(payload.get("model_profile_id"))
         connection = container.connections.get(profile.connection_id)
         prompt = container.prompt_registry.load(str(payload.get("prompt_id") or "agent_plan_v1"))
@@ -61,7 +63,7 @@ def create_agent_run(request: HttpRequest) -> JsonResponse:
         if not key:
             raise AgenticError("缺少幂等键", code="idempotency_required")
         run = _service().create_run(AgentRunRequest(
-            source_job_id=str(payload.get("source_job_id")), entity_id=str(payload.get("entity_id")),
+            source_job_id=source_job_id, entity_id=entity_id,
             entity_type=str(evidence["entity"].get("type") or ""), model_profile_id=profile.profile_id,
             prompt_id=prompt.prompt_id, max_steps=int(payload.get("max_steps") or 6),
             max_tool_calls=int(payload.get("max_tool_calls") or 10), timeout_seconds=float(payload.get("timeout_seconds") or 120),

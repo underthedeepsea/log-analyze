@@ -26,6 +26,7 @@ from logrisk_django.views.harness import (
 )
 from logrisk_django.views.jobs import (
     create_job,
+    feature_expert_opinions,
     input_orchestration_action,
     input_orchestration_detail,
     job_detail,
@@ -100,6 +101,7 @@ urlpatterns = [
     path("api/semantic/dictionaries/<str:dictionary_id>/<str:action>", dictionary_action),
     path("api/semantic/test", dictionary_test),
     path("api/jobs/<str:job_id>/features/<str:candidate_id>", update_feature),
+    path("api/jobs/<str:job_id>/features/<str:candidate_id>/expert-opinions", feature_expert_opinions),
     path("api/jobs/<str:job_id>/export", export_approved),
     path("api/feature-approvals", core_read, {"endpoint": "feature-approvals"}),
     path("api/release-readiness/validate", validate_release),

@@ -95,6 +95,7 @@
     saveDatabaseCandidate: function (payload) { return jsonRequest("/api/system/database/config", { method: "POST", body: JSON.stringify(payload) }); },
     testDatabaseCandidate: function (payload) { return jsonRequest("/api/system/database/test", { method: "POST", body: JSON.stringify(payload) }); },
     status: function () { return jsonRequest("/api/ollama/status"); },
+    expertOpinions: function (jobId, candidateId) { return jsonRequest("/api/jobs/" + encodeURIComponent(jobId) + "/features/" + encodeURIComponent(candidateId) + "/expert-opinions"); },
     rules: function () { return jsonRequest("/api/rules"); },
     governedRules: function (query) { return jsonRequest("/api/rule-governance/rules" + (query || "")); },
     ruleReviewQueue: function () { return jsonRequest("/api/rule-governance/review-queue"); },
@@ -554,6 +555,48 @@
           h("span", { className: "status-chip pending" }, submission ? reviewSubmissionLabel(submission) : group.importance || "待审批"));
         }),
         props.hasMore && h("button", { className: "secondary-button review-load-more", disabled: props.refreshing || props.saving, onClick: props.onLoadMore }, props.refreshing ? "加载中…" : "加载更多")
+      )
+    );
+  }
+
+  function ExpertOpinionsPanel(props) {
+    const feature = props.feature;
+    const identity = feature ? feature.job_id + "/" + feature.candidate_id : "";
+    const [request, setRequest] = useState({ identity: "", data: null, error: "" });
+    const [retry, setRetry] = useState(0);
+    useEffect(function () {
+      let active = true;
+      setRequest({ identity: identity, data: null, error: "" });
+      if (feature) api.expertOpinions(feature.job_id, feature.candidate_id).then(function (data) {
+        if (active) setRequest({ identity: identity, data: data, error: "" });
+      }).catch(function () {
+        if (active) setRequest({ identity: identity, data: null, error: "未能读取专家记录，请重试。" });
+      });
+      return function () { active = false; };
+    }, [identity, retry]);
+    const current = request.identity === identity ? request : { data: null, error: "" };
+    const data = current.data;
+    return h("section", { className: "surface expert-opinions", "aria-label": "三个专家的审批参考", "aria-busy": !!feature && !data && !current.error },
+      h("div", { className: "surface-head" }, h("b", null, "三个专家 · 审批参考"), h("span", null, "结论 · 关键依据 · 需要你确认")),
+      h("div", { className: "expert-opinions-body" },
+        !feature && h("div", { className: "empty-state" }, "选择候选后查看专家意见"),
+        feature && h("p", { className: "expert-scope" }, "当前审批组的代表候选 · " + (data && data.entity_id || feature.entity_id || feature.entity && feature.entity.id || "—") + " · " + (data && data.model || feature.model || "未记录模型"), h("small", null, "意见对应这一候选的分析记录；同组其他候选需结合各自证据判断。")),
+        feature && !data && !current.error && h("div", { className: "empty-state", role: "status" }, "正在读取专家记录…"),
+        current.error && h("div", { className: "expert-load-error", role: "alert" }, current.error, h("button", { type: "button", className: "secondary-button", onClick: function () { setRetry(function (value) { return value + 1; }); } }, "重新读取")),
+        data && h(React.Fragment, null,
+          h("div", { className: "expert-cards" }, (data.opinions || []).map(function (opinion) {
+            return h("article", { className: "expert-card expert-" + opinion.state, key: identity + "/" + opinion.role_id },
+              h("div", { className: "expert-card-head" }, h("b", null, opinion.name), h("span", null, opinion.kind)),
+              h("h3", { className: "expert-conclusion" }, opinion.conclusion),
+              h("div", { className: "expert-fact" }, h("b", null, "关键依据"), h("p", null, opinion.basis)),
+              h("div", { className: "expert-confirmation" }, h("b", null, "需要你确认"), h("p", null, opinion.confirmation)),
+              (opinion.records || []).length > 0 && h("details", { className: "expert-records" }, h("summary", null, "查看对应记录（" + opinion.records.length + "）"), (opinion.records || []).map(function (record) {
+                return h("section", { className: "expert-record", key: record.artifact_id }, h("b", null, record.title), h("dl", null, (record.fields || []).map(function (field, index) { return h("div", { key: index }, h("dt", null, field.label), h("dd", null, field.value)); })), h("small", null, "分析记录 " + record.run_id + " · 产物 " + record.artifact_id + " · " + timeText(record.created_at)));
+              })),
+              h("small", { className: "expert-source" }, "来源：" + opinion.source));
+          })),
+          h("p", { className: "expert-overview" }, data.overview, h("small", null, "以上摘要由已保存记录整理；审批决定仍由你确认。"))
+        )
       )
     );
   }
@@ -2536,8 +2579,11 @@
             onSelect: selectReviewGroup,
             onRefresh: function () { return loadApprovalQueue({ mode: "refresh" }).catch(function () {}); },
           }),
-          h(FeatureEvidence, { feature: selectedRepresentative, onSelectTemplate: setSelectedTemplate }),
-          h(ReviewEditor, { feature: selectedRepresentative, submission: reviewSubmissions[selectedReviewKey], onDismissFailed: dismissFailedReview, loading: approvalRefreshing || approvalInitialLoading, failureMessage: reviewFailureMessage(reviewSubmissions[selectedReviewKey] && reviewSubmissions[selectedReviewKey].error), onEditFailed: editFailedReview, onRetry: function () { reviewSender.current.retry(selectedReviewKey); }, selectedTemplate: selectedTemplate, onSave: saveReview, onOpenTrace: openTrace, onDirtyChange: setReviewDirty })),
+          h("div", { className: "approval-detail" },
+            h(ExpertOpinionsPanel, { feature: selectedRepresentative }),
+            h("div", { className: "approval-detail-fields" },
+              h(FeatureEvidence, { feature: selectedRepresentative, onSelectTemplate: setSelectedTemplate }),
+              h(ReviewEditor, { feature: selectedRepresentative, submission: reviewSubmissions[selectedReviewKey], onDismissFailed: dismissFailedReview, loading: approvalRefreshing || approvalInitialLoading, failureMessage: reviewFailureMessage(reviewSubmissions[selectedReviewKey] && reviewSubmissions[selectedReviewKey].error), onEditFailed: editFailedReview, onRetry: function () { reviewSender.current.retry(selectedReviewKey); }, selectedTemplate: selectedTemplate, onSave: saveReview, onOpenTrace: openTrace, onDirtyChange: setReviewDirty })))),
         view === "rules" && h(RuleLibrary, { rules: rules, reviewQueue: ruleReviewQueue, loading: ruleLoading, focusRuleId: ruleFocus, onOpenTrace: openTrace, onChanged: loadRules }),
         view === "nodeRisks" && h(NodeRiskPage, { catalog: nodeRiskCatalog, selected: selectedNodeRisk, onRefresh: loadNodeRisks, onSelect: function (item) { selectNodeRisk(item).catch(function (reason) { setError(reason.message); }); }, onEvent: function (eventId, action) { changeNodeEvent(eventId, action).catch(function (reason) { setError(reason.message); }); } }),
         view === "multiSource" && h(MultiSourcePage, { data: multiSourceData, onRefresh: function () { loadMultiSource().catch(function () {}); }, onSelect: function (entity) { selectMultiSourceEntity(entity).catch(function (reason) { setError(reason.message); }); }, onRule: function (rule, enabled) { changeMultiSourceRule(rule, enabled).catch(function (reason) { setError(reason.message); }); } }),

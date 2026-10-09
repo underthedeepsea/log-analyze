@@ -29,6 +29,21 @@ def _result() -> dict[str, object]:
     }
 
 
+def test_django_expert_opinions_route_delegates_read_to_facade(monkeypatch) -> None:
+    from logrisk.application.api import ApiResult
+    from logrisk_django.views import jobs
+
+    class Facade:
+        def feature_expert_opinions(self, job_id, candidate_id):
+            assert (job_id, candidate_id) == ("job-a", "candidate-a")
+            return ApiResult(200, {"candidate_id": candidate_id, "opinions": []})
+
+    monkeypatch.setattr(jobs, "get_facade", lambda: Facade())
+    response = Client().get("/api/jobs/job-a/features/candidate-a/expert-opinions")
+    assert response.status_code == 200
+    assert response.json()["candidate_id"] == "candidate-a"
+
+
 def _config(tmp_path: Path, resolver: str) -> dict[str, object]:
     return {
         "project_root": str(Path(__file__).resolve().parents[1]),

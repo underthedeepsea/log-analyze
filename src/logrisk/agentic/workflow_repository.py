@@ -7,6 +7,7 @@ from typing import Any
 from logrisk.database import Database, utc_now
 
 from .errors import AgenticError
+from .models import validate_evidence_scope, validate_run_scope
 from .tool_registry import _reject_sensitive
 from .workflow_models import CompiledWorkflow
 
@@ -123,6 +124,10 @@ class WorkflowRepository:
                    runtime_snapshot: dict[str, Any] | None = None) -> dict[str, Any]:
         if not isinstance(evidence_summary or {}, dict):
             raise AgenticError("工作流 Evidence 摘要必须是 object", code="workflow_evidence_invalid")
+        source_job_id, entity_id = validate_run_scope(source_job_id, entity_id)
+        validate_evidence_scope(
+            evidence_summary or {}, source_job_id, entity_id, code="workflow_scope_invalid",
+        )
         _reject_sensitive(evidence_summary or {})
         runtime_snapshot = validate_runtime_snapshot(
             runtime_snapshot, model_profile_id=model_profile_id, prompt_id=prompt_id,

@@ -77,6 +77,12 @@ def job_detail(request: HttpRequest, job_id: str) -> JsonResponse:
 
 
 @require_GET
+def feature_expert_opinions(request: HttpRequest, job_id: str, candidate_id: str) -> JsonResponse:
+    result = get_facade().feature_expert_opinions(job_id, candidate_id)
+    return JsonResponse(dict(result.body), status=result.status, json_dumps_params={"ensure_ascii": False})
+
+
+@require_GET
 def job_events(request: HttpRequest, job_id: str) -> StreamingHttpResponse | JsonResponse:
     try:
         cursor = _event_cursor(request)

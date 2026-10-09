@@ -93,6 +93,36 @@ def test_real_registry_evaluate_then_register_stops_at_pending_candidate(tmp_pat
     candidate = manager.get_job(request.source_job_id)["features"][0]
     assert candidate["status"] == "pending"
     assert candidate.get("rule_id") is None
+    assert {key: candidate[key] for key in FEATURE} == FEATURE
+
+
+def test_nullable_feature_metadata_survives_planner_and_tool_validation(tmp_path):
+    manager, registry, _, request = _setup(tmp_path)
+    feature = {
+        **FEATURE,
+        "problem_resolution": {
+            "confidence": "high", "semantic_safe": True, "ambiguity": False,
+            "evidence_source": "selected_template_pattern", "matched_rule": None,
+            "supporting_codes": ["linux.memory.oom"], "subtype": None,
+            "missing_selected_ids": [], "unresolved_selected_ids": [],
+        },
+    }
+
+    class Model:
+        def generate_json(self, messages, schema, **kwargs):
+            return {"goal": "校验候选", "steps": [{
+                "step_id": "evaluate", "tool_name": "evaluate_candidate", "arguments": {"feature": feature},
+            }]}
+
+    plan = ModelAgentPlanner(Model(), model="test", prompt_content="仅输出 JSON", timeout=30).plan(
+        goal="校验", evidence_summary={}, tool_descriptions=registry.describe(frozenset(request.allowed_tools)), max_steps=1,
+    )
+    context = AgentToolContext("run-1", request.source_job_id, request.entity_id,
+                               frozenset(request.allowed_tools), "alice", "req-1")
+    result = registry.execute("evaluate_candidate", plan.steps[0].arguments, context)
+
+    assert plan.steps[0].arguments["feature"] == feature
+    assert result["feature"] == feature
 
 
 def test_approved_rule_lookup_matches_only_rule_on_second_page(tmp_path):
@@ -116,6 +146,27 @@ def test_approved_rule_lookup_matches_only_rule_on_second_page(tmp_path):
     assert result["total"] == 101
     assert result["matched"] == 1
     assert result["truncated"] is False
+
+
+def test_approved_rule_lookup_preserves_empty_optional_filters(tmp_path):
+    manager, _, _, request = _setup(tmp_path)
+    received = []
+
+    class Rules:
+        def find_active_rules_by_evidence(self, hashes, components, **kwargs):
+            received.append((hashes, components))
+            return []
+
+    registry = build_agent_tool_registry(manager, Rules(), Packages())
+    context = AgentToolContext("run-1", request.source_job_id, request.entity_id,
+                               frozenset({"find_approved_rules"}), "alice", "req-1")
+    results = [
+        registry.execute("find_approved_rules", arguments, context)
+        for arguments in ({}, {"template_hashes": []}, {"components": []})
+    ]
+
+    assert results == [{"items": [], "total": 0, "matched": 0, "truncated": False}] * 3
+    assert received == [(set(), set())] * 3
 
 
 @pytest.mark.parametrize("invalid", ["missing_feature", "forged_fingerprint", "stale_version", "changed_evidence", "truthy_passed"])
@@ -253,6 +304,8 @@ def test_real_workflow_passes_read_tool_artifacts_into_downstream_model(tmp_path
         def generate_json(self, messages, schema, **kwargs):
             payload = json.loads(messages[1]["content"])
             model_inputs[self.role] = payload
+            assert payload["evidence_summary"]["source_job_id"] == request.source_job_id
+            assert payload["evidence_summary"]["entity_id"] == request.entity_id
             if self.role == "evidence_specialist":
                 steps = [{"step_id": "read", "tool_name": "get_sanitized_evidence",
                           "arguments": {"job_id": request.source_job_id, "entity_id": request.entity_id}}]

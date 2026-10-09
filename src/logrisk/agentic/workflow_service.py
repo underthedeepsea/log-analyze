@@ -8,6 +8,7 @@ from .roles import RoleRegistry
 from .workflow_repository import WorkflowRepository, validate_runtime_snapshot
 from .workflow_scheduler import WorkflowScheduler
 from .tool_registry import _reject_sensitive
+from .models import validate_evidence_scope, validate_run_scope
 
 
 class WorkflowService:
@@ -32,6 +33,11 @@ class WorkflowService:
 
     def create_run(self, workflow_id: str, *, evidence_summary: dict[str, Any], runtime_snapshot: dict[str, Any] | None = None, **kwargs: Any) -> dict[str, Any]:
         _reject_sensitive(evidence_summary)
+        source_job_id, entity_id = validate_run_scope(kwargs.get("source_job_id"), kwargs.get("entity_id"))
+        validate_evidence_scope(
+            evidence_summary, source_job_id, entity_id, code="workflow_scope_invalid",
+        )
+        kwargs["source_job_id"], kwargs["entity_id"] = source_job_id, entity_id
         runtime_snapshot = validate_runtime_snapshot(
             runtime_snapshot,
             model_profile_id=str(kwargs.get("model_profile_id") or ""),

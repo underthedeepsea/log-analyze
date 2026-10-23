@@ -94,3 +94,5 @@ class AgentStepPlan:
 class AgentPlan:
     goal: str
     steps: tuple[AgentStepPlan, ...]
+    assessment: dict[str, Any] | None = None
+    model_output: dict[str, Any] | None = None

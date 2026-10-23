@@ -31,7 +31,7 @@ def _definition() -> dict:
 def _serve(tmp_path, *, workflows: bool):
     frontend = tmp_path / "dist" / "index.html"; frontend.parent.mkdir(parents=True); frontend.write_text("<!doctype html>")
     manager = FeatureJobManager(auto_start=False)
-    server = build_server("127.0.0.1", 0, manager=manager, frontend_path=frontend, database_path=tmp_path / "state.sqlite3", agentic_enabled=workflows, agent_workflows_enabled=workflows)
+    server = build_server("127.0.0.1", 0, manager=manager, frontend_path=frontend, database_path=tmp_path / "state.sqlite3", agentic_enabled=workflows, agent_workflows_enabled=workflows, output_root=tmp_path / "output")
     if workflows:
         server.agent_runs.runtime.planner = FakeAgentPlanner(AgentPlan("读取", (AgentStepPlan("read", "get_sanitized_evidence", {"job_id": "job-1", "entity_id": "node-a"}),)))
     thread = threading.Thread(target=server.serve_forever, daemon=True); thread.start()

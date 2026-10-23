@@ -17,6 +17,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 import yaml
 
+from logrisk import __version__
 from logrisk.ai_harness.connections import ConnectionStore
 from logrisk.ai_harness.connection_check import check_model_connection, check_ollama
 from logrisk.application import ApiFacade
@@ -63,6 +64,8 @@ from logrisk.large_file_pipeline import MAX_STREAM_BATCH_RECORDS, run_large_file
 from logrisk.processing_metrics import ProcessingMetricsError, ProcessingMetricsStore
 from logrisk.rule_governance import RuleGovernanceError, RuleGovernanceRepository, RuleGovernanceService
 from logrisk.node_risk import NodeRiskError, NodeRiskService
+from logrisk.server_risk.contracts import ServerRiskError
+from logrisk.server_risk.worker import ReportWorker
 from logrisk.risk_semantics import RiskSemanticError, RiskSemanticService, validate_rule
 from logrisk.release_readiness import ReleaseReadinessRepository, ReleaseReadinessService
 from logrisk.runtime.config import RuntimeConfig, RuntimeConfigError
@@ -96,10 +99,12 @@ from pipeline.manual_import_pipeline import analyze_records
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024
 MAX_LARGE_UPLOAD_BYTES = 500 * 1024 * 1024
 DEFAULT_MODEL = "qwen3:1.7b"
-APP_VERSION = "1.40.0"
+APP_VERSION = __version__
 
 
 class DashboardHTTPServer(ThreadingHTTPServer):
+    # A page starts parallel asset/API connections before handlers can drain accept().
+    request_queue_size = 64
     daemon_threads = True
 
 
@@ -125,6 +130,8 @@ def build_server(
     agentic_enabled: bool = False,
     agent_workflows_enabled: bool = False,
     kafka_enabled: bool | str | None = None,
+    output_root: str | Path | None = None,
+    node_risk_reports_enabled: bool | None = None,
 ) -> DashboardHTTPServer:
     """Create the local development HTTP shell around shared application services."""
     root = Path(__file__).resolve().parents[2]
@@ -138,7 +145,7 @@ def build_server(
         ApplicationConfig(
             project_root=root,
             state_root=selected_state_root,
-            output_root=root / "output",
+            output_root=Path(output_root) if output_root else root / "output",
             database_provider=database_provider,
             database_url=database_url,
             database_path=Path(database_path) if database_path else None,
@@ -152,6 +159,7 @@ def build_server(
             import_legacy_state=True,
             interrupt_streaming_tasks=True,
             agentic_enabled=agentic_enabled,
+            node_risk_reports_enabled=node_risk_reports_enabled,
             agent_workflows_enabled=agent_workflows_enabled,
             kafka_enabled=selected_kafka_enabled,
         ),
@@ -200,6 +208,16 @@ def build_server(
             lambda run_id: threading.Thread(target=container.agent_workflows.execute_run, args=(run_id,), daemon=True).start()
         )
     server.risk_semantics = container.risk_semantics  # type: ignore[attr-defined]
+    server.server_risk = container.server_risk  # type: ignore[attr-defined]
+    server.server_risk.source_worker.start()
+    original_close = server.server_close
+    def close_server() -> None:
+        server.server_risk.source_worker.close()
+        server.node_risk_report_worker.close()
+        original_close()
+    server.server_close = close_server
+    server.node_risk_report_worker = ReportWorker(container.server_risk.reports)  # type: ignore[attr-defined]
+    server.node_risk_report_dispatch = lambda report_id, request_id: server.node_risk_report_worker.submit(report_id)  # type: ignore[attr-defined]
     server.node_risks = container.node_risks  # type: ignore[attr-defined]
     server.multi_source = container.multi_source  # type: ignore[attr-defined]
     server.benchmark_center = container.benchmark_center  # type: ignore[attr-defined]
@@ -372,9 +390,18 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if path.startswith("/assets/"):
                 self._serve_asset(path)
                 return
-            facade_result = self.server.api_facade.dispatch_read(path, query)  # type: ignore[attr-defined]
+            facade_result = self.server.api_facade.dispatch_read(path, query, self._runtime_request_identity())  # type: ignore[attr-defined]
             if facade_result is not None:
-                self._json(HTTPStatus(facade_result.status), dict(facade_result.body))
+                if isinstance(facade_result.body, bytes):
+                    self.send_response(facade_result.status)
+                    self.send_header("Content-Length", str(len(facade_result.body)))
+                    self.send_header("Cache-Control", "no-store")
+                    for key, value in facade_result.headers.items():
+                        self.send_header(key, value)
+                    self.end_headers()
+                    self.wfile.write(facade_result.body)
+                else:
+                    self._json(HTTPStatus(facade_result.status), dict(facade_result.body), dict(facade_result.headers))
                 return
             if path == "/api/config":
                 self._json(HTTPStatus.OK, {
@@ -877,7 +904,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
         except BenchmarkError as exc:
             self._json(exc.status_code, {"error": str(exc), "code": exc.code, "request_id": f"request-{uuid.uuid4().hex}"})
-        except (RiskSemanticError, NodeRiskError) as exc:
+        except (RiskSemanticError, NodeRiskError, ServerRiskError) as exc:
             self._json(exc.status_code, {"error": str(exc), "code": exc.code})
         except KnowledgePackageError as exc:
             status = HTTPStatus.CONFLICT if exc.code in {"package_preview_conflict", "package_version_checksum_conflict"} else (
@@ -914,7 +941,21 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     raise AgenticError("Agent 功能未启用", code="agentic_disabled", status_code=404)
                 self._json(HTTPStatus.OK, self.server.agent_runs.replay(replay_match.group(1)))  # type: ignore[attr-defined]
                 return
-            identity = self._require_runtime_write_access()
+            identity = self._runtime_request_identity() if path == "/api/node-risk-queries" else self._require_runtime_write_access()
+            if path in {"/api/node-risk-reports", "/api/node-risk-observations", "/api/node-risk-queries"} or re.fullmatch(r"/api/node-risk-reports/[a-f0-9]{32}/cancel", path):
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                except ValueError as exc:
+                    raise ServerRiskError("invalid_schema", "请求长度无效") from exc
+                if not 0 <= length <= 1048576:
+                    raise ServerRiskError("request_resource_limit", "请求体超过资源上限", 413)
+                try:
+                    payload = json.loads(self.rfile.read(length) or b"{}")
+                except (ValueError, UnicodeError) as exc:
+                    raise ServerRiskError("invalid_schema", "请求结构不符合合同") from exc
+                result = self.server.api_facade.dispatch_server_risk_write(path, payload, identity)  # type: ignore[attr-defined]
+                self._json(result.status, dict(result.body), dict(result.headers))
+                return
             if path == "/api/knowledge-packages/uploads":
                 try:
                     package_size = int(self.headers.get("Content-Length", "0"))
@@ -1438,6 +1479,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     "consumer_group": str(payload.get("consumer_group") or "").strip(),
                     "bootstrap_env": str(payload.get("bootstrap_env") or "LOGRISK_KAFKA_BOOTSTRAP").strip(),
                 }
+                for key in ("source_profile", "cluster_id"):
+                    if key in payload:
+                        configuration[key] = payload[key]
                 registered = self.server.source_capabilities()["kafka"]["registered_adapter_ids"]  # type: ignore[attr-defined]
                 if configuration["adapter_id"] not in registered:
                     self._json(HTTPStatus.UNPROCESSABLE_ENTITY, {
@@ -1448,7 +1492,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 missing = [key for key in ("topic", "consumer_group") if not configuration[key]]
                 if missing:
                     raise FeatureJobError("Kafka 配置缺少: " + ", ".join(missing))
-                source = self.server.kafka_source(configuration)  # type: ignore[attr-defined]
+                try:
+                    source = self.server.kafka_source(configuration)  # type: ignore[attr-defined]
+                except (TypeError, ValueError) as exc:
+                    self._json(HTTPStatus.UNPROCESSABLE_ENTITY, {"error": str(exc), "code": "invalid_kafka_source"})
+                    return
                 config_path = self.server.drain_quality.configs.active_snapshot()["path"]  # type: ignore[attr-defined]
                 config_hash = hashlib.sha256(Path(config_path).read_bytes()).hexdigest()
                 task = self.server.streaming_state.create_or_load(  # type: ignore[attr-defined]
@@ -1543,7 +1591,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self._json(HTTPStatus.NOT_FOUND, {"error": str(exc)})
         except BenchmarkError as exc:
             self._json(exc.status_code, {"error": str(exc), "code": exc.code, "request_id": f"request-{uuid.uuid4().hex}"})
-        except (RiskSemanticError, NodeRiskError) as exc:
+        except (RiskSemanticError, NodeRiskError, ServerRiskError) as exc:
             self._json(exc.status_code, {"error": str(exc), "code": exc.code})
         except RuleGovernanceError as exc:
             self._json(exc.status_code, {"error": str(exc), "code": exc.code, "request_id": f"request-{uuid.uuid4().hex}"})

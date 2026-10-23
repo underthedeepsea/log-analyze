@@ -3,6 +3,7 @@ from __future__ import annotations
 from django.urls import path
 
 from logrisk_django.views.api import core_read
+from logrisk_django.views.node_risks import server_risk_api
 from logrisk_django.views.agentic import agent_run_action, agent_run_detail, agent_runs, create_agent_run
 from logrisk_django.views.agent_workflows import workflow_detail, workflow_node_retry, workflow_run_action, workflow_run_detail, workflow_runs, workflows
 from logrisk_django.views.benchmark import cancel_run, compare, evaluate_gate, runs, suites
@@ -27,6 +28,7 @@ from logrisk_django.views.harness import (
 from logrisk_django.views.jobs import (
     create_job,
     feature_expert_opinions,
+    entity_analysis,
     input_orchestration_action,
     input_orchestration_detail,
     job_detail,
@@ -60,6 +62,20 @@ from logrisk_django.views.uploads import (
 
 app_name = "logrisk_django"
 urlpatterns = [
+    path("api/node-risks/overview", server_risk_api),
+    path("api/node-risks/<str:cluster>/<str:node>/overview", server_risk_api),
+    path("api/node-risks/search", server_risk_api),
+    path("api/node-risks/events/<str:event_id>/acknowledge", server_risk_api),
+    path("api/node-risks/events/<str:event_id>/recover", server_risk_api),
+    path("api/node-risks/<str:cluster>/<str:node>/assessment", server_risk_api),
+    path("api/node-risks/<str:cluster>/<str:node>/daily", server_risk_api),
+    path("api/node-risks/<str:cluster>/<str:node>/days/<str:day>", server_risk_api),
+    path("api/node-risk-observations", server_risk_api),
+    path("api/node-risk-queries", server_risk_api),
+    path("api/node-risk-reports", server_risk_api),
+    path("api/node-risk-reports/<str:report_id>", server_risk_api),
+    path("api/node-risk-reports/<str:report_id>/cancel", server_risk_api),
+    path("api/node-risk-reports/<str:report_id>/html", server_risk_api),
     path("api/agent-workflows", workflows),
     path("api/agent-workflows/<str:workflow_id>", workflow_detail),
     path("api/agent-workflows/<str:workflow_id>/runs", workflow_detail, {"view": "runs"}),
@@ -101,6 +117,7 @@ urlpatterns = [
     path("api/semantic/dictionaries/<str:dictionary_id>/<str:action>", dictionary_action),
     path("api/semantic/test", dictionary_test),
     path("api/jobs/<str:job_id>/features/<str:candidate_id>", update_feature),
+    path("api/jobs/<str:job_id>/entities/<str:entity_id>/analysis", entity_analysis),
     path("api/jobs/<str:job_id>/features/<str:candidate_id>/expert-opinions", feature_expert_opinions),
     path("api/jobs/<str:job_id>/export", export_approved),
     path("api/feature-approvals", core_read, {"endpoint": "feature-approvals"}),

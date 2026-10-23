@@ -1,4 +1,4 @@
-schema_version: 26
+schema_version: 32
 database: logrisk
 description: LOGRISK 双模式运行时数据字典；SQLite 是默认本地实现，PostgreSQL 用于显式配置的外部生产部署。
 authoritative_ddl:
@@ -249,7 +249,7 @@ tables:
   streaming_batch_windows:
     description: 已提交批次的完整脱敏窗口事实；恢复和最终归约不依赖进程内历史列表
     primary_key: [task_id, window_id, item_index]
-    foreign_keys: {task_id: streaming_tasks.task_id ON DELETE CASCADE, "[task_id, window_id]": streaming_window_commits.[task_id, window_id] ON DELETE CASCADE}
+    foreign_keys: {task_id: streaming_tasks.task_id ON DELETE CASCADE, "[task_id, window_id]": "streaming_window_commits.[task_id, window_id] ON DELETE CASCADE"}
     indexes: [idx_streaming_batch_windows_iteration(task_id, window_id, item_index)]
     columns: {task_id: 流式任务标识, window_id: 稳定批次标识, item_index: 批次内顺序, window_json: 完整脱敏窗口事实}
   unknown_template_queue:
@@ -597,6 +597,30 @@ tables:
     description: 沿用现有collapse规则生成的审批来源；FeatureJob存引用并按当前实体加载
     primary_key: [task_id, generation, entity_id]
     columns: {task_id: 任务, generation: 代次, entity_id: 实体, source_json: 完整脱敏审批来源}
+  server_risk_observations:
+    description: 严格登记来源的脱敏观测；不保存原始日志
+    primary_key: observation_id
+    columns: {schema: 0032_server_risk_intelligence.sql}
+
+  server_risk_projection_state:
+    description: 独立派生进度；不修改旧提交游标
+    primary_key: input_namespace
+    columns: {schema: 0032_server_risk_intelligence.sql}
+
+  server_risk_episodes:
+    description: 具体对象风险轮次；每subject最多一轮open
+    primary_key: episode_id
+    columns: {schema: 0032_server_risk_intelligence.sql}
+
+  server_risk_decisions:
+    description: 确定性四态决定及修订引用
+    primary_key: decision_id
+    columns: {schema: 0032_server_risk_intelligence.sql}
+
+  server_risk_reports:
+    description: 固定Ling报告Run、单次调用CAS及受控Artifact摘要
+    primary_key: report_id
+    columns: {schema: 0032_server_risk_intelligence.sql}
 postgres_type_mapping:
   TEXT: text
   TEXT_identifier: text

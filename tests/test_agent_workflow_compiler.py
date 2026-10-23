@@ -28,7 +28,7 @@ def test_compiler_builds_stable_parallel_layers_and_locks_role_tools():
     assert compiled.topological_order == ("evidence", "rules", "feature")
     assert compiled.parallel_layers == (("evidence", "rules"), ("feature",))
     assert compiled.nodes[2].allowed_tools == (
-        "get_sanitized_evidence", "evaluate_candidate", "register_feature_candidate",
+        "get_sanitized_evidence", "find_approved_rules", "evaluate_candidate", "register_feature_candidate",
     )
     assert compiled.nodes[2].role_id == "feature_specialist"
 

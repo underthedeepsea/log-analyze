@@ -5,6 +5,7 @@ from typing import Any
 from django.conf import settings
 from django.utils.module_loading import import_string
 
+from logrisk import __version__
 from logrisk.application import ApiFacade, ApplicationContainer, build_application_container
 from logrisk.orchestration import AirflowOrchestrator, AirflowOrchestratorError
 from logrisk_django.identity import IdentityResolver
@@ -31,13 +32,15 @@ def get_facade() -> ApiFacade:
     if _facade is None:
         _facade = ApiFacade(
             get_container(),
-            version="1.40.0",
+            version=__version__,
             service_resolver=_resolve_facade_service,
         )
     return _facade
 
 
 def _resolve_facade_service(name: str, default: Any) -> Any:
+    if name == "node_risk_report_dispatch":
+        return lambda report_id, request_id: get_node_risk_report_airflow_orchestrator().trigger_node_risk_report(report_id, request_id)
     if name == "airflow_readiness":
         return get_airflow_readiness()
     if name == "airflow_orchestrator":
@@ -154,3 +157,8 @@ def clear_cached_container() -> None:
     global _container, _facade
     _container = None
     _facade = None
+
+
+def get_node_risk_report_airflow_orchestrator() -> AirflowOrchestrator:
+    config = get_config()
+    return AirflowOrchestrator(config.airflow_base_url, config.airflow_node_risk_report_dag_id, timeout=config.airflow_timeout_seconds, authorization_env=config.airflow_authorization_env)

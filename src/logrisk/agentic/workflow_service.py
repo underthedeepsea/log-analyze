@@ -12,8 +12,9 @@ from .models import validate_evidence_scope, validate_run_scope
 
 
 class WorkflowService:
-    def __init__(self, repository: WorkflowRepository, scheduler: WorkflowScheduler, roles: RoleRegistry, limits: WorkflowLimits) -> None:
+    def __init__(self, repository: WorkflowRepository, scheduler: WorkflowScheduler, roles: RoleRegistry, limits: WorkflowLimits, *, evidence_locker: Any | None = None) -> None:
         self.repository, self.scheduler, self.roles, self.limits = repository, scheduler, roles, limits
+        self.evidence_locker = evidence_locker
 
     @staticmethod
     def _key(value: str) -> str:
@@ -46,6 +47,8 @@ class WorkflowService:
         kwargs["idempotency_key"] = self._key(str(kwargs.get("idempotency_key") or ""))
         if not str(kwargs.get("actor") or "").strip() or not str(kwargs.get("request_id") or "").strip():
             raise AgenticError("工作流操作人和请求标识不能为空", code="workflow_identity_invalid")
+        if self.evidence_locker is not None:
+            evidence_summary = self.evidence_locker(evidence_summary, source_job_id=source_job_id, entity_id=entity_id, actor=kwargs["actor"], request_id=kwargs["request_id"])
         return self.repository.create_run(workflow_id, evidence_summary=evidence_summary, runtime_snapshot=runtime_snapshot, **kwargs)
 
     def execute_run(self, run_id: str) -> dict[str, Any]:

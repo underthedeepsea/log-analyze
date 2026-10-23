@@ -1,0 +1,17 @@
+schema_version: server_risk_config_v1
+aliases: []
+sources: []
+policies: {}
+limits:
+  query_days: 90
+  page_size: 100
+  observation_batch: 500
+  snapshot_bytes: 1048576
+  model_input_bytes: 65536
+  model_output_bytes: 32768
+  html_bytes: 5242880
+  model_calls: 1
+  provider_timeout_seconds: 60
+  report_deadline_seconds: 120
+  local_workers: 1
+  output_tokens: 2048

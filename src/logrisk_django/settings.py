@@ -35,6 +35,8 @@ _ALLOWED = {
     "agentic_enabled",
     "agent_workflows_enabled",
     "kafka_enabled",
+    "node_risk_reports_enabled",
+    "airflow_node_risk_report_dag_id",
 }
 
 
@@ -60,6 +62,8 @@ class LogriskConfig:
     agent_workflows_enabled: bool = False
     runtime_config_path: Path | None = None
     kafka_enabled: bool = False
+    node_risk_reports_enabled: bool | None = None
+    airflow_node_risk_report_dag_id: str = "logrisk_node_risk_report"
 
     @classmethod
     def from_django_settings(cls, django_settings: Any) -> "LogriskConfig":
@@ -113,6 +117,10 @@ class LogriskConfig:
             kafka_enabled = parse_kafka_enabled(raw.get("kafka_enabled", os.getenv("LOGRISK_KAFKA_ENABLED")))
         except IncrementalSourceError as exc:
             raise LogriskSettingsError(str(exc)) from exc
+        report_enabled = raw.get("node_risk_reports_enabled")
+        if report_enabled is not None and not isinstance(report_enabled, bool):
+            raise LogriskSettingsError("node_risk_reports_enabled 必须为布尔值")
+        report_dag_id = _identifier(raw.get("airflow_node_risk_report_dag_id") or "logrisk_node_risk_report", "airflow_node_risk_report_dag_id")
         return cls(
             project_root=project_root,
             state_root=state_root,
@@ -134,6 +142,8 @@ class LogriskConfig:
             agent_workflows_enabled=agent_workflows_enabled,
             runtime_config_path=runtime_config_path,
             kafka_enabled=kafka_enabled,
+            node_risk_reports_enabled=report_enabled,
+            airflow_node_risk_report_dag_id=report_dag_id,
         )
 
     def application_config(self) -> ApplicationConfig:
@@ -157,6 +167,7 @@ class LogriskConfig:
             agentic_enabled=self.agentic_enabled,
             agent_workflows_enabled=self.agent_workflows_enabled,
             kafka_enabled=self.kafka_enabled,
+            node_risk_reports_enabled=self.node_risk_reports_enabled,
         )
 
     def public_dict(self) -> dict[str, Any]:
@@ -176,6 +187,8 @@ class LogriskConfig:
             "agentic_enabled": self.agentic_enabled,
             "agent_workflows_enabled": self.agent_workflows_enabled,
             "kafka_enabled": self.kafka_enabled,
+            "node_risk_reports_enabled": self.node_risk_reports_enabled,
+            "airflow_node_risk_report_dag_id": self.airflow_node_risk_report_dag_id,
         }
 
 

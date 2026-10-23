@@ -96,12 +96,21 @@ def mine_template_event(
         if extracted is None:
             extracted = miner.extract_parameters(template, message_core, exact_matching=False)
 
+    semantic_fields = dict(record.get("semantic_fields") or {})
+    # Keep only the typed unit identity before masking erases it. General
+    # parameter extraction remains opt-in and no other parameter is retained.
+    if component == "systemd" and template.count("<SYSTEMD_UNIT>") == 1:
+        unit_parameters = miner.extract_parameters(template, message_core, exact_matching=True) or []
+        units = [p.value for p in unit_parameters if p.mask_name == "SYSTEMD_UNIT"]
+        if len(units) == 1:
+            semantic_fields["unit"] = units[0]
+
     parameters = [
         {"type": p.mask_name, "value": p.value}
         for p in (extracted or [])
     ]
     return {
-        "schema_version": "template_event_v2" if "semantic_fields" in record else "template_event_v1",
+        "schema_version": "template_event_v2" if "semantic_fields" in record or "unit" in semantic_fields else "template_event_v1",
         "event_id": record.get("raw_log_id"),
         "timestamp": record.get("timestamp"),
         "cluster": cluster,
@@ -120,7 +129,7 @@ def mine_template_event(
         "hash_version": HASH_VERSION,
         "template": template,
         "parameters": parameters,
-        "semantic_fields": record.get("semantic_fields") or {},
+        "semantic_fields": semantic_fields,
         "semantic_tags": record.get("semantic_tags") or [],
         "typed_parameters": record.get("typed_parameters") or [],
         "semantic_extractor_version": record.get("semantic_extractor_version"),

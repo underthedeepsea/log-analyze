@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from typing import Any
+from typing import Any, Callable
 
 from logrisk.database import Database, utc_now
 
@@ -65,13 +65,19 @@ class AgentRepository:
             raise
         return {**self.get_run(run_id), "idempotent_replay": False}
 
-    def replace_plan(self, run_id: str, plan: AgentPlan) -> dict[str, Any]:
+    def replace_plan(self, run_id: str, plan: AgentPlan, *, preserve_context: bool = False) -> dict[str, Any]:
         now = utc_now()
         with self.database.transaction() as connection:
             if not connection.execute("SELECT 1 FROM agent_runs WHERE run_id=?", (run_id,)).fetchone():
                 raise AgenticError("Agent Run 不存在", code="agent_run_not_found", status_code=404)
-            connection.execute("DELETE FROM agent_run_steps WHERE run_id=?", (run_id,))
-            for sequence, step in enumerate(plan.steps):
+            prefix = connection.execute("SELECT step_id,status FROM agent_run_steps WHERE run_id=? ORDER BY sequence", (run_id,)).fetchall() if preserve_context else []
+            if prefix and any(not str(row["step_id"]).startswith("context-") or row["status"] != "completed" for row in prefix):
+                raise AgenticError("专家前置工具未完成", code="agent_context_incomplete")
+            if set(row["step_id"] for row in prefix) & {step.step_id for step in plan.steps}:
+                raise AgenticError("模型计划覆盖前置工具身份", code="agent_plan_invalid")
+            if not preserve_context:
+                connection.execute("DELETE FROM agent_run_steps WHERE run_id=?", (run_id,))
+            for sequence, step in enumerate(plan.steps, start=len(prefix)):
                 connection.execute(
                     "INSERT INTO agent_run_steps(run_id, step_id, sequence, tool_name, arguments_json, status, attempt, "
                     "result_summary_json, error_code, error_summary, started_at, completed_at, created_at, updated_at) "
@@ -80,6 +86,34 @@ class AgentRepository:
                 )
             connection.execute("UPDATE agent_runs SET goal=?, updated_at=?, state_version=state_version+1 WHERE run_id=?", (plan.goal, now, run_id))
         return self.get_run(run_id)
+
+    def reserve_model_planning(self, run_id: str) -> bool:
+        """One durable reservation covers prefetch and a single model dispatch.
+
+        An interrupted reservation is never automatically replayed. The caller
+        must inspect/recover it; it is not proof that an uncertain model ran zero.
+        """
+        with self.database.transaction() as connection:
+            connection.execute("UPDATE agent_runs SET state_version=state_version WHERE run_id=?", (run_id,))
+            row = connection.execute("SELECT status FROM agent_runs WHERE run_id=?", (run_id,)).fetchone()
+            if not row or row["status"] != "planning":
+                raise AgenticError("规划状态已变化", code="agent_state_conflict")
+            if connection.execute("SELECT 1 FROM agent_run_events WHERE run_id=? AND idempotency_key='model-planning-reservation'", (run_id,)).fetchone():
+                return False
+            self._append_event(connection, run_id, "model_planning_reserved", {"automatic_retry": False}, utc_now(), idempotency_key="model-planning-reservation")
+        return True
+
+    def add_context_step(self, run_id: str, step: Any) -> None:
+        with self.database.transaction() as connection:
+            row = connection.execute("SELECT status,max_steps FROM agent_runs WHERE run_id=?", (run_id,)).fetchone()
+            count = int(connection.execute("SELECT COUNT(*) FROM agent_run_steps WHERE run_id=?", (run_id,)).fetchone()[0])
+            if not row or row["status"] != "planning" or count >= int(row["max_steps"]):
+                raise AgenticError("前置工具步骤预算或状态无效", code="agent_budget_exhausted")
+            now = utc_now()
+            connection.execute(
+                "INSERT INTO agent_run_steps(run_id,step_id,sequence,tool_name,arguments_json,status,attempt,result_summary_json,created_at,updated_at) VALUES (?,?,?,?,?,'pending',0,?,?,?)",
+                (run_id, step.step_id, count, step.tool_name, _db_json(self.database, step.arguments), _db_json(self.database, {}), now, now),
+            )
 
     def append_event(self, run_id: str, event_type: str, attributes: dict[str, Any], *, idempotency_key: str | None = None) -> dict[str, Any]:
         with self.database.transaction() as connection:
@@ -92,14 +126,18 @@ class AgentRepository:
             event = self._append_event(connection, run_id, event_type, attributes, utc_now(), idempotency_key=idempotency_key)
         return event
 
-    def add_artifact(self, run_id: str, artifact_type: str, payload: dict[str, Any], *, step_id: str | None = None, fingerprint: str | None = None) -> dict[str, Any]:
+    def add_artifact(self, run_id: str, artifact_type: str, payload: dict[str, Any], *, step_id: str | None = None, fingerprint: str | None = None, precondition: Callable[[Any], None] | None = None) -> dict[str, Any]:
         artifact_id = uuid.uuid4().hex
         now = utc_now()
         with self.database.transaction() as connection:
+            if precondition is not None:
+                precondition(connection)
             connection.execute(
                 "INSERT INTO agent_artifacts(artifact_id, run_id, step_id, artifact_type, payload_json, fingerprint, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (artifact_id, run_id, step_id, artifact_type, _db_json(self.database, payload), fingerprint, now),
             )
+            if precondition is not None:
+                precondition(connection)
         return {"artifact_id": artifact_id, "run_id": run_id, "step_id": step_id, "artifact_type": artifact_type, "payload": payload, "fingerprint": fingerprint, "created_at": now}
 
     def get_run(self, run_id: str) -> dict[str, Any]:
@@ -265,7 +303,10 @@ class AgentRepository:
                 "SELECT run_id FROM agent_runs WHERE status IN ('queued','planning','running') ORDER BY created_at, run_id"
             ).fetchall()
             run_ids = [str(row["run_id"]) for row in rows]
-            for run_id in run_ids:
+            for run_id in list(run_ids):
+                if self._block_uncertain_planning(connection, run_id, now):
+                    run_ids.remove(run_id)
+                    continue
                 connection.execute(
                     "UPDATE agent_run_steps SET status='pending', error_code=NULL, error_summary=NULL, completed_at=NULL, updated_at=? "
                     "WHERE run_id=? AND status='running'",
@@ -282,12 +323,22 @@ class AgentRepository:
                 raise AgenticError("Agent Run 不存在", code="agent_run_not_found", status_code=404)
             if str(row["status"]) not in {"queued", "planning", "running"}:
                 raise AgenticError("Agent Run 状态不允许恢复", code="agent_state_conflict", status_code=409)
+            blocked = self._block_uncertain_planning(connection, run_id, now)
             connection.execute(
                 "UPDATE agent_run_steps SET status='pending', error_code=NULL, error_summary=NULL, completed_at=NULL, updated_at=? "
-                "WHERE run_id=? AND status='running'", (now, run_id),
+                "WHERE run_id=? AND status='running' AND NOT EXISTS (SELECT 1 FROM agent_runs WHERE run_id=? AND status='failed')", (now, run_id, run_id),
             )
             self._append_event(connection, run_id, "run_recovered", {"status": str(row["status"])}, now)
         return self.get_run(run_id)
+
+    def _block_uncertain_planning(self, connection: Any, run_id: str, now: str) -> bool:
+        reserved = connection.execute("SELECT 1 FROM agent_run_events WHERE run_id=? AND event_type='model_planning_reserved'", (run_id,)).fetchone()
+        planned = connection.execute("SELECT 1 FROM agent_run_events WHERE run_id=? AND event_type='plan_created'", (run_id,)).fetchone()
+        if not reserved or planned:
+            return False
+        connection.execute("UPDATE agent_runs SET status='failed',error_code='agent_plan_indeterminate',error_summary='规划结果未结算，禁止自动重发模型',completed_at=?,updated_at=? WHERE run_id=?", (now, now, run_id))
+        self._append_event(connection, run_id, "planning_recovery_blocked", {"automatic_retry": False}, now)
+        return True
 
     def _append_event(
         self, connection: Any, run_id: str, event_type: str, attributes: dict[str, Any], now: str,

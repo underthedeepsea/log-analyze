@@ -1,6 +1,9 @@
 from __future__ import annotations
 
-from .models import AgentRunRequest
+import copy
+
+from .models import AgentRunRequest, validate_evidence_scope
+from .tool_registry import AgentToolContext
 from .errors import AgenticError
 from .repository import AgentRepository
 from .runtime import AgentRuntime
@@ -11,8 +14,30 @@ class AgentService:
         self.repository = repository
         self.runtime = runtime
 
+    def lock_evidence_summary(self, summary: dict, *, source_job_id: str, entity_id: str, actor: str, request_id: str) -> dict:
+        value = copy.deepcopy(summary)
+        validate_evidence_scope(value, source_job_id, entity_id, code="agent_scope_invalid")
+        cluster = (value.get("entity") or {}).get("cluster")
+        context = AgentToolContext("scope-lock", source_job_id, entity_id, frozenset(), actor, request_id, cluster=cluster)
+        locked = self.runtime.tools.lock_evidence(context)
+        if locked is not None:
+            if value.get("locked_evidence_hash") not in (None, locked["evidence_hash"]):
+                raise AgenticError("锁定Evidence已变化", code="agent_evidence_changed")
+            value["locked_evidence_hash"] = locked["evidence_hash"]
+            value["locked_evidence_cluster"] = locked["cluster"]
+        return value
+
     def create_run(self, request: AgentRunRequest, *, locked_snapshot: dict) -> dict:
-        return self.repository.create_run(request, locked_snapshot=locked_snapshot)
+        existing = self.repository._by_idempotency(request.actor, request.idempotency_key)
+        if existing:
+            saved = self.repository.get_run(existing)
+            if saved["source_job_id"] != request.source_job_id or saved["entity_id"] != request.entity_id:
+                raise AgenticError("幂等键跨实体复用", code="agent_idempotency_scope_conflict")
+            return {**saved, "idempotent_replay": True}
+        value = copy.deepcopy(locked_snapshot)
+        if value.get("workflow_role_id"):
+            value["evidence_summary"] = self.lock_evidence_summary(value.get("evidence_summary") or {}, source_job_id=request.source_job_id, entity_id=request.entity_id, actor=request.actor, request_id=request.request_id)
+        return self.repository.create_run(request, locked_snapshot=value)
 
     def execute_run(self, run_id: str) -> dict:
         return self.runtime.execute(run_id)

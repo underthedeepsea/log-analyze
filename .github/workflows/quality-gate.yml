@@ -14,6 +14,11 @@ jobs:
           python-version: "3.11"
       - run: python -m venv .venv
       - run: .venv/bin/pip install -r requirements-django.txt
+      - name: Prepare existing browser test dependency
+        run: |
+          npm install --prefix "$RUNNER_TEMP/logrisk-browser" --no-save --no-package-lock --ignore-scripts playwright@1.61.1
+          "$RUNNER_TEMP/logrisk-browser/node_modules/.bin/playwright" install --with-deps chromium
+          echo "LOGRISK_PLAYWRIGHT_PATH=$RUNNER_TEMP/logrisk-browser/node_modules/playwright" >> "$GITHUB_ENV"
       - run: .venv/bin/python -m pytest -q
       - run: .venv/bin/python -m compileall -q src
       - run: bash -n scripts/*.sh

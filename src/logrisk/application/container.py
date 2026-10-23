@@ -49,6 +49,13 @@ from logrisk.multi_source.config import load_multi_source_config
 from logrisk.multi_source.repository import MultiSourceRepository
 from logrisk.multi_source.service import MultiSourceService
 from logrisk.node_risk import NodeRiskService
+from logrisk.server_risk.repository import ServerRiskRepository
+from logrisk.server_risk.reports import ReportService
+from logrisk.server_risk.service import ServerRiskService
+from logrisk.server_risk.policies import RiskPolicies
+from logrisk.server_risk.assessment import AssessmentService
+from logrisk.server_risk.observations import ObservationService
+from logrisk.server_risk.committed_adapter import CommittedObservationAdapter, CommittedObservationWorker
 from logrisk.orchestration import (
     InputOrchestrationRepository,
     InputOrchestrationService,
@@ -106,6 +113,7 @@ class ApplicationConfig:
     agentic_enabled: bool = False
     agent_workflows_enabled: bool = False
     kafka_enabled: bool = False
+    node_risk_reports_enabled: bool | None = None
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "kafka_enabled", parse_kafka_enabled(self.kafka_enabled))
@@ -157,6 +165,7 @@ class ApplicationContainer:
     multi_source: MultiSourceService
     benchmark_center: BenchmarkService
     release_readiness: ReleaseReadinessService
+    server_risk: ServerRiskService | None = None
     govern_drain_result: Callable[[dict[str, Any]], dict[str, Any]] | None = None
     input_analyzer: Callable[..., dict[str, Any]] | None = None
     input_analyzer_accepts_config: bool = True
@@ -452,6 +461,7 @@ def build_application_container(
             agent_workflows = WorkflowService(
                 workflow_repository, workflow_scheduler,
                 build_role_registry(workflow_settings["allowed_roles"]), workflow_settings["limits"],
+                evidence_locker=agent_runs.lock_evidence_summary,
             )
     upload_store = SQLiteUploadSessionStore(
         UploadConfig(upload_dir=state_root / "uploads", artifact_store=artifact_store), database
@@ -485,6 +495,24 @@ def build_application_container(
         model_runner=replay_model,
         validation_runner=validate_replay_output,
     )
+    report_flag = os.getenv("LOGRISK_NODE_RISK_REPORTS_ENABLED")
+    reports_enabled = config.node_risk_reports_enabled if config.node_risk_reports_enabled is not None else (
+        report_flag.strip().lower() in {"1", "true", "yes"} if report_flag is not None else config.agentic_enabled
+    )
+    server_risk_repository = ServerRiskRepository(database)
+    server_risk_policies = RiskPolicies(root / "configs" / "server_risk.yaml")
+    server_risk_assessment = AssessmentService(server_risk_repository, server_risk_policies, utc_now)
+    server_risk_repository.assessment = server_risk_assessment
+    server_risk = ServerRiskService(server_risk_repository, ReportService(
+        server_risk_repository, profiles, connections, prompts,
+        shared_root / "output" if config.shared_root or os.getenv("LOGRISK_SHARED_ROOT") else output_root,
+        enabled=reports_enabled,
+    ))
+    server_risk.assessments = server_risk_assessment
+    server_risk.observations = ObservationService(server_risk_repository, server_risk_policies, server_risk_assessment, utc_now)
+    server_risk.committed_adapter = CommittedObservationAdapter(server_risk_repository, server_risk.observations, server_risk_policies, utc_now)
+    server_risk.source_worker = CommittedObservationWorker(server_risk.committed_adapter)
+
     container = ApplicationContainer(
         config=config,
         database=database,
@@ -515,6 +543,7 @@ def build_application_container(
         semantic_dictionaries=semantic_dictionaries,
         risk_semantics=risk_semantics,
         node_risks=node_risks,
+        server_risk=server_risk,
         multi_source=multi_source,
         benchmark_center=benchmark_center,
         release_readiness=release_readiness,

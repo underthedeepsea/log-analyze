@@ -11,6 +11,7 @@ from logrisk.ai_harness.usage_accounting import run_model_attempt
 from .errors import AgenticError
 from .models import AgentPlan, AgentStepPlan
 from .tool_registry import validate_argument_schema
+from .evidence_context import EXPERT_ROLES, expert_input_summary, assessment_schema, reference_array_schema, validate_assessment
 
 
 _SENSITIVE_KEYS = frozenset({"samples", "raw_sample", "raw_log", "raw_logs", "raw_message", "message", "api_key", "token", "password", "secret", "dsn", "authorization", "cookie"})
@@ -51,9 +52,34 @@ PLAN_SCHEMA = {
 }
 
 
-def build_plan_schema(tool_descriptions: list[dict[str, Any]]) -> dict[str, Any]:
+def expert_tool_descriptions(tool_descriptions: list[dict[str, Any]], context: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if context is None:
+        return copy.deepcopy(tool_descriptions)
+    if context["role_id"] not in EXPERT_ROLES:
+        raise AgenticError("未知固定专家角色", code="agent_plan_invalid")
+    if context["role_id"] != "feature_specialist":
+        return []  # Counted prefetch already supplied the material for analysis.
+    result = []
+    hashes = [item["template_hash"] for item in context["evidence"]["templates"]]
+    components = [item["component"] for item in context["evidence"]["templates"] if item.get("component")]
+    for source in tool_descriptions:
+        if source.get("name") not in {"evaluate_candidate", "register_feature_candidate"}:
+            continue
+        tool = copy.deepcopy(source)
+        feature = tool.get("argument_schema", {}).get("properties", {}).get("feature")
+        if isinstance(feature, dict):
+            properties = feature.get("properties") or {}
+            for field, identities in (("template_hashes", hashes), ("components", components)):
+                if field in properties:
+                    properties[field] = reference_array_schema(identities, minimum=1)
+        result.append(tool)
+    return result
+
+
+def build_plan_schema(tool_descriptions: list[dict[str, Any]], *, max_steps: int | None = None, expert_context: dict[str, Any] | None = None) -> dict[str, Any]:
     """Pair every permitted tool name with its own strict argument schema."""
     pairs = []
+    tool_descriptions = expert_tool_descriptions(tool_descriptions, expert_context)
     for tool in tool_descriptions:
         name = tool.get("name")
         if not isinstance(name, str) or not name:
@@ -72,7 +98,19 @@ def build_plan_schema(tool_descriptions: list[dict[str, Any]]) -> dict[str, Any]
             },
         })
     schema = copy.deepcopy(PLAN_SCHEMA)
-    schema["properties"]["steps"]["items"] = {"oneOf": pairs} if pairs else {"not": {}}
+    steps = schema["properties"]["steps"]
+    steps["items"] = {"oneOf": pairs} if pairs else {}
+    steps["uniqueItems"] = True
+    if max_steps is not None:
+        steps["maxItems"] = int(max_steps)
+    if expert_context is not None:
+        steps["minItems"] = 0
+        if expert_context["role_id"] != "feature_specialist":
+            steps["maxItems"] = 0
+        schema["required"].append("assessment")
+        schema["properties"]["assessment"] = assessment_schema(expert_context)
+    else:
+        steps["minItems"] = 1
     return schema
 
 
@@ -88,7 +126,8 @@ class AgentPlanner(Protocol):
 
 
 def validate_plan(plan: AgentPlan, *, allowed_tools: set[str], max_steps: int) -> AgentPlan:
-    if not plan.goal.strip() or not 1 <= len(plan.steps) <= int(max_steps):
+    minimum = 0 if plan.assessment is not None else 1
+    if not plan.goal.strip() or not minimum <= len(plan.steps) <= int(max_steps):
         raise AgenticError("Agent 计划步骤数量无效", code="agent_plan_invalid")
     step_ids = [step.step_id for step in plan.steps]
     if len(step_ids) != len(set(step_ids)):
@@ -100,8 +139,9 @@ def validate_plan(plan: AgentPlan, *, allowed_tools: set[str], max_steps: int) -
     return plan
 
 
-def _parse_plan(value: Any, tool_descriptions: list[dict[str, Any]]) -> AgentPlan:
-    if not isinstance(value, dict) or set(value) != {"goal", "steps"}:
+def _parse_plan(value: Any, tool_descriptions: list[dict[str, Any]], expert_context: dict[str, Any] | None = None) -> AgentPlan:
+    required = {"goal", "steps", "assessment"} if expert_context is not None else {"goal", "steps"}
+    if not isinstance(value, dict) or set(value) != required:
         raise AgenticError("模型返回了无效 Agent 计划", code="agent_plan_invalid")
     if not isinstance(value.get("goal"), str):
         raise AgenticError("模型返回了无效 Agent 计划", code="agent_plan_invalid")
@@ -109,6 +149,7 @@ def _parse_plan(value: Any, tool_descriptions: list[dict[str, Any]]) -> AgentPla
     if not isinstance(raw_steps, list):
         raise AgenticError("模型返回了无效 Agent 计划", code="agent_plan_invalid")
     steps: list[AgentStepPlan] = []
+    tool_descriptions = expert_tool_descriptions(tool_descriptions, expert_context)
     schemas = {
         item["name"]: item.get("argument_schema") if isinstance(item.get("argument_schema"), dict) else {"type": "object"}
         for item in tool_descriptions
@@ -127,7 +168,18 @@ def _parse_plan(value: Any, tool_descriptions: list[dict[str, Any]]) -> AgentPla
         except AgenticError as exc:
             raise AgenticError("模型返回了不符合工具契约的参数", code="agent_plan_invalid") from exc
         steps.append(AgentStepPlan(item["step_id"], item["tool_name"], item["arguments"]))
-    return AgentPlan(value["goal"], tuple(steps))
+    if expert_context is not None:
+        if expert_context["role_id"] != "feature_specialist" and steps:
+            raise AgenticError("已预取专家只能分析，不能重复读取", code="agent_plan_invalid")
+        if expert_context["role_id"] == "feature_specialist":
+            if len(steps) % 2:
+                raise AgenticError("每个候选必须完整校验再登记", code="agent_plan_invalid")
+            for index in range(0, len(steps), 2):
+                evaluated, registered = steps[index:index + 2]
+                if evaluated.tool_name != "evaluate_candidate" or registered.tool_name != "register_feature_candidate" or evaluated.arguments.get("feature") != registered.arguments.get("feature"):
+                    raise AgenticError("候选必须先校验并登记同一特征", code="agent_plan_invalid")
+    assessment = validate_assessment(value["assessment"], expert_context, steps) if expert_context is not None else None
+    return AgentPlan(value["goal"], tuple(steps), assessment, copy.deepcopy(value) if expert_context is not None else None)
 
 
 class FakeAgentPlanner:
@@ -140,6 +192,8 @@ class FakeAgentPlanner:
 
 
 class ModelAgentPlanner:
+    requires_evidence_context = True
+
     def __init__(
         self,
         model_client: ModelClient,
@@ -168,12 +222,16 @@ class ModelAgentPlanner:
         self.logical_call_id = logical_call_id
 
     def plan(self, *, goal: str, evidence_summary: dict[str, Any], tool_descriptions: list[dict[str, Any]], max_steps: int) -> AgentPlan:
+        context = evidence_summary.get("expert_context")
+        planning_tools = expert_tool_descriptions(tool_descriptions, context)
+        remaining_steps = 0 if context is not None and context["role_id"] != "feature_specialist" else int(max_steps)
         payload = {
             "goal": str(goal),
-            "evidence_summary": evidence_summary,
-            "allowed_tools": tool_descriptions,
-            "max_steps": int(max_steps),
+            "evidence_summary": expert_input_summary(evidence_summary),
+            "allowed_tools": planning_tools,
+            "max_steps": remaining_steps,
         }
+        schema = build_plan_schema(planning_tools, max_steps=remaining_steps, expert_context=context)
         try:
             output = run_model_attempt(
                 self.model_client,
@@ -181,7 +239,7 @@ class ModelAgentPlanner:
                     {"role": "system", "content": self.prompt_content},
                     {"role": "user", "content": json.dumps(payload, ensure_ascii=False, separators=(",", ":"))},
                 ],
-                build_plan_schema(tool_descriptions),
+                schema,
                 model=self.model,
                 timeout=self.timeout,
                 options=self.options,
@@ -194,10 +252,10 @@ class ModelAgentPlanner:
                 caller_id=self.caller_id,
                 logical_call_id=self.logical_call_id,
             )
-            plan = _parse_plan(output, tool_descriptions)
+            plan = _parse_plan(output, planning_tools, context)
         except AgenticError:
             raise
         except Exception as exc:
             raise AgenticError("模型未返回有效 Agent 计划", code="agent_plan_failed", status_code=502) from exc
-        allowed = {str(item.get("name")) for item in tool_descriptions}
-        return validate_plan(plan, allowed_tools=allowed, max_steps=max_steps)
+        allowed = {str(item.get("name")) for item in planning_tools}
+        return validate_plan(plan, allowed_tools=allowed, max_steps=remaining_steps)

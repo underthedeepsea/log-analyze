@@ -282,7 +282,7 @@ class WorkflowRepository:
             if idempotency_key and connection.execute("SELECT 1 FROM agent_workflow_events WHERE workflow_run_id=? AND idempotency_key=?", (run_id, idempotency_key)).fetchone():
                 replay = True
             if not replay:
-                changed = connection.execute("UPDATE agent_workflow_nodes SET status='pending',child_agent_run_id=NULL,error_code=NULL,error_summary=NULL,completed_at=NULL,updated_at=? WHERE workflow_run_id=? AND node_id=? AND status IN ('running','failed')", (now, run_id, node_id))
+                changed = connection.execute("UPDATE agent_workflow_nodes SET status='pending',child_agent_run_id=CASE WHEN EXISTS(SELECT 1 FROM agent_run_events WHERE run_id=agent_workflow_nodes.child_agent_run_id AND event_type='model_planning_reserved') THEN child_agent_run_id ELSE NULL END,error_code=NULL,error_summary=NULL,completed_at=NULL,updated_at=? WHERE workflow_run_id=? AND node_id=? AND status IN ('running','failed')", (now, run_id, node_id))
                 if changed.rowcount != 1:
                     raise AgenticError("工作流节点不可重试", code="workflow_node_conflict", status_code=409)
                 self._append_event(connection, run_id, "workflow_node_retry_queued", node_id, {}, now, idempotency_key=idempotency_key)
@@ -296,7 +296,7 @@ class WorkflowRepository:
             rows = connection.execute("SELECT workflow_run_id FROM agent_workflow_runs WHERE status IN ('queued','running') ORDER BY created_at,workflow_run_id").fetchall()
             run_ids = [str(row["workflow_run_id"]) for row in rows]
             for run_id in run_ids:
-                connection.execute("UPDATE agent_workflow_nodes SET status='pending',child_agent_run_id=NULL,error_code=NULL,error_summary=NULL,completed_at=NULL,updated_at=? WHERE workflow_run_id=? AND status='running'", (now, run_id))
+                connection.execute("UPDATE agent_workflow_nodes SET status='pending',child_agent_run_id=CASE WHEN EXISTS(SELECT 1 FROM agent_run_events WHERE run_id=agent_workflow_nodes.child_agent_run_id AND event_type='model_planning_reserved') THEN child_agent_run_id ELSE NULL END,error_code=NULL,error_summary=NULL,completed_at=NULL,updated_at=? WHERE workflow_run_id=? AND status='running'", (now, run_id))
                 self._append_event(connection, run_id, "workflow_run_recovered", None, {}, now)
         return run_ids
 
@@ -308,7 +308,7 @@ class WorkflowRepository:
                 raise AgenticError("Agent 工作流 Run 不存在", code="workflow_run_not_found", status_code=404)
             if str(row["status"]) not in {"queued", "running"}:
                 raise AgenticError("工作流 Run 状态不允许恢复", code="workflow_state_conflict", status_code=409)
-            connection.execute("UPDATE agent_workflow_nodes SET status='pending',child_agent_run_id=NULL,error_code=NULL,error_summary=NULL,completed_at=NULL,updated_at=? WHERE workflow_run_id=? AND status='running'", (now, run_id))
+            connection.execute("UPDATE agent_workflow_nodes SET status='pending',child_agent_run_id=CASE WHEN EXISTS(SELECT 1 FROM agent_run_events WHERE run_id=agent_workflow_nodes.child_agent_run_id AND event_type='model_planning_reserved') THEN child_agent_run_id ELSE NULL END,error_code=NULL,error_summary=NULL,completed_at=NULL,updated_at=? WHERE workflow_run_id=? AND status='running'", (now, run_id))
             self._append_event(connection, run_id, "workflow_run_recovered", None, {}, now)
         return self.get_run(run_id)
 

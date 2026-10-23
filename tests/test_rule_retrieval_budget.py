@@ -1,4 +1,5 @@
 from __future__ import annotations
+from logrisk.agentic.tool_registry import AgentToolContext
 
 from logrisk.agentic.tools import build_agent_tool_registry
 
@@ -29,7 +30,7 @@ def test_agent_rule_lookup_uses_lightweight_repository_path_and_both_hash_aliase
     rules = Rules()
     registry = build_agent_tool_registry(Dummy(), rules, Dummy())
     tool = registry.get("find_approved_rules")
-    result = tool.handler({"template_hashes": ["hash-a", "fp-a"], "components": ["kernel"]}, Dummy())
+    result = tool.handler({"template_hashes": ["hash-a", "fp-a"], "components": ["kernel"]}, AgentToolContext(run_id="run", source_job_id="job", entity_id="node", allowed_tools=frozenset({"find_approved_rules"}), actor="tester", request_id="req", cluster="prod"))
 
     assert result["matched"] == 1
     assert rules.health_calls == 0

@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import sqlite3
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
@@ -161,7 +162,7 @@ class SQLiteToPostgresMigration:
         column_sql = ", ".join(_quote_identifier(name) for name in names)
         placeholders = ", ".join("?" for _ in names)
         target.executemany(
-            f"INSERT INTO {_quote_identifier(table)} ({column_sql}) VALUES ({placeholders}) ON CONFLICT DO NOTHING",
+            f"INSERT INTO {_quote_identifier(table)} ({column_sql}) VALUES ({placeholders})",
             [self._prepare_row(row, boolean_columns) for row in rows],
         )
         return len(rows)
@@ -211,10 +212,49 @@ class SQLiteToPostgresMigration:
                 failures.append(table)
         return {"valid": not failures, "tables": table_reports, "failed_tables": failures}
 
+    def _prepare_fresh_target(self, target: Any) -> None:
+        # Only unconditional migration-owned seeds may occupy a fresh target.
+        # Data-dependent migration backfills are business data, not disposable seeds.
+        tables = sorted(str(row["table_name"]) for row in target.execute(
+            "SELECT table_name FROM information_schema.tables "
+            "WHERE table_schema=current_schema() AND table_type='BASE TABLE' "
+            "AND table_name != 'schema_migrations'"
+        ).fetchall())
+        if tables:
+            target.execute("LOCK TABLE " + ", ".join(_quote_identifier(table) for table in tables)
+                           + " IN ACCESS EXCLUSIVE MODE")
+        disposable = []
+        for table in tables:
+            rows = target.execute(f"SELECT * FROM {_quote_identifier(table)} LIMIT 2").fetchall()
+            if not rows:
+                continue
+            seed = False
+            if table == "approval_projection_state" and len(rows) == 1:
+                row = dict(rows[0])
+                generation = row.get("generation")
+                # 0028 first inserts canonical-v1, then rebuild_projection sets
+                # uuid4().hex on both Providers, including a completely empty DB.
+                seed = row == {"singleton": 1, "generation": "canonical-v1"}
+                if row.get("singleton") == 1 and set(row) == {"singleton", "generation"} and isinstance(generation, str):
+                    try:
+                        parsed = uuid.UUID(generation)
+                    except ValueError:
+                        pass
+                    else:
+                        seed = seed or (parsed.version == 4 and parsed.variant == uuid.RFC_4122
+                                        and parsed.hex == generation)
+            if not seed:
+                raise MigrationError(f"PostgreSQL 目标非空或含自定义状态，拒绝迁移: {table}")
+            disposable.append(table)
+        # Run only after every table passes, within the copy/verification transaction.
+        for table in disposable:
+            target.execute(f"DELETE FROM {_quote_identifier(table)}")
+
     def execute(self) -> dict[str, Any]:
         preview = self.preview()
         target = PostgresDatabase(self.target_url, state_root=self.state_root)
         with _source_connection(self.source_sqlite) as source, target.transaction() as connection:
+            self._prepare_fresh_target(connection)
             copied = {table: self._copy_table(source, connection, table) for table in preview["tables"]}
             self._reset_identity_sequences(connection, preview["tables"])
             verification = self._verify(source, connection, preview["tables"])

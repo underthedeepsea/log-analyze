@@ -28,8 +28,8 @@ class RoleRegistry:
 def build_role_registry(allowed_roles: tuple[str, ...] | None = None) -> RoleRegistry:
     roles = (
         AgentRole("evidence_specialist", "证据专家", "读取当前实体的聚合脱敏 Evidence", ("get_sanitized_evidence",), 3, 4, 120),
-        AgentRole("rule_specialist", "规则专家", "查询已批准规则和已安装知识资产摘要", ("find_approved_rules", "inspect_knowledge_assets"), 4, 6, 120),
-        AgentRole("feature_specialist", "特征专家", "提取、校验并登记待人工审批 Candidate", ("get_sanitized_evidence", "evaluate_candidate", "register_feature_candidate"), 6, 10, 180),
+        AgentRole("rule_specialist", "规则专家", "查询已批准规则和已安装知识资产摘要", ("get_sanitized_evidence", "find_approved_rules", "inspect_knowledge_assets"), 4, 6, 120),
+        AgentRole("feature_specialist", "特征专家", "提取、校验并登记待人工审批 Candidate", ("get_sanitized_evidence", "find_approved_rules", "evaluate_candidate", "register_feature_candidate"), 6, 10, 180),
     )
     if allowed_roles is not None:
         allowed = set(allowed_roles)

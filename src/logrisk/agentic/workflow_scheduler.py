@@ -65,11 +65,18 @@ class WorkflowScheduler:
                         except Exception as exc:
                             result = {"status": "failed", "used_tool_calls": 0, "error_code": getattr(exc, "code", "workflow_node_failed"), "artifacts": []}
                         current_run = self.repository.get_run(run_id)
+                        used_tool_calls = int(result.get("used_tool_calls") or 0)
+                        node_limit = int(next(item for item in current_run["nodes"] if item["node_id"] == node_id)["max_tool_calls"])
+                        if used_tool_calls < 0 or used_tool_calls > node_limit or int(current_run["used_tool_calls"]) + used_tool_calls > int(current_run["max_tool_calls"]):
+                            raise AgenticError("Agent 工作流工具预算已耗尽",code="workflow_budget_exhausted")
                         if current_run["status"] == "paused" or result["status"] == "paused":
+                            if result.get("model_request_reserved"):
+                                self.repository.finish_node(run_id,node_id,status="failed",used_tool_calls=used_tool_calls,error_code="agent_plan_indeterminate",error_summary="暂停中的模型规划不自动重发")
+                                continue
                             self.repository.requeue_node(run_id, node_id, reason="workflow_paused")
                             continue
                         if current_run["status"] == "cancelled" or result["status"] == "cancelled":
-                            self.repository.finish_node(run_id, node_id, status="cancelled", used_tool_calls=0, error_code="workflow_cancelled", error_summary="工作流在节点执行期间被取消")
+                            self.repository.finish_node(run_id, node_id, status="cancelled", used_tool_calls=used_tool_calls, error_code="workflow_cancelled", error_summary="工作流在节点执行期间被取消")
                             continue
                         used_tool_calls = int(result.get("used_tool_calls") or 0)
                         node_limit = int(next(item for item in current_run["nodes"] if item["node_id"] == node_id)["max_tool_calls"])
@@ -81,6 +88,8 @@ class WorkflowScheduler:
                             continue
                         node = next(item for item in self.repository.get_run(run_id)["nodes"] if item["node_id"] == node_id)
                         self.repository.finish_node(run_id, node_id, status="failed", used_tool_calls=used_tool_calls, error_code=str(result.get("error_code") or "workflow_node_failed"), error_summary="受控角色节点执行失败")
+                        if result.get("model_request_reserved"):
+                            raise AgenticError("已有模型规划预约，禁止自动重发",code=str(result.get("error_code") or "agent_plan_indeterminate"))
                         if int(node["attempt"]) < int(run["max_attempts"]):
                             self.repository.reset_node(run_id, node_id)
         except Exception as exc:

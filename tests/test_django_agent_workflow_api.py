@@ -97,7 +97,10 @@ def test_django_workflow_actions_route_to_control_view(tmp_path, monkeypatch):
     with override_settings(LOGRISK=_config(tmp_path)):
         clear_cached_container(); call_command("logrisk_migrate", "--json")
         workflow = Client().post("/api/agent-workflows", data=_definition(), content_type="application/json").json()
-        created = get_container().agent_workflows.create_run(workflow["workflow_id"], source_job_id="job-1", entity_id="node-a", entity_type="node", model_profile_id="qwen3_5_9b_mlx", prompt_id="agent_plan_v1", actor="alice", roles=("logrisk:operator",), request_id="req-1", idempotency_key="run-1", evidence_summary={"entity": {"id": "node-a"}}, runtime_snapshot=_runtime_snapshot())
+        manager = get_container().feature_jobs
+        manager.auto_start = False
+        source_job = manager.create_job(_result(), model="qwen3.5:9b-mlx", min_score=40)
+        created = get_container().agent_workflows.create_run(workflow["workflow_id"], source_job_id=source_job, entity_id="node-a", entity_type="node", model_profile_id="qwen3_5_9b_mlx", prompt_id="agent_plan_v1", actor="alice", roles=("logrisk:operator",), request_id="req-1", idempotency_key="run-1", evidence_summary={"entity": {"id": "node-a"}}, runtime_snapshot=_runtime_snapshot())
         response = Client().post(f"/api/agent-workflow-runs/{created['workflow_run_id']}/actions/pause", data={"idempotency_key": "pause-1"}, content_type="application/json")
         clear_cached_container()
 
@@ -120,7 +123,10 @@ def test_django_node_retry_dispatch_failure_is_persisted(tmp_path, monkeypatch):
         clear_cached_container(); call_command("logrisk_migrate", "--json")
         workflow = Client().post("/api/agent-workflows", data=_definition(), content_type="application/json").json()
         service = get_container().agent_workflows
-        created = service.create_run(workflow["workflow_id"], source_job_id="job-1", entity_id="node-a", entity_type="node", model_profile_id="qwen3_5_9b_mlx", prompt_id="agent_plan_v1", actor="alice", roles=("logrisk:operator",), request_id="req-1", idempotency_key="run-1", evidence_summary={"entity": {"id": "node-a"}}, runtime_snapshot=_runtime_snapshot())
+        manager = get_container().feature_jobs
+        manager.auto_start = False
+        source_job = manager.create_job(_result(), model="qwen3.5:9b-mlx", min_score=40)
+        created = service.create_run(workflow["workflow_id"], source_job_id=source_job, entity_id="node-a", entity_type="node", model_profile_id="qwen3_5_9b_mlx", prompt_id="agent_plan_v1", actor="alice", roles=("logrisk:operator",), request_id="req-1", idempotency_key="run-1", evidence_summary={"entity": {"id": "node-a"}}, runtime_snapshot=_runtime_snapshot())
         service.repository.transition_run(created["workflow_run_id"], "running", allowed_from={"queued"})
         service.repository.claim_node(created["workflow_run_id"], "evidence")
         service.repository.finish_node(created["workflow_run_id"], "evidence", status="failed", error_code="temporary", error_summary="failed")

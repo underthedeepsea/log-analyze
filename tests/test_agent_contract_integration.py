@@ -285,7 +285,7 @@ def test_dependency_summary_is_bounded_and_preserves_every_artifact_reference():
         assert summary[str(index)]["limitations"]
 
 
-def test_real_workflow_passes_read_tool_artifacts_into_downstream_model(tmp_path):
+def test_real_workflow_passes_read_tool_artifacts_into_downstream_model(tmp_path, fake_mode="v3"):
     manager, _, repository, request = _setup(tmp_path)
 
     class MatchingRules:
@@ -306,18 +306,35 @@ def test_real_workflow_passes_read_tool_artifacts_into_downstream_model(tmp_path
             model_inputs[self.role] = payload
             assert payload["evidence_summary"]["source_job_id"] == request.source_job_id
             assert payload["evidence_summary"]["entity_id"] == request.entity_id
-            if self.role == "evidence_specialist":
-                steps = [{"step_id": "read", "tool_name": "get_sanitized_evidence",
-                          "arguments": {"job_id": request.source_job_id, "entity_id": request.entity_id}}]
-            elif self.role == "rule_specialist":
-                steps = [{"step_id": "rules", "tool_name": "find_approved_rules", "arguments": {"template_hashes": ["hash-oom"]}}]
+            if self.role in {"evidence_specialist", "rule_specialist"}:
+                steps = []
+                if fake_mode == "legacy_steps":
+                    steps = [{"step_id": "read", "tool_name": "get_sanitized_evidence",
+                              "arguments": {"job_id": request.source_job_id, "entity_id": request.entity_id}}]
             else:
-                dependencies = payload["evidence_summary"]["dependency_artifacts"]
-                assert dependencies["evidence"]["artifacts"][0]["payload"]["safe_payload"]["templates"][0]["template_hash"] == "hash-oom"
-                assert dependencies["rules"]["artifacts"][0]["payload"]["safe_payload"]["items"][0]["rule_id"] == "approved-1"
+                context = payload["evidence_summary"]["expert_context"]
+                assert context["evidence"]["templates"][0]["template_hash"] == "hash-oom"
+                assert context["approved_rules"]["items"][0]["rule_id"] == "approved-1"
+                assert {item["role_id"] for item in context["upstream_assessments"]} == {"evidence_specialist", "rule_specialist"}
                 steps = [{"step_id": "evaluate", "tool_name": "evaluate_candidate", "arguments": {"feature": FEATURE}},
                          {"step_id": "register", "tool_name": "register_feature_candidate", "arguments": {"feature": FEATURE}}]
-            return {"goal": "分析聚合证据", "steps": steps}
+            context = payload["evidence_summary"]["expert_context"]
+            from logrisk.agentic.evidence_context import rule_reference
+            return {"goal": "分析聚合证据", "steps": steps, "assessment": {
+                "role_id": self.role, "context_hash": context["context_hash"],
+                **({"conclusion": "根据真实脱敏模板形成的本角色判断"} if fake_mode == "legacy_assessment" else {
+                    "schema_version": "expert_analysis_v3",
+                    "analyses": [{"kind": "manual_guidance", "status": "guidance",
+                                  "fact_refs": [item["template_hash"] for item in context["evidence"]["templates"]],
+                                  "text": "人工核对内存异常对应的进程事件，实际根因和恢复状态未知",
+                                  "missing_evidence": ["缺少进程事件与恢复证据"],
+                                  "manual_checks": ["核对本实体进程退出与内存事件"]}],
+                }),
+                "template_refs": [item["template_hash"] for item in context["evidence"]["templates"]],
+                "rule_refs": [rule_reference(item) for item in context["approved_rules"]["items"]],
+                "upstream_refs": [item["artifact_id"] for item in context["upstream_assessments"]],
+                "limitations": ["根因与实际影响未知，等待人工审批"],
+            }}
 
     def planner(run):
         return ModelAgentPlanner(Model(run["locked_snapshot"]["workflow_role_id"]), model="test-model",
@@ -346,7 +363,19 @@ def test_real_workflow_passes_read_tool_artifacts_into_downstream_model(tmp_path
 
     result = service.execute_run(run["workflow_run_id"])
 
+    if fake_mode != "v3":
+        assert result["status"] == "failed"
+        assert result["error_code"]
+        assert "feature_specialist" not in model_inputs
+        assert manager.get_job(request.source_job_id)["features"] == []
+        return
+
     assert result["status"] == "awaiting_human"
     assert len(model_inputs) == 3
     assert "raw secret" not in json.dumps(model_inputs)
     assert manager.get_job(request.source_job_id)["features"][0]["status"] == "pending"
+
+
+@pytest.mark.parametrize("fake_mode", ["legacy_steps", "legacy_assessment"])
+def test_real_workflow_rejects_legacy_model_contract(tmp_path, fake_mode):
+    test_real_workflow_passes_read_tool_artifacts_into_downstream_model(tmp_path, fake_mode=fake_mode)

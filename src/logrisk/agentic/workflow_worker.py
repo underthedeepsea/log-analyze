@@ -17,6 +17,8 @@ class WorkflowWorker:
     def execute_node(self, workflow_run_id: str, node_id: str) -> dict[str, Any]:
         run = self.repository.get_run(workflow_run_id)
         node = next(item for item in run["nodes"] if item["node_id"] == node_id)
+        if run["status"] in {"cancelled", "paused"}:
+            return {"status":run["status"],"child_agent_run_id":node.get("child_agent_run_id"),"used_tool_calls":0,"artifacts":[],"error_code":None}
         attempt = int(node["attempt"])
         key = f"workflow:{workflow_run_id}:{node_id}:{attempt}"
         evidence_summary = run["locked_snapshot"].get("evidence_summary")
@@ -50,19 +52,27 @@ class WorkflowWorker:
             ],
         }
         locked.update({key: runtime_snapshot[key] for key in runtime_keys})
-        child = self.agent_service.create_run(AgentRunRequest(
-            source_job_id=run["source_job_id"], entity_id=run["entity_id"], entity_type=run["entity_type"],
-            model_profile_id=run["model_profile_id"], prompt_id=run["prompt_id"],
-            max_steps=node["max_steps"], max_tool_calls=node["max_tool_calls"], timeout_seconds=node["timeout_seconds"],
-            allowed_tools=tuple(node["allowed_tools"]), idempotency_key=key, actor=run["actor"],
-            roles=tuple(run["roles"]), request_id=run["request_id"],
-        ), locked_snapshot=locked)
+        existing_child = node.get("child_agent_run_id")
+        if existing_child:
+            child = self.agent_service.get_run(str(existing_child))
+            child_scope = child.get("locked_snapshot") or {}
+            if child["source_job_id"] != run["source_job_id"] or child["entity_id"] != run["entity_id"] or child_scope.get("workflow_run_id") != workflow_run_id or child_scope.get("workflow_node_id") != node_id:
+                raise AgenticError("恢复子运行跨工作流范围",code="agent_upstream_scope_invalid")
+        else:
+            child = self.agent_service.create_run(AgentRunRequest(
+                source_job_id=run["source_job_id"], entity_id=run["entity_id"], entity_type=run["entity_type"],
+                model_profile_id=run["model_profile_id"], prompt_id=run["prompt_id"],
+                max_steps=node["max_steps"], max_tool_calls=node["max_tool_calls"], timeout_seconds=node["timeout_seconds"],
+                allowed_tools=tuple(node["allowed_tools"]), idempotency_key=key, actor=run["actor"],
+                roles=tuple(run["roles"]), request_id=run["request_id"],
+            ), locked_snapshot=locked)
         self.repository.attach_child_run(workflow_run_id, node_id, str(child["run_id"]))
         result = self.agent_service.execute_run(str(child["run_id"]))
         return {
             "status": str(result["status"]), "child_agent_run_id": str(child["run_id"]),
             "used_tool_calls": int(result.get("used_tool_calls") or 0),
             "artifacts": list(result.get("artifacts") or []), "error_code": result.get("error_code"),
+            "model_request_reserved": any(event.get("type") == "model_planning_reserved" for event in result.get("events") or []),
         }
 
     def pause_active(self, run: dict[str, Any], key: str) -> None:

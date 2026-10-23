@@ -4,6 +4,7 @@ import json
 from typing import Any
 
 from logrisk.database import Database
+from logrisk.agentic.artifacts import canonical_fingerprint
 
 
 ROLES = (
@@ -68,6 +69,7 @@ class ApprovalExpertReader:
             if run:
                 artifacts = self._artifacts(connection, run_id)
                 opinions[2] = self._feature(opinions[2], artifacts, candidate_id, run_id)
+                opinions[2] = self._model_card(opinions[2], artifacts, run_id, job_id, entity_id)
                 # Check workflow scope before resolving fixed roles for dependency IDs.
                 workflow = connection.execute(
                     "SELECT 1 FROM agent_workflow_runs WHERE workflow_run_id=? AND source_job_id=? AND entity_id=?",
@@ -88,6 +90,7 @@ class ApprovalExpertReader:
                         records = self._assessments(connection, dependency_id, job_id, entity_id)
                         reader = self._evidence if index == 0 else self._rules
                         opinions[index] = reader(opinions[index], records, dependency_id)
+                        opinions[index] = self._model_card(opinions[index], records, dependency_id, job_id, entity_id)
             available = sum(item["state"] != "missing" for item in opinions)
             return {
                 "schema_version": "approval_expert_opinions_v1", "job_id": job_id,
@@ -125,6 +128,11 @@ class ApprovalExpertReader:
         items = []
         for artifact in self._artifacts(connection, run_id):
             payload = artifact["payload"]
+            if artifact["artifact_type"] == "expert_assessment_v1":
+                scope = _object(payload.get("scope"))
+                if scope.get("source_job_id") == job_id and scope.get("entity_id") == entity_id:
+                    items.append(artifact)
+                continue
             if payload.get("producer_run_id") != run_id:
                 continue
             refs = _list(payload.get("evidence_refs"))
@@ -142,6 +150,29 @@ class ApprovalExpertReader:
                 output = _object(call["result_summary_json"]) if call else {}
             items.append({**artifact, "output": output})
         return items
+
+    def _model_card(self, card: dict[str, Any], artifacts: list[dict[str, Any]], run_id: str, job_id: str, entity_id: str) -> dict[str, Any]:
+        item = next((a for a in reversed(artifacts) if a["artifact_type"] == "expert_assessment_v1"), None)
+        if item is None:
+            return card
+        payload = item["payload"]; scope = _object(payload.get("scope")); opinion = _object(payload.get("assessment"))
+        response = _object(payload.get("model_response"))
+        if payload.get("origin") != "model" or scope.get("source_job_id") != job_id or scope.get("entity_id") != entity_id or opinion.get("role_id") != card["role_id"] or canonical_fingerprint(response) != payload.get("model_response_hash") or response.get("assessment") != opinion or opinion.get("context_hash") != payload.get("context_hash"):
+            return {**card, "state": "attention", "conclusion": "模型意见引用校验未通过", "confirmation": "不要把不一致的记录作为专家判断；请核对原始分析。"}
+        if opinion.get("schema_version") == "expert_analysis_v3":
+            fields = []
+            for block in _list(opinion.get("analyses")):
+                fields.extend([_field("待核查解释 · " + str(block.get("status")), block.get("text")), _field("事实引用", _strings(block.get("fact_refs"))), _field("缺失证据", _strings(block.get("missing_evidence"))), _field("人工核查", _strings(block.get("manual_checks")))])
+            return {**card, "opinion_origin": "model", "conclusion": "已记录待核查解释，请对照独立事实区。", "confirmation": "假设未证实，原Evaluator和人工审批仍必需。", "records": [self._record(item, run_id, "引用明确的模型解释（非事实清单）", fields), *card["records"]]}
+        fields = [_field("模型结论", opinion.get("conclusion")), _field("模板引用", _strings(opinion.get("template_refs"))), _field("批准规则版本引用", _strings(opinion.get("rule_refs"))), _field("上游模型意见引用", _strings(opinion.get("upstream_refs"))), _field("未知与限制", _strings(opinion.get("limitations")))]
+        for fact in _list(opinion.get("observations")):
+            if not isinstance(fact, dict):
+                continue
+            count = fact.get("proven_object_count")
+            objects = "未知" if count == "unknown" else str(count) + "（仅已见标识，非完整影响范围）"
+            fields.append(_field("输入核验事实 " + str(fact.get("anomaly_type")),
+                                 "模板 " + str(fact.get("template_ref")) + "；日志出现次数 " + str(fact.get("log_occurrence_count")) + "；可证实对象数 " + objects))
+        return {**card, "opinion_origin": "model", "conclusion": _text(opinion.get("conclusion")), "basis": "本角色模型基于锁定材料形成的判断。" + card["basis"], "confirmation": _strings(opinion.get("limitations")) + " 原Evaluator和人工审批仍必需。", "source": "已记录的结构化模型意见及确定性材料", "records": [self._record(item, run_id, "真实模型意见与引用", fields), *card["records"]]}
 
     @staticmethod
     def _record(artifact: dict[str, Any], run_id: str, title: str, fields: list[dict[str, str]]) -> dict[str, Any]:
@@ -164,7 +195,7 @@ class ApprovalExpertReader:
                              f"{t.get('count') if type(t.get('count')) is int else '未知'} 次\n"
                              f"{_text(t.get('template'))}\nHash {_text(t.get('template_hash'))}")
                       for index, t in enumerate(templates[:50]))
-        return {**card, "state": "recorded", "conclusion": f"已核对 {len(templates)} 个脱敏证据模板",
+        return {**card, "opinion_origin": "deterministic_tool", "state": "recorded", "conclusion": f"已核对 {len(templates)} 个脱敏证据模板",
                 "basis": f"组件：{components or '未记录'}；聚合日志命中 {count} 次。记录级别：{severities or '未记录'}。"
                          "各模板内容和时间范围可在对应记录中查看。",
                 "confirmation": "确认这些模板描述的异常与候选标题、摘要一致，且适用范围合适。",
@@ -187,7 +218,7 @@ class ApprovalExpertReader:
             basis += f"另读取 {len(assets['output']['items'])} 项已物化知识资产。"
         fields = [_field("匹配数量", str(matched)), _field("查询完整性", "部分结果" if partial else "完整")]
         fields.extend(_field("匹配规则", _text(r.get("rule_id")) + " · " + _text(r.get("title"))) for r in rules[:30])
-        return {**card, "state": "attention" if partial or matched else "recorded",
+        return {**card, "opinion_origin": "deterministic_tool", "state": "attention" if partial or matched else "recorded",
                 "conclusion": ("规则查询结果不完整" if partial else f"找到 {matched} 条可核对规则" if matched else "本次未匹配到批准规则"),
                 "basis": basis, "confirmation": ("核对已有规则是否可复用，避免重复登记。" if matched or partial
                                                    else "确认新规则的组件、模板范围及重要性。"),

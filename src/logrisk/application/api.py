@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import re
+from urllib.parse import unquote
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping
 
@@ -12,13 +14,15 @@ from logrisk.database import DatabaseError, PostgresDatabase
 from logrisk.database_config import database_url_from_candidate
 from logrisk.feature_extractor_ollama import FEATURE_PROMPT_ID
 from logrisk.feature_jobs import FeatureJobError
-from logrisk.runtime.identity import RequestIdentity, require_write_access
+from logrisk.runtime.identity import RequestIdentity, RuntimeAccessError, require_write_access
+from logrisk.server_risk.contracts import ServerRiskError, integer
+from logrisk.server_risk.render import CSP
 
 
 @dataclass(frozen=True)
 class ApiResult:
     status: int
-    body: Mapping[str, Any]
+    body: Mapping[str, Any] | bytes
     headers: Mapping[str, str] = field(default_factory=dict)
 
 
@@ -36,8 +40,13 @@ class ApiFacade:
         self.version = str(version)
         self.service_resolver = service_resolver
 
-    def dispatch_read(self, path: str, query: Mapping[str, Any] | None = None) -> ApiResult | None:
+    def dispatch_read(self, path: str, query: Mapping[str, Any] | None = None, identity: RequestIdentity | None = None) -> ApiResult | None:
+        server_risk = self.dispatch_server_risk_read(path, query or {}, identity)
+        if server_risk is not None:
+            return server_risk
         parts = path.split("/")
+        if len(parts) == 7 and parts[:3] == ["", "api", "jobs"] and parts[4] == "entities" and parts[6] == "analysis":
+            return self.entity_analysis(parts[3], unquote(parts[5]), run_id=self._query(query or {}, "run_id"))
         if len(parts) == 7 and parts[:3] == ["", "api", "jobs"] and parts[4] == "features" and parts[6] == "expert-opinions":
             return self.feature_expert_opinions(parts[3], parts[5])
         if path == "/api/streaming/sources":
@@ -823,6 +832,15 @@ class ApiFacade:
         manager.refresh_from_persistence(str(job_id))
         return ApiResult(200, manager.get_job(str(job_id), cursor=cursor))
 
+    def entity_analysis(self, job_id: str, entity_id: str, *, run_id: str | None = None) -> ApiResult:
+        from logrisk.agentic.analysis_view import entity_analysis_view
+        from logrisk.agentic.errors import AgenticError
+        try:
+            result = entity_analysis_view(self._service("feature_jobs", self.container.feature_jobs), self._service("agent_runs", self.container.agent_runs), job_id, entity_id, run_id)
+            return ApiResult(200, result)
+        except (FeatureJobError, AgenticError, KeyError, ValueError) as exc:
+            return ApiResult(getattr(exc, "status_code", 404), {"code": getattr(exc, "code", "entity_analysis_not_found"), "error": str(exc)})
+
     def feature_expert_opinions(self, job_id: str, candidate_id: str) -> ApiResult:
         result = ApprovalExpertReader(self.container.database).read(job_id, candidate_id)
         if result is None:
@@ -1057,6 +1075,98 @@ class ApiFacade:
             attributes={"target_version": result["target_version"], "status": result["status"]},
         )
         return ApiResult(200, {**result, "request_id": identity.request_id, "resource_id": result["validation_id"]})
+
+    def _server_risk(self) -> Any:
+        service = self._service("server_risk", self.container.server_risk)
+        if service is None:
+            raise ServerRiskError("server_risk_unavailable", "服务器风险服务不可用", 503)
+        return service
+
+    def require_server_risk_access(self, identity: RequestIdentity | None, *, write: bool = False) -> None:
+        config = self.container.runtime_config
+        if config.identity.enabled:
+            if identity is None or identity.source not in {"trusted_proxy", "django"} or not identity.authenticated or not identity.actor:
+                raise RuntimeAccessError("服务器风险入口需要可信 PACAS/RBAC 身份")
+            if write and (not config.identity.write_roles or not set(config.identity.write_roles).intersection(identity.roles)):
+                raise RuntimeAccessError("服务器风险写操作需要配置且匹配的角色")
+        elif write and identity is not None:
+            require_write_access(identity, config)
+
+    def dispatch_server_risk_read(self, path: str, query: Mapping[str, Any], identity: RequestIdentity | None) -> ApiResult | None:
+        overview_match = re.fullmatch(r"/api/node-risks/([^/]+)/([^/]+)/overview", path)
+        assessment_match = re.fullmatch(r"/api/node-risks/([^/]+)/([^/]+)/assessment", path)
+        day_match = re.fullmatch(r"/api/node-risks/([^/]+)/([^/]+)/days/([^/]+)", path)
+        daily_match = re.fullmatch(r"/api/node-risks/([^/]+)/([^/]+)/daily", path)
+        report_match = re.fullmatch(r"/api/node-risk-reports/([a-f0-9]{32})(/html)?", path)
+        if not (overview_match or path == "/api/node-risks/overview" or assessment_match or day_match or report_match or path == "/api/node-risks/search" or (daily_match and any(k in query for k in ("from", "to", "timezone")))):
+            return None
+        self.require_server_risk_access(identity)
+        service = self._server_risk()
+        service.reports.hit("http_ingress")
+        if overview_match or path == "/api/node-risks/overview":
+            from logrisk.server_risk.overview import http_overview_arguments
+            service.reports.hit("query_validation")
+            arguments = http_overview_arguments(query, detail=bool(overview_match))
+            return ApiResult(200, service.overview_detail(*map(unquote, overview_match.groups()), **arguments) if overview_match else service.overview(**arguments))
+        if path == "/api/node-risks/search":
+            return ApiResult(200, service.search(self._query(query, "q") or "", self._query(query, "cluster"), self._query(query, "cursor"), self._strict_limit(query)))
+        if assessment_match:
+            if set(query) - {"cluster", "node_id"}:
+                raise ServerRiskError("invalid_schema", "当前判断不接受客户端时间覆盖")
+            return ApiResult(200, service.assessment(*map(unquote, assessment_match.groups())))
+        if day_match:
+            cluster, node, day = map(unquote, day_match.groups())
+            return ApiResult(200, service.day(cluster, node, day, self._query(query, "timezone") or "Asia/Shanghai", cursor=self._query(query, "cursor"), limit=self._strict_limit(query)))
+        if daily_match:
+            cluster, node = map(unquote, daily_match.groups())
+            return ApiResult(200, service.daily(cluster, node, self._query(query, "from"), self._query(query, "to"), self._query(query, "timezone") or "Asia/Shanghai"))
+        report_id = report_match.group(1)
+        if report_match.group(2):
+            body = service.reports.download(report_id)
+            return ApiResult(200, body, {"Content-Type": "text/html; charset=utf-8", "Content-Disposition": ('inline' if self._query(query, 'preview') == '1' else 'attachment') + '; filename="node-risk-' + report_id + '.html"', "Content-Security-Policy": CSP, "X-Content-Type-Options": "nosniff"})
+        return ApiResult(200, service.reports.get(report_id))
+
+    def dispatch_server_risk_write(self, path: str, payload: dict[str, Any], identity: RequestIdentity) -> ApiResult | None:
+        cancel = re.fullmatch(r"/api/node-risk-reports/([a-f0-9]{32})/cancel", path)
+        event_action = re.fullmatch(r"/api/node-risks/events/([^/]+)/(acknowledge|recover)", path)
+        if path not in {"/api/node-risk-reports", "/api/node-risk-observations", "/api/node-risk-queries"} and not (cancel or event_action):
+            return None
+        self.require_server_risk_access(identity, write=path != "/api/node-risk-queries")
+        service = self._server_risk()
+        service.reports.hit("http_ingress")
+        if event_action:
+            if set(payload) - {"operator", "reason", "expected_updated_at"}:
+                raise ServerRiskError("invalid_schema", "处理记录字段无效")
+            method = self.container.node_risks.acknowledge_event if event_action.group(2) == "acknowledge" else self.container.node_risks.recover_event
+            return ApiResult(200, method(unquote(event_action.group(1)), operator=identity.actor or "local-development", reason=payload.get("reason", "人工更新处理记录"), expected_updated_at=payload.get("expected_updated_at")))
+        if path == "/api/node-risk-queries":
+            return ApiResult(200, service.query(payload))
+        if path == "/api/node-risk-observations":
+            return ApiResult(201, service.observations.submit(payload, identity.actor))
+        if cancel:
+            if set(payload) - {"idempotency_key"}:
+                raise ServerRiskError("invalid_schema", "取消请求字段无效")
+            return ApiResult(200, service.reports.cancel(cancel.group(1)))
+        run = service.reports.create(payload, identity.actor or "local-development", request_id=identity.request_id)
+        dispatch = self._service("node_risk_report_dispatch", None)
+        if run["status"] == "queued":
+            if dispatch is None:
+                service.reports.fail(run["report_id"], "report_dispatch_unavailable")
+            else:
+                try:
+                    dispatch(run["report_id"], run["request_id"])
+                except Exception:
+                    service.reports.fail(run["report_id"], "report_dispatch_failed")
+        result = service.reports.get(run["report_id"])
+        return ApiResult(503 if result["status"] == "failed" else 202, result)
+
+    @classmethod
+    def _strict_limit(cls, query: Mapping[str, Any]) -> int:
+        raw = cls._query(query, "limit")
+        try:
+            return integer(int(raw) if raw is not None else 50, 1, 100)
+        except ValueError as exc:
+            raise ServerRiskError("invalid_limit", "分页大小必须为1至100") from exc
 
     def _service(self, name: str, default: Any) -> Any:
         return self.service_resolver(name, default) if self.service_resolver else default

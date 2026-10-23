@@ -23,6 +23,8 @@ class AgentToolContext:
     actor: str
     request_id: str
     evidence_hash: str | None = None
+    cluster: str | None = None
+    rule_bindings: tuple[dict[str, Any], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -38,9 +40,17 @@ class AgentTool:
 
 
 class ToolRegistry:
-    def __init__(self, *, evidence_loader: Callable[[AgentToolContext], dict[str, Any]] | None = None) -> None:
+    def __init__(self, *, evidence_loader: Callable[[AgentToolContext], dict[str, Any]] | None = None,
+                 rule_validator: Callable[..., None] | None = None) -> None:
         self._tools: dict[str, AgentTool] = {}
         self._evidence_loader = evidence_loader
+        self._rule_validator = rule_validator
+
+    def validate_rule_bindings(self, bindings: tuple[dict[str, Any], ...], context: AgentToolContext, *, connection: Any = None) -> None:
+        if bindings:
+            if self._rule_validator is None:
+                raise AgenticError("缺少权威规则校验", code="agent_rule_reference_changed")
+            self._rule_validator(bindings, context, connection=connection)
 
     def current_evidence_hash(self, context: AgentToolContext) -> str | None:
         if self._evidence_loader is None:
@@ -49,6 +59,15 @@ class ToolRegistry:
         evidence = self._evidence_loader(context)
         _reject_sensitive(evidence)
         return canonical_fingerprint(evidence)
+
+    def lock_evidence(self, context: AgentToolContext) -> dict[str, Any] | None:
+        if self._evidence_loader is None:
+            return None
+        from .artifacts import canonical_fingerprint
+        from .evidence_context import validate_material
+        evidence = self._evidence_loader(context)
+        validate_material(evidence, context.source_job_id, context.entity_id, expected_cluster=context.cluster)
+        return {"evidence_hash": canonical_fingerprint(evidence), "cluster": evidence["entity"]["cluster"]}
 
     def register(
         self,
@@ -122,6 +141,17 @@ class ToolRegistry:
         return output
 
 
+def _json_values_equal(left: Any, right: Any) -> bool:
+    # JSON booleans differ from numbers; numeric 1 and 1.0 compare equally.
+    if isinstance(left, bool) or isinstance(right, bool):
+        return isinstance(left, bool) and isinstance(right, bool) and left == right
+    if isinstance(left, dict) and isinstance(right, dict):
+        return left.keys() == right.keys() and all(_json_values_equal(left[key], right[key]) for key in left)
+    if isinstance(left, list) and isinstance(right, list):
+        return len(left) == len(right) and all(_json_values_equal(a, b) for a, b in zip(left, right))
+    return left == right
+
+
 def validate_argument_schema(value: Any, schema: dict[str, Any], *, path: str = "arguments") -> None:
     """Validate the small, strict JSON-Schema subset used by Agent tools.
 
@@ -143,13 +173,19 @@ def validate_argument_schema(value: Any, schema: dict[str, Any], *, path: str = 
     expected_types = expected if isinstance(expected, list) else [expected]
     if expected is not None and not any(valid_types.get(str(item), False) for item in expected_types):
         raise AgenticError(f"工具参数 {path} 类型无效", code="tool_arguments_invalid")
-    if "enum" in schema and value not in schema["enum"]:
+    if "const" in schema and not _json_values_equal(value, schema["const"]):
+        raise AgenticError(f"工具参数 {path} 不等于锁定值", code="tool_arguments_invalid")
+    if "enum" in schema and not any(_json_values_equal(value, item) for item in schema["enum"]):
         raise AgenticError(f"工具参数 {path} 不在允许范围", code="tool_arguments_invalid")
     if isinstance(value, str) and "minLength" in schema and len(value) < int(schema["minLength"]):
         raise AgenticError(f"工具参数 {path} 不能为空", code="tool_arguments_invalid")
     if isinstance(value, list):
         if "minItems" in schema and len(value) < int(schema["minItems"]):
             raise AgenticError(f"工具参数 {path} 不能为空", code="tool_arguments_invalid")
+        if "maxItems" in schema and len(value) > int(schema["maxItems"]):
+            raise AgenticError(f"工具参数 {path} 超出数组上限", code="tool_arguments_invalid")
+        if schema.get("uniqueItems") and any(_json_values_equal(item, previous) for index, item in enumerate(value) for previous in value[:index]):
+            raise AgenticError(f"工具参数 {path} 含重复项", code="tool_arguments_invalid")
         item_schema = schema.get("items")
         if item_schema is not None:
             for index, item in enumerate(value):

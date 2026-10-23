@@ -605,7 +605,7 @@ def test_node_risk_and_editable_semantic_ui_contract():
         '"/api/node-risks"',
         '"/api/semantics"',
         '"创建覆盖草稿"',
-        '"24h 风险事件数"',
+        '"每日风险"',
         'occurrence_count',
     ):
         assert text in source

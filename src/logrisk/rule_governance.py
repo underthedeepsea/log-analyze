@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import uuid
+from contextlib import nullcontext
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
@@ -15,6 +16,7 @@ from logrisk.approved_rules import (
     hydrate_persisted_rule,
     normalize_legacy_rule_version,
     public_rule,
+    rule_scope_matches,
 )
 from logrisk.database import SQLiteDatabase
 
@@ -113,12 +115,14 @@ class RuleGovernanceRepository:
             })
         return result
 
-    def get_rule(self, rule_id: str) -> dict[str, Any] | None:
-        with self.database.connect() as connection:
-            row = connection.execute(
+    def get_rule(self, rule_id: str, *, connection: Any = None) -> dict[str, Any] | None:
+        # A caller's persistence transaction must read and lock the same row.
+        with (nullcontext(connection) if connection is not None else self.database.connect()) as current:
+            suffix = " FOR SHARE" if connection is not None and self.database.provider == "postgres" else ""
+            row = current.execute(
                 "SELECT rule_id, signature, feature_type, rule_json, status, current_version, next_review_at, schema_version, "
                 "approved_at, updated_at, problem_code, approval_key "
-                "FROM approved_rules WHERE rule_id=?",
+                "FROM approved_rules WHERE rule_id=?" + suffix,
                 (rule_id,),
             ).fetchone()
         return self._rule(row) if row else None
@@ -410,8 +414,7 @@ class RuleGovernanceService:
                 for signature in signatures
                 if isinstance(signature, dict) and signature.get("component")
             }
-            rule_scope = str(rule.get("scope") or rule.get("cluster") or "")
-            if scope and rule_scope and rule_scope != scope:
+            if scope is not None and not rule_scope_matches(rule, scope):
                 continue
             if hashes and not hashes.intersection(rule_hashes):
                 continue

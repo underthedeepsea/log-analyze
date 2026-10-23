@@ -117,7 +117,9 @@ rules:
     domain: system_service
     category: unit
     risk_type: systemd.unit.failed
-    match: {source_types: [], components: [systemd], message_regex: ['(?i)(?P<unit>[A-Za-z0-9_.@-]+)\s+failed|Failed to start (?P<unit_alt>[^.]+)']}
+    match: {source_types: [], components: [systemd], message_regex: ['(?i)(?P<unit>[A-Za-z0-9_.@-]+\.(?:service|socket|target|mount|automount|swap|timer|path|scope|slice))\s+failed\b|Failed to start (?P<unit_alt>[^.]+)']}
+    extract:
+      unit: {type: string, from_group: unit, optional: true}
     classification: {default_severity: high, base_score: 75, confidence: 0.95}
     dedup: {key_fields: [cluster, node_id, risk_type], window_seconds: 300}
     lifecycle: {recovery_mode: explicit_or_timeout, recovery_timeout_seconds: 1800}

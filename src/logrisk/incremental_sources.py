@@ -312,9 +312,17 @@ class KafkaIncrementalSource:
             "consumer_group": str(configuration.get("consumer_group") or ""),
             "bootstrap_env": str(configuration.get("bootstrap_env") or ""),
         }
-        cluster_id = str(configuration.get("cluster_id") or "").strip()
-        if cluster_id:
-            self.configuration["cluster_id"] = cluster_id
+        if "cluster_id" in configuration:
+            cluster_id = configuration["cluster_id"]
+            if not isinstance(cluster_id, str) or not cluster_id.strip() or len(cluster_id) > 256 or any(ord(char) < 32 for char in cluster_id):
+                raise IncrementalSourceError("Kafka cluster_id 必须是有效的非空标识")
+            self.configuration["cluster_id"] = cluster_id.strip()
+        from logrisk.normalizer import validate_source_profile
+        profile = validate_source_profile(configuration.get("source_profile"))
+        if "source_profile" in configuration and profile is None:
+            raise IncrementalSourceError("Kafka source_profile 必须使用登记的解析profile")
+        if profile:
+            self.configuration["source_profile"] = profile
         self.environment = str(environment or "production")
         self.scope_key = str(scope_key or "default")
 
@@ -349,7 +357,18 @@ class KafkaIncrementalSource:
             raise IncrementalSourceError("Kafka 消费适配器未注册，无法启动消费")
         if cursor.kind not in {"", "kafka"}:
             raise IncrementalSourceError("Kafka 来源不能使用其他来源的 Checkpoint")
-        return iter(adapter.read(self.configuration, cursor))
+        def records() -> Iterator[SourceRecord]:
+            from logrisk.normalizer import ConfiguredSourceText
+            for item in adapter.read(self.configuration, cursor):
+                # These internal normalization hints belong to registered source
+                # configuration. JSON producer fields cannot activate or replace them.
+                record = {key: value for key, value in item.record.items() if key not in {"_source_profile", "_source_cluster"}}
+                if self.configuration.get("source_profile"):
+                    record["_source_profile"] = ConfiguredSourceText(self.configuration["source_profile"])
+                if self.configuration.get("cluster_id"):
+                    record["_source_cluster"] = ConfiguredSourceText(self.configuration["cluster_id"])
+                yield SourceRecord(record, item.next_cursor, item.metadata)
+        return iter(records())
 
     def commit(self, cursor: SourceCursor) -> None:
         adapter_id = self.configuration["adapter_id"]

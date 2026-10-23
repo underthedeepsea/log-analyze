@@ -311,8 +311,24 @@ class RiskSemanticService:
             fields[name] = value
         return fields
 
-    def match(self, record: dict[str, Any]) -> dict[str, Any]:
+    @staticmethod
+    def _matching_message(record: dict[str, Any]) -> str:
         message = str(record.get("message_core") or record.get("template") or "")
+        if record.get("component") != "systemd" or message.count("<SYSTEMD_UNIT>") != 1:
+            return message
+        unit = (record.get("semantic_fields") or {}).get("unit")
+        if isinstance(unit, list):
+            if len(unit) != 1 or not isinstance(unit[0], dict) or unit[0].get("count") != record.get("count"):
+                return message
+            unit = unit[0].get("value")
+        if not isinstance(unit, str) or not re.fullmatch(
+            r"[A-Za-z0-9_@.-]+\.(?:service|socket|target|mount|automount|swap|timer|path|scope|slice)", unit,
+        ):
+            return message
+        return message.replace("<SYSTEMD_UNIT>", unit)
+
+    def match(self, record: dict[str, Any]) -> dict[str, Any]:
+        message = self._matching_message(record)
         with self._lock:
             rules = self._effective
         for rule in rules:

@@ -184,3 +184,9 @@ def _sse(events: list[dict[str, object]], cursor: int):
         event_type = str(event.get("type") or "message").replace("\n", "")[:100]
         data = json.dumps(event, ensure_ascii=False, separators=(",", ":"))
         yield f"id: {cursor + offset}\nevent: {event_type}\ndata: {data}\n\n".encode("utf-8")
+
+
+@require_GET
+def entity_analysis(request: HttpRequest, job_id: str, entity_id: str) -> JsonResponse:
+    result = get_facade().entity_analysis(job_id, entity_id, run_id=request.GET.get("run_id"))
+    return JsonResponse(dict(result.body), status=result.status, json_dumps_params={"ensure_ascii": False})

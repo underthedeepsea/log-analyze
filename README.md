@@ -10,7 +10,47 @@
   <img src="frontend/logo/logrisk-app-icon-orange-v2.png" width="112" alt="LOGRISK 应用图标" />
 </p>
 
-当前版本：`1.40.0`。完整变更记录见 [`releas.md`](releas.md)。
+当前版本：`1.44.17`。完整变更记录见 [`releas.md`](releas.md)。
+
+### 当前功能与启动方式
+
+服务器风险总览位于 `/node-risks`，支持时间范围、主机筛选、分页和详情；日期证据、当前确定性判断与持久 HTML 日报使用同一套事实。基础总览可直接启动，日报模型执行默认关闭，来源配置 `configs/server_risk.yaml` 默认 `sources: []`，启动不会自动连接 Kafka。
+
+在仓库根目录使用已有虚拟环境：
+
+```bash
+bash scripts/dashboard.sh start
+bash scripts/dashboard.sh status
+# 前台运行
+bash scripts/run_dashboard.sh
+```
+
+后台与前台启动器不接收额外 Dashboard 参数。需要指定监听地址、端口或数据库时，直接使用实际 CLI；源码运行需要 `PYTHONPATH=src`：
+
+```bash
+PYTHONPATH=src .venv/bin/python -m pipeline.dashboard_server --host 127.0.0.1 --port 8080 --database state/logrisk.sqlite3
+PYTHONPATH=src .venv/bin/python -m pipeline.dashboard_server --help
+```
+
+CLI 还支持 `--model`、`--ollama-url`、`--ollama-timeout`、`--database-provider {sqlite,postgres}`、`--database-url`、`--cors-origins`、`--enable-agentic` 和 `--enable-agent-workflows`。数据库连接秘密仍从环境变量读取，勿写入命令记录或配置；生产部署继续使用既有 PACAS/RBAC。
+
+只有需要尝试日报时才显式启用 `LOGRISK_NODE_RISK_REPORTS_ENABLED=1`；该开关不代表真实 Ling 模型已经通过验收。先启动 HTTP 服务，再连接项目 MCP：
+
+```bash
+LOGRISK_MCP_API_BASE=http://127.0.0.1:8080 bash scripts/run_node_risk_mcp.sh
+```
+
+MCP 的实际参数只有 `--api-base`，由启动脚本从上述环境变量传入；七个固定工具及项目 Skill 见 `skills/logrisk-server-risk/SKILL.md`，不要求安装全局 Skill。SQLite 继续是默认数据库；迁移到 PostgreSQL 前必须停服务、备份并执行本页“停机迁移到 PostgreSQL”的 `--dry-run`、`--execute`、`--verify`，Django/Airflow 不自动迁移。
+
+浏览器开发验收需要已有 Node、Playwright 及匹配浏览器；脚本默认使用正常模块解析 `playwright`，可用 `LOGRISK_PLAYWRIGHT_PATH` 指定已有模块路径。产品已提交的前端运行包不要求这些开发依赖。
+
+### 1.44.17 验收状态
+
+本版本的软件验收限定为本地环境：完整回归 1479 项通过、0 失败、0 错误，30 项因未配置外部 PostgreSQL 测试连接而跳过；同一迁移程序与测试已在隔离 PostgreSQL 17.11 中由作者和独立审查分别完成 30/30。实际仓库根入口、项目原生 Skill、浏览器和三条合成 Kafka 日志的解析及事实计数已核验，独立审查结论为 PASS_SCOPE。生产 PACAS、Airflow、PostgreSQL 与部署重复验证沿用豁免，未视为生产通过。
+
+报告成功、预览与下载路径使用假 Provider 验证。真实本地 Ollama 的 Ling 尚未通过报告生成及语义验收：关闭思考时存在不受证据支持的叙述；开启思考后，即使提高输出上限或移除请求格式约束，仍可能在生成最终正文前耗尽预算。Luna 同题单样本通过不等于本地模型或真实 Provider 全链路通过。模型调查独立继续，本版本不自动采用实验提示词或改变模型配置。
+
+systemd 服务失败日志保留屏蔽前的 typed unit 身份，`<SYSTEMD_UNIT> failed` 与对应原文命中同一内置规则；不同 unit、节点和集群保持独立计数，无关或身份不明确的 failed 不因此成为服务失败风险。
 
 开发中审计修复：审批列表使用 canonical 数据库轻投影和不受前页审批影响的 opaque cursor；新增迁移 0027（节点投影修订与真实评分样本）与 0028（审批投影）。节点当前状态可补偿未完成投影，历史没有评分样本时显示 uncertain；流式恢复校验已提交 miner generation 的 SHA-256 manifest。
 
@@ -18,7 +58,7 @@
 
 人工审批支持连续操作：点击批准或驳回后，条目立即变绿并显示“保存中”，数据库确认后变为“已保存”；当前面板保留，可继续选择下一组。保存失败保留提交内容并可重试；有未确认提交时请保留页面，关闭或刷新浏览器会提示。列表中的“刷新”会重新获取待审批队列并移除已保存条目，“加载更多”继续读取后续组。审批身份和规则复用范围仍按脱敏证据确定。
 
-PostgreSQL 部署升级到 1.40.0 时，应先通过 `python manage.py logrisk_migrate --json` 显式应用待执行迁移，再更新服务；Django/Airflow 不会自动迁移。批量审批只更新命中候选、分组状态和审计事件，完整任务快照不再逐条回写。审批携带版本与请求幂等键，冲突保留草稿并展示最新决定；新候选审批和已批准规则健康复审分别展示。Kafka 默认关闭，各部署实例独立配置；读取本批高水位后结束，未探测连接时明确显示“未检查”。
+PostgreSQL 部署升级到 1.41.0 时，应先通过 `python manage.py logrisk_migrate --json` 显式应用待执行迁移，再更新服务；Django/Airflow 不会自动迁移。批量审批只更新命中候选、分组状态和审计事件，完整任务快照不再逐条回写。审批携带版本与请求幂等键，冲突保留草稿并展示最新决定；新候选审批和已批准规则健康复审分别展示。Kafka 默认关闭，各部署实例独立配置；读取本批高水位后结束，未探测连接时明确显示“未检查”。
 
 
 新生成的日志候选按已识别语义拆分，未解析证据单独保留待人工复核；日志命中次数按各自所选模板计算。审批页区分结构校验与语义证据完整性。历史候选和审批状态不会自动重写。
@@ -137,7 +177,7 @@ export LOGRISK_KAFKA_BOOTSTRAP=127.0.0.1:19092
 bash scripts/dashboard.sh restart
 ```
 
-调用启动接口时只传 Topic、Consumer Group、Bootstrap 环境变量名和 adapter ID；Broker 地址从环境变量读取，不写入任务状态：
+调用启动接口时传 Topic、Consumer Group、Bootstrap 环境变量名和 adapter ID；可选 `cluster_id` 和已登记的 `source_profile`。Broker 地址从环境变量读取，不写入任务状态：
 
 ```bash
 curl -X POST http://127.0.0.1:8080/api/streaming/kafka/start \
@@ -146,6 +186,10 @@ curl -X POST http://127.0.0.1:8080/api/streaming/kafka/start \
 ```
 
 Kafka 任务在启动时锁定各分区的高水位，只读取当时已存在的消息；每批最多消费 10,000 条，先提交本地脱敏 Checkpoint，再提交 Kafka offset。服务重启后可从最后成功的分区 offset 恢复。任务状态、审计事件和未知模板不保存原始日志、Kafka Token 或密码。
+
+`source_profile: "log-cloud-shanghai-v1"` 为明确选择的来源解析配置：剥离 CRI stdout/stderr 包装，从显式主机字段、syslog 主机头或 `source_metadata.node_id/hostname` 读取主机；不会把正文里的对端 IP 当成本机。外层 `timestamp/@timestamp` 为无时区时间时按北京时间解释并转换到 UTC；缺失或无效的外层时间不会借用 CRI 正文时间。未知 profile 或错误类型在创建任务前拒绝。
+
+`cluster_id` 保存在来源描述中，并作为没有显式 `record.cluster` 时的日志集群默认值。生产者提供的合法 `cluster` 保持自己的集群归属，不会被来源默认值覆盖；错误的显式集群标识会拒绝解析。消息内的 `_source_profile/_source_cluster` 无权启用或替换来源配置。未传 profile 时沿用原有解析行为，未传集群且消息也未给集群时仍使用 `default`。
 
 ## 模型连接与 Profile
 
@@ -268,10 +312,10 @@ bash scripts/dashboard.sh start
 
 ```bash
 bash scripts/dashboard.sh stop
-.venv/bin/python -m pipeline.database_migrate --source-sqlite state/logrisk.sqlite3 --dry-run
-LOGRISK_DATABASE_URL="$LOGRISK_DATABASE_URL" .venv/bin/python -m pipeline.database_migrate \
+PYTHONPATH=src .venv/bin/python -m pipeline.database_migrate --source-sqlite state/logrisk.sqlite3 --dry-run
+LOGRISK_DATABASE_URL="$LOGRISK_DATABASE_URL" PYTHONPATH=src .venv/bin/python -m pipeline.database_migrate \
   --source-sqlite state/logrisk.sqlite3 --execute
-LOGRISK_DATABASE_URL="$LOGRISK_DATABASE_URL" .venv/bin/python -m pipeline.database_migrate \
+LOGRISK_DATABASE_URL="$LOGRISK_DATABASE_URL" PYTHONPATH=src .venv/bin/python -m pipeline.database_migrate \
   --source-sqlite state/logrisk.sqlite3 --verify
 LOGRISK_DATABASE_PROVIDER=postgres LOGRISK_DATABASE_URL="$LOGRISK_DATABASE_URL" \
   bash scripts/dashboard.sh start
@@ -433,3 +477,74 @@ HTTP、SSE 和 Provider 测试使用模拟提取器或模拟 HTTP 服务，不�
 - API Key 只从环境变量读取，不进入数据库、Trace、错误消息或前端响应；
 - 系统不生成根因、业务影响或处置建议；
 - 只有人工批准的特征可以导出到外部 RCA 专家系统。
+
+### 服务器风险总览（1.43.0）
+
+`/node-risks` 提供北京时间日期范围、今天/昨天/近7天快捷选择、风险等级、恢复状态与主机查询。列表每台主机一行，先按筛选范围聚合，再按最高风险等级、最近发生时间和稳定主机标识排序分页；顶部统计覆盖全部筛选结果。详情抽屉展示该主机的多种异常、对象、已知次数和真实发生区间，关闭后保留筛选、页码与列表位置；原有主机深链接及日期、当前判断、自然语言查询和日报入口仍可使用。
+
+Standalone 与 Django 共用只读接口：
+
+```text
+GET /api/node-risks/overview?from=2026-08-31&to=2026-08-31&timezone=Asia/Shanghai&level=all&recovery=all&q=&page=1&page_size=20
+GET /api/node-risks/{cluster}/{node}/overview?from=2026-08-31&to=2026-08-31&timezone=Asia/Shanghai&level=all&recovery=all
+```
+
+日期范围为北京时间闭区间，服务器转换为 UTC 半开区间；最多90天，每页1至100台主机。等级为 `all/high/medium/low/unknown`（critical 归入 high），恢复状态为 `all/unrecovered/recovered/unknown`。集群与主机分别 URL 编码；字面 `%41`、`%2F` 标识不会二次解码成其他实体。Django 当前不支持解码后含 `/` 的路由标识，返回404。
+
+`known_occurrence_count` 表示所选范围可确认的已观测次数下界；只有同对象、同 boot/来源版本的完整覆盖和处理前沿均可证明时，`occurrence_count` 才是整数，否则为 `null`。跨日期边界且不可拆分的聚合保留未知，不逐日相加重复计数。历史 active、人工 recovered、没有新错误或仅有过期观测都不能证明当前未恢复或健康；恢复未知单独保留。
+
+正式接口依据登记来源策略和已提交来源描述排除演示/合成证据，空结果保持真实空态。可读标题和说明仅使用该实体命中的规则版本与自身事实；内置 CNI 配置失败、镜像拉取退避提供带版本的一般可能影响及核对建议，当前业务影响仍标为未确认，未标识对象先定位。关联仅展示同主机、同对象且实际时间区间重叠的异常共现，不推断因果。没有实际分析记录时显示 `not_analyzed`；原有证据、规则、特征三专家仍使用固定流程，不新增组件专家或多数投票因果判断。
+
+本轮隔离 Kafka→Drain3→风险→API→页面已核对30条输入、2台风险主机、2组异常与4次已知命中，主链路 AI 运行0次；解析得到的主机数不等同于风险主机数。另在独立数据库中实测本地 Ling 的三专家固定流程，共3次 Provider 调用：证据与规则步骤完成，特征输出引用了证据中不存在的组件，被确定性 Evaluator 拒绝，后续登记也被原审批门禁阻止，新增候选0。该实测属于失败候选，不能视为三专家流程已通过；真实恢复、生产 PACAS/Airflow及外部 PostgreSQL 仍需对应验证。
+
+### 服务器风险日报（1.41.0）
+
+新增共用服务的本地日期查询：`GET /api/node-risks/{cluster}/{node}/days/{YYYY-MM-DD}?timezone=Asia/Shanghai`，以及带 `from`、`to`、`timezone` 的每日查询。默认返回真实已知次数及覆盖缺口；历史台账、人工恢复和无新日志都不能证明服务器现在正常。
+
+日报使用 `POST /api/node-risk-reports` 创建持久 Run，`GET /api/node-risk-reports/{id}` 查询状态，`POST /api/node-risk-reports/{id}/cancel` 取消，完成后从 `/api/node-risk-reports/{id}/html` 下载独立 HTML。必须显式指定 `ling_3_0_tiny_8b_q4km` 或实际模型匹配的 Ling Profile；固定模型为 `maternion/ling-3.0-tiny:8b-Q4_K_M`，失败不切换其他模型、不自动重试。每个 Run 最多一次模型调用。默认关闭，`LOGRISK_NODE_RISK_REPORTS_ENABLED=1` 可开启；未设置时沿用已有 `agentic_enabled`。
+
+新的生产入口要求可信身份；写入还要求明确配置且匹配的角色，不能使用开发 loopback 放行。只读的自然语言查询不要求写入角色。报告事实经过白名单重建、引用校验和固定转义模板；每条恢复或硬件未结束说明绑定具体对象与轮次。HTML 自包含，下载与发布都校验受控路径，禁止沿报告目录的符号链接写入。模型与 MCP 的 HTTP 连接、响应头和响应体共用绝对期限，取消会关闭传输。
+
+本地临时 SQLite、Fake Provider 与真实 loopback HTTP/stdio fixtures 已验证对象状态、覆盖合并、次数口径、并发幂等、报告发布/下载、慢速响应期限和畸形协议消息。相关本地浏览器行为与独立审查已完成，当前验收范围见页首 1.44.17 摘要；隔离 PostgreSQL 实测不替代生产 PostgreSQL、真实 Ling、PACAS 或 Airflow 部署验证。
+
+可直接打开 `/node-risks/{cluster}/{node}` 定位主机，无需该节点出现在目录第一页；抽屉中的“每日风险与日报”可展开原有日期证据面板。该面板默认跳到节点最近有记录的真实历史日；灰色覆盖缺口和空白评分点不代表风险为零。每日查询支持最多 90 天，明细按 `next_cursor` 完整分页；严重度柱段按已知发生次数统计，跨日仍未结束轮次单独展示，不增加当日发生次数。相邻完整覆盖仅在对象、来源版本与 boot 一致且无缺口时合并。自然语言接口 `POST /api/node-risk-queries` 仅解析明确节点/登记别名、单日与 IANA 时区，不调用模型，不接受运维修复请求。
+
+受控观测由 `POST /api/node-risk-observations` 接收。在 `configs/server_risk.yaml` 显式登记 `source_id`、`source_epoch`、`config_revision`、`environment`、`cluster`、`node_ids`、对象范围、`signals` 映射和 `permitted_actors`，并配置 `freshness_seconds`、`max_gap_seconds`、`allowed_lateness_seconds`。默认没有启用来源或恢复规则。`error_only` 只能证明异常；`authoritative_state` 需同对象状态采样与连续通过期限；`complete_event_stream` 需完整覆盖、无丢失/解析缺口和应用内部完成前沿。普通正常日志、heartbeat、文件读完和手动恢复不能代替上述证据。明确节点别名采用 `aliases: [{alias: 名称, cluster: 集群, node_id: 节点}]`；重复映射需澄清。
+
+Django 的 `LOGRISK` 可配置 `node_risk_reports_enabled` 和 `airflow_node_risk_report_dag_id`（默认 `logrisk_node_risk_report`）。Web 仅持久化 Run 并向专用 DAG 分发 `report_id`/`request_id`；Worker 使用离线已迁移数据库和共享报告目录，DAG 无自动重试。执行在 120 秒期限内收束，GET 可以观察崩溃后的安全终态，不能重放不确定调用。生产身份依赖既有宿主 resolver/PACAS 与配置角色。
+
+项目 MCP 使用标准 stdio，连接已有 loopback HTTP 服务：
+
+```bash
+LOGRISK_MCP_API_BASE=http://127.0.0.1:8080 bash scripts/run_node_risk_mcp.sh
+```
+
+固定七个工具为 `logrisk_find_nodes`、`logrisk_daily_series`、`logrisk_day_evidence`、`logrisk_current_assessment`、`logrisk_generate_day_report`、`logrisk_get_report`、`logrisk_cancel_report`。项目 Skill 位于 `skills/logrisk-server-risk/SKILL.md`；按目录、日证据、当前判断、持久报告和真实 Artifact 顺序使用。MCP 无数据库直连、身份注入或远程 API 地址；生产身份启用而缺少可信宿主桥时明确拒绝。未验证 PostgreSQL 外部实例、真实 Ling 模型或生产 Airflow/PACAS 部署。
+
+### 自动恢复与隔离历史预览（1.42.0）
+
+服务器风险默认展示确定性当前判断、缺失条件、恢复观察进度和轮次证据；人工处理记录位于可选审计详情，不改变健康判断。当前端点始终使用服务器当前时间；每日事实明确标注历史事件时间回看，历史结束不能证明当前正常。
+
+独立提交适配器默认关闭（`configs/server_risk.yaml` 保留 `sources: []`）。部署需要明确登记来源能力、节点/对象、来源epoch、配置版本、允许actor、信号映射和业务hold/freshness/activity条件；仅成功完整且hash一致的提交可原子推进新模块自己的派生前沿。派生完成、EOF、没有新错误和旧台账状态均不能证明覆盖。完整流覆盖还需要登记生产者的独立覆盖证书；硬件结束必须同设备权威验证。Standalone拥有一个有界来源worker；Django读取入口不启动采集或模型任务。
+
+开发存量日志可运行隔离预览（源库只读，仅白名单复制到新临时库，不复制连接凭据或修改原始时间）：
+
+```bash
+.venv/bin/python scripts/preview_server_risk_replay.py --source state/logrisk.sqlite3 --output-root output/server-risk-auto-recovery-continuation/author/preview --synthetic
+```
+
+脚本使用随机 `127.0.0.1` 端口，打印实际页面URL和manifest。真实历史保持未知；SYNTHETIC合成恢复链单独标注。`--fake-model` 仅显式注入本地Fake用于预览日报，默认关闭模型调用。退出清理自有服务器、来源worker和报告HTTP helper。正式部署实时来源、PACAS/Airflow、Ling、Broker及PostgreSQL运行仍需要对应环境验证。
+
+生产Django部署可在已离线迁移的共享数据库上显式启动独立来源Worker：
+
+```bash
+.venv/bin/python -m logrisk.server_risk.committed_adapter --database /approved/shared/logrisk.sqlite3 --state-root /approved/shared --config configs/server_risk.yaml
+```
+
+该入口不会迁移数据库、登记来源或连接Broker；空来源配置直接保持关闭。PostgreSQL须明确`--database-provider postgres`及环境变量`LOGRISK_DATABASE_URL`。真实来源登记和覆盖证书由部署方提供，本次仅验证隔离本地夹具。
+
+## 固定三专家事实与解释视图
+
+`GET /api/jobs/{job_id}/entities/{entity_id}/analysis` 在没有候选或模型尚未运行时返回本实体已保存的脱敏模板、日志出现次数、时间与可证实对象数量；无对象证明时保持未知。Dashboard 的 `/agent-runs?source_job_id=...&entity_id=...` 显示相同事实及三角色的实际状态，模型失败仍保留事实，不生成替代意见。Django 提供同一只读接口。
+
+固定专家使用锁定证据、批准规则版本和真实完成的上游意见；v3输出只引用事实并给出待人工核查的解释、条件影响和建议。程序检查引用、作用域和可识别技术字面值，不能证明一般自然语言语义正确；Evaluator、人工审批及既有身份机制仍适用。本地集成和fake检查不代表生产模型或真实Kafka到页面全链路通过；生产模型待明确，拒绝身份界面仍待补齐。独立node-runtime/MCP功能修订未随本次核心集成引入。

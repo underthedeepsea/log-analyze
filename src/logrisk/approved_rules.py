@@ -171,6 +171,25 @@ def _preferred_rule(rules: list[Dict[str, Any]]) -> Dict[str, Any] | None:
     )
 
 
+def rule_scope_matches(rule: Dict[str, Any], cluster: str | None) -> bool:
+    """Respect explicit cluster limits without binding scenario rules to a host.
+
+    Persisted scope/cluster are scalar cluster limits. Missing limits and
+    explicit global scopes are portable; review_scope is approval governance,
+    not an entity/cluster restriction. Unknown structured scopes fail closed.
+    """
+    for value in (rule.get("scope"), rule.get("cluster")):
+        if value is None or value == "":
+            continue
+        if not isinstance(value, str):
+            return False
+        if value in {"global", "*"}:
+            continue
+        if not cluster or value != cluster:
+            return False
+    return True
+
+
 def _is_active(rule: Dict[str, Any]) -> bool:
     return str(rule.get("status") or "active") == "active"
 

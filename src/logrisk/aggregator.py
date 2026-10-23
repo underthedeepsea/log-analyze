@@ -84,6 +84,7 @@ class TemplateEventAggregator:
             event.get("semantic_extractor_version"),
             repr(sorted((event.get("semantic_dictionary_versions") or {}).items())),
             (event.get("risk_semantic") or {}).get("risk_type"),
+            (event.get("semantic_fields") or {}).get("unit") if event.get("component") == "systemd" else None,
         )
 
         if key not in self.windows:

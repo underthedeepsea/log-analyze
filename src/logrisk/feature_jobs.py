@@ -2214,6 +2214,7 @@ class FeatureJobManager:
         feature: Dict[str, Any],
         *,
         run_id: str,
+        precondition: Callable[[Any], None] | None = None,
     ) -> Dict[str, Any]:
         evidence = self.get_agent_evidence(job_id, entity_id)
         known_hashes = {
@@ -2267,7 +2268,9 @@ class FeatureJobManager:
                 if item.get("template_hash") in hashes
             ],
         }
-        with self._lock, self.approval_service._unit_of_work(job_ids={str(job_id)}):
+        with self._lock, self.approval_service._unit_of_work(job_ids={str(job_id)}) as connection:
+            if precondition is not None:
+                precondition(connection)
             job = self._job(job_id)
             self._require_complete_input(job)
             self.approval_service.journal_job(job)
@@ -2289,6 +2292,8 @@ class FeatureJobManager:
                     candidate_id=candidate["candidate_id"],
                     agent_run_id=str(run_id),
                 )
+            if precondition is not None:
+                precondition(connection)
         return copy.deepcopy(candidate)
 
     def list_jobs(self) -> list[Dict[str, Any]]:

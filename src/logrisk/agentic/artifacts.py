@@ -37,6 +37,7 @@ def read_tool_artifact(
         "evidence_refs": [{"source_job_id": source_job_id, "entity_id": entity_id,
                            "evidence_hash": evidence_hash, "tool_call_id": tool_call_id}],
         "source_tool": tool_name,
+        "origin": "deterministic_tool",
         "safe_payload": copy.deepcopy(output),
         "limitations": [],
         "requires_explicit_read": False,

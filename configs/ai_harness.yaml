@@ -58,3 +58,11 @@ prompts:
     status: active
     is_default: false
     version: v4
+
+  - prompt_id: node_risk_report_v1
+    display_name: 服务器风险日报 v1
+    description: 固定证据引用叙述计划
+    analysis_type: node_risk_report
+    status: active
+    is_default: true
+    version: v1

@@ -41,6 +41,7 @@ class AirflowRun:
     input_orchestration_run_id: str | None = None
     agent_run_id: str | None = None
     workflow_run_id: str | None = None
+    report_id: str | None = None
 
 
 class AirflowOrchestrator:
@@ -167,6 +168,25 @@ class AirflowOrchestrator:
             raise AirflowOrchestratorError("Airflow 返回的 Agent 工作流信息无效", code="airflow_invalid_response")
         return result
 
+    def trigger_node_risk_report(self, report_id: str, request_id: str) -> AirflowRun:
+        report = self._identifier(report_id, "报告 ID")
+        request = self._identifier(request_id, "请求 ID")
+        external_run_id = self._identifier("logrisk_report__" + report, "Airflow DAG Run ID")
+        conf = {"report_id": report, "request_id": request}
+        try:
+            payload = self._request("POST", self._dag_path("dagRuns"), {"dag_run_id": external_run_id, "conf": conf})
+        except AirflowOrchestratorError as exc:
+            if exc.code != "airflow_run_conflict":
+                raise
+            existing = self.get_run(external_run_id)
+            if existing.report_id == report and existing.request_id == request:
+                return existing
+            raise AirflowOrchestratorError("Airflow 报告ID已被不同请求占用", code="airflow_run_conflict", status_code=409) from exc
+        result = self._run(payload)
+        if result.external_run_id != external_run_id or result.report_id != report or result.request_id != request:
+            raise AirflowOrchestratorError("Airflow 报告分派响应不匹配", code="airflow_invalid_response")
+        return result
+
     def get_run(self, external_run_id: str) -> AirflowRun:
         run = self._identifier(external_run_id, "Airflow DAG Run ID")
         return self._run(self._request("GET", self._dag_path("dagRuns", run)))
@@ -243,6 +263,7 @@ class AirflowOrchestrator:
                 ),
                 agent_run_id=self._optional_identifier(conf.get("agent_run_id"), "Agent Run ID"),
                 workflow_run_id=self._optional_identifier(conf.get("workflow_run_id"), "Agent 工作流 Run ID"),
+                report_id=self._optional_identifier(conf.get("report_id"), "报告 ID"),
             )
         except ValueError as exc:
             raise AirflowOrchestratorError("Airflow DAG Run 响应字段无效", code="airflow_invalid_response") from exc

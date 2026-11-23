@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import time
+from contextlib import ExitStack
 import hashlib
 import json
 import tempfile
@@ -14,6 +15,7 @@ from logrisk.incremental_sources import (
     FileIncrementalSource,
     IncrementalSource,
     IncrementalSourceError,
+    KafkaIncrementalSource,
     SourceCursor,
     SourceDescriptor,
     SourceRecord,
@@ -161,15 +163,35 @@ def run_incremental_pipeline(
     task_id = str(streaming_task["task_id"])
     # A failed claim does not establish ownership, so it must never publish a
     # terminal state for a task that may belong to another Worker.
-    streaming_task = streaming_repository.claim_task(task_id)
+    kafka_epoch = source.control_epoch if isinstance(source, KafkaIncrementalSource) else None
+    streaming_task = (streaming_repository.claim_task(task_id, kafka_control_epoch=kafka_epoch)
+                      if kafka_epoch is not None else streaming_repository.claim_task(task_id))
     lease_token = str(streaming_task.get("lease_token") or "")
+    worker_observation = None
+    source_ownership = ExitStack()
+    previous_source_guard = source.check_active if isinstance(source, KafkaIncrementalSource) else None
     try:
+        if isinstance(source, KafkaIncrementalSource):
+            from logrisk.streaming_observability.repository import ObservabilityRepository
+            from logrisk.streaming_observability.worker import WorkerObservation
+
+            worker_observation = WorkerObservation(
+                ObservabilityRepository(streaming_repository.database), task_id, lease_token,
+            )
+            source.observe = worker_observation.event
+            worker_observation.__enter__()
         if streaming_task.get("config_hash") != config_hash:
             raise StreamingConflictError("Drain3 配置已变化，不能继续恢复")
         try:
             source.validate_descriptor(streaming_task.get("source") or {})
         except IncrementalSourceError as exc:
             raise StreamingConflictError(str(exc)) from exc
+        if isinstance(source, KafkaIncrementalSource) and source.batch is None:
+            from logrisk.streaming_observability.ownership import legacy_execution
+
+            source.check_active = source_ownership.enter_context(legacy_execution(
+                ObservabilityRepository(streaming_repository.database), source,
+            ))
         source_cursor = SourceCursor.from_dict(streaming_task.get("cursor"))
         streaming_resumed = bool(
             source_cursor.value
@@ -215,7 +237,8 @@ def run_incremental_pipeline(
             parser_version=parser_version,
         )
     except BaseException as exc:
-        interrupted = not isinstance(exc, Exception) or isinstance(exc, FutureCancelledError)
+        interrupted = (not isinstance(exc, Exception) or isinstance(exc, FutureCancelledError)
+                       or getattr(exc, "code", None) in {"batch_stopped", "batch_time_budget_exceeded"})
         try:
             streaming_repository.finish_claim(
                 task_id,
@@ -235,6 +258,12 @@ def run_incremental_pipeline(
             # persistence impossible and must not replace that exception.
             pass
         raise
+    finally:
+        source_ownership.close()
+        if worker_observation is not None:
+            worker_observation.__exit__()
+            source.observe = None
+            source.check_active = previous_source_guard
 
 
 def run_large_file_pipeline(
@@ -637,6 +666,7 @@ def _run_checkpointed_source_batches(
     rules = load_rules(rules_path)
     semantic_extractor = SemanticExtractor.from_snapshot(semantic_snapshot) if semantic_snapshot else None
     source_kind = source_descriptor.kind
+    kafka = source if isinstance(source, KafkaIncrementalSource) else None
     persistent_spool_dir = Path(state_dir) / "input_jobs" / input_job_id / "spool" if source_kind != "kafka" else None
     ledger_source = (
         _ledger_source(
@@ -664,6 +694,8 @@ def _run_checkpointed_source_batches(
             )
 
     def emit(stage: str, progress: float, **extra: Any) -> None:
+        if kafka is not None and kafka.observe is not None:
+            kafka.observe("phase", {"phase": stage.upper()})
         if progress_callback is None:
             return
         elapsed = max(time.monotonic() - started, 0.001)
@@ -762,9 +794,10 @@ def _run_checkpointed_source_batches(
         streaming_task = streaming_repository.mark_claim_stage(
             str(streaming_task["task_id"]), lease_token, "MINING"
         )
+        kafka_batch = (kafka.batch or {}) if kafka is not None else {}
         generation_dir = prepare_generation(
-            Path(state_dir) / "miner_generations" / str(streaming_task["task_id"]),
-            streaming_task.get("miner_generation"),
+            Path(state_dir) / "miner_generations" / str(kafka_batch.get("source_id") or streaming_task["task_id"]),
+            streaming_task.get("miner_generation") or kafka_batch.get("miner_generation"),
         )
         template_windows, mining = mine_spooled_partitions(
             spool_dir=batch_spool_dir,
@@ -807,6 +840,8 @@ def _run_checkpointed_source_batches(
                 ),
             )
         generation = seal_generation(generation_dir)
+        if kafka is not None:
+            kafka.before_durable_checkpoint(checkpoint)
         committed = streaming_repository.commit_window(
             str(streaming_task["task_id"]),
             window_id=window_id,
@@ -867,8 +902,10 @@ def _run_checkpointed_source_batches(
         """Commit an empty/duplicate source window without mining it."""
 
         nonlocal newly_committed, streaming_task
-        if ledger_repository is None:
+        if ledger_repository is None and not (kafka is not None and kafka.batch is not None):
             return
+        if kafka is not None:
+            kafka.before_durable_checkpoint(checkpoint)
         cursor_hash = hashlib.sha256(
             json.dumps(checkpoint.to_dict(), ensure_ascii=False, sort_keys=True).encode("utf-8")
         ).hexdigest()[:32]
@@ -893,9 +930,11 @@ def _run_checkpointed_source_batches(
                 "ranges": ranges,
                 "actual_count": _range_count(ranges) if provenance == "verified" else None,
                 "provenance": provenance,
-            },
+            } if ledger_repository is not None else None,
             fencing_token=lease_token,
             expected_cursor=streaming_task.get("cursor"),
+            miner_generation=(kafka.batch or {}).get("miner_generation") if kafka is not None
+            and not streaming_task.get("miner_generation") else None,
         )
         source.commit(checkpoint)
         streaming_task = streaming_repository.clear_pending_external_commit(
@@ -903,7 +942,8 @@ def _run_checkpointed_source_batches(
         )
         if committed:
             newly_committed += 1
-        receipt_ids.append(ingestion_batch_id(input_job_id, window_id))
+        if ledger_repository is not None:
+            receipt_ids.append(ingestion_batch_id(input_job_id, window_id))
 
     def flush(
         batch: list[dict[str, Any]],
@@ -993,6 +1033,9 @@ def _run_checkpointed_source_batches(
                 canonical_ranges(receipt_ranges),
                 batch_provenance,
             )
+        if kafka is not None and kafka.final_cursor is not None:
+            if kafka.final_cursor.to_dict() != streaming_task.get("cursor"):
+                commit_receipt_only(kafka.final_cursor, [], "verified")
         elif ledger_repository is not None and not receipt_ids and not int(
             streaming_task.get("windows_committed") or 0
         ):
@@ -1005,6 +1048,10 @@ def _run_checkpointed_source_batches(
             _shutdown_executor(shared_executor, batch_error)
 
     from logrisk.streaming_results import StreamingResultRepository
+    if kafka is not None:
+        kafka.check_active()
+    if kafka is not None and kafka.observe is not None:
+        kafka.observe("phase", {"phase": "PUBLISHING"})
     result_repository = StreamingResultRepository(streaming_repository.database)
     prefix_evidence = streaming_repository.require_complete_prefix(str(streaming_task["task_id"]))
     result_ref = result_repository.build(
@@ -1128,6 +1175,8 @@ def _run_checkpointed_source_batches(
     result["risk_entities"].sort(key=lambda item: -float(item["risk_score"]))
     if result_is_paged:
         result.update(schema_version="streaming_result_ref_v1",result_ref=result_ref,complete=False,next_cursor=first_page["next_key"])
+    if kafka is not None:
+        kafka.check_active()
     streaming_repository.save_result(
         str(streaming_task["task_id"]),
         _safe_streaming_result(result),

@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import re
 from collections import Counter
-from datetime import date
+from dataclasses import dataclass
+from datetime import date, datetime
 from typing import Any, Mapping
 from zoneinfo import ZoneInfo
 
@@ -90,6 +91,16 @@ def quality(groups: list[dict[str, Any]]) -> dict[str, Any]:
     return {"complete": bool(groups) and not reasons, "coverage": "complete" if groups and not reasons else "partial" if groups else "unknown", "missing_reasons": reasons, "source_mode": "real", "bounded": False}
 
 
+@dataclass(frozen=True)
+class _OverviewFacts:
+    snapshot: Any
+    metadata: dict[str, Any]
+    observations: dict[str, Any]
+    checks: dict[str, Any]
+    intervals: list[tuple[dict[str, Any], datetime, datetime, bool]]
+    projection_complete: bool
+
+
 class RiskOverview:
     """Aggregate a scoped immutable fact view without materializing business state."""
 
@@ -128,6 +139,41 @@ class RiskOverview:
         result_query = {key: value for key, value in query.items() if key not in {"q", "page", "page_size"}}
         return {"schema_version": "node_risk_overview_detail_v1", "query": result_query, "host": {"cluster": cluster, "node_id": node, "label": node}, "groups": groups, "revision": digest({"query": result_query, "host": [cluster, node], "groups": groups}), "quality": quality(groups), "analysis_status": "not_analyzed"}
 
+    def daily_summaries(self, dates: list[str], *, today_limit: int) -> list[dict[str, Any]]:
+        bounds = [day_bounds(day, "Asia/Shanghai") for day in dates]
+        daily_hosts: list[list[dict[str, Any]]] = [[] for _ in bounds]
+        daily_groups: list[list[dict[str, Any]]] = [[] for _ in bounds]
+        for node, snapshot in self.repository.overview_snapshots():
+            cluster, node_id = node["cluster"], node["node_id"]
+            source = self._prepare_facts(cluster, node_id, snapshot)
+            for (start, end), hosts, groups in zip(bounds, daily_hosts, daily_groups):
+                matched = self._group_facts(cluster, node_id, source, start, end, brief=True)
+                if not matched:
+                    continue
+                groups.extend(matched)
+                if len(groups) > MAX_SCOPE_ROWS:
+                    raise ServerRiskError("query_resource_limit", "概览聚合超过资源上限")
+                hosts.append({
+                    **node, "highest_level": max((group["level"] for group in matched), key=LEVELS.__getitem__),
+                    "risk_count": len(matched),
+                    "known_occurrence_count": sum(group["known_occurrence_count"] for group in matched),
+                    "last_seen": max((group["last_seen"] for group in matched), key=utc),
+                })
+        if daily_hosts:
+            daily_hosts[-1].sort(key=lambda item: (
+                -LEVELS[item["highest_level"]], -utc(item["last_seen"]).timestamp(), item["cluster"], item["node_id"],
+            ))
+        return [{
+            "summary": {
+                "host_count": len(hosts), "high_host_count": sum(host["highest_level"] == "high" for host in hosts),
+                "risk_count": len(groups), "known_occurrence_count": sum(group["known_occurrence_count"] for group in groups),
+                "unknown_occurrence_groups": sum(group["occurrence_count"] is None for group in groups),
+                "recovery_counts": recovery_counts(groups),
+            },
+            "quality": quality(groups),
+            "items": hosts[:today_limit] if index == len(bounds) - 1 else [],
+        } for index, (hosts, groups) in enumerate(zip(daily_hosts, daily_groups))]
+
     def _metadata(self, snapshot: Any, cluster: str, node: str) -> dict[str, Any]:
         metadata: dict[str, Any] = {}
         with self.repository.database.connect() as conn:
@@ -157,6 +203,11 @@ class RiskOverview:
 
     def _groups(self, cluster: str, node: str, query: dict[str, Any], start: Any, end: Any) -> list[dict[str, Any]]:
         snapshot = self.repository.snapshot(cluster, node)
+        source = self._prepare_facts(cluster, node, snapshot)
+        groups = self._group_facts(cluster, node, source, start, end)
+        return [group for group in groups if (query["level"] == "all" or group["level"] == query["level"]) and (query["recovery"] == "all" or group["recovery_state"] == query["recovery"])]
+
+    def _prepare_facts(self, cluster: str, node: str, snapshot: Any) -> _OverviewFacts:
         policies = snapshot.assessment.policies if snapshot.assessment is not None else None
         observations = {row["observation_id"]: row for row in snapshot.observations(cluster, node)}
         metadata = self._metadata(snapshot, cluster, node)
@@ -166,7 +217,7 @@ class RiskOverview:
             source = policies.sources.get(row["source_id"]) if policies is not None else None
             return bool(source and str(source.get("environment", "")).casefold() not in SYNTHETIC_ENVIRONMENTS)
         safe_observations = {key: row for key, row in observations.items() if is_real(row)}
-        grouped: dict[tuple[Any, ...], list[Any]] = {}
+        intervals = []
         for fact in snapshot.facts(cluster, node):
             if fact.get("cluster") != cluster or fact.get("node_id") != node:
                 continue
@@ -181,39 +232,62 @@ class RiskOverview:
             except ServerRiskError:
                 continue
             exclusive = fact["provenance"] == "registered_observation" and left != right
-            if right < left or not (left < end and (right > start if exclusive else right >= start)):
+            if right >= left:
+                intervals.append((fact, left, right, exclusive))
+        assessment = snapshot.assessment.evaluate(cluster, node) if snapshot.assessment is not None else {"checks": []}
+        checks = {check["subject_key"]: check for check in assessment["checks"]}
+        return _OverviewFacts(
+            snapshot, metadata, safe_observations, checks, intervals,
+            snapshot.historical_projection(cluster, node)["projection_complete"],
+        )
+
+    def _group_facts(
+        self, cluster: str, node: str, source: _OverviewFacts, start: datetime, end: datetime,
+        *, brief: bool = False,
+    ) -> list[dict[str, Any]]:
+        snapshot, metadata, safe_observations, checks = source.snapshot, source.metadata, source.observations, source.checks
+        grouped: dict[tuple[Any, ...], list[Any]] = {}
+        for fact, left, right, exclusive in source.intervals:
+            if not (left < end and (right > start if exclusive else right >= start)):
                 continue
             bounded = left >= start and (right <= end if exclusive else right < end)
             key = (fact["risk_type"], fact["object_kind"], fact["object_id"])
             grouped.setdefault(key, []).append({**fact, "_bounded": bounded})
-        assessment = snapshot.assessment.evaluate(cluster, node) if snapshot.assessment is not None else {"checks": []}
-        checks = {check["subject_key"]: check for check in assessment["checks"]}
         groups = []
         for key, facts in sorted(grouped.items()):
             risk_type, kind, obj = key
-            object_label = "未标识对象" if obj.startswith("legacy:") else obj
-            refs = sorted({f["fact_ref"] for f in facts})
             matching_checks = [checks[subject] for subject in {f.get("subject_key") for f in facts} if subject in checks]
             matching_checks = [check for check in matching_checks if check["identity"]["cluster"] == cluster and check["identity"]["node_id"] == node and (check["identity"]["object_kind"], check["identity"]["object_id"]) == (kind, obj) and check["risk_type"] == risk_type]
             states = {check["status"] for check in matching_checks}
             state = "unrecovered" if states and states <= {"present", "recovering"} else "recovered" if states == {"clear"} else "unknown"
             if any(not f.get("subject_key") for f in facts):
                 state = "unknown"
-            recovery_refs = sorted({ref for check in matching_checks for ref in check["evidence_refs"] if ref in safe_observations and (safe_observations[ref]["payload"]["identity"]["object_kind"], safe_observations[ref]["payload"]["identity"]["object_id"]) == (kind, obj)})
             reasons = []
             if any(not fact["_bounded"] for fact in facts):
                 reasons.append("boundary_ambiguous")
             if any(fact["provenance"] == "legacy_unverified" for fact in facts):
                 reasons.append("legacy_unverified")
-            if not snapshot.historical_projection(cluster, node)["projection_complete"]:
+            if not source.projection_complete:
                 reasons.append("projection_pending")
             if not self._covered(snapshot, facts, safe_observations, start, end):
                 reasons.append("source_coverage_unregistered")
             known = sum(fact["count"] for fact in facts if fact["_bounded"])
             level = max((level_of(fact["severity"]) for fact in facts), key=LEVELS.__getitem__)
+            if brief:
+                groups.append({
+                    "level": level, "known_occurrence_count": known, "occurrence_count": known if not reasons else None,
+                    "last_seen": max((fact["last_seen"] for fact in facts), key=utc), "recovery_state": state,
+                    "quality": {"complete": not reasons, "missing_reasons": reasons},
+                })
+                continue
+            object_label = "未标识对象" if obj.startswith("legacy:") else obj
+            refs = sorted({f["fact_ref"] for f in facts})
+            recovery_refs = sorted({ref for check in matching_checks for ref in check["evidence_refs"] if ref in safe_observations and (safe_observations[ref]["payload"]["identity"]["object_kind"], safe_observations[ref]["payload"]["identity"]["object_id"]) == (kind, obj)})
             narrative = self._narrative(cluster, node, key, facts, metadata, known)
             groups.append({"group_id": digest([cluster, node, *key]), "risk_type": risk_type, "title": narrative["title"], "level": level, "object": {"kind": kind, "id": obj, "label": obj}, "known_occurrence_count": known, "occurrence_count": known if not reasons else None, "first_seen": min((f["first_seen"] for f in facts), key=utc), "last_seen": max((f["last_seen"] for f in facts), key=utc), "recovery_state": state, "recovery_reason": "当前有效的同对象观测支持风险仍存在。" if state == "unrecovered" else "当前有效的同对象观测已满足登记的恢复条件。" if state == "recovered" else "缺少当前有效且匹配本对象的完整恢复判断。", "description": narrative["description"], "consequence": narrative["consequence"], "recommendation": narrative["recommendation"], "narrative_source": narrative["source"], "evidence_refs": refs, "recovery_evidence_refs": recovery_refs, "association": {"status": "unverified", "reason": "没有可验证的同对象关联证据。", "evidence_refs": []}, "analysis_status": "not_analyzed", "quality": {"complete": not reasons, "missing_reasons": sorted(set(reasons))}})
             groups[-1]["object"]["label"] = object_label
+        if brief:
+            return groups
         # Only explicit object equality and overlapping observed intervals support co-occurrence.
         # The relation never asserts a cause and never borrows another object's evidence.
         for group in groups:
@@ -230,7 +304,7 @@ class RiskOverview:
             related = [other for other in groups if other["group_id"] != group["group_id"] and other["object"]["kind"] == group["object"]["kind"] and other["object"]["id"] == group["object"]["id"] and overlaps(other)]
             if related:
                 group["association"] = {"status": "confirmed", "reason": "同一主机、同一对象存在时间重叠的异常记录；此关联不代表因果关系。", "evidence_refs": sorted(set(group["evidence_refs"]) | {ref for other in related for ref in other["evidence_refs"]})}
-        return [group for group in groups if (query["level"] == "all" or group["level"] == query["level"]) and (query["recovery"] == "all" or group["recovery_state"] == query["recovery"])]
+        return groups
 
     def _covered(self, snapshot: Any, facts: list[Any], observations: dict[str, Any], start: Any, end: Any) -> bool:
         if snapshot.assessment is None or any(f["fact_ref"] not in observations for f in facts):

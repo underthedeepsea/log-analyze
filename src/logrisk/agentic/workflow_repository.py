@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import json
+import re
 import uuid
+from collections import Counter
+from datetime import datetime
+from itertools import groupby
 from typing import Any
 
 from logrisk.database import Database, utc_now
@@ -13,6 +17,67 @@ from .workflow_models import CompiledWorkflow
 
 
 RUNTIME_SNAPSHOT_KEYS = frozenset({"profile_snapshot", "connection_snapshot", "prompt_id", "prompt_sha256"})
+OVERVIEW_RUN_ID = re.compile(r"[0-9a-f]{32}")
+_OVERVIEW_ROLES = {
+    "evidence_specialist": "evidence", "rule_specialist": "rules", "feature_specialist": "feature",
+}
+_OVERVIEW_CODES = {
+    "agent_budget_exhausted", "agent_plan_indeterminate", "agent_rule_reference_changed", "agent_timeout",
+    "human_gate_bypass", "workflow_budget_exhausted", "workflow_cancelled", "workflow_dependency_blocked",
+    "workflow_node_failed", "workflow_retry_exhausted", "workflow_runtime_snapshot_invalid", "workflow_timeout",
+}
+_DEFAULT_OVERVIEW_GRAPH = (
+    ("evidence", "evidence_specialist", ()),
+    ("rules", "rule_specialist", ()),
+    ("feature", "feature_specialist", ("evidence", "rules")),
+)
+
+
+def _overview_time(value: Any) -> str | None:
+    try:
+        parsed = datetime.fromisoformat(value)
+    except (ValueError, TypeError):
+        return None
+    return parsed.isoformat() if parsed.tzinfo else None
+
+
+def _overview_run(row: Any) -> dict[str, Any]:
+    return {
+        "run_id": row["workflow_run_id"], "status": row["status"],
+        "created_at": _overview_time(row["created_at"]), "updated_at": _overview_time(row["updated_at"]),
+    }
+
+
+def _overview_graph(rows: Any) -> list[dict[str, Any]]:
+    ids, aliases = {}, Counter()
+    for row in rows:
+        base = _OVERVIEW_ROLES.get(row["role_id"], "step")
+        aliases[base] += 1
+        ids[row["node_id"]] = base if aliases[base] == 1 else f"{base}-{aliases[base]}"
+    states = {row["node_id"]: row["status"] for row in rows}
+    nodes = []
+    for row in rows:
+        dependencies = [key for key in _decode(row["dependencies_json"], []) if key in ids]
+        code = row["error_code"]
+        nodes.append({
+            "id": ids[row["node_id"]],
+            "role": row["role_id"] if row["role_id"] in _OVERVIEW_ROLES else "unknown",
+            "depends_on": [ids[key] for key in dependencies],
+            "downstream": [],
+            "status": row["status"],
+            "attempts": int(row["attempt"]),
+            "started_at": _overview_time(row["started_at"]),
+            "finished_at": _overview_time(row["completed_at"]),
+            "used_tool_calls": int(row["used_tool_calls"]),
+            "result_code": code if code in _OVERVIEW_CODES else ("failed" if row["status"] == "failed" else None),
+            "blocked_by": [ids[key] for key in dependencies if states[key] != "completed"]
+            if row["status"] == "pending" else [],
+        })
+    by_id = {node["id"]: node for node in nodes}
+    for node in nodes:
+        for key in node["depends_on"]:
+            by_id[key]["downstream"].append(node["id"])
+    return nodes
 
 
 def _db_json(database: Database, value: Any) -> Any:
@@ -212,6 +277,148 @@ class WorkflowRepository:
             else:
                 rows = connection.execute("SELECT workflow_run_id FROM agent_workflow_runs ORDER BY created_at DESC, workflow_run_id DESC LIMIT ?", (bounded,)).fetchall()
         return [self.get_run(str(row["workflow_run_id"])) for row in rows]
+
+    def overview(self, now: str, since: str, *, enabled: bool) -> dict[str, Any]:
+        with self.database.connect() as connection:
+            runs = [
+                _overview_run(row)
+                for row in connection.execute(
+                    "SELECT workflow_run_id,status,created_at,updated_at FROM agent_workflow_runs WHERE created_at<=? "
+                    "ORDER BY created_at DESC,workflow_run_id DESC LIMIT 12",
+                    (now,),
+                )
+                if OVERVIEW_RUN_ID.fullmatch(row["workflow_run_id"])
+            ]
+            events = dict(
+                (row["event_type"], int(row["run_count"]))
+                for row in connection.execute(
+                    "SELECT event_type,COUNT(DISTINCT workflow_run_id) AS run_count FROM agent_workflow_events "
+                    "WHERE created_at>=? AND created_at<=? "
+                    "AND event_type IN ('workflow_run_completed','workflow_run_failed','workflow_run_awaiting_human') "
+                    "GROUP BY event_type",
+                    (since, now),
+                )
+            )
+            started = int(connection.execute(
+                "SELECT COUNT(*) FROM agent_workflow_runs WHERE started_at>=? AND started_at<=?", (since, now),
+            ).fetchone()[0])
+            queued = None
+            active_nodes = dict.fromkeys(("queued", "running", "waiting"))
+            if enabled:
+                queued = int(connection.execute(
+                    "SELECT COUNT(*) FROM agent_workflow_runs WHERE status='queued'",
+                ).fetchone()[0])
+                active_nodes = self._overview_active_nodes(connection)
+        has_records = bool(enabled or runs or events or started)
+        return {
+            "enabled": enabled, "queued": queued, "active_nodes": active_nodes,
+            "last_hour": {
+                "started": started if has_records else None,
+                **{status: events.get(f"workflow_run_{status}", 0) if has_records else None
+                   for status in ("completed", "failed", "awaiting_human")},
+            },
+            "runs": runs,
+            "nodes": [
+                {"id": node_id, "role": role, "depends_on": list(dependencies)}
+                for node_id, role, dependencies in _DEFAULT_OVERVIEW_GRAPH
+            ],
+        }
+
+    @staticmethod
+    def _overview_active_nodes(connection: Any) -> dict[str, int]:
+        counts = {"queued": 0, "running": 0, "waiting": 0}
+        nodes = connection.execute(
+            "SELECT n.workflow_run_id,n.node_id,n.dependencies_json,n.status,r.status AS run_status,n.attempt,r.max_attempts "
+            "FROM agent_workflow_nodes n JOIN agent_workflow_runs r ON r.workflow_run_id=n.workflow_run_id "
+            "WHERE r.status IN ('queued','running','paused') ORDER BY n.workflow_run_id,n.sequence",
+        )
+        for _, group in groupby(nodes, key=lambda row: row["workflow_run_id"]):
+            rows = list(group)
+            finished = {row["node_id"] for row in rows if row["status"] == "completed"}
+            for row in rows:
+                if row["status"] == "running":
+                    counts["running"] += 1
+                elif row["status"] == "pending":
+                    ready = (
+                        row["run_status"] != "paused" and row["attempt"] < row["max_attempts"]
+                        and set(_decode(row["dependencies_json"], [])) <= finished
+                    )
+                    counts["queued" if ready else "waiting"] += 1
+        return counts
+
+    def overview_run(self, run_id: str) -> dict[str, Any] | None:
+        with self.database.connect() as connection:
+            run = connection.execute(
+                "SELECT workflow_run_id,status,created_at,updated_at,error_code,source_job_id,entity_id "
+                "FROM agent_workflow_runs WHERE workflow_run_id=?",
+                (run_id,),
+            ).fetchone()
+            if run is None:
+                return None
+            child_workflow = self._overview_json("a.locked_snapshot_json", "workflow_run_id")
+            child_node = self._overview_json("a.locked_snapshot_json", "workflow_node_id")
+            rows = connection.execute(
+                "SELECT n.node_id,n.role_id,n.dependencies_json,n.status,n.attempt,n.used_tool_calls,n.error_code,"
+                "n.started_at,n.completed_at,a.run_id AS child_agent_run_id "
+                "FROM agent_workflow_nodes n LEFT JOIN agent_runs a ON a.run_id=n.child_agent_run_id "
+                f"AND a.source_job_id=? AND a.entity_id=? AND {child_workflow}=n.workflow_run_id "
+                f"AND {child_node}=n.node_id WHERE n.workflow_run_id=? ORDER BY n.sequence",
+                (run["source_job_id"], run["entity_id"], run_id),
+            ).fetchall()
+            children = [row["child_agent_run_id"] for row in rows
+                        if row["role_id"] == "feature_specialist" and row["child_agent_run_id"]]
+            evaluator, human = self._overview_gates(connection, run, children)
+        return {
+            **_overview_run(run), "nodes": _overview_graph(rows), "evaluator": evaluator, "human": human,
+            "candidate_count": sum(human.values()) if human is not None else None,
+            "result_code": run["error_code"] if run["error_code"] in _OVERVIEW_CODES else None,
+        }
+
+    def _overview_json(self, column: str, key: str) -> str:
+        if self.database.provider == "postgres":
+            return f"({column}->>'{key}')"
+        return f"json_extract({column},'$.{key}')"
+
+    def _overview_gates(
+        self, connection: Any, run: Any, children: list[str],
+    ) -> tuple[dict[str, int] | None, dict[str, int] | None]:
+        if not children:
+            return None, None
+        params = ",".join("?" for _ in children)
+        passed = self._overview_json("payload_json", "passed")
+        evidence = self._overview_json("payload_json", "evidence_hash")
+        version = self._overview_json("payload_json", "evaluator_version")
+        candidate_run = self._overview_json("candidate_json", "agent_run_id")
+        resolution = self._overview_json("candidate_json", "resolution_type")
+        origin = self._overview_json("candidate_json", "origin")
+        boolean_check = (
+            "jsonb_typeof(payload_json->'passed')='boolean'" if self.database.provider == "postgres"
+            else "json_type(payload_json,'$.passed') IN ('true','false')"
+        )
+        outcomes = Counter(
+            row["passed"] for row in connection.execute(
+                f"SELECT {passed} AS passed FROM agent_artifacts WHERE artifact_type='evaluation' "
+                f"AND {evidence} IS NOT NULL AND {version} IS NOT NULL AND {boolean_check} AND run_id IN ({params})",
+                children,
+            )
+        )
+        passed_count, failed_count = outcomes[True] + outcomes["true"], outcomes[False] + outcomes["false"]
+        evaluator = {"passed": passed_count, "failed": failed_count} if passed_count or failed_count else None
+        candidates = Counter(
+            (row["status"], row["resolution_type"]) for row in connection.execute(
+                f"SELECT status,{resolution} AS resolution_type FROM feature_candidates WHERE job_id=? AND entity_id=? "
+                f"AND {origin}='agentic' AND {candidate_run} IN ({params})",
+                (run["source_job_id"], run["entity_id"], *children),
+            )
+        )
+        human = {
+            "pending": sum(count for (status, _), count in candidates.items() if status == "pending"),
+            "approved": candidates[("approved", "manual")],
+            "rejected": sum(count for (status, _), count in candidates.items() if status == "rejected"),
+            "resolved": sum(count for (status, resolution_type), count in candidates.items()
+                            if status == "approved" and resolution_type != "manual"),
+        } if candidates else None
+        return evaluator, human
 
     def transition_run(self, run_id: str, status: str, *, allowed_from: set[str], idempotency_key: str | None = None,
                        error_code: str | None = None, error_summary: str | None = None) -> dict[str, Any]:

@@ -5,11 +5,16 @@ import hashlib
 import os
 import re
 import threading
+import time
 from collections.abc import Iterator, Mapping
 from importlib.util import find_spec
 from typing import Any, Callable
 
 from logrisk.incremental_sources import IncrementalSourceError, SourceCursor, SourceRecord
+from logrisk.streaming_observability.contracts import offset_vector
+from logrisk.streaming_observability.kafka_offsets import (
+    KafkaBoundaryError, KafkaOffsetReader, REQUEST_TIMEOUT_MS, classify,
+)
 
 
 KAFKA_PYTHON_ADAPTER_ID = "kafka-python"
@@ -34,8 +39,11 @@ class KafkaPythonConsumerAdapter:
 
     adapter_id = KAFKA_PYTHON_ADAPTER_ID
 
-    def __init__(self, consumer_factory: Callable[..., Any] | None = None) -> None:
+    def __init__(
+        self, consumer_factory: Callable[..., Any] | None = None, *, offset_reader: KafkaOffsetReader | None = None,
+    ) -> None:
         self._consumer_factory = consumer_factory
+        self.offset_reader = offset_reader or KafkaOffsetReader()
         self._consumers: dict[int, Any] = {}
         self._lock = threading.Lock()
 
@@ -49,7 +57,15 @@ class KafkaPythonConsumerAdapter:
         configuration: Mapping[str, str],
         cursor: SourceCursor,
     ) -> Iterator[SourceRecord]:
-        consumer = self._new_consumer(configuration)
+        return self.read_observed(configuration, cursor, None)
+
+    def read_observed(
+        self, configuration: Mapping[str, str], cursor: SourceCursor, observe: Callable[..., None] | None,
+    ) -> Iterator[SourceRecord]:
+        try:
+            consumer = self._new_consumer(configuration)
+        except Exception as exc:
+            raise KafkaBoundaryError(classify(exc), "Kafka Consumer 初始化失败", stage="consume") from None
         thread_id = threading.get_ident()
         with self._lock:
             self._consumers[thread_id] = consumer
@@ -90,6 +106,8 @@ class KafkaPythonConsumerAdapter:
             current = dict(offsets)
             while True:
                 records = consumer.poll(timeout_ms=500, max_records=_MAX_POLL_RECORDS)
+                if observe is not None:
+                    observe("poll")
                 for partition in sorted(records, key=lambda item: (item.topic, item.partition)):
                     for message in records[partition]:
                         if message.offset >= end_offsets[partition]:
@@ -115,7 +133,7 @@ class KafkaPythonConsumerAdapter:
         except IncrementalSourceError:
             raise
         except Exception as exc:
-            raise IncrementalSourceError("Kafka 消费失败，请检查 Broker、Topic 和消费权限") from exc
+            raise KafkaBoundaryError(classify(exc), "Kafka 消费失败，请检查 Broker、Topic 和消费权限", stage="consume") from None
         finally:
             with self._lock:
                 self._consumers.pop(thread_id, None)
@@ -134,9 +152,9 @@ class KafkaPythonConsumerAdapter:
             return
         consumer = self._active_consumer()
         temporary = consumer is None
-        if temporary:
-            consumer = self._new_consumer(configuration)
         try:
+            if temporary:
+                consumer = self._new_consumer(configuration)
             topic = self._topic(configuration)
             partitions = {
                 TopicPartition(topic, int(partition)): _offset_metadata(int(offset))
@@ -148,12 +166,15 @@ class KafkaPythonConsumerAdapter:
         except IncrementalSourceError:
             raise
         except Exception as exc:
-            raise IncrementalSourceError("Kafka Checkpoint 提交失败，请检查 Consumer Group 权限") from exc
+            raise KafkaBoundaryError(classify(exc), "Kafka Checkpoint 提交失败，请检查 Consumer Group 权限", stage="group_commit") from None
         finally:
-            if temporary:
-                consumer.close(autocommit=False)
+            if temporary and consumer is not None:
+                try:
+                    consumer.close(autocommit=False)
+                except Exception:
+                    pass
 
-    def _new_consumer(self, configuration: Mapping[str, str]) -> Any:
+    def _new_consumer(self, configuration: Mapping[str, str], *, managed: bool = False) -> Any:
         bootstrap_servers, _ = self._bootstrap_servers(configuration)
         group = str(configuration.get("consumer_group") or "").strip()
         if not group:
@@ -166,17 +187,155 @@ class KafkaPythonConsumerAdapter:
                 raise IncrementalSourceError("未安装 kafka-python，请先安装项目依赖") from exc
             factory = KafkaConsumer
         try:
+            options = {
+                "auto_offset_reset": "none", "allow_auto_create_topics": False,
+                "isolation_level": "read_uncommitted", "session_timeout_ms": 6000,
+                "request_timeout_ms": REQUEST_TIMEOUT_MS, "api_version_auto_timeout_ms": REQUEST_TIMEOUT_MS,
+            } if managed else {
+                "auto_offset_reset": "earliest", "session_timeout_ms": 10000, "request_timeout_ms": 30000,
+            }
             return factory(
                 bootstrap_servers=bootstrap_servers,
                 group_id=group,
                 enable_auto_commit=False,
-                auto_offset_reset="earliest",
                 max_poll_records=_MAX_POLL_RECORDS,
-                session_timeout_ms=10000,
-                request_timeout_ms=30000,
+                **options,
             )
         except Exception as exc:
-            raise IncrementalSourceError("Kafka Consumer 初始化失败，请检查 Broker 和 Consumer Group") from exc
+            raise KafkaBoundaryError(classify(exc), "Kafka Consumer 初始化失败，请检查 Broker 和 Consumer Group") from None
+
+    def _managed_offsets(self, source: Any, *, stage: str = "source_check") -> Any:
+        try:
+            snapshot = self.offset_reader.read(source.configuration, require_beginning=True)
+        except Exception as exc:
+            raise KafkaBoundaryError(classify(exc), stage=stage) from None
+        if snapshot.identity != source.batch["identity"]:
+            raise KafkaBoundaryError("topic_identity_changed")
+        if set(snapshot.partitions) != set(offset_vector(source.batch["target"])):
+            raise KafkaBoundaryError("partition_set_changed")
+        return snapshot
+
+    @staticmethod
+    def _check_bounds(snapshot: Any, positions: Mapping[int, int], target: Mapping[int, int]) -> None:
+        if set(positions) != set(target) or any(
+            not snapshot.beginning[key] <= position <= target[key] <= snapshot.end[key]
+            for key, position in positions.items()
+        ):
+            raise KafkaBoundaryError("offset_out_of_range")
+
+    def read_bounded(self, source: Any, cursor: SourceCursor) -> Iterator[SourceRecord]:
+        configuration = source.configuration
+        target = offset_vector(source.batch["target"])
+        positions = offset_vector(cursor.value.get("partitions")) or offset_vector(source.batch["start"])
+        snapshot = self._managed_offsets(source, stage="consume")
+        self._check_bounds(snapshot, positions, target)
+        if dict(snapshot.group) != source.group_frontier:
+            raise KafkaBoundaryError("group_frontier_changed")
+        source.check_active()
+        topic = configuration["topic"]
+
+        def checkpoint() -> SourceCursor:
+            return SourceCursor("kafka", {
+                "partitions": {str(key): value for key, value in positions.items()},
+                "high_water": {str(key): value for key, value in target.items()},
+                "topic_identity": source.batch["identity"],
+            })
+
+        if positions == target:
+            source.final_cursor = checkpoint()
+            return
+        try:
+            consumer = self._new_consumer(configuration, managed=True)
+        except Exception as exc:
+            raise KafkaBoundaryError(classify(exc), stage="consume") from None
+        thread_id = threading.get_ident()
+        with self._lock:
+            self._consumers[thread_id] = consumer
+        try:
+            partitions = tuple(
+                TopicPartition(topic, partition) for partition in sorted(target) if positions[partition] < target[partition]
+            )
+            consumer.assign(partitions)
+            for partition in partitions:
+                consumer.seek(partition, positions[partition.partition])
+            stalled_at = time.monotonic()
+            furthest = dict(positions)
+            while True:
+                source.check_active()
+                records = consumer.poll(timeout_ms=500, max_records=_MAX_POLL_RECORDS)
+                if source.observe is not None:
+                    source.observe("poll")
+                for partition, messages in records.items():
+                    number = partition.partition
+                    for message in messages:
+                        if positions[number] <= message.offset < target[number]:
+                            positions[number] = message.offset + 1
+                            yield SourceRecord(
+                                decode_kafka_value(message.value), checkpoint(),
+                                {"partition": number, "offset": message.offset},
+                            )
+                scanned = {**positions, **{
+                    partition.partition: min(consumer.position(partition), target[partition.partition])
+                    for partition in partitions
+                }}
+                if scanned == target:
+                    positions.update(scanned)
+                    source.final_cursor = checkpoint()
+                    return
+                if any(scanned[key] > furthest[key] for key in scanned):
+                    furthest = scanned
+                    stalled_at = time.monotonic()
+                elif time.monotonic() - stalled_at >= 30:
+                    raise KafkaBoundaryError("timeout")
+        except IncrementalSourceError:
+            raise
+        except Exception as exc:
+            raise KafkaBoundaryError(classify(exc), stage="consume") from None
+        finally:
+            with self._lock:
+                self._consumers.pop(thread_id, None)
+            try:
+                consumer.close(autocommit=False)
+            except Exception:
+                pass
+
+    def commit_bounded(self, source: Any, cursor: SourceCursor) -> None:
+        configuration = source.configuration
+        durable = offset_vector(cursor.value.get("partitions"))
+        snapshot = self._managed_offsets(source, stage="group_commit")
+        self._check_bounds(snapshot, durable, offset_vector(source.batch["target"]))
+        expected = source.group_frontier
+        if any(snapshot.group[key] not in {expected.get(key), durable[key]} for key in durable):
+            raise KafkaBoundaryError("group_frontier_changed")
+        source.check_active()
+        if dict(snapshot.group) != durable:
+            consumer = self._active_consumer()
+            temporary = consumer is None
+            try:
+                if temporary:
+                    consumer = self._new_consumer(configuration, managed=True)
+                topic = configuration["topic"]
+                offsets = {TopicPartition(topic, key): _offset_metadata(value) for key, value in durable.items()}
+                source.check_active()
+                source.external_commit(lambda: consumer.commit(offsets=offsets, timeout_ms=REQUEST_TIMEOUT_MS))
+            except KafkaBoundaryError as exc:
+                exc.stage = exc.stage or "group_commit"
+                raise
+            except Exception as exc:
+                raise KafkaBoundaryError(classify(exc), stage="group_commit") from None
+            finally:
+                if temporary and consumer is not None:
+                    try:
+                        consumer.close(autocommit=False)
+                    except Exception:
+                        pass
+        source.group_frontier = durable
+
+    def validate_bounded_checkpoint(self, source: Any, cursor: SourceCursor) -> None:
+        snapshot = self._managed_offsets(source)
+        self._check_bounds(snapshot, offset_vector(cursor.value.get("partitions")), offset_vector(source.batch["target"]))
+        if dict(snapshot.group) != source.group_frontier:
+            raise KafkaBoundaryError("group_frontier_changed")
 
     def _bootstrap_servers(self, configuration: Mapping[str, str]) -> tuple[list[str], str]:
         bootstrap_env = str(configuration.get("bootstrap_env") or "").strip()

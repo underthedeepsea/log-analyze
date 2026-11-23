@@ -9,6 +9,9 @@ from typing import Any, Mapping
 
 from logrisk.database import Database, utc_now
 from logrisk.incremental_sources import SourceCursor, SourceDescriptor
+from logrisk.streaming_observability.contracts import offset_vector
+from logrisk.streaming_observability.kafka_offsets import KafkaBoundaryError
+from logrisk.streaming_observability.repository import ObservabilityRepository, assignment_key, writer_key
 
 
 class StreamingStateError(ValueError):
@@ -75,6 +78,8 @@ class StreamingStateRepository:
         descriptor: SourceDescriptor,
         config_hash: str,
         task_id: str | None = None,
+        kafka_source_id: str | None = None,
+        kafka_batch: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         if not config_hash:
             raise StreamingStateError("缺少 Drain3 配置摘要")
@@ -101,24 +106,78 @@ class StreamingStateRepository:
             "created_at": now,
             "updated_at": now,
         }
+        if descriptor.kind == "kafka":
+            if kafka_source_id is None:
+                repository = ObservabilityRepository(self.database)
+                with repository.control_lock(writer_key(descriptor.configuration)):
+                    return self._create_task(task, descriptor, "legacy_" + task_id, legacy=True)
+            task["kafka_batch"] = dict(kafka_batch or {})
+        return self._create_task(task, descriptor, kafka_source_id, legacy=False)
+
+    def _create_task(
+        self, task: dict[str, Any], descriptor: SourceDescriptor, source_id: str | None, *, legacy: bool,
+    ) -> dict[str, Any]:
+        task_id, now = task["task_id"], task["created_at"]
         with self.database.transaction() as connection:
+            if legacy:
+                key = writer_key(descriptor.configuration)
+                if connection.execute(
+                    "SELECT 1 FROM kafka_stream_sources WHERE writer_key=? AND mode='continuous_bounded'",
+                    (key,),
+                ).fetchone() is not None:
+                    raise StreamingConflictError("该 Kafka 消费组已登记为连续来源")
+                existing = connection.execute("SELECT task_json FROM streaming_tasks WHERE task_id=?", (task_id,)).fetchone()
+                if existing:
+                    return _decode_json(existing[0])
+                connection.execute(
+                    "INSERT INTO kafka_stream_sources(source_id, descriptor_json, mode, writer_key, assignment_key) "
+                    "VALUES (?, ?, 'bounded_high_water', ?, ?)",
+                    (source_id, _json(descriptor.to_dict()), key, assignment_key(descriptor.configuration)),
+                )
+            elif source_id is not None:
+                source = ObservabilityRepository(self.database).get(source_id, connection, lock=True)
+                batch = task.get("kafka_batch") or {}
+                if (source["mode"] != "continuous_bounded" or not source["enabled"]
+                        or source["control_epoch"] != batch.get("plan_control_epoch")):
+                    raise KafkaBoundaryError("batch_stopped", "Kafka 连续来源已停止，保留当前批次")
+                if source["active_task_id"]:
+                    raise StreamingConflictError("连续 Kafka 来源已停止或正在处理已有批次")
+                if source["broker_identity"] and source["broker_identity"] != batch.get("identity"):
+                    raise StreamingConflictError("连续 Kafka 来源 Topic 身份已经变化")
+                if connection.execute(
+                    "SELECT 1 FROM kafka_stream_sources WHERE broker_writer_key=? AND source_id<>?",
+                    (batch["broker_writer_key"], source_id),
+                ).fetchone():
+                    raise KafkaBoundaryError("group_frontier_changed", "该 Broker Topic 与消费组已绑定到另一连续来源")
+            source_column = ", kafka_source_id" if source_id is not None else ""
+            source_parameter = ", ?" if source_id is not None else ""
             connection.execute(
-                "INSERT INTO streaming_tasks(task_id, source_kind, source_identity_json, config_hash, status, stage, cursor_json, task_json, created_at, updated_at) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO streaming_tasks(task_id, source_kind, source_identity_json, config_hash, status, stage, cursor_json, task_json, created_at, updated_at"
+                + source_column + ") "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?" + source_parameter + ")",
                 (
                     task_id,
                     descriptor.kind,
                     _json(descriptor.to_dict()),
-                    config_hash,
+                    task["config_hash"],
                     task["status"],
                     task["stage"],
                     _json(task["cursor"]),
                     _json(task),
                     now,
                     now,
+                    *((source_id,) if source_id is not None else ()),
                 ),
             )
-            self._append_event(connection, task_id, "task_created", {"source_kind": descriptor.kind, "config_hash": config_hash}, now)
+            if source_id is not None:
+                connection.execute(
+                    "UPDATE kafka_stream_sources SET active_task_id=?, idle_at=NULL, block_reason=NULL, block_stage=NULL, "
+                    "broker_identity=COALESCE(broker_identity, ?), broker_writer_key=COALESCE(broker_writer_key, ?) "
+                    "WHERE source_id=?",
+                    (task_id, (task.get("kafka_batch") or {}).get("identity"),
+                     (task.get("kafka_batch") or {}).get("broker_writer_key"), source_id),
+                )
+            self._append_event(connection, task, "task_created", {"source_kind": descriptor.kind, "config_hash": task["config_hash"]}, now)
         return task
 
     def get_task(self, task_id: str) -> dict[str, Any]:
@@ -146,7 +205,7 @@ class StreamingStateRepository:
             ).fetchone()
         return int(row[0])
 
-    def claim_task(self, task_id: str) -> dict[str, Any]:
+    def claim_task(self, task_id: str, *, kafka_control_epoch: int | None = None) -> dict[str, Any]:
         now = utc_now()
         with self.database.transaction() as connection:
             lock = " FOR UPDATE" if getattr(self.database, "provider", "sqlite") == "postgres" else ""
@@ -159,6 +218,9 @@ class StreamingStateRepository:
             previous_status = str(row["status"] or task.get("status") or "")
             if previous_status == "running" or task.get("status") == "running":
                 raise StreamingTaskBusyError("流式任务已被其他 Worker 占用")
+            if task.get("kafka_batch"):
+                task["kafka_control_epoch"] = kafka_control_epoch
+                self._check_kafka_owner(connection, task)
             task.update({
                 "status": "running", "stage": "READING", "error": None,
                 "lease_token": uuid.uuid4().hex, "updated_at": now,
@@ -170,8 +232,18 @@ class StreamingStateRepository:
             )
             if updated.rowcount != 1:
                 raise StreamingTaskBusyError("流式任务已被其他 Worker 占用")
-            self._append_event(connection, task_id, "task_claimed", {}, now)
+            self._append_event(connection, task, "task_claimed", {}, now)
         return task
+
+    def _check_kafka_owner(self, connection: Any, task: Mapping[str, Any]) -> None:
+        batch = task.get("kafka_batch")
+        if not batch:
+            return
+        row = ObservabilityRepository(self.database).get(batch["source_id"], connection, lock=True)
+        if not row["enabled"] or row["control_epoch"] != task.get("kafka_control_epoch"):
+            raise KafkaBoundaryError("batch_stopped", "Kafka 连续来源已停止，保留当前批次")
+        if row["active_task_id"] != task["task_id"]:
+            raise StreamingConflictError("连续 Kafka 批次归属已变化")
 
     def mark_stage(self, task_id: str, stage: str) -> dict[str, Any]:
         allowed = {"READING", "SPOOLING", "MINING", "AGGREGATING"}
@@ -199,7 +271,7 @@ class StreamingStateRepository:
                 "UPDATE streaming_tasks SET status='running', stage=?, task_json=?, updated_at=? WHERE task_id=?",
                 (stage, _json(task), now, str(task_id)),
             )
-            self._append_event(connection, str(task_id), "stage_changed", {}, now)
+            self._append_event(connection, task, "stage_changed", {}, now)
         return task
 
     def attach_input_job(self, task_id: str, input_job_id: str) -> dict[str, Any]:
@@ -217,7 +289,7 @@ class StreamingStateRepository:
                 "UPDATE streaming_tasks SET task_json=?, updated_at=? WHERE task_id=?",
                 (_json(task), now, task_id),
             )
-            self._append_event(connection, task_id, "input_job_attached", {"input_job_id": input_job_id}, now)
+            self._append_event(connection, task, "input_job_attached", {"input_job_id": input_job_id}, now)
         return task
 
     def mark_completed(self, task_id: str) -> dict[str, Any]:
@@ -273,7 +345,7 @@ class StreamingStateRepository:
             event = {"error": error}
             if error_details is not None:
                 event["details"] = dict(error_details)
-            self._append_event(connection, str(task_id), event_type, event, now)
+            self._append_event(connection, task, event_type, event, now)
         return task
 
     def complete_claim(
@@ -296,6 +368,7 @@ class StreamingStateRepository:
             task = _decode_json(row[0])
             if task.get("status") != "running" or str(task.get("lease_token") or "") != str(lease_token):
                 raise StreamingConflictError("流式任务租约已变化，迟到 Worker 不能完成任务")
+            self._check_kafka_owner(connection, task)
             if result_reference is None or prefix_evidence is None:
                 raise StreamingIncompleteError("任务缺少结果完整性证据，不能完成")
             reference = dict(result_reference)
@@ -329,13 +402,21 @@ class StreamingStateRepository:
                 "UPDATE streaming_tasks SET status='completed', stage='COMPLETED', task_json=?, updated_at=? WHERE task_id=?",
                 (_json(task), now, str(task_id)),
             )
-            self._append_event(connection, str(task_id), "task_completed", {}, now)
+            self._append_event(connection, task, "task_completed", {}, now)
+            if task.get("kafka_batch"):
+                updated = connection.execute(
+                    "UPDATE kafka_stream_sources SET completed_task_id=?, active_task_id=NULL, block_reason=NULL, block_stage=NULL "
+                    "WHERE source_id=? AND active_task_id=?",
+                    (task_id, task["kafka_batch"]["source_id"], task_id),
+                )
+                if updated.rowcount != 1:
+                    raise StreamingConflictError("连续 Kafka 批次归属已变化")
         return task
 
     def interrupt_running_tasks(self) -> int:
         count = 0
         for task in self.list_tasks(limit=500):
-            if task.get("status") == "running":
+            if task.get("status") == "running" and not task.get("kafka_batch"):
                 self.mark_interrupted(str(task["task_id"]))
                 count += 1
         return count
@@ -364,12 +445,16 @@ class StreamingStateRepository:
                 raise StreamingConflictError("流式任务租约已变化，迟到 Worker 不能确认外部提交")
             if task.get("pending_external_commit") == cursor_value:
                 task["pending_external_commit"] = None
+                task["pending_external_commit_at"] = None
+                task["last_external_commit_at"] = now
+                if task.get("kafka_batch"):
+                    task["last_external_commit_cursor"] = cursor_value
                 task["updated_at"] = now
                 connection.execute(
                     "UPDATE streaming_tasks SET task_json=?, updated_at=? WHERE task_id=?",
                     (_json(task), now, task_id),
                 )
-                self._append_event(connection, task_id, "external_commit_completed", {}, now)
+                self._append_event(connection, task, "external_commit_completed", {}, now)
         return task
 
     def save_result(
@@ -396,15 +481,19 @@ class StreamingStateRepository:
                 or str(task.get("lease_token") or "") != str(expected_lease_token)
             ):
                 raise StreamingConflictError("流式任务租约已变化，迟到 Worker 不能保存结果")
+            self._check_kafka_owner(connection, task)
             task["result"] = safe_result
             if result_reference is not None:
+                if task.get("result_reference") != result_reference or not task.get("result_published_at"):
+                    task["result_published_at"] = now
+                    task["result_durable_at"] = task.get("last_durable_commit_at")
                 task["result_reference"] = dict(result_reference)
             task["updated_at"] = now
             connection.execute(
                 "UPDATE streaming_tasks SET task_json=?, updated_at=? WHERE task_id=?",
                 (_json(task), now, task_id),
             )
-            self._append_event(connection, task_id, "result_saved", {}, now)
+            self._append_event(connection, task, "result_saved", {}, now)
         return task
 
     def commit_window(
@@ -441,6 +530,7 @@ class StreamingStateRepository:
                 or str(task.get("lease_token") or "") != str(fencing_token)
             ):
                 raise StreamingConflictError("流式任务租约已变化，迟到 Worker 不能提交")
+            self._check_kafka_owner(connection, task)
             if self.ledger_repository is not None and ledger_batch is None:
                 raise StreamingStateError("启用 operational ledger 时窗口缺少 ingestion receipt")
             if self.ledger_repository is not None and ledger_batch is not None:
@@ -462,10 +552,12 @@ class StreamingStateRepository:
             if not _cursor_is_at_least(cursor_value, current_cursor):
                 raise StreamingConflictError("新批次不能回退检查点")
             state_manifest = miner_generation if miner_generation is not None else task.get("miner_generation")
+            sequence = int(task.get("windows_committed") or 0) + 1
             connection.execute(
-                "INSERT INTO streaming_window_commits(task_id, window_id, cursor_json, summary_json, committed_at, payload_hash, state_manifest_json) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO streaming_window_commits(task_id, window_id, cursor_json, summary_json, committed_at, "
+                "payload_hash, state_manifest_json, commit_sequence) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                 (task_id, window_id, _json(cursor_value), _json(commit_summary), now, payload_hash,
-                 _json(state_manifest) if state_manifest is not None else None),
+                 _json(state_manifest) if state_manifest is not None else None, sequence),
             )
             for item_index, window in enumerate(sanitized_windows):
                 connection.execute(
@@ -496,19 +588,28 @@ class StreamingStateRepository:
                     "status": "running",
                     "stage": "AGGREGATING",
                     "cursor": cursor_value,
-                    "windows_committed": int(task.get("windows_committed") or 0) + 1,
+                    "windows_committed": sequence,
                     "records_processed": int(task.get("records_processed") or 0) + int(commit_summary.get("record_count") or 0),
                     "pending_external_commit": cursor_value,
+                    "pending_external_commit_at": now,
+                    "first_durable_commit_at": task.get("first_durable_commit_at") or now,
+                    "last_durable_commit_at": now,
                     "updated_at": now,
                 }
             )
+            if cursor_value["kind"] == "kafka":
+                previous = offset_vector(current_cursor.value.get("partitions"))
+                positions = offset_vector(cursor_value["value"].get("partitions"))
+                changed = task.get("partition_durable_changed_at") or {}
+                changed.update({str(key): now for key, value in positions.items() if previous.get(key) != value})
+                task["partition_durable_changed_at"] = changed
             if miner_generation is not None:
                 task["miner_generation"] = dict(miner_generation)
             connection.execute(
                 "UPDATE streaming_tasks SET status=?, stage=?, cursor_json=?, task_json=?, updated_at=? WHERE task_id=?",
                 (task["status"], task["stage"], _json(cursor_value), _json(task), now, task_id),
             )
-            self._append_event(connection, task_id, "window_committed", {"window_id": window_id, "template_count": len(sanitized_templates)}, now)
+            self._append_event(connection, task, "window_committed", {"window_id": window_id, "template_count": len(sanitized_templates)}, now)
         return True
 
     def list_unknown_templates(self, *, task_id: str | None = None, limit: int = 200) -> list[dict[str, Any]]:
@@ -543,7 +644,8 @@ class StreamingStateRepository:
     def list_commits(self, task_id: str) -> list[str]:
         with self.database.connect() as connection:
             rows = connection.execute(
-                "SELECT window_id FROM streaming_window_commits WHERE task_id=? ORDER BY committed_at, window_id", (task_id,)
+                "SELECT window_id FROM streaming_window_commits WHERE task_id=? "
+                "ORDER BY CASE WHEN commit_sequence IS NULL THEN 0 ELSE 1 END, commit_sequence, committed_at, window_id", (task_id,)
             ).fetchall()
         return [str(row[0]) for row in rows]
 
@@ -628,7 +730,8 @@ class StreamingStateRepository:
             task = _decode_json(task_row[0])
             commits = connection.execute(
                 "SELECT window_id,cursor_json,summary_json,payload_hash,state_manifest_json "
-                "FROM streaming_window_commits WHERE task_id=? ORDER BY committed_at,window_id",
+                "FROM streaming_window_commits WHERE task_id=? "
+                "ORDER BY CASE WHEN commit_sequence IS NULL THEN 0 ELSE 1 END, commit_sequence, committed_at, window_id",
                 (task_id,),
             )
             digest = hashlib.sha256()
@@ -768,17 +871,28 @@ class StreamingStateRepository:
                 "UPDATE streaming_tasks SET status=?, stage=?, task_json=?, updated_at=? WHERE task_id=?",
                 (status, stage, _json(task), now, task_id),
             )
-            self._append_event(connection, task_id, event_type, {"error": error} if error else {}, now)
+            self._append_event(connection, task, event_type, {"error": error} if error else {}, now)
         return task
 
-    def _append_event(self, connection: Any, task_id: str, event_type: str, payload: Mapping[str, Any], created_at: str) -> None:
+    def _append_event(
+        self, connection: Any, task: Mapping[str, Any], event_type: str, payload: Mapping[str, Any], created_at: str,
+    ) -> None:
+        task_id = task["task_id"]
         row = connection.execute(
             "SELECT COALESCE(MAX(sequence), 0) + 1 FROM streaming_task_events WHERE task_id=?", (task_id,)
         ).fetchone()
-        connection.execute(
-            "INSERT INTO streaming_task_events(task_id, sequence, event_type, event_json, created_at) VALUES (?, ?, ?, ?, ?)",
-            (task_id, int(row[0]), event_type, _json(dict(payload)), created_at),
-        )
+        parameters = (task_id, int(row[0]), event_type, _json(dict(payload)), created_at)
+        if (task.get("source") or {}).get("kind") == "kafka":
+            connection.execute(
+                "INSERT INTO streaming_task_events(task_id, sequence, event_type, event_json, created_at, kafka_source_id) "
+                "VALUES (?, ?, ?, ?, ?, (SELECT kafka_source_id FROM streaming_tasks WHERE task_id=?))",
+                (*parameters, task_id),
+            )
+        else:
+            connection.execute(
+                "INSERT INTO streaming_task_events(task_id, sequence, event_type, event_json, created_at) VALUES (?, ?, ?, ?, ?)",
+                parameters,
+            )
 
 
 def _safe_template(value: Mapping[str, Any]) -> dict[str, Any]:

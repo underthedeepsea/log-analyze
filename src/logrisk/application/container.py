@@ -83,6 +83,9 @@ from logrisk.sqlite_stores import (
     SQLiteUploadSessionStore,
 )
 from logrisk.streaming_state import StreamingConflictError, StreamingStateRepository, StreamingTaskBusyError
+from logrisk.streaming_observability.repository import ObservabilityError, ObservabilityRepository as KafkaObservabilityRepository, writer_key
+from logrisk.streaming_observability.service import ObservabilityService
+from logrisk.operational_ledgers import OperationalLedgerRepository
 from logrisk.upload_sessions import UploadConfig
 from pipeline.manual_import_pipeline import analyze_records
 
@@ -171,7 +174,7 @@ class ApplicationContainer:
     input_analyzer_accepts_config: bool = True
     run_input_job: Callable[[str], None] | None = None
     create_recompute_input_job: Callable[[str], dict[str, Any]] | None = None
-    run_kafka_task: Callable[[str, dict[str, str]], None] | None = None
+    run_kafka_task: Callable[..., None] | None = None
     kafka_adapters: dict[str, KafkaConsumerAdapter] = field(default_factory=dict)
 
     def source_capabilities(self) -> dict[str, dict[str, Any]]:
@@ -181,10 +184,13 @@ class ApplicationContainer:
             active_tasks=self.streaming_state.count_active_tasks(source_kind="kafka"),
         )
 
-    def kafka_source(self, configuration: dict[str, Any]) -> KafkaIncrementalSource:
+    def kafka_source(self, configuration: dict[str, Any], **scope: Any) -> KafkaIncrementalSource:
         if not self.config.kafka_enabled:
             raise IncrementalSourceError("Kafka 消费适配器未启用，无法启动消费")
-        return KafkaIncrementalSource(configuration, adapters=self.kafka_adapters)
+        return KafkaIncrementalSource(configuration, adapters=self.kafka_adapters, **scope)
+
+    def streaming_observability(self) -> ObservabilityService:
+        return ObservabilityService(KafkaObservabilityRepository(self.database), kafka_enabled=self.config.kafka_enabled)
 
     def recover_agent_runs(self, submit: Callable[[str], None] | None = None) -> list[str]:
         """Recover persisted local Agent runs only when the feature is explicitly enabled."""
@@ -232,6 +238,7 @@ def build_application_container(
         migrate=config.migrate_database,
     )
     runtime_config = config.runtime_config or _load_runtime_config(config, root)
+    operational_ledger = OperationalLedgerRepository(database)
 
     connections = ConnectionStore(database)
     connections.seed_defaults(config.default_ollama_url)
@@ -291,6 +298,11 @@ def build_application_container(
             provider=connection["provider"],
             model_profile=profile,
             connection_snapshot=connection,
+            ledger_repository=operational_ledger,
+            analysis_run_id=kwargs.get("analysis_run_id"),
+            analysis_member_id=kwargs.get("analysis_member_id"),
+            environment=str(kwargs.get("environment") or "production"),
+            scope_key=str(kwargs.get("scope_key") or "default"),
         )
 
     def validate_replay_output(snapshot: dict[str, Any], output: dict[str, Any]) -> dict[str, Any]:
@@ -446,6 +458,8 @@ def build_application_container(
             prompt_content=prompt.content,
             timeout=float(run["timeout_seconds"]),
             options=profile.build_model_options(),
+            ledger_repository=operational_ledger,
+            caller_id=run["run_id"],
         )
 
     agent_runs = None
@@ -671,16 +685,38 @@ def build_application_container(
             if interrupted:
                 raise
 
-    def run_kafka_task(task_id: str, source_configuration: dict[str, str]) -> None:
-        source = container.kafka_source(source_configuration)
+    def run_kafka_task(
+        task_id: str, source_configuration: dict[str, str], *, source: KafkaIncrementalSource | None = None,
+    ) -> None:
+        if source is None:
+            source = container.kafka_source(source_configuration)
+            try:
+                observed = KafkaObservabilityRepository(container.database)
+                with observed.control_lock(writer_key(source.configuration)):
+                    observed.require_legacy_writer(source.configuration)
+                    run_kafka_task(task_id, source_configuration, source=source)
+            except ObservabilityError as exc:
+                if exc.code not in {"source_busy", "source_conflict"}:
+                    raise
+            return
+        task = container.streaming_state.get_task(task_id)
+        if source.batch is None and task.get("kafka_batch"):
+            raise StreamingConflictError("连续 Kafka 批次必须由来源 Worker 恢复")
+        drain_config = container.drain_quality.configs
+        config_ref = source.batch or {}
+        config_snapshot = (
+            drain_config.get_version(config_ref["config_id"], config_ref["config_version"])
+            if config_ref.get("config_id") and config_ref.get("config_version") else drain_config.active_snapshot()
+        )
+        directory = config_ref.get("source_id") or task_id
         try:
             run_incremental_pipeline(
                 input_job_id=task_id,
                 source=source,
                 source_name=f"kafka://{source_configuration['topic']}",
-                config_path=container.drain_quality.configs.active_snapshot()["path"],
+                config_path=config_snapshot["path"],
                 rules_path=root / "configs" / "risk_rules.yaml",
-                state_dir=state_root / "dashboard_kafka" / task_id,
+                state_dir=state_root / "dashboard_kafka" / directory,
                 streaming_repository=container.streaming_state,
                 semantic_snapshot=container.semantic_dictionaries.active_snapshot(),
                 risk_semantics=container.risk_semantics,
@@ -688,6 +724,8 @@ def build_application_container(
                 multi_source=container.multi_source,
                 resume_task_id=task_id,
                 stream_batch_records=MAX_STREAM_BATCH_RECORDS,
+                environment=source.environment,
+                scope_key=source.scope_key,
             )
         except StreamingTaskBusyError:
             return

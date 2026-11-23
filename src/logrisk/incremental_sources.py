@@ -4,7 +4,7 @@ import hashlib
 import json
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterator, Mapping, Protocol
+from typing import Any, Callable, Iterator, Mapping, Protocol
 
 from logrisk.stream_input_parser import iter_log_records_from_file
 
@@ -325,6 +325,13 @@ class KafkaIncrementalSource:
             self.configuration["source_profile"] = profile
         self.environment = str(environment or "production")
         self.scope_key = str(scope_key or "default")
+        self.observe: Callable[..., None] | None = None
+        self.batch: Mapping[str, Any] | None = None
+        self.final_cursor: SourceCursor | None = None
+        self.group_frontier: dict[int, int | None] = {}
+        self.control_epoch: int | None = None
+        self.external_commit: Callable[[Callable[[], None]], None] = lambda operation: operation()
+        self.check_active: Callable[[], None] = lambda: None
 
     def descriptor(self) -> SourceDescriptor:
         cluster_id = str(self.configuration.get("cluster_id") or "")
@@ -357,9 +364,27 @@ class KafkaIncrementalSource:
             raise IncrementalSourceError("Kafka 消费适配器未注册，无法启动消费")
         if cursor.kind not in {"", "kafka"}:
             raise IncrementalSourceError("Kafka 来源不能使用其他来源的 Checkpoint")
+        self.check_active()
+
+        def adapter_records() -> Iterator[SourceRecord]:
+            from logrisk.streaming_observability.kafka_offsets import KafkaBoundaryError, classify
+
+            try:
+                if self.batch is not None:
+                    yield from adapter.read_bounded(self, cursor)
+                elif self.observe is not None and callable(getattr(adapter, "read_observed", None)):
+                    yield from adapter.read_observed(self.configuration, cursor, self.observe)
+                else:
+                    yield from adapter.read(self.configuration, cursor)
+            except KafkaBoundaryError:
+                raise
+            except Exception as exc:
+                raise KafkaBoundaryError(classify(exc), stage="consume") from None
+
         def records() -> Iterator[SourceRecord]:
             from logrisk.normalizer import ConfiguredSourceText
-            for item in adapter.read(self.configuration, cursor):
+
+            for item in adapter_records():
                 # These internal normalization hints belong to registered source
                 # configuration. JSON producer fields cannot activate or replace them.
                 record = {key: value for key, value in item.record.items() if key not in {"_source_profile", "_source_cluster"}}
@@ -367,20 +392,44 @@ class KafkaIncrementalSource:
                     record["_source_profile"] = ConfiguredSourceText(self.configuration["source_profile"])
                 if self.configuration.get("cluster_id"):
                     record["_source_cluster"] = ConfiguredSourceText(self.configuration["cluster_id"])
+                if self.observe is not None:
+                    metadata = item.metadata or {}
+                    position = metadata.get("offset")
+                    if type(position) is int:
+                        self.observe("yield", {"partition": metadata.get("partition"), "next_offset": position + 1})
                 yield SourceRecord(record, item.next_cursor, item.metadata)
         return iter(records())
 
+    def before_durable_checkpoint(self, cursor: SourceCursor) -> None:
+        self.check_active()
+        if self.batch is not None:
+            adapter = self.adapters[self.configuration["adapter_id"]]
+            adapter.validate_bounded_checkpoint(self, cursor)
+            self.check_active()
+
     def commit(self, cursor: SourceCursor) -> None:
+        from logrisk.streaming_observability.kafka_offsets import KafkaBoundaryError, classify
+
         adapter_id = self.configuration["adapter_id"]
         adapter = self.adapters.get(adapter_id)
         if adapter is None:
             raise IncrementalSourceError("Kafka 消费适配器未注册，无法提交消费位点")
         if cursor.kind not in {"", "kafka"}:
             raise IncrementalSourceError("Kafka 来源不能提交其他来源的 Checkpoint")
-        commit = getattr(adapter, "commit", None)
-        if not callable(commit):
-            raise IncrementalSourceError("Kafka 消费适配器缺少 commit 方法")
-        commit(self.configuration, cursor)
+        self.check_active()
+        try:
+            if self.batch is not None:
+                adapter.commit_bounded(self, cursor)
+                return
+            commit = getattr(adapter, "commit", None)
+            if not callable(commit):
+                raise KafkaBoundaryError("consumer_failed", "Kafka 消费适配器缺少 commit 方法", stage="group_commit")
+            commit(self.configuration, cursor)
+        except KafkaBoundaryError as exc:
+            exc.stage = exc.stage or "group_commit"
+            raise
+        except Exception as exc:
+            raise KafkaBoundaryError(classify(exc), stage="group_commit") from None
 
 
 def source_capabilities(

@@ -75,6 +75,7 @@ from logrisk.runtime.service import RuntimeQuotaError, RuntimeService
 from logrisk.semantic.schema import SemanticValidationError
 from logrisk.semantic.store import SemanticDictionaryStore
 from logrisk.streaming_state import StreamingConflictError, StreamingStateRepository
+from logrisk.streaming_observability.repository import ObservabilityError, ObservabilityRepository
 from logrisk.upload_sessions import UploadConfig, UploadSessionStore
 from logrisk.database import DatabaseError, PostgresDatabase, create_database
 from logrisk.database_config import DatabaseConnectionSettings, database_url_from_candidate, resolve_database_runtime
@@ -303,6 +304,12 @@ class DashboardHandler(BaseHTTPRequestHandler):
         self._runtime_identity = identity
         return identity
 
+    def _require_legacy_kafka_writer(self, configuration: dict[str, str]) -> None:
+        try:
+            ObservabilityRepository(self.server.database).require_legacy_writer(configuration)  # type: ignore[attr-defined]
+        except ObservabilityError as exc:
+            raise StreamingConflictError(str(exc)) from exc
+
     def _require_runtime_write_access(self) -> RequestIdentity:
         identity = self._runtime_request_identity()
         path, _ = self._route_parts()
@@ -378,7 +385,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if path == "/help":
                 self._serve_help()
                 return
-            if path in {"/", "/review", "/queue", "/export", "/prompts", "/ai-traces", "/ai-observability", "/model-profiles", "/drain-quality", "/benchmark-center", "/rules", "/settings", "/runtime", "/release-readiness", "/node-risks", "/semantic-library", "/multi-source", "/knowledge-packages", "/agent-runs", "/agent-workflows"} or path.startswith("/node-risks/"):
+            if path in {"/", "/streaming", "/streaming-tasks", "/offline-analysis", "/review", "/queue", "/export", "/prompts", "/ai-traces", "/ai-observability", "/model-profiles", "/drain-quality", "/benchmark-center", "/rules", "/settings", "/runtime", "/release-readiness", "/node-risks", "/semantic-library", "/multi-source", "/knowledge-packages", "/agent-runs", "/agent-workflows"} or path.startswith("/node-risks/"):
                 self._serve_frontend()
                 return
             if path == "/config.js":
@@ -861,20 +868,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 result = self.server.input_jobs.get_result_page(match.group(1),cursor=query.get("cursor",[None])[0],limit=int(query.get("limit",["100"])[0]),collection=query.get("collection",["entities"])[0],window_key=query.get("window_key",[None])[0])  # type: ignore[attr-defined]
                 self._json(HTTPStatus.OK, {"result_path": str(self.server.input_jobs.result_path(match.group(1))), "result": result})  # type: ignore[attr-defined]
                 return
-            if path == "/api/streaming/tasks":
-                self._json(HTTPStatus.OK, {"tasks": self.server.streaming_state.list_tasks(  # type: ignore[attr-defined]
-                    limit=int(query.get("limit", ["100"])[0]),
-                )})
-                return
             match = re.fullmatch(r"/api/streaming/tasks/([A-Za-z0-9_-]+)", path)
             if match:
+                if not self.server.api_facade._streaming_read_allowed(self._runtime_request_identity()):  # type: ignore[attr-defined]
+                    raise RuntimeAccessError("流任务需要可信 PACAS/RBAC 身份")
                 self._json(HTTPStatus.OK, self.server.streaming_state.get_task(match.group(1)))  # type: ignore[attr-defined]
-                return
-            if path == "/api/streaming/unknown-templates":
-                self._json(HTTPStatus.OK, {"items": self.server.streaming_state.list_unknown_templates(  # type: ignore[attr-defined]
-                    task_id=query.get("task_id", [None])[0],
-                    limit=int(query.get("limit", ["200"])[0]),
-                )})
                 return
             match = re.fullmatch(r"/api/ai-harness/traces/([A-Za-z0-9_-]+)", path)
             if match:
@@ -1439,10 +1437,13 @@ class DashboardHandler(BaseHTTPRequestHandler):
             match = re.fullmatch(r"/api/streaming/tasks/([A-Za-z0-9_-]+)/resume", path)
             if match:
                 task = self.server.streaming_state.get_task(match.group(1))  # type: ignore[attr-defined]
+                if task.get("kafka_batch"):
+                    raise StreamingConflictError("连续 Kafka 批次必须由来源 Worker 恢复")
                 if task.get("status") not in {"failed", "interrupted"}:
                     raise FeatureJobError("仅失败或中断的流式任务可以恢复")
                 if (task.get("source") or {}).get("kind") == "kafka":
                     configuration = dict((task.get("source") or {}).get("configuration") or {})
+                    self._require_legacy_kafka_writer(configuration)
                     adapter_id = str(configuration.get("adapter_id") or "")
                     if adapter_id not in self.server.source_capabilities()["kafka"]["registered_adapter_ids"]:  # type: ignore[attr-defined]
                         self._json(HTTPStatus.UNPROCESSABLE_ENTITY, {
@@ -1498,6 +1499,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     self._json(HTTPStatus.UNPROCESSABLE_ENTITY, {"error": str(exc), "code": "invalid_kafka_source"})
                     return
                 config_path = self.server.drain_quality.configs.active_snapshot()["path"]  # type: ignore[attr-defined]
+                self._require_legacy_kafka_writer(source.configuration)
                 config_hash = hashlib.sha256(Path(config_path).read_bytes()).hexdigest()
                 task = self.server.streaming_state.create_or_load(  # type: ignore[attr-defined]
                     descriptor=source.descriptor(),

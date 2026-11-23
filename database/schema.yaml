@@ -236,16 +236,33 @@ tables:
     foreign_keys: {upload_id: upload_sessions.upload_id}
     columns: {input_job_id: 输入任务标识, upload_id: 来源上传会话, status: 任务状态, stage: 当前处理阶段, job_json: 输入任务配置, progress_json: 实时处理进度, result_json: 聚合后的 result.json, created_at: 创建时间, updated_at: 更新时间}
   streaming_tasks:
-    description: 可恢复文件或预留 Kafka 来源的增量处理任务；来源游标、配置摘要与任务状态为运行时权威记录
+    description: 可恢复文件或 Kafka 来源的增量处理任务；连续 Kafka 批次单独保存不可变目标和来源归属
     primary_key: task_id
     constraints: source_kind 仅允许 file/kafka；status 为 queued/running/failed/interrupted/completed/conflict；不保存原始日志或凭据
-    indexes: [idx_streaming_tasks_status_updated(status, updated_at DESC)]
-    columns: {task_id: 流式任务标识, source_kind: 来源类型, source_identity_json: 文件身份或 Kafka 非敏感来源快照, config_hash: 锁定的 Drain3 配置摘要, status: 运行状态, stage: READING/SPOOLING/MINING/AGGREGATING/COMPLETED/FAILED/CONFLICT, cursor_json: 最后成功提交的来源游标, task_json: 完整任务脱敏快照, created_at: 创建时间, updated_at: 更新时间}
+    indexes: ["idx_streaming_tasks_status_updated(status, updated_at DESC)", "idx_streaming_tasks_kafka_source(kafka_source_id, created_at, task_id)"]
+    foreign_keys: {kafka_source_id: kafka_stream_sources.source_id}
+    columns: {task_id: 流式任务标识, source_kind: 来源类型, source_identity_json: 文件身份或 Kafka 非敏感来源快照, config_hash: 锁定的 Drain3 配置摘要, status: 运行状态, stage: READING/SPOOLING/MINING/AGGREGATING/COMPLETED/FAILED/CONFLICT, cursor_json: 最后成功提交的来源游标, task_json: 完整任务脱敏快照, created_at: 创建时间, updated_at: 更新时间, kafka_source_id: 观测来源标识}
+  kafka_stream_sources:
+    description: Kafka 来源识别、连续批次合同与同事务维护的批次指针
+    primary_key: source_id
+    indexes: [idx_kafka_continuous_writer(writer_key), idx_kafka_stream_writer(writer_key), idx_kafka_stream_assignment(assignment_key)]
+    columns: {source_id: 来源标识, descriptor_json: 配置标识与 Bootstrap 变量名, mode: 固定或连续有界批次, writer_key: 配置写者归属键, assignment_key: Topic 和消费组的写者协调键, writer_scope: 部署方声明的消费组写者范围, enabled: 连续批次期望开关, control_epoch: 启停代次, initial_offset: 首次起点合同, active_task_id: 当前批次指针, completed_task_id: 最后完成的批次指针, block_reason: 稳定错误分类, block_stage: 来源检查或消费及提交阶段, broker_identity: Broker 集群及 Topic UUID 的摘要, broker_writer_key: 已验证 Topic 与消费组的唯一归属键, idle_at: 最近无新批检查时间, scheduler_token: 调度进程当前归属, scheduler_heartbeat_at: 来源调度进程最近一次真实心跳, scheduler_phase: 正在检查或等待下一批, scheduler_control_epoch: 调度启动时的启停代次}
+  kafka_observer_state:
+    description: 独立只读采样器租约与最新有界快照
+    primary_key: source_id
+    foreign_keys: {source_id: kafka_stream_sources.source_id ON DELETE CASCADE}
+    columns: {source_id: 来源标识, owner_token: 当前采样归属, expires_at: 采样锁有效期, next_due_at: 多实例共享的下一次允许采样时间, failed_samples: 当前连续失败次数上限3, recovering: 是否正在重新建立有效采样, latest_epoch: 最新采样的来源代次, sampled_at: 最近采样时间, status: 最新采样状态, snapshot_json: 脱敏位点向量与时间}
+  kafka_worker_observations:
+    description: 任务 Worker 的最近心跳与已交付记录位点
+    primary_key: task_id
+    foreign_keys: {task_id: streaming_tasks.task_id ON DELETE CASCADE}
+    columns: {task_id: 流式任务标识, worker_epoch: Worker 租约代次, observed_at: 最近真实心跳时间, snapshot_json: 脱敏投影及采样时间}
   streaming_window_commits:
     description: 已原子提交的增量窗口；相同 task/window 只能提交一次
     primary_key: [task_id, window_id]
     foreign_keys: {task_id: streaming_tasks.task_id ON DELETE CASCADE}
-    columns: {task_id: 流式任务标识, window_id: 稳定窗口标识, cursor_json: 本窗口提交后的来源游标, summary_json: 窗口聚合摘要, committed_at: 提交时间, payload_hash: 游标/完整窗口/摘要的规范摘要, state_manifest_json: 与本批游标同事务绑定的 miner generation manifest（TEXT 可空；旧行不回填）}
+    indexes: ["idx_streaming_commits_time(task_id, committed_at)", "idx_streaming_commits_sequence(task_id, commit_sequence)"]
+    columns: {task_id: 流式任务标识, window_id: 稳定窗口标识, cursor_json: 本窗口提交后的来源游标, summary_json: 窗口聚合摘要, committed_at: 提交时间, payload_hash: 游标/完整窗口/摘要的规范摘要, state_manifest_json: 与本批游标同事务绑定的 miner generation manifest（TEXT 可空；旧行不回填）, commit_sequence: 同任务的提交序列（旧行保留历史排序）}
   streaming_batch_windows:
     description: 已提交批次的完整脱敏窗口事实；恢复和最终归约不依赖进程内历史列表
     primary_key: [task_id, window_id, item_index]
@@ -261,8 +278,9 @@ tables:
   streaming_task_events:
     description: 流式任务创建、提交、失败、冲突和恢复的追加式审计事件
     primary_key: [task_id, sequence]
-    foreign_keys: {task_id: streaming_tasks.task_id ON DELETE CASCADE}
-    columns: {task_id: 流式任务标识, sequence: 任务内递增序号, event_type: 事件类型, event_json: 脱敏事件详情, created_at: 发生时间}
+    foreign_keys: {task_id: streaming_tasks.task_id ON DELETE CASCADE, kafka_source_id: kafka_stream_sources.source_id}
+    indexes: ["idx_streaming_events_kafka_source(kafka_source_id, created_at DESC, task_id DESC, sequence DESC)"]
+    columns: {task_id: 流式任务标识, sequence: 任务内递增序号, event_type: 事件类型, event_json: 脱敏事件详情, created_at: 发生时间, kafka_source_id: 观测来源标识}
   artifacts:
     description: 原始上传、分片、Drain3 快照和导出物路径与校验值
     primary_key: artifact_id

@@ -177,7 +177,7 @@ def test_m11_quality_and_settings_use_workspace_design_contract():
         "secondary-button",
     ):
         assert text in source
-    assert '!["drainQuality", "benchmarkCenter", "streaming", "runtime", "releaseReadiness", "settings", "rules", "nodeRisks", "multiSource", "semanticLibrary", "agentRuns", "agentWorkflows"].includes(view)' in source
+    assert '!["streamOverview", "drainQuality", "benchmarkCenter", "streaming", "runtime", "releaseReadiness", "settings", "rules", "nodeRisks", "multiSource", "semanticLibrary", "agentRuns", "agentWorkflows"].includes(view)' in source
     assert "h(CodeBlock, { value: profile.parameters })" not in source
 
 
@@ -492,7 +492,9 @@ def test_benchmark_center_has_route_api_and_six_decision_views():
     source = source_text()
     assert '["benchmarkCenter", "评测与基准"]' in source
     assert 'if (path === "/benchmark-center") return "benchmarkCenter";' in source
-    assert 'benchmarkCenter: "/benchmark-center", runtime: "/runtime", releaseReadiness: "/release-readiness", streaming: "/streaming"' in source
+    assert 'benchmarkCenter: "/benchmark-center", runtime: "/runtime", releaseReadiness: "/release-readiness", streaming: "/streaming-tasks"' in source
+    assert 'if (path === "/streaming-tasks") return "streaming";' in source
+    assert 'overview: "/offline-analysis", streamOverview: "/"' in source
     assert 'function BenchmarkCenterPage(props)' in source
     assert "/api/benchmark-center/overview" in source
     assert "/api/benchmark-center/leaderboard" in source

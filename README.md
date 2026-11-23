@@ -10,9 +10,15 @@
   <img src="frontend/logo/logrisk-app-icon-orange-v2.png" width="112" alt="LOGRISK 应用图标" />
 </p>
 
-当前版本：`1.44.17`。完整变更记录见 [`releas.md`](releas.md)。
+当前版本：`1.48.1`。完整变更记录见 [`releas.md`](releas.md)。
 
 ### 当前功能与启动方式
+
+「识别工作台 → 流运行总览」位于 `/` 与 `/streaming`。首屏显示服务器风险与模型 Token 用量。风险按北京时间统计，主机按集群和主机去重，恢复状态按异常组计数。Token 使用已入账的物理调用记录，覆盖正常特征识别与专家规划，展示输入、输出、分时趋势、模型贡献和这些调用的回执覆盖。缺少回执或单价时明确标注。
+
+在「风险识别与特征流转」中可查看固定三专家的依赖、运行记录、校验和人工审批阶段。工作台同时展示已提交流批次的每日与累计处理条数、Drain3、已批准规则和今日待审批组数。跨任务重复处理仍计入批次条数，已核验的去重消费单独展示。待审批折线随当前会话采样增长，历史覆盖缺失时保留缺口。
+
+Kafka 运行观测沿用所选消费组的落库前积压趋势、处理阶段差距、消费组积压、落库速率和结果发布等待。位点、任务与采样详情均可展开，位点差与已核验日志条数分别显示。
 
 服务器风险总览位于 `/node-risks`，支持时间范围、主机筛选、分页和详情；日期证据、当前确定性判断与持久 HTML 日报使用同一套事实。基础总览可直接启动，日报模型执行默认关闭，来源配置 `configs/server_risk.yaml` 默认 `sources: []`，启动不会自动连接 Kafka。
 
@@ -163,6 +169,8 @@ python3 -m pipeline.manual_import_pipeline \
 
 ### 可恢复处理与 Kafka 来源
 
+Dashboard 和 Django 的 `/`、`/streaming` 用真实采样点展示 Kafka 待持久化趋势和各处理阶段的位点差距；未知、陈旧和部分分区读数单独标示。分区、任务证据和事件可按需展开。`/offline-analysis` 保留文件上传及离线分析，`/streaming-tasks` 保留流任务和未知模板。观测 API 读取数据库中已有的采样与任务事实。没有当前读数时显示具体缺失原因。启用身份校验的部署要求可信 PACAS/RBAC 身份读取观测 API。
+
 B12 恢复会在读取、派生、结果投影和完成发布前核对 committed batch、窗口、payload hash、cursor 前沿及 ready result generation。无法证明的旧前缀以稳定错误码 `STREAMING_PREFIX_INCOMPLETE` 失败，普通恢复不会自动重算。注册入口 `container.create_recompute_input_job(old_input_job_id)` 只接受仍可证明原始快照的 file/upload；大于 128 KiB 且历史没有完整摘要的弱身份来源返回 `RECOMPUTE_SOURCE_IDENTITY_UNVERIFIABLE`。新 Run 使用受控来源快照、空 cursor、独立 miner generation，并默认隔离节点台账和多来源全局副作用；之后由 `container.run_input_job(new_job["input_job_id"])` 执行。旧任务、批次和结果证据保持不变，Kafka 不支持重算。
 
 “流式处理”工作区会显示大文件任务的来源、Drain3 配置摘要、最后成功 Checkpoint、提交批次和脱敏未知模板队列。文件任务同时受记录数、序列化字节数和分区 writer 数量预算约束；每个批次在 Drain3 模板化、语义/规则判定后，以单个数据库事务提交完整脱敏窗口、未知模板、摘要和字节 Offset。服务重启会将运行中任务标记为中断，恢复会从全部已提交批次重建结果；只有人工点击“从 Checkpoint 恢复”才会继续。文件身份、内容前缀、批次 payload 或 Drain3 配置变化会标记为冲突，不能静默重读、回退游标或跳过数据。大结果以服务端结果引用和 opaque cursor 分页；界面明确显示当前预览数与精确总数，后续特征任务会在服务端消费完整投影，不会把预览页当作全部实体。
@@ -185,7 +193,31 @@ curl -X POST http://127.0.0.1:8080/api/streaming/kafka/start \
   -d '{"adapter_id":"kafka-python","topic":"logs","consumer_group":"logrisk-debug","bootstrap_env":"LOGRISK_KAFKA_BOOTSTRAP"}'
 ```
 
-Kafka 任务在启动时锁定各分区的高水位，只读取当时已存在的消息；每批最多消费 10,000 条，先提交本地脱敏 Checkpoint，再提交 Kafka offset。服务重启后可从最后成功的分区 offset 恢复。任务状态、审计事件和未知模板不保存原始日志、Kafka Token 或密码。
+旧固定批次在启动时锁定各分区的高水位，只读取本批范围内的消息。处理过程按最多 10,000 条记录的块持久化，先提交本地脱敏 Checkpoint，再提交 Kafka offset。旧任务可从最后成功的分区 offset 恢复。任务状态、审计事件和未知模板仅保存脱敏事实及来源配置标识。
+
+#### 连续有界批次与独立采样
+
+使用具有 LOGRISK 数据库及状态目录权限的部署账户执行命令。命令与 Web 服务使用同一数据库和状态目录。PostgreSQL 部署先按既有离线流程应用迁移 0033，Worker 不自动迁移 PostgreSQL。以下命令中的来源配置与环境变量名为示例。
+
+```bash
+PYTHONPATH=src .venv/bin/python -m logrisk.streaming_observability \
+  --database state/logrisk.sqlite3 register \
+  --topic logs --group logrisk-dedicated --cluster-id cluster-a \
+  --bootstrap-env LOGRISK_KAFKA_BOOTSTRAP --initial-offset earliest --exclusive-group
+```
+
+登记只写来源配置，返回 `source_id`。首次起点必须明确选择 `earliest`、`latest` 或 `committed`。`earliest` 从当前保留起点开始，`latest` 从此次锁定的末端开始，两者均要求组没有已提交位点。已有固定批次的组可在旧任务结束后以 `committed` 登记。该起点要求当前 Topic 每个分区都有有效的组提交位点，连续批次从这些位置接续，旧结果仍保留在原任务。登记后同一消费组的旧固定任务不可再开始或恢复。部署方需确保该组只有一个 LOGRISK 写者，包括不同 Bootstrap 别名指向同一组的情况。
+
+```bash
+PYTHONPATH=src .venv/bin/python -m logrisk.streaming_observability start SOURCE_ID
+LOGRISK_KAFKA_ENABLED=1 PYTHONPATH=src .venv/bin/python -m logrisk.streaming_observability run SOURCE_ID
+PYTHONPATH=src .venv/bin/python -m logrisk.streaming_observability sample SOURCE_ID --watch
+PYTHONPATH=src .venv/bin/python -m logrisk.streaming_observability stop SOURCE_ID
+```
+
+`start` 允许独立 Worker 调度该来源。运行中的 Worker 每批结束后等待 30 秒检查下一批，`run --once` 仅执行一次检查和可能的一批。来源调度心跳在等待期间持续更新，页面单独显示消费端最近一次实际 poll。每个新批次全来源合计最多推进 10,000 个位点，按分区分配预算；每次执行在检查点边界应用 90 秒处理预算。失败、中断、预算到达或停止时保留原批目标、已持久化前沿和待确认提交。再次执行会恢复原批，完成后才锁定新批目标。120 秒是结果覆盖的诊断目标，过慢的下游会显示实际逾期。停止会阻止后续读写边界，已完成的事务与正在执行的提交保持原有顺序。Topic 重建、分区集合变化、位点超出保留范围，或组提交与记录的前沿不一致时，Worker 保留原状态并报告冲突。对可能指向同一 Topic 与组的其它 Bootstrap 别名，旧批次在消费前核实实际 Broker 身份。
+
+`sample` 单独执行只读 Kafka 元数据、末端位点和组提交位点查询，允许来源消费处于停止状态。各采样进程共享同来源的 15 秒最短间隔和连续失败的 15、30、60 秒退避。失败后连续两次有效采样才恢复来源可达状态。旧 Broker 至少需支持可禁止自动创建 Topic 的 Metadata API 才可采样。无法读取稳定 Topic UUID 时，采样保留本轮读数但不跨样本比较；连续消费要求支持 Metadata v10 和有效 Topic UUID。应用启动和页面刷新均只读已有数据库快照。内置接入使用现有 Kafka Bootstrap 环境配置。Kafka Broker/ACL、SASL/TLS 和生产数据库联通需要各自环境验收。
 
 `source_profile: "log-cloud-shanghai-v1"` 为明确选择的来源解析配置：剥离 CRI stdout/stderr 包装，从显式主机字段、syslog 主机头或 `source_metadata.node_id/hostname` 读取主机；不会把正文里的对端 IP 当成本机。外层 `timestamp/@timestamp` 为无时区时间时按北京时间解释并转换到 UTC；缺失或无效的外层时间不会借用 CRI 正文时间。未知 profile 或错误类型在创建任务前拒绝。
 

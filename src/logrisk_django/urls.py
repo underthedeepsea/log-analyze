@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from django.urls import path
+from django.urls import path, re_path
 
 from logrisk_django.views.api import core_read
 from logrisk_django.views.node_risks import server_risk_api
@@ -145,7 +145,12 @@ urlpatterns = [
     path("api/ai-harness/model-profiles", model_profiles),
     path("api/ai-harness/prompts/<str:prompt_id>", prompt_detail),
     path("api/health", core_read, {"endpoint": "health"}),
+    path("api/stream-overview", core_read, {"endpoint": "stream-overview"}),
+    re_path(r"^api/(?P<endpoint>stream-overview/workflow-runs/[^/]+)$", core_read),
     path("api/streaming/sources", core_read, {"endpoint": "streaming/sources"}),
+    path("api/streaming/tasks", core_read, {"endpoint": "streaming/tasks"}),
+    path("api/streaming/unknown-templates", core_read, {"endpoint": "streaming/unknown-templates"}),
+    re_path(r"^api/(?P<endpoint>streaming/observability/.+)$", core_read),
     path("api/runtime/readiness", core_read, {"endpoint": "runtime/readiness"}),
     path("api/runtime/health", core_read, {"endpoint": "runtime/health"}),
     path("api/runtime/airflow", core_read, {"endpoint": "runtime/airflow"}),
@@ -160,5 +165,6 @@ urlpatterns = [
     path("api/benchmark-center/trends", core_read, {"endpoint": "benchmark-center/trends"}),
     path("api/benchmark-center/leaderboard", core_read, {"endpoint": "benchmark-center/leaderboard"}),
     path("api/release-readiness", core_read, {"endpoint": "release-readiness"}),
+    path("", frontend),
     path("<path:path>", frontend),
 ]

@@ -6,6 +6,7 @@ from urllib.parse import unquote
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping
 
+from logrisk.agentic.workflow_repository import OVERVIEW_RUN_ID
 from logrisk.ai_harness.connection_check import check_model_connection
 from logrisk.application.container import ApplicationContainer
 from logrisk.approval_queue import approval_metrics, build_review_groups
@@ -17,6 +18,8 @@ from logrisk.feature_jobs import FeatureJobError
 from logrisk.runtime.identity import RequestIdentity, RuntimeAccessError, require_write_access
 from logrisk.server_risk.contracts import ServerRiskError, integer
 from logrisk.server_risk.render import CSP
+from logrisk.stream_overview import StreamOverview
+from logrisk.streaming_observability.repository import ObservabilityError, SOURCE_ID
 
 
 @dataclass(frozen=True)
@@ -41,6 +44,10 @@ class ApiFacade:
         self.service_resolver = service_resolver
 
     def dispatch_read(self, path: str, query: Mapping[str, Any] | None = None, identity: RequestIdentity | None = None) -> ApiResult | None:
+        if path == "/api/stream-overview" or path.startswith("/api/stream-overview/"):
+            return self.stream_overview(path, query or {}, identity)
+        if path.startswith("/api/streaming/observability/"):
+            return self.streaming_observation(path, query or {}, identity)
         server_risk = self.dispatch_server_risk_read(path, query or {}, identity)
         if server_risk is not None:
             return server_risk
@@ -51,6 +58,18 @@ class ApiFacade:
             return self.feature_expert_opinions(parts[3], parts[5])
         if path == "/api/streaming/sources":
             return ApiResult(200, {"sources": self.container.source_capabilities()})
+        if path == "/api/streaming/tasks":
+            if not self._streaming_read_allowed(identity):
+                return ApiResult(403, {"code": "forbidden", "error": "流任务需要可信 PACAS/RBAC 身份"})
+            return ApiResult(200, {"tasks": self.container.streaming_state.list_tasks(
+                limit=self._integer(query or {}, "limit", 100),
+            )})
+        if path == "/api/streaming/unknown-templates":
+            if not self._streaming_read_allowed(identity):
+                return ApiResult(403, {"code": "forbidden", "error": "流任务需要可信 PACAS/RBAC 身份"})
+            return ApiResult(200, {"items": self.container.streaming_state.list_unknown_templates(
+                task_id=self._query(query or {}, "task_id"), limit=self._integer(query or {}, "limit", 200),
+            )})
         if path == "/api/health":
             return self.health()
         if path == "/api/runtime/readiness":
@@ -1091,6 +1110,68 @@ class ApiFacade:
                 raise RuntimeAccessError("服务器风险写操作需要配置且匹配的角色")
         elif write and identity is not None:
             require_write_access(identity, config)
+
+    def _streaming_read_allowed(self, identity: RequestIdentity | None) -> bool:
+        return not self.container.runtime_config.identity.enabled or bool(
+            identity and identity.source in {"trusted_proxy", "django"} and identity.authenticated and identity.actor
+        )
+
+    def stream_overview(
+        self, path: str, query: Mapping[str, Any], identity: RequestIdentity | None,
+    ) -> ApiResult:
+        headers = {"Cache-Control": "no-store"}
+        try:
+            self.require_server_risk_access(identity)
+        except RuntimeAccessError:
+            return ApiResult(403, {"code": "forbidden", "error": "流运行总览需要可信 PACAS/RBAC 身份"}, headers)
+        if query:
+            return ApiResult(422, {"code": "invalid_query", "error": "流运行总览不接受查询参数"}, headers)
+        overview = StreamOverview(
+            self.container.database, self._service("server_risk", self.container.server_risk),
+            workflows_enabled=self.container.agent_workflows is not None,
+        )
+        if path == "/api/stream-overview":
+            return ApiResult(200, overview.read(), headers)
+        prefix = "/api/stream-overview/workflow-runs/"
+        run_id = path[len(prefix):] if path.startswith(prefix) else ""
+        if OVERVIEW_RUN_ID.fullmatch(run_id):
+            try:
+                run = overview.workflows.overview_run(run_id)
+            except Exception:
+                return ApiResult(503, {"code": "workflow_run_unavailable", "error": "多专家运行详情暂时不可读取"}, headers)
+            if run is not None:
+                return ApiResult(200, run, headers)
+        return ApiResult(404, {"code": "workflow_run_not_found", "error": "未找到多专家运行"}, headers)
+
+    def streaming_observation(
+        self, path: str, query: Mapping[str, Any], identity: RequestIdentity | None,
+    ) -> ApiResult:
+        if not self._streaming_read_allowed(identity):
+            return ApiResult(403, {"code": "forbidden", "error": "Kafka 观测需要可信 PACAS/RBAC 身份"})
+        match = re.fullmatch(r"/api/streaming/observability/sources(?:/([A-Za-z0-9_-]{1,128})(?:/(partitions|events))?)?", path)
+        if not match:
+            return ApiResult(404, {"code": "source_not_found", "error": "未找到 Kafka 观测资源"})
+        source_id, section = match.groups()
+        try:
+            limit_text = self._query(query, "limit") or "100"
+            if not re.fullmatch(r"(?:[1-9][0-9]?|100)", limit_text):
+                raise ObservabilityError("invalid_limit", "每页数量须在 1 至 100 之间")
+            limit = int(limit_text)
+            cursor = self._query(query, "cursor")
+            service = self.container.streaming_observability()
+            if source_id is None:
+                if cursor and not SOURCE_ID.fullmatch(cursor):
+                    raise ObservabilityError("invalid_cursor", "无效的分页游标")
+                body = service.sources(cursor=cursor, limit=limit)
+            elif section == "partitions":
+                body = service.partitions(source_id, snapshot_id=self._query(query, "snapshot_id"), cursor=cursor, limit=limit)
+            elif section == "events":
+                body = service.repository.events(source_id, cursor=cursor, limit=limit)
+            else:
+                body = service.detail(source_id)
+        except ObservabilityError as exc:
+            return ApiResult(exc.status, {"code": exc.code, "error": str(exc)})
+        return ApiResult(200, body, {"Cache-Control": "no-store"})
 
     def dispatch_server_risk_read(self, path: str, query: Mapping[str, Any], identity: RequestIdentity | None) -> ApiResult | None:
         overview_match = re.fullmatch(r"/api/node-risks/([^/]+)/([^/]+)/overview", path)

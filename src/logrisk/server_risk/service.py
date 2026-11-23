@@ -21,6 +21,9 @@ class ServerRiskService:
         self.reports.hit("query_validation")
         return RiskOverview(self.repository, self.reports.clock).overview(first, last, zone, **filters)
 
+    def overview_daily_summaries(self, dates: list[str], *, today_limit: int) -> list[dict[str, Any]]:
+        return RiskOverview(self.repository, self.reports.clock).daily_summaries(dates, today_limit=today_limit)
+
     def overview_detail(self, cluster: str, node: str, first: str | None = None, last: str | None = None, zone: str = "Asia/Shanghai", **filters: Any) -> dict[str, Any]:
         self.reports.hit("query_validation")
         return RiskOverview(self.repository, self.reports.clock).detail(cluster, node, first, last, zone, **filters)

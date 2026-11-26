@@ -150,8 +150,11 @@ def test_registration_rechecks_rule_after_another_connection_approves(review_dat
     raw.update({"candidate_id": "candidate-new", "status": "pending"})
     assert registering.rule_store.match_feature(raw) == []
     approved = manager_for(database).update_feature("job-scale", "candidate-00000", {"status": "approved"})
+    record = registering._job("job-scale")["entities"][0]
+    record["feature_ids"].append(raw["candidate_id"])
+    store.append_entities("job-scale", [record])
     if entrypoint == "register":
-        registering.approval_service.register(raw, {}, job=registering._job("job-scale"), record={"source": {}})
+        registering.approval_service.register(raw, record["source"], job=registering._job("job-scale"), record=record)
     elif entrypoint == "save_generated_candidate":
         store.save_generated_candidate("job-scale", raw)
     else:

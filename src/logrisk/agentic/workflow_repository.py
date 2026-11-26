@@ -11,7 +11,7 @@ from typing import Any
 from logrisk.database import Database, utc_now
 
 from .errors import AgenticError
-from .models import validate_evidence_scope, validate_run_scope
+from .models import enforce_replay_scope, validate_evidence_scope, validate_run_scope
 from .tool_registry import _reject_sensitive
 from .workflow_models import CompiledWorkflow
 
@@ -197,10 +197,18 @@ class WorkflowRepository:
         runtime_snapshot = validate_runtime_snapshot(
             runtime_snapshot, model_profile_id=model_profile_id, prompt_id=prompt_id,
         )
+        scoped_snapshot = {"evidence_summary": evidence_summary or {}}
+
+        def replay(existing_id: str) -> dict[str, Any]:
+            saved = self.get_run(existing_id)
+            enforce_replay_scope(saved, source_job_id, entity_id, scoped_snapshot,
+                                 code="workflow_idempotency_scope_conflict")
+            return {**saved, "idempotent_replay": True}
+
         with self.database.connect() as connection:
             existing = connection.execute("SELECT workflow_run_id FROM agent_workflow_runs WHERE actor=? AND idempotency_key=?", (actor, idempotency_key)).fetchone()
         if existing:
-            return {**self.get_run(str(existing["workflow_run_id"])), "idempotent_replay": True}
+            return replay(str(existing["workflow_run_id"]))
         definition = dict(self.get_workflow(workflow_id)["definition"])
         definition["evidence_summary"] = dict(evidence_summary or {})
         # Store only the public Profile/Connection snapshot and Prompt hash
@@ -229,7 +237,7 @@ class WorkflowRepository:
             with self.database.connect() as connection:
                 existing = connection.execute("SELECT workflow_run_id FROM agent_workflow_runs WHERE actor=? AND idempotency_key=?", (actor, idempotency_key)).fetchone()
             if existing:
-                return {**self.get_run(str(existing["workflow_run_id"])), "idempotent_replay": True}
+                return replay(str(existing["workflow_run_id"]))
             raise
         return {**self.get_run(run_id), "idempotent_replay": False}
 

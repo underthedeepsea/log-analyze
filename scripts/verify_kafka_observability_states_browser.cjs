@@ -24,6 +24,7 @@ function fixture() {
     result: { generation:1,published_at:sampled,coverage_checked_at:sampled,coverage_target_seconds:120,oldest_uncovered_commit_at:null },
     derived:{undurable_offset_gap:metric('10'),group_offset_gap:metric(null),unconfirmed_commit_offset_gap:metric(null),read_undurable_offset_gap:metric(null),batch_remaining_offset_gap:metric('0'),durable_records_per_second:{value:null,reason_code:'baseline_required'}}, next_action:null };
   if (state.mode === 'checking') sample.state.worker.reason_code='scheduler_checking';
+  if (state.mode === 'retry_backoff') { sample.state.worker.reason_code='scheduler_retry_backoff'; scheduler.phase='retry_backoff'; }
   if (state.mode === 'scheduler_stale') { sample.state.worker={status:'stale',reason_code:'scheduler_heartbeat_expired'}; scheduler.state='stale'; }
   if (state.mode === 'unknown') { sample.state.worker={status:'unknown',reason_code:'process_unverified'}; sample.worker.scheduler={state:'inactive',phase:null,last_heartbeat_at:null,owner_epoch:null}; sample.task.status='running'; }
   if (state.mode === 'normal') { sample.state.worker={status:'running',reason_code:null}; sample.worker.phase='persisting'; sample.worker.last_heartbeat_at=sampled; sample.worker.last_poll_returned_at=sampled; sample.task.status='running'; }
@@ -95,8 +96,10 @@ const server = http.createServer((request,response)=>{
     assert.match(await page.locator('.so-evidence').innerText(),/最近拉取返回\s+未知/);
     assert.match(await page.locator('.so-evidence').innerText(),/调度器 运行中 · 等待下一批 · 调度心跳/);
     assert.doesNotMatch(await page.locator('.so-health').innerText(),/消费进程\s+运行中/);
-    await change('checking'); assert.match(await page.locator('.so-health').innerText(),/调度器检查下一批/);
-    assert.match(await page.locator('.so-evidence').innerText(),/检查下一批/);
+    await change('checking'); assert.match(await page.locator('.so-health').innerText(),/调度器检查来源/);
+    assert.match(await page.locator('.so-evidence').innerText(),/检查来源/);
+    await change('retry_backoff'); assert.match(await page.locator('.so-health').innerText(),/等待重试/);
+    assert.match(await page.locator('.so-evidence').innerText(),/调度器 运行中 · 等待重试 · 调度心跳/);
     await change('scheduler_stale'); assert.match(await page.locator('.so-health').innerText(),/调度器心跳陈旧/);
     assert.match(await page.locator('.so-evidence').innerText(),/调度器心跳已过期/);
     await change('unknown'); assert.match(await page.locator('.so-diagnostic').innerText(),/任务记录存在，进程未验证/);

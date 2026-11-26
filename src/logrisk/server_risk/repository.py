@@ -2,12 +2,13 @@ from __future__ import annotations
 
 from collections import defaultdict
 from collections.abc import Iterator
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Any
 
-from logrisk.database import Database
-from logrisk.server_risk.contracts import ServerRiskError, decode, digest, json_text, typed_fields
+from logrisk.database import Database, risk_window_physical
+from logrisk.server_risk.contracts import ServerRiskError, decode, digest, json_text, typed_fields, utc
 
 PAGE_ROWS = 250
 MAX_SCOPE_ROWS = 10000
@@ -16,14 +17,39 @@ OVERVIEW_GROUP_SIZE = 128
 CommitVerifications = dict[tuple[str, str, str | None], bool]
 
 
+def _observation_identity(column: str, key: str, provider: str) -> str:
+    if provider == "postgres":
+        return f"({column}::jsonb->'identity'->>'{key}')"
+    return f"json_extract({column}, '$.identity.{key}')"
+
+
 def identity_filter(column: str, cluster: str, node_id: str, provider: str) -> tuple[str, list[str]]:
-    """Match canonical identity fields without relying on database JSON extensions."""
-    tokens = []
-    for key, value in (("cluster", cluster), ("node_id", node_id)):
-        token = json_text(key) + ":" + json_text(value)
-        tokens.append(token)
-    function = "strpos" if provider == "postgres" else "instr"
-    return function + "(" + column + ",?)>0 AND " + function + "(" + column + ",?)>0", tokens
+    fields = [_observation_identity(column, key, provider) for key in ("cluster", "node_id")]
+    return " AND ".join(f"{field}=?" for field in fields), [cluster, node_id]
+
+
+def _window_field(key: str, provider: str) -> str:
+    if provider == "postgres":
+        return f"(w.window_json->>'{key}')"
+    return f"(CASE WHEN json_valid(w.window_json) THEN json_extract(w.window_json, '$.{key}') END)"
+
+
+def _physical_token(provider: str) -> str:
+    if provider == "postgres":
+        return (
+            "ARRAY[w.window_json->>'source_namespace', COALESCE(w.window_json->>'source_batch_id',w.window_id), "
+            "w.window_json->>'window_start', COALESCE(w.window_json->>'source_item_id',w.window_json->>'raw_log_id',"
+            "w.window_json->>'template_instance_hash')]"
+        )
+    return (
+        "(CASE WHEN json_valid(w.window_json) THEN json_array("
+        "json_extract(w.window_json,'$.source_namespace'), COALESCE(json_extract(w.window_json,'$.source_batch_id'),w.window_id), "
+        "json_extract(w.window_json,'$.window_start'), COALESCE(json_extract(w.window_json,'$.source_item_id'),"
+        "json_extract(w.window_json,'$.raw_log_id'),json_extract(w.window_json,'$.template_instance_hash'))) END)"
+    )
+
+
+DateScope = tuple[datetime, datetime]
 
 
 @dataclass(frozen=True)
@@ -44,6 +70,7 @@ class _OverviewWindows:
         self.by_commit: dict[tuple[str, str], list[_IndexedWindow]] = defaultdict(list)
         self.commits: dict[tuple[str, str], dict[str, Any]] = {}
         self.scoped_physical_keys = scoped_physical_keys
+        self.related_by_node: dict[tuple[str, str], set[str]] = {}
 
     def select(self, node: tuple[str, str], physical_keys: set[str] | None) -> list[_IndexedWindow]:
         scoped = self.by_node.get(node, [])
@@ -78,15 +105,65 @@ class ServerRiskRepository:
         self.database = database
         self.assessment = None
 
-    def _recorded_node_keys(self) -> set[tuple[str, str]]:
+    def _recorded_node_keys(
+        self, bounds: DateScope | None = None, *, physical_keys: set[str] | None = None,
+    ) -> set[tuple[str, str]]:
+        provider = self.database.provider
+        obs_cluster = _observation_identity("sanitized_payload_json", "cluster", provider)
+        obs_node = _observation_identity("sanitized_payload_json", "node_id", provider)
+        legacy_filter = obs_filter = ""
+        legacy_params: tuple[Any, ...] = ()
+        obs_params: tuple[Any, ...] = ()
+        if bounds is not None:
+            left, right = bounds
+            legacy_filter = (
+                " WHERE derivation_status='current' AND last_seen>=? AND first_seen<?"
+                if provider == "postgres" else
+                " WHERE derivation_status='current' AND julianday(last_seen)>=julianday(?) AND julianday(first_seen)<=julianday(?)"
+            )
+            obs_filter = " WHERE kind='adverse' AND interval_end>=? AND interval_start<?"
+            legacy_params = ((left - timedelta(milliseconds=1)).isoformat(), right.isoformat())
+            obs_params = ((left - timedelta(seconds=1)).isoformat(), right.isoformat())
         with self.database.connect() as conn:
-            rows = conn.execute("SELECT DISTINCT cluster,node_id FROM node_risk_events ORDER BY cluster,node_id").fetchall()
-            observations = conn.execute("SELECT sanitized_payload_json FROM server_risk_observations").fetchall()
-        keys = {(row["cluster"], row["node_id"]) for row in rows}
-        for row in observations:
-            identity = decode(row["sanitized_payload_json"])["identity"]
-            keys.add((identity["cluster"], identity["node_id"]))
+            keys = {
+                (row["cluster"], row["node_id"]) for row in conn.execute(
+                    "SELECT DISTINCT cluster,node_id FROM node_risk_events" + legacy_filter, legacy_params,
+                )
+            }
+            keys.update(
+                (row["cluster"], row["node_id"]) for row in conn.execute(
+                    f"SELECT DISTINCT {obs_cluster} AS cluster,{obs_node} AS node_id FROM server_risk_observations" + obs_filter,
+                    obs_params,
+                ) if row["cluster"] and row["node_id"]
+            )
+        keys.update(self._linked_legacy_nodes(physical_keys or set()))
         return keys
+
+    def _linked_legacy_nodes(self, physical_keys: set[str]) -> dict[tuple[str, str], set[str]]:
+        result: dict[tuple[str, str], set[str]] = defaultdict(set)
+        physical = sorted(physical_keys)
+        if physical:
+            with self.database.connect() as conn:
+                for start in range(0, len(physical), PAGE_ROWS):
+                    part = physical[start:start + PAGE_ROWS]
+                    marks = ",".join("?" for _ in part)
+                    for row in conn.execute(
+                        "SELECT e.cluster,e.node_id,i.physical_key FROM node_risk_ingestions i "
+                        "JOIN node_risk_events e ON e.event_id=i.event_id "
+                        f"WHERE i.is_current=1 AND e.derivation_status='current' AND i.physical_key IN ({marks})", part,
+                    ):
+                        result[row["cluster"], row["node_id"]].add(row["physical_key"])
+        return result
+
+    def _legacy_scope(self, bounds: DateScope | None) -> tuple[str, tuple[str, ...]]:
+        if bounds is None:
+            return "", ()
+        start, end = bounds
+        if self.database.provider == "postgres":
+            query = " AND e.last_seen>=? AND e.first_seen<?"
+        else:
+            query = " AND julianday(e.last_seen)>=julianday(?) AND julianday(e.first_seen)<=julianday(?)"
+        return query, ((start - timedelta(milliseconds=1)).isoformat(), end.isoformat())
 
     @staticmethod
     def _node_rows(keys: set[tuple[str, str]]) -> list[dict[str, str]]:
@@ -96,10 +173,13 @@ class ServerRiskRepository:
 
     def nodes(self) -> list[dict[str, str]]:
         keys = self._recorded_node_keys()
-        for row in self._window_pages():
-            window = decode(row["window_json"])
-            if window.get("entity_type") == "node" and window.get("cluster") and window.get("entity_id"):
-                keys.add((window["cluster"], window["entity_id"]))
+        identity, cluster, entity = (
+            _window_field(key, self.database.provider) for key in ("entity_type", "cluster", "entity_id")
+        )
+        with self.database.connect() as conn:
+            keys.update((row["cluster"], row["node_id"]) for row in conn.execute(
+                f"SELECT DISTINCT {cluster} AS cluster,{entity} AS node_id FROM streaming_batch_windows w WHERE {identity}='node'"
+            ) if row["cluster"] and row["node_id"])
         return self._node_rows(keys)
 
     def latest_risk_times(self) -> dict[tuple[str, str], str]:
@@ -120,27 +200,48 @@ class ServerRiskRepository:
                 result[key] = max(result.get(key, ""), window["last_seen"])
         return result
 
-    def snapshot(self, cluster: str, node: str) -> Any:
-        return ReadRiskSnapshot(self, cluster, node)
+    def snapshot(self, cluster: str, node: str, *, bounds: DateScope | None = None) -> Any:
+        if bounds is None:
+            return ReadRiskSnapshot(self, cluster, node)
+        node_row = {"cluster": cluster, "node_id": node, "label": node}
+        return next(snapshot for _, snapshot in self._overview_group([node_row], {}, bounds))
 
-    def overview_snapshots(self) -> Iterator[tuple[dict[str, str], ReadRiskSnapshot]]:
-        """Share one ordered window scan and commit verification across all hosts."""
-        index = self._index_overview_windows()
+    def overview_snapshots(self, bounds: DateScope, *, query: str = "") -> Iterator[tuple[dict[str, str], ReadRiskSnapshot]]:
+        """Share one indexed date projection and commit verification across all hosts."""
+        def matches(node: dict[str, str]) -> bool:
+            return not query or query.casefold() in (node["cluster"] + " " + node["node_id"] + " " + node["label"]).casefold()
+
+        index = self._index_overview_windows(bounds=bounds)
         verifications: CommitVerifications = {}
         if index is None:
-            nodes = self.nodes()
+            keys = self._recorded_node_keys(bounds)
+            physical: set[str] = set()
+            for row in self._window_pages(bounds=bounds):
+                window = decode(row["window_json"])
+                if window.get("entity_type") == "node" and window.get("cluster") and window.get("entity_id"):
+                    keys.add((window["cluster"], window["entity_id"]))
+                key = self._physical(row, window)
+                if key:
+                    physical.add(key)
+                if len(physical) >= PAGE_ROWS:
+                    keys.update(self._recorded_node_keys(bounds, physical_keys=physical))
+                    physical.clear()
+            keys.update(self._recorded_node_keys(bounds, physical_keys=physical))
+            nodes = [node for node in self._node_rows(keys) if matches(node)]
             for start in range(0, len(nodes), OVERVIEW_GROUP_SIZE):
-                yield from self._overview_group(nodes[start:start + OVERVIEW_GROUP_SIZE], verifications)
+                yield from self._overview_group(nodes[start:start + OVERVIEW_GROUP_SIZE], verifications, bounds)
             return
-        keys = self._recorded_node_keys()
+        keys = self._recorded_node_keys(bounds) | set(index.related_by_node)
         keys.update((cluster, entity) for cluster, entity in index.by_node if cluster and entity)
         for node in self._node_rows(keys):
+            if not matches(node):
+                continue
             yield node, ReadRiskSnapshot(
-                self, node["cluster"], node["node_id"], window_index=index, commit_verifications=verifications,
+                self, node["cluster"], node["node_id"], window_index=index, commit_verifications=verifications, bounds=bounds,
             )
 
     def _overview_group(
-        self, nodes: list[dict[str, str]], verifications: CommitVerifications,
+        self, nodes: list[dict[str, str]], verifications: CommitVerifications, bounds: DateScope,
     ) -> Iterator[tuple[dict[str, str], ReadRiskSnapshot]]:
         scopes = [(node["cluster"], node["node_id"]) for node in nodes]
         filter_by_node = " OR ".join("(e.cluster=? AND e.node_id=?)" for _ in scopes)
@@ -154,24 +255,25 @@ class ServerRiskRepository:
         index = None
         if len(rows) <= MAX_OVERVIEW_WINDOWS:
             index = self._index_overview_windows(
-                nodes=set(scopes), physical_keys={row["physical_key"] for row in rows},
+                nodes=set(scopes), physical_keys={row["physical_key"] for row in rows}, bounds=bounds,
             )
         if index is None and len(nodes) > 1:
             middle = len(nodes) // 2
-            yield from self._overview_group(nodes[:middle], verifications)
-            yield from self._overview_group(nodes[middle:], verifications)
+            yield from self._overview_group(nodes[:middle], verifications, bounds)
+            yield from self._overview_group(nodes[middle:], verifications, bounds)
             return
         for node in nodes:
             yield node, ReadRiskSnapshot(
-                self, node["cluster"], node["node_id"], window_index=index, commit_verifications=verifications,
+                self, node["cluster"], node["node_id"], window_index=index, commit_verifications=verifications, bounds=bounds,
             )
 
     def _index_overview_windows(
         self, *, nodes: set[tuple[str, str]] | None = None, physical_keys: set[str] | None = None,
+        bounds: DateScope | None = None,
     ) -> _OverviewWindows | None:
         index = _OverviewWindows(physical_keys)
         retained = 0
-        for order, row in enumerate(self._window_pages()):
+        for order, row in enumerate(self._window_pages(bounds=bounds)):
             window = decode(row["window_json"])
             cluster, entity = window.get("cluster"), window.get("entity_id")
             node = (cluster, entity) if window.get("entity_type") == "node" and isinstance(cluster, str) and isinstance(entity, str) else None
@@ -196,6 +298,7 @@ class ServerRiskRepository:
                 index.by_node[node].append(item)
             if physical:
                 index.by_physical[physical].append(item)
+        index.related_by_node = self._linked_legacy_nodes(set(index.by_physical))
         return index
 
     def require_node(self, cluster: str, node_id: str) -> None:
@@ -205,23 +308,179 @@ class ServerRiskRepository:
             observed = conn.execute("SELECT 1 FROM server_risk_observations WHERE " + clause + " LIMIT 1", parameters).fetchone()
         if event or observed:
             return
-        if any(decode(row["window_json"]).get("cluster") == cluster and decode(row["window_json"]).get("entity_type") == "node" and decode(row["window_json"]).get("entity_id") == node_id for row in self._window_pages()):
-            return
+        kind, cluster_field, node_field = (
+            _window_field(key, self.database.provider) for key in ("entity_type", "cluster", "entity_id")
+        )
+        with self.database.connect() as conn:
+            if conn.execute(
+                f"SELECT 1 FROM streaming_batch_windows w WHERE {kind}='node' AND {cluster_field}=? AND {node_field}=? LIMIT 1",
+                (cluster, node_id),
+            ).fetchone():
+                return
         raise ServerRiskError("node_not_found", "节点不存在于指定集群", 404)
 
-    def observations(self, cluster: str, node_id: str, connection: Any = None) -> list[dict[str, Any]]:
+    def _observation_scope(
+        self, cluster: str, node_id: str, as_of: str | None, subject: str | None, bounds: DateScope | None = None,
+    ) -> tuple[str, list[Any]]:
         clause, parameters = identity_filter("o.sanitized_payload_json", cluster, node_id, self.database.provider)
-        query = "SELECT o.* FROM server_risk_observations o LEFT JOIN server_risk_projection_state p ON p.input_namespace='fact:' || o.source_fact_key WHERE (p.last_fact_ref IS NULL OR p.last_fact_ref=o.observation_id) AND " + clause + " ORDER BY o.interval_start,o.source_fact_key LIMIT 10001"
-        if connection is None:
-            with self.database.connect() as conn:
-                rows = conn.execute(query, parameters).fetchall()
-        else:
-            rows = connection.execute(query, parameters).fetchall()
+        if subject is not None:
+            clause = "o.subject_key=? AND " + clause
+            parameters.insert(0, subject)
+        if as_of is not None:
+            value = utc(as_of)
+            # All admitted observation endpoints are canonical UTC. Compare
+            # at microsecond precision and prune later times by indexed end.
+            bound = value.replace(microsecond=999999).isoformat()
+            clause += " AND o.interval_end<=? AND " + (
+                "o.interval_end::timestamptz<=?::timestamptz" if self.database.provider == "postgres"
+                else "CASE WHEN length(o.interval_end)=25 THEN substr(o.interval_end,1,19)||'.000000+00:00' "
+                     "ELSE o.interval_end END<=?"
+            )
+            parameters.extend((bound, value.isoformat(timespec="microseconds")))
+        if bounds is not None:
+            start, end = bounds
+            # These integer-second outer bounds only narrow the indexed SQL
+            # read; the caller still applies the exact point/interval rules.
+            clause += " AND o.interval_end>=? AND o.interval_start<?"
+            parameters.extend(((start - timedelta(seconds=1)).isoformat(), end.isoformat()))
+
+        return (
+            " FROM server_risk_observations o "
+            "LEFT JOIN server_risk_projection_state p ON p.input_namespace='fact:' || o.source_fact_key "
+            "WHERE (p.last_fact_ref IS NULL OR p.last_fact_ref=o.observation_id) AND " + clause,
+            parameters,
+        )
+
+    def observations(
+        self, cluster: str, node_id: str, connection: Any = None, *,
+        as_of: str | None = None, subject: str | None = None, bounds: DateScope | None = None,
+    ) -> list[dict[str, Any]]:
+        scope, parameters = self._observation_scope(cluster, node_id, as_of, subject, bounds)
+        query = "SELECT o.*" + scope + " ORDER BY o.interval_start,o.source_fact_key LIMIT ?"
+        with nullcontext(connection) if connection is not None else self.database.connect() as conn:
+            rows = conn.execute(query, (*parameters, MAX_SCOPE_ROWS + 1)).fetchall()
         if len(rows) > MAX_SCOPE_ROWS:
             raise ServerRiskError("query_resource_limit", "当前节点观测超过资源上限")
         return [dict(row, payload=decode(row["sanitized_payload_json"])) for row in rows]
 
-    def _window_pages(self):
+    @contextmanager
+    def current_snapshot(self) -> Iterator[Any]:
+        with self.database.connect() as conn:
+            if self.database.provider == "postgres":
+                conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
+            else:
+                conn.execute("BEGIN")
+            yield conn
+
+    def current_subjects(self, cluster: str, node_id: str, as_of: str, conn: Any) -> list[str]:
+        scope, parameters = self._observation_scope(cluster, node_id, as_of, None)
+        rows = conn.execute(
+            "SELECT DISTINCT o.subject_key" + scope + " ORDER BY o.subject_key LIMIT ?",
+            (*parameters, MAX_SCOPE_ROWS + 1),
+        ).fetchall()
+        if len(rows) > MAX_SCOPE_ROWS:
+            raise ServerRiskError("query_resource_limit", "当前节点对象数量超过资源上限")
+        return [row["subject_key"] for row in rows]
+
+    def _ordered_observations(self) -> tuple[str, str]:
+        instant = ("CASE WHEN length(o.interval_start)=25 THEN substr(o.interval_start,1,19)"
+                   "||'.000000+00:00' ELSE o.interval_start END")
+        sequence = (
+            "(o.sanitized_payload_json::jsonb->>'source_sequence')::bigint" if self.database.provider == "postgres"
+            else "json_extract(o.sanitized_payload_json,'$.source_sequence')"
+        )
+        return f"({instant})", f"({sequence})"
+
+    def iter_subject_observations(
+        self, cluster: str, node_id: str, subject: str, as_of: str, conn: Any, *,
+        after: tuple[Any, ...] = (),
+    ) -> Iterator[dict[str, Any]]:
+        scope, parameters = self._observation_scope(cluster, node_id, as_of, subject)
+        instant, sequence = self._ordered_observations()
+        fields = f"SELECT o.*,{instant} AS start_key,{sequence} AS sequence_key"
+        order = f" ORDER BY {instant},{sequence},o.observation_id LIMIT ?"
+        while True:
+            if after:
+                # Separate index seeks for the rest of this instant and then
+                # later instants. This also bounds same-time replay pages.
+                equal = conn.execute(
+                    fields + scope + f" AND {instant}=? AND {sequence}>=? "
+                    f"AND ({sequence},o.observation_id)>(?,?)" + order,
+                    (*parameters, after[0], after[1], after[1], after[2], PAGE_ROWS),
+                ).fetchall()
+                additional = PAGE_ROWS - len(equal)
+                later = conn.execute(
+                    fields + scope + f" AND {instant}>?" + order, (*parameters, after[0], additional),
+                ).fetchall() if additional else []
+                page = [*equal, *later]
+            else:
+                page = conn.execute(fields + scope + order, (*parameters, PAGE_ROWS)).fetchall()
+            for row in page:
+                yield dict(row, payload=decode(row["sanitized_payload_json"]))
+            if len(page) < PAGE_ROWS:
+                return
+            row = page[-1]
+            after = row["start_key"], row["sequence_key"], row["observation_id"]
+
+    def lock_current_scopes(self, scopes: set[tuple[str, str, str]], conn: Any) -> None:
+        if self.database.provider == "postgres":
+            for scope in sorted(scopes):
+                key = int.from_bytes(bytes.fromhex(digest(scope)[:16]), "big", signed=True)
+                conn.execute("SELECT pg_advisory_xact_lock(?)", (key,))
+
+    def valid_current_checkpoint(
+        self, cluster: str, node_id: str, subject: str, as_of: str, policy_digest: str, conn: Any,
+    ) -> dict[str, Any] | None:
+        row = conn.execute(
+            "SELECT * FROM server_risk_current_checkpoints WHERE cluster=? AND node_id=? AND subject_key=? "
+            "AND invalidated=0 AND policy_digest=?", (cluster, node_id, subject, policy_digest),
+        ).fetchone()
+        now = utc(as_of)
+        if row is None or utc(row["as_of"]) > now:
+            return None
+        if utc(row["as_of"]) < now:
+            instant, sequence = self._ordered_observations()
+            scope, params = self._observation_scope(cluster, node_id, as_of, subject)
+            # A previously admitted future interval can become as-of eligible
+            # behind the stored key even if the incoming records are ordered.
+            expiry = utc(row["as_of"])
+            exact_end = "(CASE WHEN length(o.interval_end)=25 THEN substr(o.interval_end,1,19)||'.000000+00:00' ELSE o.interval_end END)"
+            crossed = conn.execute(
+                "SELECT 1" + scope + f" AND o.interval_end>=? AND {exact_end}>? "
+                f"AND ({instant},{sequence},o.observation_id)<=(?,?,?) LIMIT 1",
+                (*params, expiry.replace(microsecond=0).isoformat(), expiry.isoformat(timespec="microseconds"),
+                 row["start_key"], row["sequence_key"], row["observation_id"]),
+            ).fetchone()
+            if crossed:
+                return None
+        state = decode(row["reducer_json"])
+        if not isinstance(state, dict) or state.get("version") != 1:
+            return None
+        return state
+
+    def active_observation_refs(self, subject: str, refs: list[str], conn: Any) -> bool:
+        for start in range(0, len(refs), PAGE_ROWS):
+            part = set(refs[start:start + PAGE_ROWS])
+            marks = ",".join("?" for _ in part)
+            found = conn.execute(
+                "SELECT COUNT(*) FROM server_risk_observations o "
+                "LEFT JOIN server_risk_projection_state p ON p.input_namespace='fact:'||o.source_fact_key "
+                "WHERE o.subject_key=? AND (p.last_fact_ref IS NULL OR p.last_fact_ref=o.observation_id) "
+                f"AND o.observation_id IN ({marks})", (subject, *sorted(part)),
+            ).fetchone()[0]
+            if found != len(part):
+                return False
+        return True
+
+    def latest_registered_adverse(self, cluster: str, node_id: str) -> str | None:
+        scope, parameters = self._observation_scope(cluster, node_id, None, None)
+        with self.database.connect() as conn:
+            return conn.execute("SELECT MAX(o.interval_end)" + scope + " AND o.kind='adverse'", parameters).fetchone()[0]
+
+    def _window_pages(self, *, bounds: DateScope | None = None):
+        if bounds is not None:
+            yield from self._dated_windows(bounds)
+            return
         after = ("", "", -1)
         with self.database.connect() as conn:
             while True:
@@ -233,17 +492,50 @@ class ServerRiskRepository:
                 last = rows[-1]
                 after = (last["task_id"], last["window_id"], last["item_index"])
 
+    def _dated_windows(self, bounds: DateScope):
+        provider = self.database.provider
+        first, last, namespace = (_window_field(key, provider) for key in ("first_seen", "last_seen", "source_namespace"))
+        time = "logrisk_iso_time" if provider == "postgres" else "julianday"
+        start, end = bounds
+        # Last/first indexes use the observed interval. Include all revisions
+        # of a physical contribution so its latest link keeps precedence.
+        token = _physical_token(provider)
+        columns = "w.task_id,w.window_id,w.item_index"
+        with self.database.connect() as conn:
+            yield from conn.execute(
+                f"WITH dated AS (SELECT {columns}, CASE WHEN {namespace}<>'' THEN {token} END AS link "
+                f"FROM streaming_batch_windows w WHERE {time}({last})>={time}(?) AND {time}({first})<={time}(?)), "
+                f"matched AS (SELECT task_id,window_id,item_index FROM dated UNION SELECT {columns} "
+                f"FROM streaming_batch_windows w WHERE {token} IN (SELECT DISTINCT link FROM dated WHERE link IS NOT NULL)) "
+                f"SELECT {columns},w.window_json,c.cursor_json,c.summary_json,c.payload_hash FROM matched m "
+                "JOIN streaming_batch_windows w ON w.task_id=m.task_id AND w.window_id=m.window_id AND w.item_index=m.item_index "
+                "JOIN streaming_window_commits c ON c.task_id=m.task_id AND c.window_id=m.window_id "
+                "ORDER BY w.task_id,w.window_id,w.item_index",
+                ((start - timedelta(milliseconds=1)).isoformat(), end.isoformat()),
+            )
+
+    def _physical_window_pages(self, keys: set[str]):
+        wanted = sorted(keys)
+        with self.database.connect() as conn:
+            for start in range(0, len(wanted), PAGE_ROWS):
+                part = wanted[start:start + PAGE_ROWS]
+                marks = ",".join("?" for _ in part)
+                yield from conn.execute(
+                    "SELECT w.task_id,w.window_id,w.item_index,w.window_json,c.cursor_json,c.summary_json,c.payload_hash "
+                    "FROM streaming_batch_windows w JOIN streaming_window_commits c ON c.task_id=w.task_id AND c.window_id=w.window_id "
+                    f"WHERE logrisk_window_physical(w.window_json,w.window_id) IN ({marks}) "
+                    "ORDER BY w.task_id,w.window_id,w.item_index", part,
+                )
+
     @staticmethod
     def _physical(row: Any, window: dict[str, Any]) -> str | None:
-        item = window.get("source_item_id") or window.get("raw_log_id") or window.get("template_instance_hash")
-        if window.get("source_namespace") and item is not None and window.get("window_start"):
-            return digest([window["source_namespace"], window.get("source_batch_id") or row["window_id"], window["window_start"], item])
-        return None
+        return risk_window_physical(window, row["window_id"])
 
     def historical_projection(
         self, cluster: str, node_id: str, physical_keys: set[str] | None = None,
         *, window_index: _OverviewWindows | None = None,
-        commit_verifications: CommitVerifications | None = None,
+        commit_verifications: CommitVerifications | None = None, bounds: DateScope | None = None,
+        physical_only: bool = False,
     ) -> dict[str, Any]:
         """Read committed facts in stable pages; never invoke old side effects."""
         from logrisk.streaming_state import StreamingIncompleteError, _stored_payload_hash
@@ -255,11 +547,17 @@ class ServerRiskRepository:
             window_index = None
         windows, linked, commits = [], {}, {}
         def matching_windows():
-            if window_index is not None:
+            if physical_only:
+                for row in self._physical_window_pages(physical_keys or set()):
+                    window = decode(row["window_json"])
+                    physical = self._physical(row, window)
+                    if physical in (physical_keys or ()):
+                        yield row, window, physical, False
+            elif window_index is not None:
                 for item in window_index.select((cluster, node_id), physical_keys):
                     yield item.row, item.window, item.physical, item.node == (cluster, node_id)
             else:
-                for row in self._window_pages():
+                for row in self._window_pages(bounds=bounds):
                     window = decode(row["window_json"])
                     physical = self._physical(row, window)
                     scoped = window.get("entity_type") == "node" and window.get("entity_id") == node_id and window.get("cluster") == cluster
@@ -278,16 +576,22 @@ class ServerRiskRepository:
         complete = True
         frontiers = []
         verified_commits = {} if commit_verifications is None else commit_verifications
-        complete_index = window_index is not None and window_index.scoped_physical_keys is None
-        needs_storage = not complete_index and any(
-            (*key, row["payload_hash"]) not in verified_commits for key, row in commits.items()
+        def complete_locally(key: tuple[str, str], row: dict[str, Any]) -> bool:
+            if window_index is None or window_index.scoped_physical_keys is not None:
+                return False
+            commit = window_index.by_commit[key]
+            return decode(row["summary_json"]).get("template_count") == len(commit)
+
+        needs_storage = any(
+            (*key, row["payload_hash"]) not in verified_commits and not complete_locally(key, row)
+            for key, row in commits.items()
         )
         with self.database.connect() if needs_storage else nullcontext() as conn:
             for key, row in commits.items():
                 revision = row["payload_hash"]
                 verification_key = (*key, revision)
                 if verification_key not in verified_commits:
-                    if complete_index:
+                    if complete_locally(key, row):
                         verified_commits[verification_key] = window_index.verify(key, row)
                     else:
                         try:
@@ -306,18 +610,86 @@ class ServerRiskRepository:
         self, cluster: str, node_id: str, connection: Any = None,
         *, observations: list[dict[str, Any]] | None = None,
         window_index: _OverviewWindows | None = None,
-        commit_verifications: CommitVerifications | None = None,
+        commit_verifications: CommitVerifications | None = None, bounds: DateScope | None = None,
+        include_registered: bool = True, recorded_as_of: str | None = None,
     ) -> list[dict[str, Any]]:
+        date_clause, values = self._legacy_scope(bounds)
         with nullcontext(connection) if connection is not None else self.database.connect() as conn:
-            events = conn.execute("SELECT * FROM node_risk_events WHERE cluster=? AND node_id=? AND derivation_status='current' ORDER BY first_seen,event_id LIMIT 10001", (cluster, node_id)).fetchall()
-            contributions = conn.execute("SELECT i.* FROM node_risk_ingestions i JOIN node_risk_events e ON e.event_id=i.event_id WHERE e.cluster=? AND e.node_id=? AND i.is_current=1 AND e.derivation_status='current' ORDER BY i.source_event_fingerprint LIMIT 10001", (cluster, node_id)).fetchall()
+            events = conn.execute(
+                "SELECT e.* FROM node_risk_events e WHERE e.cluster=? AND e.node_id=? AND e.derivation_status='current'"
+                + date_clause + " ORDER BY e.first_seen,e.event_id LIMIT ?", (cluster, node_id, *values, MAX_SCOPE_ROWS + 1),
+            ).fetchall()
+            contributions = conn.execute(
+                "SELECT i.* FROM node_risk_ingestions i JOIN node_risk_events e ON e.event_id=i.event_id "
+                "WHERE e.cluster=? AND e.node_id=? AND i.is_current=1 AND e.derivation_status='current'"
+                + date_clause + " ORDER BY i.source_event_fingerprint LIMIT ?", (cluster, node_id, *values, MAX_SCOPE_ROWS + 1),
+            ).fetchall()
+            if bounds is not None:
+                if window_index is not None:
+                    linked = window_index.related_by_node.get((cluster, node_id), set())
+                else:
+                    # At the one-node fallback the scoped window set could not
+                    # fit the in-memory share. Retain its links in bounded chunks.
+                    linked = set()
+                    pending: set[str] = set()
+                    for row in self._window_pages(bounds=bounds):
+                        physical = self._physical(row, decode(row["window_json"]))
+                        if physical:
+                            pending.add(physical)
+                        if len(pending) >= PAGE_ROWS:
+                            linked.update(self._linked_legacy_nodes(pending).get((cluster, node_id), ()))
+                            pending.clear()
+                    linked.update(self._linked_legacy_nodes(pending).get((cluster, node_id), ()))
+                extra = sorted(linked - {row["physical_key"] for row in contributions})
+                known_events = {row["event_id"] for row in events}
+                extra_events: set[str] = set()
+                for start in range(0, len(extra), PAGE_ROWS):
+                    part = extra[start:start + PAGE_ROWS]
+                    marks = ",".join("?" for _ in part)
+                    for row in conn.execute(
+                        "SELECT i.* FROM node_risk_ingestions i "
+                        f"WHERE i.is_current=1 AND i.physical_key IN ({marks})", part,
+                    ):
+                        contributions.append(row)
+                        if row["event_id"] not in known_events:
+                            extra_events.add(row["event_id"])
+                missing = sorted(extra_events)
+                for start in range(0, len(missing), PAGE_ROWS):
+                    part = missing[start:start + PAGE_ROWS]
+                    marks = ",".join("?" for _ in part)
+                    events.extend(conn.execute(
+                        f"SELECT e.* FROM node_risk_events e WHERE e.event_id IN ({marks}) "
+                        "AND e.cluster=? AND e.node_id=? AND e.derivation_status='current'",
+                        (*part, cluster, node_id),
+                    ))
         if any(len(rows) > MAX_SCOPE_ROWS for rows in (events, contributions)):
             raise ServerRiskError("query_resource_limit", "当前节点历史事实超过资源上限")
         physical_keys = {r["physical_key"] for r in contributions if r["physical_key"]}
+        selected = physical_keys if bounds is None or window_index is None else physical_keys & set(window_index.by_physical)
         projection = self.historical_projection(
-            cluster, node_id, physical_keys, window_index=window_index, commit_verifications=commit_verifications,
+            cluster, node_id, selected, window_index=window_index, commit_verifications=commit_verifications, bounds=bounds,
         )
-        if observations is None:
+        missing = physical_keys - set(projection["linked"])
+        if bounds is not None and missing:
+            linked = self.historical_projection(
+                cluster, node_id, missing, commit_verifications=commit_verifications, physical_only=True,
+            )
+            projection["linked"].update(linked["linked"])
+        if not include_registered:
+            candidates = sorted(physical_keys | {physical for _, _, physical in projection["windows"] if physical})
+            observations = []
+            scope, params = self._observation_scope(cluster, node_id, recorded_as_of, None)
+            with nullcontext(connection) if connection is not None else self.database.connect() as conn:
+                for start in range(0, len(candidates), PAGE_ROWS):
+                    part = ["committed:" + key for key in candidates[start:start + PAGE_ROWS]]
+                    marks = ",".join("?" for _ in part)
+                    observations.extend(
+                        dict(row, payload=decode(row["sanitized_payload_json"])) for row in conn.execute(
+                            "SELECT o.source_fact_key,o.sanitized_payload_json" + scope
+                            + f" AND o.source_fact_key IN ({marks})", (*params, *part),
+                        )
+                    )
+        elif observations is None:
             observations = self.observations(cluster, node_id, connection=connection)
         by_event: dict[str, list[Any]] = {}
         for row in contributions:
@@ -353,7 +725,7 @@ class ServerRiskRepository:
                 continue
             ref = "window:" + digest([row["task_id"], row["window_id"], row["item_index"], physical])
             facts.append({"fact_ref": ref, "risk_ref": ref, "subject_key": None, "episode_ref": None, "cluster": cluster, "node_id": node_id, "risk_type": semantic["risk_type"], "severity": semantic.get("severity", "high"), "object_kind": "legacy", "object_id": str(obj), "first_seen": first, "last_seen": last, "count": int(window.get("count") or 1), "time_quality": "observed_interval", "provenance": "committed_window", "typed_fields": fields, "template_ref": window.get("template_hash"), "template_text": "", "processing_status": "observed", "manual_closed_at": None})
-        for row in observations:
+        for row in observations if include_registered else ():
             payload = row["payload"]
             if payload["kind"] != "adverse":
                 continue
@@ -362,12 +734,17 @@ class ServerRiskRepository:
         return sorted(facts, key=lambda f: (f["first_seen"], f["fact_ref"]))
 
     def decisions(self, cluster: str, node_id: str) -> list[dict[str, Any]]:
-        clause, parameters = identity_filter("o.sanitized_payload_json", cluster, node_id, self.database.provider)
         with self.database.connect() as conn:
-            rows = conn.execute("SELECT d.* FROM server_risk_decisions d JOIN (SELECT DISTINCT o.subject_key FROM server_risk_observations o WHERE " + clause + ") scoped ON scoped.subject_key=d.subject_key ORDER BY d.effective_at,d.decision_id LIMIT 10001", parameters).fetchall()
+            rows = conn.execute(
+                "SELECT d.*,n.decision_id AS scoped_superseded_by FROM server_risk_decisions d "
+                "LEFT JOIN server_risk_decisions n ON n.decision_id=d.superseded_by AND n.cluster=d.cluster "
+                "AND n.node_id=d.node_id AND n.subject_key=d.subject_key "
+                "WHERE d.cluster=? AND d.node_id=? ORDER BY d.effective_at,d.decision_id LIMIT ?",
+                (cluster, node_id, MAX_SCOPE_ROWS + 1),
+            ).fetchall()
         if len(rows) > MAX_SCOPE_ROWS:
             raise ServerRiskError("query_resource_limit", "当前节点决定超过资源上限")
-        return [{"decision_ref": r["decision_id"], "episode_ref": r["episode_id"], "subject_key": r["subject_key"], "state": r["state"], "effective_at": r["effective_at"], "valid_until": r["valid_until"], "superseded_by": r["superseded_by"], "evidence_refs": decode(r["evidence_refs_json"]), "evaluation_mode": "historical" if "evaluation_mode:historical" in decode(r["reason_codes_json"]) else "current", "as_of": r["effective_at"] if "evaluation_mode:historical" in decode(r["reason_codes_json"]) else r["decided_at"]} for r in rows]
+        return [{"decision_ref": r["decision_id"], "episode_ref": r["episode_id"], "subject_key": r["subject_key"], "state": r["state"], "effective_at": r["effective_at"], "valid_until": r["valid_until"], "superseded_by": r["scoped_superseded_by"], "evidence_refs": decode(r["evidence_refs_json"]), "evaluation_mode": "historical" if "evaluation_mode:historical" in decode(r["reason_codes_json"]) else "current", "as_of": r["effective_at"] if "evaluation_mode:historical" in decode(r["reason_codes_json"]) else r["decided_at"]} for r in rows]
 
     def scores(self, cluster: str, node_id: str) -> list[dict[str, Any]]:
         with self.database.connect() as conn:
@@ -390,25 +767,38 @@ class ReadRiskSnapshot:
     def __init__(
         self, repository: ServerRiskRepository, cluster: str, node: str,
         *, window_index: _OverviewWindows | None = None,
-        commit_verifications: CommitVerifications | None = None,
+        commit_verifications: CommitVerifications | None = None, bounds: DateScope | None = None,
     ) -> None:
         from logrisk.server_risk.assessment import AssessmentService
         self.database = repository.database
-        self._observations = repository.observations(cluster, node)
-        if window_index is None and commit_verifications is None:
+        self.repository = repository
+        self.bounds = bounds
+        self._observations = repository.observations(cluster, node, bounds=bounds)
+        if window_index is None and commit_verifications is None and bounds is None:
             self._facts = repository.facts(cluster, node)
             self._projection = repository.historical_projection(cluster, node)
         else:
             self._facts = repository.facts(
                 cluster, node, observations=self._observations, window_index=window_index,
-                commit_verifications=commit_verifications,
+                commit_verifications=commit_verifications, bounds=bounds,
             )
             self._projection = repository.historical_projection(
-                cluster, node, window_index=window_index, commit_verifications=commit_verifications,
+                cluster, node, window_index=window_index, commit_verifications=commit_verifications, bounds=bounds,
             )
-        self._scores = repository.scores(cluster, node)
-        self._decisions = repository.decisions(cluster, node)
+        self._scores = repository.scores(cluster, node) if bounds is None else []
+        self._decisions = repository.decisions(cluster, node) if bounds is None else []
         self.assessment = AssessmentService(self, repository.assessment.policies, repository.assessment.clock) if repository.assessment is not None else None
+
+    def overview_checks(self, cluster: str, node: str) -> list[dict[str, Any]]:
+        if self.assessment is None:
+            return []
+        if self.bounds is None:
+            return self.assessment.evaluate(cluster, node)["checks"]
+        now = utc(self.assessment.clock())
+        subjects = {row["subject_key"] for row in self._observations if row["kind"] == "adverse"}
+        with self.repository.current_snapshot() as conn:
+            checks = [self.repository.assessment.current_subject(cluster, node, subject, now, conn)[0] for subject in sorted(subjects)]
+        return [check for check in checks if check]
 
     def observations(self, *_args: Any, **_kwargs: Any) -> list[dict[str, Any]]:
         return self._observations

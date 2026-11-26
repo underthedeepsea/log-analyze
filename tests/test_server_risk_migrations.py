@@ -36,7 +36,10 @@ def test_empty_and_old_upgrade_preserve_seed_default_and_user_profile(tmp_path):
         assert conn.execute("SELECT COUNT(*) FROM schema_migrations WHERE version='0032'").fetchone()[0] == 1
     empty = SQLiteDatabase(tmp_path / "empty.sqlite3")
     with empty.connect() as conn:
-        assert len(conn.execute("SELECT name FROM sqlite_master WHERE name LIKE 'server_risk_%' AND type='table'").fetchall()) == 5
+        assert {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE name LIKE 'server_risk_%' AND type='table'")} == {
+            "server_risk_observations", "server_risk_projection_state", "server_risk_episodes",
+            "server_risk_decisions", "server_risk_reports", "server_risk_current_checkpoints",
+        }
 
 
 def test_old_database_missing_ling_gets_nondefault_seed(tmp_path):

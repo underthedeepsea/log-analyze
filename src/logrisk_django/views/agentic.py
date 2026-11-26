@@ -5,8 +5,9 @@ import json
 from django.http import HttpRequest, JsonResponse
 from django.views.decorators.http import require_GET, require_POST
 
+from logrisk.feature_jobs import FeatureJobError
 from logrisk.agentic import AgentRunRequest, AgenticError
-from logrisk.agentic.models import validate_run_scope
+from logrisk.agentic.models import evidence_selection, scoped_evidence_summary, validate_run_scope
 from logrisk.orchestration import AirflowOrchestratorError
 from logrisk_django.service_factory import get_agent_airflow_orchestrator, get_config, get_container
 from logrisk_django.views.access import require_django_write_access
@@ -55,7 +56,7 @@ def create_agent_run(request: HttpRequest) -> JsonResponse:
             raise AgenticError("请求体必须是 JSON object")
         container = get_container()
         source_job_id, entity_id = validate_run_scope(payload.get("source_job_id"), payload.get("entity_id"))
-        evidence = container.feature_jobs.get_agent_evidence(source_job_id, entity_id)
+        evidence = container.feature_jobs.get_agent_evidence(source_job_id, entity_id, **evidence_selection(payload))
         profile = container.model_profiles.get(payload.get("model_profile_id"))
         connection = container.connections.get(profile.connection_id)
         prompt = container.prompt_registry.load(str(payload.get("prompt_id") or "agent_plan_v1"))
@@ -71,7 +72,7 @@ def create_agent_run(request: HttpRequest) -> JsonResponse:
             idempotency_key=key, actor=identity.actor or "unknown", roles=tuple(identity.roles), request_id=identity.request_id,
         ), locked_snapshot={
             "schema_version": "1.0", "goal": str(payload.get("goal") or "提取可审批日志特征"),
-            "evidence_summary": {"entity": evidence["entity"], "risk_score": evidence["risk_score"], "template_count": len(evidence["templates"])},
+            "evidence_summary": scoped_evidence_summary(evidence),
             "profile_snapshot": profile.public_dict(), "connection_snapshot": connection,
             "prompt_id": prompt.prompt_id, "prompt_sha256": prompt.sha256,
         })
@@ -91,6 +92,9 @@ def create_agent_run(request: HttpRequest) -> JsonResponse:
         return JsonResponse({"code": "invalid_json", "error": "请求体必须是 JSON object"}, status=400)
     except AgenticError as exc:
         return _error(exc)
+    except FeatureJobError as exc:
+        return JsonResponse({"code": getattr(exc, "code", "agent_evidence_invalid"), "error": str(exc)},
+                            status=getattr(exc, "status_code", 422), json_dumps_params={"ensure_ascii": False})
     except AirflowOrchestratorError as exc:
         return JsonResponse({"code": exc.code, "error": str(exc)}, status=exc.status_code, json_dumps_params={"ensure_ascii": False})
     except (KeyError, TypeError, ValueError) as exc:

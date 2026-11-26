@@ -2,9 +2,11 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 from datetime import timedelta
+from collections.abc import Callable
 from typing import Any
 
-from logrisk.server_risk.contracts import ServerRiskError, TYPED_FIELDS, digest, identifier, integer, json_text, strict_object, typed_fields, utc
+from logrisk.server_risk.contracts import ServerRiskError, TYPED_FIELDS, decode, digest, identifier, integer, json_text, strict_object, typed_fields, utc
+from logrisk.server_risk.replay import EvaluationContext
 
 BATCH_FIELDS = {"schema_version", "source_id", "source_epoch", "config_revision", "batch_id", "idempotency_key", "mode", "observations"}
 OBS_FIELDS = {"identity", "kind", "signal_code", "risk_type", "occurred_at", "interval_start", "interval_end", "source_sequence", "source_position_ref", "count", "typed_fields", "template_ref", "evidence_refs", "coverage"}
@@ -31,31 +33,45 @@ class ObservationService:
             raise ServerRiskError("observation_batch_limit", "观测批次必须为1至500条")
         now, batch_digest = self.clock(), digest(payload)
         receipt_key = "batch:" + digest([payload["source_id"], payload["idempotency_key"]])
-        with nullcontext(connection) if connection is not None else self.repository.database.connect() as conn:
-            previous = conn.execute("SELECT input_revision,status FROM server_risk_projection_state WHERE input_namespace=?", (receipt_key,)).fetchone()
-        if previous:
-            if previous["input_revision"] != batch_digest:
-                raise ServerRiskError("observation_idempotency_conflict", "观测幂等键内容不同", 409)
-            return {"schema_version": "server_risk_observation_receipt_v1", "batch_id": payload["batch_id"], "idempotent_replay": True, "projection_complete": previous["status"] == "complete"}
-        validated = [self.validate(item, payload, source, now) for item in payload["observations"]]
-        if physical_keys is not None:
-            if len(physical_keys) != len(validated):
-                raise ServerRiskError("commit_identity_invalid", "物理贡献与观测数量不一致")
-            for item, physical in zip(validated, physical_keys):
-                item["source_fact_key"] = "committed:" + physical
-                item["observation_id"] = digest([item["source_fact_key"], source["config_revision"]])
-        if len({item["source_fact_key"] for item in validated}) != len(validated):
-            raise ServerRiskError("observation_duplicate_fact", "同批次来源事实重复")
-        subjects = {(item["payload"]["identity"]["cluster"], item["payload"]["identity"]["node_id"]) for item in validated}
+        lock = " FOR UPDATE" if self.repository.database.provider == "postgres" else ""
         with nullcontext(connection) if connection is not None else self.repository.database.transaction() as conn:
-            admitted = conn.execute("INSERT INTO server_risk_projection_state(input_namespace,input_revision,status,updated_at) VALUES (?,?,'pending',?) ON CONFLICT(input_namespace) DO NOTHING", (receipt_key, batch_digest, now))
-            lock = " FOR UPDATE" if getattr(self.repository.database, "provider", "sqlite") == "postgres" else ""
-            saved = conn.execute("SELECT input_revision,status FROM server_risk_projection_state WHERE input_namespace=?" + lock, (receipt_key,)).fetchone()
+            admitted = conn.execute(
+                "INSERT INTO server_risk_projection_state(input_namespace,input_revision,status,updated_at) "
+                "VALUES (?,?,'pending',?) ON CONFLICT(input_namespace) DO NOTHING", (receipt_key, batch_digest, now),
+            )
+            saved = conn.execute(
+                "SELECT input_revision,status FROM server_risk_projection_state WHERE input_namespace=?" + lock,
+                (receipt_key,),
+            ).fetchone()
             if saved["input_revision"] != batch_digest:
                 raise ServerRiskError("observation_idempotency_conflict", "观测幂等键内容不同", 409)
             if admitted.rowcount != 1:
-                return {"schema_version": "server_risk_observation_receipt_v1", "batch_id": payload["batch_id"], "idempotent_replay": True, "projection_complete": saved["status"] == "complete"}
+                complete = saved["status"] == "complete" and self.resume_projection(
+                    conn, receipt_key, batch_digest, now, retry=not defer_persist,
+                )
+                return {"schema_version": "server_risk_observation_receipt_v1", "batch_id": payload["batch_id"], "idempotent_replay": True, "projection_complete": complete}
+            validated = [self.validate(item, payload, source, now) for item in payload["observations"]]
+            if physical_keys is not None:
+                if len(physical_keys) != len(validated):
+                    raise ServerRiskError("commit_identity_invalid", "物理贡献与观测数量不一致")
+                for item, physical in zip(validated, physical_keys):
+                    item["source_fact_key"] = "committed:" + physical
+                    item["observation_id"] = digest([item["source_fact_key"], source["config_revision"]])
+            if len({item["source_fact_key"] for item in validated}) != len(validated):
+                raise ServerRiskError("observation_duplicate_fact", "同批次来源事实重复")
+            subjects = {(item["payload"]["identity"]["cluster"], item["payload"]["identity"]["node_id"], item["subject_key"]) for item in validated}
+            affected_from: dict[tuple[str, str, str], str] = {}
+            new_keys: dict[tuple[str, str, str], tuple[str, int, str]] = {}
+            self.repository.lock_current_scopes(subjects, conn)
             for item in validated:
+                identity = item["payload"]["identity"]
+                scope = (identity["cluster"], identity["node_id"], item["subject_key"])
+                if not defer_persist:
+                    earliest = conn.execute(
+                        "SELECT MIN(interval_end) FROM server_risk_observations WHERE source_fact_key=? AND subject_key=?",
+                        (item["source_fact_key"], item["subject_key"]),
+                    ).fetchone()[0]
+                    affected_from[scope] = min(filter(None, (earliest, item["end"], affected_from.get(scope))), key=utc)
                 old = conn.execute("SELECT payload_digest FROM server_risk_observations WHERE source_fact_key=? AND semantic_revision=?", (item["source_fact_key"], payload["config_revision"])).fetchone()
                 if old and old["payload_digest"] != item["payload_digest"]:
                     raise ServerRiskError("observation_fact_conflict", "相同来源事实版本内容不同", 409)
@@ -63,13 +79,121 @@ class ObservationService:
                 actual = conn.execute("SELECT observation_id,payload_digest FROM server_risk_observations WHERE source_fact_key=? AND semantic_revision=?" + lock, (item["source_fact_key"], payload["config_revision"])).fetchone()
                 if actual["payload_digest"] != item["payload_digest"]:
                     raise ServerRiskError("observation_fact_conflict", "相同来源事实版本内容不同", 409)
+                previous_fact = conn.execute(
+                    "SELECT o.subject_key,o.sanitized_payload_json FROM server_risk_projection_state p "
+                    "JOIN server_risk_observations o ON o.observation_id=p.last_fact_ref "
+                    "WHERE p.input_namespace=? AND p.last_fact_ref<>?",
+                    ("fact:" + item["source_fact_key"], actual["observation_id"]),
+                ).fetchone()
+                if previous_fact:
+                    old_identity = decode(previous_fact["sanitized_payload_json"])["identity"]
+                    conn.execute(
+                        "UPDATE server_risk_current_checkpoints SET invalidated=1 "
+                        "WHERE cluster=? AND node_id=? AND subject_key=?",
+                        (old_identity["cluster"], old_identity["node_id"], previous_fact["subject_key"]),
+                    )
+                if not old or previous_fact:
+                    key = (utc(item["start"]).isoformat(timespec="microseconds"),
+                           item["payload"]["source_sequence"], actual["observation_id"])
+                    new_keys[scope] = min(key, new_keys.get(scope, key))
                 conn.execute("INSERT INTO server_risk_projection_state(input_namespace,input_revision,last_fact_ref,status,updated_at) VALUES (?,?,?,'complete',?) ON CONFLICT(input_namespace) DO UPDATE SET input_revision=excluded.input_revision,last_fact_ref=excluded.last_fact_ref,updated_at=excluded.updated_at", ("fact:" + item["source_fact_key"], payload["config_revision"], item["observation_id"], now))
-            # This frontier proves only this module processed the registered batch.
-            conn.execute("UPDATE server_risk_projection_state SET last_fact_ref=?,evaluated_through=?,status='complete',updated_at=? WHERE input_namespace=? AND input_revision=?", (validated[-1]["observation_id"], max(item["end"] for item in validated), now, receipt_key, batch_digest))
-            if not defer_persist:
-                for cluster, node in subjects:
-                    self.assessment.persist(cluster, node, conn, now, context=context)
-        return {"schema_version": "server_risk_observation_receipt_v1", "batch_id": payload["batch_id"], "idempotent_replay": False, "accepted_count": len(validated), "projection_complete": True}
+            for scope, key in sorted(new_keys.items()):
+                conn.execute(
+                    "UPDATE server_risk_current_checkpoints SET invalidated=1 WHERE cluster=? AND node_id=? "
+                    "AND subject_key=? AND (start_key,sequence_key,observation_id)>=(?,?,?)",
+                    (*scope, *key),
+                )
+            # This frontier proves that the facts were admitted. Evaluating
+            # a future-dated fact is a separate, resumable obligation.
+            end = max((item["end"] for item in validated), key=utc)
+            conn.execute("UPDATE server_risk_projection_state SET last_fact_ref=?,evaluated_through=?,status='complete',updated_at=? WHERE input_namespace=? AND input_revision=?", (validated[-1]["observation_id"], end, now, receipt_key, batch_digest))
+            assessment_complete = defer_persist or self.project_admitted(
+                conn, receipt_key, batch_digest, now, end, affected_from, context=context,
+            )
+        return {"schema_version": "server_risk_observation_receipt_v1", "batch_id": payload["batch_id"], "idempotent_replay": False, "accepted_count": len(validated), "projection_complete": assessment_complete}
+
+    def project_admitted(
+        self, conn: Any, receipt_key: str, revision: str, now: str, evidence_end: str | None,
+        scopes: dict[tuple[str, str, str], str | None], *, context: EvaluationContext | None = None,
+        commit: dict[str, Any] | None = None, before_scope: Callable[[str, str], None] | None = None,
+        resumed: bool = False,
+    ) -> bool:
+        as_of = context.as_of if context is not None else now
+        effective = utc(as_of)
+        complete = evidence_end is None or utc(evidence_end) <= effective
+        self.repository.lock_current_scopes(set(scopes), conn)
+        for (cluster, node, subject), affected in sorted(scopes.items()):
+            if affected is not None and utc(affected) > effective:
+                complete = False
+                continue
+            if before_scope is not None:
+                before_scope(cluster, node)
+            evaluated = self.assessment.persist(
+                cluster, node, conn, now, context=context, subject=subject, input_revision=revision,
+                affected_from=affected,
+            )
+            complete = complete and evaluated
+        projection_key = "assessment-" + receipt_key
+        if complete:
+            if resumed:
+                conn.execute(
+                    "UPDATE server_risk_projection_state SET status='complete',updated_at=? "
+                    "WHERE input_namespace=? AND input_revision=? AND status='pending'", (now, projection_key, revision),
+                )
+        else:
+            plan = {"version": 1, "scopes": [[*scope, affected] for scope, affected in sorted(scopes.items())]}
+            if context is not None:
+                plan["context"] = {"mode": context.mode, "as_of": context.as_of}
+            if commit is not None:
+                plan["commit"] = commit
+            due_at = utc(evidence_end or as_of).isoformat(timespec="microseconds")
+            conn.execute(
+                "INSERT INTO server_risk_projection_state(input_namespace,input_revision,last_fact_ref,"
+                "evaluated_through,status,updated_at) VALUES (?,?,?,?,'pending',?) "
+                "ON CONFLICT(input_namespace) DO NOTHING", (projection_key, revision, json_text(plan), due_at, now),
+            )
+        return complete
+
+    def resume_projection(
+        self, conn: Any, receipt_key: str, revision: str, now: str, *, retry: bool = True,
+        before_scope: Callable[[str, str], None] | None = None,
+    ) -> bool:
+        row = conn.execute(
+            "SELECT input_revision,last_fact_ref,evaluated_through,status FROM server_risk_projection_state "
+            "WHERE input_namespace=?", ("assessment-" + receipt_key,),
+        ).fetchone()
+        if row is None:
+            return True
+        if revision != row["input_revision"]:
+            return False
+        if row["status"] == "complete":
+            return True
+        if row["status"] != "pending" or not retry or not row["last_fact_ref"] or not row["evaluated_through"]:
+            return False
+        try:
+            plan = decode(row["last_fact_ref"])
+            if plan.get("version") != 1:
+                return False
+            fixed = plan.get("context")
+            context = EvaluationContext(**fixed) if fixed is not None else None
+            as_of = context.as_of if context is not None else now
+            if utc(row["evaluated_through"]) > utc(as_of):
+                return False
+            scopes = {(cluster, node, subject): affected for cluster, node, subject, affected in plan["scopes"]}
+            if not scopes:
+                return False
+        except (AttributeError, KeyError, TypeError, ValueError):
+            return False
+        return self.project_admitted(
+            conn, receipt_key, revision, now, row["evaluated_through"], scopes, context=context,
+            commit=plan.get("commit"), before_scope=before_scope, resumed=True,
+        )
+
+    @staticmethod
+    def subject_key(source: dict[str, Any], item: dict[str, Any]) -> str:
+        identity = item["identity"]
+        return digest([source["environment"], identity["cluster"], identity.get("node_uid") or identity["node_id"],
+                       item["risk_type"], identity["object_kind"], identity["object_id"]])
 
     def validate(self, item: Any, batch: dict[str, Any], source: dict[str, Any], now: str) -> dict[str, Any]:
         strict_object(item, OBS_FIELDS, {"identity", "kind", "signal_code", "risk_type", "source_sequence", "source_position_ref", "typed_fields"})
@@ -149,6 +273,6 @@ class ObservationService:
             safe["coverage"] = dict(coverage)
         elif "coverage" in item:
             raise ServerRiskError("invalid_schema", "非coverage不能声明覆盖")
-        subject = digest([source["environment"], identity["cluster"], identity.get("node_uid") or identity["node_id"], item["risk_type"], identity["object_kind"], identity["object_id"]])
+        subject = self.subject_key(source, item)
         physical = digest([source["source_id"], source["source_epoch"], item["source_sequence"], item["source_position_ref"]])
         return {"observation_id": digest([physical, source["config_revision"]]), "source_fact_key": physical, "subject_key": subject, "start": start.isoformat(), "end": end.isoformat(), "payload": safe, "payload_digest": digest(safe)}

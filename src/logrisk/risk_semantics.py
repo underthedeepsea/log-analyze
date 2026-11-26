@@ -6,6 +6,7 @@ import json
 import re
 import threading
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
@@ -184,6 +185,92 @@ def validate_rule(raw: Any) -> dict[str, Any]:
     return rule
 
 
+@dataclass(frozen=True)
+class RiskSemanticSnapshot:
+    """Active rule content pinned for one batch."""
+
+    revision: str
+    _rules: tuple[dict[str, Any], ...]
+
+    def effective_rules(self) -> list[dict[str, Any]]:
+        return copy.deepcopy(list(self._rules))
+
+    @staticmethod
+    def _applies(rule: dict[str, Any], record: dict[str, Any]) -> bool:
+        match = rule["match"]
+        sources = {str(item).lower() for item in match.get("source_types") or []}
+        components = {str(item).lower() for item in match.get("components") or []}
+        source = str(record.get("source_type") or "unknown").lower()
+        component = str(record.get("component") or "unknown").lower()
+        return (not sources or source in sources) and (not components or component in components)
+
+    @staticmethod
+    def _fields(rule: dict[str, Any], match: re.Match[str], message: str) -> dict[str, Any]:
+        fields: dict[str, Any] = {}
+        groups = match.groupdict()
+        for name, spec in rule.get("extract", {}).items():
+            value = groups.get(str(spec.get("from_group") or ""))
+            if value is None and spec.get("regex"):
+                found = re.search(str(spec["regex"]), message)
+                value = found.group(1) if found else None
+            if value is None:
+                if not spec.get("optional"):
+                    continue
+                continue
+            if spec.get("type") == "integer":
+                value = int(value)
+            elif spec.get("normalize") == "pci_bdf":
+                value = str(value).strip().lower()
+            fields[name] = value
+        return fields
+
+    @staticmethod
+    def _matching_message(record: dict[str, Any]) -> str:
+        message = str(record.get("message_core") or record.get("template") or "")
+        if record.get("component") != "systemd" or message.count("<SYSTEMD_UNIT>") != 1:
+            return message
+        unit = (record.get("semantic_fields") or {}).get("unit")
+        if isinstance(unit, list):
+            if len(unit) != 1 or not isinstance(unit[0], dict) or unit[0].get("count") != record.get("count"):
+                return message
+            unit = unit[0].get("value")
+        if not isinstance(unit, str) or not re.fullmatch(
+            r"[A-Za-z0-9_@.-]+\.(?:service|socket|target|mount|automount|swap|timer|path|scope|slice)", unit,
+        ):
+            return message
+        return message.replace("<SYSTEMD_UNIT>", unit)
+
+    def match(self, record: dict[str, Any]) -> dict[str, Any]:
+        message = self._matching_message(record)
+        for rule in self._rules:
+            if not self._applies(rule, record):
+                continue
+            for pattern in rule["match"]["message_regex"]:
+                found = re.search(pattern, message)
+                if not found:
+                    continue
+                classification = rule["classification"]
+                return {
+                    "schema_version": "semantic_event_v1",
+                    "semantic_rule_id": rule["id"],
+                    "semantic_rule_version": rule["version"],
+                    "domain": rule["domain"],
+                    "category": rule["category"],
+                    "risk_type": rule["risk_type"],
+                    "risk_subtype": rule.get("risk_subtype"),
+                    "severity": classification["default_severity"],
+                    "base_score": float(classification["base_score"]),
+                    "confidence": float(classification["confidence"]),
+                    "semantic_fields": self._fields(rule, found, message),
+                    "dedup": copy.deepcopy(rule["dedup"]),
+                    "lifecycle": copy.deepcopy(rule["lifecycle"]),
+                    "hard_override": copy.deepcopy(classification.get("hard_override")),
+                    "recommendation": copy.deepcopy(rule.get("recommendation") or {}),
+                    "tags": list(rule.get("tags") or []),
+                }
+        raise RiskSemanticError("未命中风险语义", code="semantic_unclassified", status_code=404)
+
+
 class RiskSemanticService:
     def __init__(
         self,
@@ -196,7 +283,7 @@ class RiskSemanticService:
         self.builtin_path = Path(builtin_path)
         self.clock = clock
         self._lock = threading.RLock()
-        self._effective: tuple[dict[str, Any], ...] = ()
+        self._snapshot = RiskSemanticSnapshot("", ())
         self._seed_builtins()
         self.reload()
 
@@ -255,109 +342,38 @@ class RiskSemanticService:
             raise RiskSemanticError("风险语义不存在", code="semantic_not_found", status_code=404)
         return self._row(row)
 
+    def snapshot(self) -> RiskSemanticSnapshot:
+        # Read the version and its content in one statement. The returned
+        # object stays pinned even if another Worker publishes during the batch.
+        with self._lock, self.database.connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM risk_semantic_rules WHERE status='published' AND enabled=TRUE ORDER BY rule_id"
+            ).fetchall()
+            overrides = {row["override_of"] for row in rows if row["override_of"]}
+            effective = [
+                row for row in rows
+                if (row["source"] == "builtin" and row["rule_id"] not in overrides)
+                or row["override_of"] or row["source"] in {"user", "imported"}
+            ]
+            revision = _hash([
+                (row["rule_id"], int(row["current_version"]), row["content_hash"]) for row in effective
+            ])[:16]
+            if revision != self._snapshot.revision:
+                rules = [validate_rule(self._row(row)) for row in effective]
+                rules.sort(key=lambda item: (item["priority"], 0 if item.get("override_of") else 1, item["id"]))
+                self._snapshot = RiskSemanticSnapshot(revision, tuple(rules))
+            return self._snapshot
+
     def reload(self) -> dict[str, Any]:
-        with self._lock:
-            rules = self.list_rules()
-            overrides = {
-                rule["override_of"]: rule
-                for rule in rules
-                if rule.get("override_of") and rule["status"] == "published" and rule["enabled"]
-            }
-            effective = []
-            for rule in rules:
-                if rule["status"] != "published" or not rule["enabled"]:
-                    continue
-                if rule["source"] == "builtin" and rule["id"] in overrides:
-                    continue
-                if rule.get("override_of") or rule["source"] == "builtin":
-                    effective.append(validate_rule(rule))
-                elif rule["source"] in {"user", "imported"}:
-                    effective.append(validate_rule(rule))
-            effective.sort(key=lambda item: (int(item.get("priority") or 100), 0 if item.get("override_of") else 1, item["id"]))
-            self._effective = tuple(copy.deepcopy(effective))
-            version = _hash([(item["id"], item["version"], item["content_hash"]) for item in effective])[:16]
-            return {"schema_version": "risk_semantic_registry_v1", "registry_version": version, "rule_count": len(effective)}
+        snapshot = self.snapshot()
+        return {"schema_version": "risk_semantic_registry_v1", "registry_version": snapshot.revision,
+                "rule_count": len(snapshot._rules)}
 
     def effective_rules(self) -> list[dict[str, Any]]:
-        with self._lock:
-            return copy.deepcopy(list(self._effective))
-
-    @staticmethod
-    def _applies(rule: dict[str, Any], record: dict[str, Any]) -> bool:
-        match = rule["match"]
-        sources = {str(item).lower() for item in match.get("source_types") or []}
-        components = {str(item).lower() for item in match.get("components") or []}
-        source = str(record.get("source_type") or "unknown").lower()
-        component = str(record.get("component") or "unknown").lower()
-        return (not sources or source in sources) and (not components or component in components)
-
-    @staticmethod
-    def _fields(rule: dict[str, Any], match: re.Match[str], message: str) -> dict[str, Any]:
-        fields: dict[str, Any] = {}
-        groups = match.groupdict()
-        for name, spec in rule.get("extract", {}).items():
-            value = groups.get(str(spec.get("from_group") or ""))
-            if value is None and spec.get("regex"):
-                found = re.search(str(spec["regex"]), message)
-                value = found.group(1) if found else None
-            if value is None:
-                if not spec.get("optional"):
-                    continue
-                continue
-            if spec.get("type") == "integer":
-                value = int(value)
-            elif spec.get("normalize") == "pci_bdf":
-                value = str(value).strip().lower()
-            fields[name] = value
-        return fields
-
-    @staticmethod
-    def _matching_message(record: dict[str, Any]) -> str:
-        message = str(record.get("message_core") or record.get("template") or "")
-        if record.get("component") != "systemd" or message.count("<SYSTEMD_UNIT>") != 1:
-            return message
-        unit = (record.get("semantic_fields") or {}).get("unit")
-        if isinstance(unit, list):
-            if len(unit) != 1 or not isinstance(unit[0], dict) or unit[0].get("count") != record.get("count"):
-                return message
-            unit = unit[0].get("value")
-        if not isinstance(unit, str) or not re.fullmatch(
-            r"[A-Za-z0-9_@.-]+\.(?:service|socket|target|mount|automount|swap|timer|path|scope|slice)", unit,
-        ):
-            return message
-        return message.replace("<SYSTEMD_UNIT>", unit)
+        return self.snapshot().effective_rules()
 
     def match(self, record: dict[str, Any]) -> dict[str, Any]:
-        message = self._matching_message(record)
-        with self._lock:
-            rules = self._effective
-        for rule in rules:
-            if not self._applies(rule, record):
-                continue
-            for pattern in rule["match"]["message_regex"]:
-                found = re.search(pattern, message)
-                if not found:
-                    continue
-                classification = rule["classification"]
-                return {
-                    "schema_version": "semantic_event_v1",
-                    "semantic_rule_id": rule["id"],
-                    "semantic_rule_version": rule["version"],
-                    "domain": rule["domain"],
-                    "category": rule["category"],
-                    "risk_type": rule["risk_type"],
-                    "risk_subtype": rule.get("risk_subtype"),
-                    "severity": classification["default_severity"],
-                    "base_score": float(classification["base_score"]),
-                    "confidence": float(classification["confidence"]),
-                    "semantic_fields": self._fields(rule, found, message),
-                    "dedup": copy.deepcopy(rule["dedup"]),
-                    "lifecycle": copy.deepcopy(rule["lifecycle"]),
-                    "hard_override": copy.deepcopy(classification.get("hard_override")),
-                    "recommendation": copy.deepcopy(rule.get("recommendation") or {}),
-                    "tags": list(rule.get("tags") or []),
-                }
-        raise RiskSemanticError("未命中风险语义", code="semantic_unclassified", status_code=404)
+        return self.snapshot().match(record)
 
     def _test(self, rule: dict[str, Any]) -> dict[str, Any]:
         errors = []
@@ -432,8 +448,9 @@ class RiskSemanticService:
         with self.database.transaction() as connection:
             result = connection.execute(
                 "UPDATE risk_semantic_rules SET status='draft', enabled=?, current_version=?, content_json=?, content_hash=?, updated_at=? "
-                "WHERE rule_id=? AND current_version=?",
-                (bool(updated["enabled"]), version, _json(updated), _hash(updated), now, rule_id, expected_version),
+                "WHERE rule_id=? AND current_version=? AND content_hash=? AND status=? AND enabled=?",
+                (bool(updated["enabled"]), version, _json(updated), _hash(updated), now,
+                 rule_id, expected_version, current["content_hash"], current["status"], current["enabled"]),
             )
             if result.rowcount != 1:
                 raise RiskSemanticError("语义版本冲突", code="version_conflict", status_code=409)
@@ -455,17 +472,24 @@ class RiskSemanticService:
         if not report["valid"]:
             raise RiskSemanticError("发布前验证失败: " + "；".join(report["errors"]))
         now = self.clock()
+        published = dict(current, status="published", enabled=True, updated_at=now)
         with self.database.transaction() as connection:
+            updated = connection.execute(
+                "UPDATE risk_semantic_rules SET status='published', enabled=TRUE, updated_at=? "
+                "WHERE rule_id=? AND current_version=? AND content_hash=? AND status=? AND enabled=?",
+                (now, rule_id, current["version"], current["content_hash"], current["status"], current["enabled"]),
+            )
+            if updated.rowcount != 1:
+                raise RiskSemanticError("语义版本冲突", code="version_conflict", status_code=409)
             connection.execute(
                 "INSERT INTO risk_semantic_validations(rule_id, version, valid, validation_json, content_hash, created_at) "
                 "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(rule_id, version) DO UPDATE SET valid=excluded.valid, "
                 "validation_json=excluded.validation_json, content_hash=excluded.content_hash, created_at=excluded.created_at",
                 (rule_id, current["version"], True, _json(report), current["content_hash"], now),
             )
-            connection.execute("UPDATE risk_semantic_rules SET status='published', enabled=TRUE, updated_at=? WHERE rule_id=?", (now, rule_id))
-            self._audit(connection, rule_id, "published", current["version"], current["version"], current, dict(current, status="published"), operator, reason, now)
-        self.reload()
-        return self.get_rule(rule_id)
+            self._audit(connection, rule_id, "published", current["version"], current["version"],
+                        current, published, operator, reason, now)
+        return published
 
     def restore_default(self, builtin_id: str, *, expected_version: int, confirmed: bool, operator: str, reason: str) -> dict[str, Any]:
         if confirmed is not True:
@@ -529,7 +553,7 @@ class RiskSemanticService:
                 "sample": sample,
                 "expected": expected,
                 "matched": matched,
-                "semantic_fields": self._fields(rule, found, sample) if found else {},
+                "semantic_fields": RiskSemanticSnapshot._fields(rule, found, sample) if found else {},
                 "risk_type": rule["risk_type"] if found else None,
                 "severity": rule["classification"]["default_severity"] if found else None,
             })

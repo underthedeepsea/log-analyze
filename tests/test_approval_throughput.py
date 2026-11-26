@@ -42,6 +42,7 @@ def review_database(request, tmp_path):
 def seed_candidates(database, *, count=1200, distinct=False):
     store = SQLiteFeatureJobStore(database)
     features = {}
+    entities = []
     for index in range(count):
         template = f"Unclassified failure family_{index:05d}" if distinct else "CNI no enough IPs while creating pod sandbox"
         feature = {
@@ -56,8 +57,14 @@ def seed_candidates(database, *, count=1200, distinct=False):
         feature.update({"approval_key": identity["approval_key"], "problem_code": identity["problem_code"],
                         "approval_group_id": group_id_for_key(identity["approval_key"])})
         features[feature["candidate_id"]] = feature
+        record = FeatureJobManager._source_record({
+            "entity_id": feature["entity_id"], "entity_type": "node", "risk_score": 90,
+            "top_templates": feature["source_templates"],
+        }, 0, [])
+        record.update(status="completed", feature_ids=[feature["candidate_id"]])
+        entities.append(record)
     store.save({"job_id": "job-scale", "status": "completed", "model": "test-model", "provider": "test",
-                "created_at": "2026-09-01T00:00:00+00:00", "features": features, "entities": [], "events": []})
+                "created_at": "2026-09-01T00:00:00+00:00", "features": features, "entities": entities, "events": []})
     if not distinct:
         first = next(iter(features.values()))
         group = {"approval_group_id": first["approval_group_id"], "approval_key": first["approval_key"],

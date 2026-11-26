@@ -10,7 +10,7 @@
   <img src="frontend/logo/logrisk-app-icon-orange-v2.png" width="112" alt="LOGRISK 应用图标" />
 </p>
 
-当前版本：`1.48.1`。完整变更记录见 [`releas.md`](releas.md)。
+当前版本：`1.48.3`。完整变更记录见 [`releas.md`](releas.md)。
 
 ### 当前功能与启动方式
 
@@ -215,7 +215,9 @@ PYTHONPATH=src .venv/bin/python -m logrisk.streaming_observability sample SOURCE
 PYTHONPATH=src .venv/bin/python -m logrisk.streaming_observability stop SOURCE_ID
 ```
 
-`start` 允许独立 Worker 调度该来源。运行中的 Worker 每批结束后等待 30 秒检查下一批，`run --once` 仅执行一次检查和可能的一批。来源调度心跳在等待期间持续更新，页面单独显示消费端最近一次实际 poll。每个新批次全来源合计最多推进 10,000 个位点，按分区分配预算；每次执行在检查点边界应用 90 秒处理预算。失败、中断、预算到达或停止时保留原批目标、已持久化前沿和待确认提交。再次执行会恢复原批，完成后才锁定新批目标。120 秒是结果覆盖的诊断目标，过慢的下游会显示实际逾期。停止会阻止后续读写边界，已完成的事务与正在执行的提交保持原有顺序。Topic 重建、分区集合变化、位点超出保留范围，或组提交与记录的前沿不一致时，Worker 保留原状态并报告冲突。对可能指向同一 Topic 与组的其它 Bootstrap 别名，旧批次在消费前核实实际 Broker 身份。
+`start` 允许独立 Worker 调度该来源。成功处理满额批次且确认仍有积压时，Worker 立即检查下一批。空闲或尚未发现更多数据时，等待 30 秒再检查。遇到明确分类的 Broker 超时或连接故障时，连续 Worker 每隔 5、10、20、40 秒重试，随后最多每 60 秒重试一次。成功处理或检查后恢复正常间隔，停止会中断等待。`run --once` 仅执行一次检查和可能的一批，故障直接返回。来源调度心跳在等待期间持续更新，页面单独显示消费端最近一次实际 poll。
+
+每个新批次全来源合计最多推进 10,000 个位点，按分区分配预算。每次执行在检查点边界应用 90 秒处理预算。失败、中断、预算到达或停止时保留原批目标、已持久化前沿和待确认提交。再次执行会核对 Kafka 位点并恢复原批，完成后才锁定新批目标。120 秒是结果覆盖的诊断目标，过慢的下游会显示实际逾期。停止同一来源时会等待已经发出的同步提交返回，随后阻止后续读写边界。SQLite 在等待 Broker 返回期间允许其他来源和业务继续写入。 不能解析的记录用分区、位点和脱敏原因记入该批结果，已核验的实际处理量按有效记录统计。鉴权失败、Topic 重建、分区集合变化、位点超出保留范围，或组提交与记录的前沿不一致时，Worker 保留原状态并报告错误。对可能指向同一 Topic 与组的其它 Bootstrap 别名，旧批次在消费前核实实际 Broker 身份。
 
 `sample` 单独执行只读 Kafka 元数据、末端位点和组提交位点查询，允许来源消费处于停止状态。各采样进程共享同来源的 15 秒最短间隔和连续失败的 15、30、60 秒退避。失败后连续两次有效采样才恢复来源可达状态。旧 Broker 至少需支持可禁止自动创建 Topic 的 Metadata API 才可采样。无法读取稳定 Topic UUID 时，采样保留本轮读数但不跨样本比较；连续消费要求支持 Metadata v10 和有效 Topic UUID。应用启动和页面刷新均只读已有数据库快照。内置接入使用现有 Kafka Bootstrap 环境配置。Kafka Broker/ACL、SASL/TLS 和生产数据库联通需要各自环境验收。
 
@@ -326,6 +328,8 @@ API 导入保持两阶段确认：先 `POST /api/knowledge-packages/uploads`（�
 ## 运行期存储：SQLite 与 PostgreSQL
 
 默认使用 `state/logrisk.sqlite3`。启动时应用 `database/migrations/`；SQLite 启用外键、WAL、`busy_timeout` 和短事务写入。`database/schema.yaml` 是双模式数据字典，PostgreSQL 对应迁移保存在 `database/postgres/migrations/`。批准规则、风险语义、节点风险、版本、反馈、Trace、评测和审计记录均使用同一运行数据库。
+
+迁移 0035 的物理贡献索引使用应用注册的 `logrisk_window_physical`。对 SQLite 备份执行 `PRAGMA integrity_check` 时，通过 `SQLiteDatabase(path, migrate=False).connect()` 连接备份副本。未注册该函数的 SQLite 客户端执行完整性检查会报告 `unknown function`。
 
 生产环境可显式改用外部 PostgreSQL，不提供 Docker Compose，也不会自动回退到 SQLite：
 
@@ -542,6 +546,8 @@ GET /api/node-risks/{cluster}/{node}/overview?from=2026-08-31&to=2026-08-31&time
 可直接打开 `/node-risks/{cluster}/{node}` 定位主机，无需该节点出现在目录第一页；抽屉中的“每日风险与日报”可展开原有日期证据面板。该面板默认跳到节点最近有记录的真实历史日；灰色覆盖缺口和空白评分点不代表风险为零。每日查询支持最多 90 天，明细按 `next_cursor` 完整分页；严重度柱段按已知发生次数统计，跨日仍未结束轮次单独展示，不增加当日发生次数。相邻完整覆盖仅在对象、来源版本与 boot 一致且无缺口时合并。自然语言接口 `POST /api/node-risk-queries` 仅解析明确节点/登记别名、单日与 IANA 时区，不调用模型，不接受运维修复请求。
 
 受控观测由 `POST /api/node-risk-observations` 接收。在 `configs/server_risk.yaml` 显式登记 `source_id`、`source_epoch`、`config_revision`、`environment`、`cluster`、`node_ids`、对象范围、`signals` 映射和 `permitted_actors`，并配置 `freshness_seconds`、`max_gap_seconds`、`allowed_lateness_seconds`。默认没有启用来源或恢复规则。`error_only` 只能证明异常；`authoritative_state` 需同对象状态采样与连续通过期限；`complete_event_stream` 需完整覆盖、无丢失/解析缺口和应用内部完成前沿。普通正常日志、heartbeat、文件读完和手动恢复不能代替上述证据。明确节点别名采用 `aliases: [{alias: 名称, cluster: 集群, node_id: 节点}]`；重复映射需澄清。
+
+允许的时钟偏差范围内，未来观测先入库，观测收据的 `projection_complete` 为 `false`。直接调用观测接口时，调用方在事件时间到达后使用相同请求体和幂等键重试。已启用的提交观测 Worker 会补处理从已提交窗口派生的到期收据。节点评估的 `projection_complete` 表示本次只读计算已完成。查询批次的持久派生状态以观测收据为准。
 
 Django 的 `LOGRISK` 可配置 `node_risk_reports_enabled` 和 `airflow_node_risk_report_dag_id`（默认 `logrisk_node_risk_report`）。Web 仅持久化 Run 并向专用 DAG 分发 `report_id`/`request_id`；Worker 使用离线已迁移数据库和共享报告目录，DAG 无自动重试。执行在 120 秒期限内收束，GET 可以观察崩溃后的安全终态，不能重放不确定调用。生产身份依赖既有宿主 resolver/PACAS 与配置角色。
 

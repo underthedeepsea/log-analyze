@@ -8,13 +8,14 @@ try:
 except ImportError:  # Airflow is installed only in the external scheduler image.
     dag = None
 else:
+    from airflow.exceptions import AirflowFailException
+    from airflow.operators.python import get_current_context
     from integrations.airflow.tasks import preprocess_uploaded_input
+    from logrisk.airflow_tasks import InputPreprocessTerminalError
 
     _START_DATE = datetime(2024, 1, 1, tzinfo=timezone.utc)
 
     def _conf() -> dict[str, str]:
-        from airflow.operators.python import get_current_context
-
         value = dict(get_current_context()["dag_run"].conf or {})
         return {
             "input_job_id": str(value.get("input_job_id") or ""),
@@ -32,6 +33,10 @@ else:
     ) as dag:
         @task(pool="logrisk_cpu_pool", queue="logrisk_cpu")
         def preprocess_uploaded() -> dict[str, str]:
-            return preprocess_uploaded_input(**_conf())
+            attempt = get_current_context()["ti"]
+            try:
+                return preprocess_uploaded_input(**_conf(), final_attempt=attempt.try_number > attempt.max_tries)
+            except InputPreprocessTerminalError as exc:
+                raise AirflowFailException(str(exc)) from exc
 
         preprocess_uploaded()

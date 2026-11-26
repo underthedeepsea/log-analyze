@@ -29,9 +29,13 @@ def classify(exc: Exception) -> str:
     if isinstance(exc, KafkaBoundaryError):
         return exc.code
     names = {cls.__name__.lower() for cls in type(exc).__mro__}
+    if isinstance(exc, TimeoutError) or names & {"kafkatimeouterror", "requesttimedouterror"}:
+        return "timeout"
+    if isinstance(exc, ConnectionError) or "networkexceptionerror" in names:
+        return "broker_unavailable"
     for fragment, code in (
         ("authorization", "authorization"), ("authentication", "authentication"),
-        ("timeout", "timeout"), ("offsetoutofrange", "offset_out_of_range"),
+        ("offsetoutofrange", "offset_out_of_range"),
         ("unknowntopic", "topic_unavailable"), ("unsupportedversion", "metadata_unsupported"),
         ("nobrokersavailable", "broker_unavailable"), ("kafkaconnection", "broker_unavailable"),
     ):

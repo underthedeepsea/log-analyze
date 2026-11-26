@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 import re
 import uuid
 from typing import Any, Mapping
@@ -191,13 +192,42 @@ class MultiSourceRepository:
             )
         return dict(observation)
 
-    def recent_observations(self, *, cluster: str, since: str) -> list[dict[str, Any]]:
+    def correlation_observations(
+        self, *, cluster: str, since: datetime, through: datetime, families: set[str],
+        min_risk: float, min_count: int, limit: int,
+    ) -> list[dict[str, Any]] | None:
+        sqlite = self.database.provider == "sqlite"
+        # SQLite Julian days have millisecond-scale resolution; apply the
+        # index first with a conservative margin, then test exact instants.
+        instant = "julianday(window_start)" if sqlite else "window_start"
+        parameter = "julianday(?)" if sqlite else "?"
+        margin = timedelta(milliseconds=1) if sqlite else timedelta()
+        lower = (since - margin).isoformat()
+        upper = (through + margin).isoformat()
+        marks = ",".join("?" for _ in families)
         with self.database.connect() as connection:
             rows = connection.execute(
-                "SELECT * FROM multi_source_observations WHERE cluster=? AND window_end>=? ORDER BY window_start",
-                (cluster, since),
+                "SELECT observation_id, cluster, source_family, occurrence_count, risk_score, "
+                "window_start, window_end, entity_keys_json FROM multi_source_observations "
+                f"WHERE cluster=? AND {instant} BETWEEN {parameter} AND {parameter} "
+                f"AND source_family IN ({marks}) AND risk_score>=? AND occurrence_count>=? "
+                f"ORDER BY {instant}, observation_id LIMIT ?",
+                (cluster, lower, upper, *sorted(families), min_risk, min_count, limit + 1),
             ).fetchall()
-        return [self._observation(row) for row in rows]
+        if len(rows) > limit:
+            return None
+        result = []
+        for row in rows:
+            when = datetime.fromisoformat(str(row["window_start"]).replace("Z", "+00:00"))
+            when = when.replace(tzinfo=timezone.utc) if when.tzinfo is None else when
+            if since <= when <= through:
+                result.append({
+                    "observation_id": row["observation_id"], "cluster": row["cluster"],
+                    "source_family": row["source_family"], "count": row["occurrence_count"],
+                    "risk_score": row["risk_score"], "window_start": str(row["window_start"]),
+                    "window_end": str(row["window_end"]), "entity_keys": _array(row["entity_keys_json"]),
+                })
+        return result
 
     def save_correlation(self, correlation: Mapping[str, Any]) -> dict[str, Any]:
         now = utc_now()

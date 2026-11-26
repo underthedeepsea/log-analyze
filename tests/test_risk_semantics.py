@@ -109,3 +109,59 @@ def test_rollback_appends_version_and_preserves_history(tmp_path):
     assert rolled["version"] == 3
     assert rolled["display_name"] == "自定义失败"
     assert [item["version"] for item in subject.versions(created["id"])] == [3, 2, 1]
+
+
+def test_publish_cas_leaves_concurrently_edited_draft_unvalidated(tmp_path, monkeypatch):
+    publisher = service(tmp_path)
+    editor = RiskSemanticService(publisher.database, BUILTINS)
+    draft = publisher.create_override(
+        "builtin.gpu.xid.35", {}, operator="author", reason="starting draft",
+    )
+    original_test = publisher._test
+
+    def edit_after_validation(rule):
+        report = original_test(rule)
+        editor.update_rule(
+            rule["id"], {"test_samples": {"positive": ["normal operation"]}},
+            expected_version=1, operator="editor", reason="edit during publish",
+        )
+        return report
+
+    monkeypatch.setattr(publisher, "_test", edit_after_validation)
+    with pytest.raises(RiskSemanticError) as exc:
+        publisher.publish(draft["id"], expected_version=1, confirmed=True, operator="reviewer", reason="publish v1")
+    assert exc.value.code == "version_conflict" and exc.value.status_code == 409
+    current = editor.get_rule(draft["id"])
+    assert current["version"] == 2 and current["status"] == "draft"
+    assert not original_test(current)["valid"]
+    with publisher.database.connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM risk_semantic_validations WHERE rule_id=?", (draft["id"],)).fetchone()[0] == 0
+
+
+def test_snapshot_is_stable_for_batch_and_next_snapshot_refreshes_across_workers(tmp_path):
+    publisher = service(tmp_path)
+    worker = RiskSemanticService(publisher.database, BUILTINS)
+    payload = record("NVRM: Xid (0000:65:00): 35, diagnostic event")
+    batch = worker.snapshot()
+    draft = publisher.create_override(
+        "builtin.gpu.xid.35", {"classification": {"default_severity": "high"}},
+        operator="author", reason="raise severity",
+    )
+    assert worker.snapshot().revision == batch.revision
+    active = publisher.publish(draft["id"], expected_version=1, confirmed=True, operator="reviewer", reason="validated")
+    next_batch = worker.snapshot()
+    assert next_batch.revision != batch.revision
+    assert batch.match(payload)["severity"] == "medium"
+    assert next_batch.match(payload)["severity"] == "high"
+    assert worker.match(payload)["semantic_rule_version"] == active["version"]
+    changed = publisher.update_rule(
+        draft["id"], {"classification": {"default_severity": "critical"}},
+        expected_version=1, operator="author", reason="fresh draft",
+    )
+    assert changed["status"] == "draft"
+    assert worker.snapshot().revision == batch.revision
+    assert next_batch.match(payload)["severity"] == "high"
+    publisher.publish(draft["id"], expected_version=2, confirmed=True, operator="reviewer", reason="validated")
+    latest = worker.snapshot()
+    assert latest.revision not in (batch.revision, next_batch.revision)
+    assert latest.match(payload)["severity"] == "critical"

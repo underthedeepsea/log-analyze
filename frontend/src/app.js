@@ -95,7 +95,12 @@
     saveDatabaseCandidate: function (payload) { return jsonRequest("/api/system/database/config", { method: "POST", body: JSON.stringify(payload) }); },
     testDatabaseCandidate: function (payload) { return jsonRequest("/api/system/database/test", { method: "POST", body: JSON.stringify(payload) }); },
     status: function () { return jsonRequest("/api/ollama/status"); },
-    entityAnalysis: function (jobId, entityId, runId) { return jsonRequest("/api/jobs/" + encodeURIComponent(jobId) + "/entities/" + encodeURIComponent(entityId) + "/analysis" + (runId ? "?run_id=" + encodeURIComponent(runId) : "")); },
+    entityAnalysis: function (jobId, entityId, runId, entityKey) {
+      const query = new URLSearchParams();
+      if (runId) query.set("run_id", runId);
+      if (entityKey) query.set("entity_key", entityKey);
+      return jsonRequest("/api/jobs/" + encodeURIComponent(jobId) + "/entities/" + encodeURIComponent(entityId) + "/analysis" + (query.size ? "?" + query : ""));
+    },
     expertOpinions: function (jobId, candidateId) { return jsonRequest("/api/jobs/" + encodeURIComponent(jobId) + "/features/" + encodeURIComponent(candidateId) + "/expert-opinions"); },
     rules: function () { return jsonRequest("/api/rules"); },
     governedRules: function (query) { return jsonRequest("/api/rule-governance/rules" + (query || "")); },
@@ -195,8 +200,8 @@
     createJob: function (result, model, minScore, promptId, modelProfileId, retryCount) {
       return jsonRequest("/api/jobs", { method: "POST", body: JSON.stringify({ result: result, model: model, min_score: Number(minScore), prompt_id: promptId, model_profile_id: modelProfileId, retry_count: Number(retryCount), cache_enabled: true }) });
     },
-    retry: function (jobId, entityId) {
-      return jsonRequest("/api/jobs/" + jobId + "/entities/" + encodeURIComponent(entityId) + "/retry", { method: "POST", body: "{}" });
+    retry: function (jobId, entityId, entityKey) {
+      return jsonRequest("/api/jobs/" + jobId + "/entities/" + encodeURIComponent(entityId) + "/retry", { method: "POST", body: JSON.stringify({ entity_key: entityKey }) });
     },
     update: function (jobId, candidateId, changes) {
       const controller = new AbortController();
@@ -448,15 +453,22 @@
   }
 
   function Workspace(props) {
+    const [selectedEntity, setSelectedEntity] = useState(null);
     const entities = props.snapshot && props.snapshot.entities || [];
     const features = props.snapshot && props.snapshot.features || [];
     return h("section", { className: "workspace-grid" },
       h("div", { className: "surface queue-surface" }, h("div", { className: "surface-head" }, h("b", null, "风险实体与识别状态"), h("span", null, entities.length + " 个实体")),
         props.snapshot && props.snapshot.preview && h("div", { className: "fact-box" }, "分页预览：本页 " + entities.length + " / 全部 " + props.snapshot.entities_total + " 个实体；候选共 " + props.snapshot.features_total + " 条。完整待审批候选请进入审批队列。", props.snapshot.next_cursor && h("button", { className: "text-button", onClick: props.onNextPage }, "下一页")),
         h("div", { className: "entity-list" }, entities.length === 0 && h("div", { className: "empty-state" }, "上传日志后显示识别队列"), entities.map(function (entity) {
-          const traceCount = features.filter(function (feature) { return feature.entity && feature.entity.id === entity.entity_id && feature.trace_id; }).length;
-          return h("div", { className: "entity-row", key: (entity.cluster || "") + "-" + entity.entity_id }, h("div", null, h("b", null, entity.entity_id), h("span", null, (entity.cluster || "default") + " · " + entity.log_count + " 条关联日志 · AI 调用 " + traceCount + " 次")), h("span", { className: "status-chip " + entity.status }, statusNames[entity.status] || entity.status), h("span", { className: "risk-score" }, Number(entity.risk_score || 0).toFixed(0)), h("button", { className: "text-button", onClick: function () { props.onOpenObservability(props.snapshot.job_id || ""); } }, "查看 AI 观测"), traceCount > 0 && h("button", { className: "text-button", onClick: function () { props.onOpenTraces("?job_id=" + encodeURIComponent(props.snapshot.job_id || "")); } }, "查看 Trace"), entity.cache_hit && h("span", { className: "skip-llm" }, "Cache 命中"), entity.status === "rule_matched" && h("span", { className: "skip-llm" }, "跳过 LLM"), entity.status === "failed" && h("button", { className: "text-button", onClick: function () { props.onRetry(entity.entity_id); } }, "重试"));
-        }))),
+          const traceCount = features.filter(function (feature) {
+            return feature.entity && feature.entity.id === entity.entity_id && feature.entity.type === entity.entity_type
+              && feature.cluster === entity.cluster && feature.trace_id;
+          }).length;
+          return h("div", { className: "entity-row", key: entity.entity_key || JSON.stringify([entity.cluster, entity.entity_type, entity.entity_id]) }, h("div", null, h("b", null, entity.entity_id), h("span", null, (entity.cluster || "default") + " · " + (entity.entity_type || "—") + " · " + entity.log_count + " 条关联日志 · AI 调用 " + traceCount + " 次")), h("span", { className: "status-chip " + entity.status }, statusNames[entity.status] || entity.status), h("span", { className: "risk-score" }, Number(entity.risk_score || 0).toFixed(0)), h("button", { className: "text-button", onClick: function () { props.onOpenObservability(props.snapshot.job_id || ""); } }, "查看 AI 观测"), h("button", { className: "text-button", onClick: function () { setSelectedEntity(entity); } }, "查看实体证据"), traceCount > 0 && h("button", { className: "text-button", onClick: function () { props.onOpenTraces("?job_id=" + encodeURIComponent(props.snapshot.job_id || "")); } }, "查看 Trace"), entity.cache_hit && h("span", { className: "skip-llm" }, "Cache 命中"), entity.status === "rule_matched" && h("span", { className: "skip-llm" }, "跳过 LLM"), ["failed", "interrupted"].includes(entity.status) && h("button", { className: "text-button", onClick: function () { props.onRetry(entity.entity_id, entity.entity_key); } }, "重试"));
+        })),
+        selectedEntity && props.snapshot && h(EntityAnalysisPanel, {
+          jobId: props.snapshot.job_id, entityId: selectedEntity.entity_id, entityKey: selectedEntity.entity_key,
+        })),
       h("div", { className: "surface feature-surface" }, h("div", { className: "surface-head" }, h("b", null, "候选与复用特征"), h("span", null, features.length + " 条")),
         h("div", { className: "feature-list" }, features.length === 0 && h("div", { className: "empty-state" }, "识别后显示候选特征"), features.map(function (feature) {
           return h("button", { className: "feature-row " + (props.selectedId === feature.candidate_id ? "active" : ""), key: feature.candidate_id, onClick: function () { props.onSelect(feature.candidate_id); } }, h("div", null, h("b", null, feature.title), h("span", null, (feature.entity && feature.entity.id || "") + " · " + feature.summary)), h("span", { className: "status-chip " + feature.status }, feature.origin === "approved_rule" ? "规则复用" : feature.status));
@@ -2261,11 +2273,12 @@
 
   function EntityAnalysisPanel(props) {
     const [view, setView] = useState(null), [error, setError] = useState("");
-    useEffect(function () { let active = true; setView(null); setError(""); if (props.jobId && props.entityId) api.entityAnalysis(props.jobId, props.entityId, props.runId).then(function (value) { if (active) setView(value); }).catch(function (reason) { if (active) setError(reason.message); }); return function () { active = false; }; }, [props.jobId, props.entityId, props.runId]);
+    useEffect(function () { let active = true; setView(null); setError(""); if (props.jobId && props.entityId) api.entityAnalysis(props.jobId, props.entityId, props.runId, props.entityKey).then(function (value) { if (active) setView(value); }).catch(function (reason) { if (active) setError(reason.message); }); return function () { active = false; }; }, [props.jobId, props.entityId, props.runId, props.entityKey]);
     if (!props.jobId || !props.entityId) return null;
     const labels = { not_analyzed: "AI 未分析", running: "AI 分析中", analysis_failed: "AI 分析失败", partial: "AI 分析未完成", analysis_available_pending_review: "已分析，待人工核查" };
     return h("section", { className: "surface", "aria-label": "真实问题与AI分析" }, h("h3", null, "真实日志事实"), h("p", null, "事实独立于AI分析保存；日志次数不等于对象数。"), error && h("p", { role: "alert" }, error), !view && !error && h("p", { role: "status" }, "正在读取已有事实…"), view && h(React.Fragment, null,
-      h("p", { role: "status" }, labels[view.ai_state] || view.ai_state), h("p", null, view.facts.entity.id + " · " + (view.facts.window.start || "未知时间") + " 至 " + (view.facts.window.end || "未知时间")),
+      h("p", { role: "status" }, labels[view.ai_state] || view.ai_state), h("p", null, [view.facts.entity.cluster, view.facts.entity.type, view.facts.entity.id].filter(Boolean).join(" / ") + " · " + (view.facts.window.start || "未知时间") + " 至 " + (view.facts.window.end || "未知时间")),
+      view.entity_key && h("details", null, h("summary", null, "实体键"), h("code", null, view.entity_key)),
       view.observed_problems.map(function (problem) { return h("article", { key: problem.fact_ref }, h("b", null, "日志出现次数 " + problem.log_occurrence_count + " · 可证实对象数 " + (problem.proven_object_count === "unknown" ? "未知" : problem.proven_object_count + "（仅已见标识）")), h("pre", { style: { whiteSpace: "pre-wrap", wordBreak: "break-word" } }, problem.description), h("small", null, "模板 " + problem.fact_ref)); }),
       h("h4", null, "AI 待核查解释"), view.opinions.map(function (opinion) { return h("div", { key: opinion.role_id }, h("b", null, opinion.role_id + " · " + (labels[opinion.state] || opinion.state)), opinion.error_code && h("p", null, "失败原因：" + opinion.error_code), opinion.opinion && (opinion.opinion.analyses || []).map(function (block, index) { return h("section", { key: index }, h("p", null, "待核查（" + block.status + "） · " + block.text), h("p", null, "依据：" + block.fact_refs.join("、")), h("p", null, "缺失证据：" + block.missing_evidence.join("、")), h("p", null, "人工核查：" + block.manual_checks.join("、"))); })); })));
   }
@@ -2273,10 +2286,11 @@
   function AgentRunsPage(props) {
     const runs = props.data.items || [], selected = props.data.selected;
     const toolNames = ["get_sanitized_evidence", "find_approved_rules", "inspect_knowledge_assets", "evaluate_candidate", "register_feature_candidate"];
-    const [draft, setDraft] = useState({ source_job_id: "", entity_id: "", model_profile_id: "", prompt_id: "agent_plan_v1", max_steps: 6, max_tool_calls: 10, timeout_seconds: 120, allowed_tools: toolNames });
+    const query = new URLSearchParams(window.location.search);
+    const [draft, setDraft] = useState({ source_job_id: query.get("source_job_id") || "", entity_id: query.get("entity_id") || "", entity_key: query.get("entity_key") || "", model_profile_id: "", prompt_id: "agent_plan_v1", max_steps: 6, max_tool_calls: 10, timeout_seconds: 120, allowed_tools: toolNames });
     const [showCreate, setShowCreate] = useState(false), [creating, setCreating] = useState(false);
     function field(name, value) { setDraft(function (current) { return Object.assign({}, current, { [name]: value }); }); }
-    async function create() { setCreating(true); try { await props.onCreate(draft); setShowCreate(false); } finally { setCreating(false); } }
+    async function create() { setCreating(true); try { await props.onCreate(Object.assign({}, draft, { entity_key: draft.entity_key || undefined })); setShowCreate(false); } finally { setCreating(false); } }
     function actionsFor(status) {
       const items = [];
       if (["queued", "planning", "running"].includes(status)) items.push("pause");
@@ -2291,6 +2305,7 @@
       showCreate && h("section", { className: "surface agent-run-create" }, h("div", { className: "section-title" }, h("h3", null, "创建受控 Run"), h("span", null, "配置将锁定为运行快照")), h("div", { className: "agent-run-create-grid" },
         h("label", null, "来源任务", h("input", { value: draft.source_job_id, onChange: function (event) { field("source_job_id", event.target.value); } })),
         h("label", null, "风险实体", h("input", { value: draft.entity_id, onChange: function (event) { field("entity_id", event.target.value); } })),
+        h("label", null, "实体键（同名时必填）", h("input", { value: draft.entity_key, onChange: function (event) { field("entity_key", event.target.value); } })),
         h("label", null, "模型 Profile", h("select", { value: draft.model_profile_id, onChange: function (event) { field("model_profile_id", event.target.value); } }, h("option", { value: "" }, "请选择"), (props.profiles || []).map(function (profile) { return h("option", { key: profile.profile_id, value: profile.profile_id }, (profile.display_name || profile.profile_id) + " · " + profile.provider); }))),
         h("label", null, "规划 Prompt", h("select", { value: draft.prompt_id, onChange: function (event) { field("prompt_id", event.target.value); } }, (props.prompts || []).map(function (prompt) { return h("option", { key: prompt.prompt_id, value: prompt.prompt_id }, prompt.display_name || prompt.prompt_id); }))),
         h("label", null, "最大步骤", h("input", { type: "number", min: 1, max: 20, value: draft.max_steps, onChange: function (event) { field("max_steps", Number(event.target.value)); } })),
@@ -2299,7 +2314,10 @@
         h("fieldset", { className: "agent-run-tools" }, h("legend", null, "允许工具"), toolNames.map(function (tool) { return h("label", { key: tool }, h("input", { type: "checkbox", checked: draft.allowed_tools.includes(tool), onChange: function (event) { field("allowed_tools", event.target.checked ? draft.allowed_tools.concat([tool]) : draft.allowed_tools.filter(function (item) { return item !== tool; })); } }), tool); }))),
         h("div", { className: "agent-run-create-note" }, h("b", null, "运行边界"), h("span", null, "模型计划 → 确定性工具 → 质量门禁 → 人工 Gate；不展示思考过程，不自动批准。")),
         h("button", { className: "primary-button", disabled: creating || !draft.source_job_id || !draft.entity_id || !draft.model_profile_id, onClick: create }, creating ? "创建中…" : "创建并执行")),
-      h(EntityAnalysisPanel, { jobId: new URLSearchParams(window.location.search).get("source_job_id") || (selected && selected.source_job_id), entityId: new URLSearchParams(window.location.search).get("entity_id") || (selected && selected.entity_id), runId: new URLSearchParams(window.location.search).get("source_job_id") ? null : (selected && selected.run_id) }),
+      h(EntityAnalysisPanel, { jobId: query.get("source_job_id") || (selected && selected.source_job_id),
+        entityId: query.get("entity_id") || (selected && selected.entity_id),
+        entityKey: query.get("source_job_id") ? query.get("entity_key") : (selected && (selected.locked_snapshot || {}).evidence_summary || {}).entity_key,
+        runId: query.get("source_job_id") ? null : (selected && selected.run_id) }),
       props.data.failure && h("p", { className: "agent-runs-notice error" }, props.data.failure),
       h("div", { className: "agent-runs-metrics" },
         h("article", null, h("b", null, runs.length), h("span", null, "Run 总数")),
@@ -2335,9 +2353,9 @@
     ];
     const defaultNodes = [{ node_id: "evidence", role_id: "evidence_specialist", depends_on: [] }, { node_id: "rules", role_id: "rule_specialist", depends_on: [] }, { node_id: "feature", role_id: "feature_specialist", depends_on: ["evidence", "rules"] }];
     const [definition, setDefinition] = useState({ name: "节点风险特征协作", description: "固定角色并行收集证据后生成待审批候选", nodes: defaultNodes, max_concurrency: 2, max_tool_calls: 20, timeout_seconds: 300, max_attempts: 2 });
-    const [runDraft, setRunDraft] = useState({ workflow_id: "", source_job_id: "", entity_id: "", model_profile_id: "", prompt_id: "agent_plan_v1" });
+    const [runDraft, setRunDraft] = useState({ workflow_id: "", source_job_id: "", entity_id: "", entity_key: "", model_profile_id: "", prompt_id: "agent_plan_v1" });
     function createWorkflow() { return props.onCreateWorkflow({ schema_version: "1.0", name: definition.name, description: definition.description, nodes: definition.nodes, budget: { max_nodes: definition.nodes.length, max_concurrency: definition.max_concurrency, max_tool_calls: definition.max_tool_calls, timeout_seconds: definition.timeout_seconds }, retry_policy: { max_attempts: definition.max_attempts } }); }
-    function createRun() { return props.onCreateRun(runDraft.workflow_id, runDraft); }
+    function createRun() { return props.onCreateRun(runDraft.workflow_id, Object.assign({}, runDraft, { entity_key: runDraft.entity_key || undefined })); }
     function nodeId(roleId) { return { evidence_specialist: "evidence", rule_specialist: "rules", feature_specialist: "feature" }[roleId]; }
     function toggleRole(roleId) { const id = nodeId(roleId), exists = definition.nodes.some(function (node) { return node.node_id === id; }); let nodes = exists ? definition.nodes.filter(function (node) { return node.node_id !== id; }).map(function (node) { return Object.assign({}, node, { depends_on: node.depends_on.filter(function (dependency) { return dependency !== id; }) }); }) : definition.nodes.concat([{ node_id: id, role_id: roleId, depends_on: [] }]); setDefinition(Object.assign({}, definition, { nodes: nodes })); }
     function toggleDependency(targetId, dependencyId) { const nodes = definition.nodes.map(function (node) { if (node.node_id !== targetId) return node; const exists = node.depends_on.includes(dependencyId); return Object.assign({}, node, { depends_on: exists ? node.depends_on.filter(function (item) { return item !== dependencyId; }) : node.depends_on.concat([dependencyId]) }); }); setDefinition(Object.assign({}, definition, { nodes: nodes })); }
@@ -2354,7 +2372,7 @@
           h("button", { className: "primary-button", disabled: !definition.nodes.length, onClick: createWorkflow }, "保存工作流")),
         h("section", { className: "surface workflow-run-create" }, h("div", { className: "section-title" }, h("h3", null, "启动工作流"), h("span", null, workflows.length + " 个定义")),
           h("label", null, "工作流", h("select", { value: runDraft.workflow_id, onChange: function (event) { setRunDraft(Object.assign({}, runDraft, { workflow_id: event.target.value })); } }, h("option", { value: "" }, "请选择"), workflows.map(function (workflow) { return h("option", { key: workflow.workflow_id, value: workflow.workflow_id }, workflow.name); }))),
-          [["source_job_id", "来源任务"], ["entity_id", "风险实体"]].map(function (field) { return h("label", { key: field[0] }, field[1], h("input", { value: runDraft[field[0]], onChange: function (event) { setRunDraft(Object.assign({}, runDraft, { [field[0]]: event.target.value })); } })); }),
+          [["source_job_id", "来源任务"], ["entity_id", "风险实体"], ["entity_key", "实体键（同名时必填）"]].map(function (field) { return h("label", { key: field[0] }, field[1], h("input", { value: runDraft[field[0]], onChange: function (event) { setRunDraft(Object.assign({}, runDraft, { [field[0]]: event.target.value })); } })); }),
           h("label", null, "模型 Profile", h("select", { value: runDraft.model_profile_id, onChange: function (event) { setRunDraft(Object.assign({}, runDraft, { model_profile_id: event.target.value })); } }, h("option", { value: "" }, "请选择"), (props.profiles || []).map(function (profile) { return h("option", { key: profile.profile_id, value: profile.profile_id }, profile.display_name || profile.profile_id); }))),
           h("button", { className: "primary-button", disabled: !runDraft.workflow_id || !runDraft.source_job_id || !runDraft.entity_id || !runDraft.model_profile_id, onClick: createRun }, "创建并调度"))),
       h("div", { className: "agent-runs-layout workflow-runs-layout" },
@@ -2767,7 +2785,7 @@
         changes: Object.assign({}, changes, { review_scope: "approval_identity" }),
       });
     }
-    function retry(entityId) { api.retry(jobId, entityId).then(function () { return refresh(); }).catch(function (reason) { setError(reason.message); }); }
+    function retry(entityId, entityKey) { api.retry(jobId, entityId, entityKey).then(function () { return refresh(); }).catch(function (reason) { setError(reason.message); }); }
     function openTrace(traceId) { api.trace(traceId).then(function (item) { setDrawer({ type: "trace", item: item }); applyTraceFilters({ job_id: "", trace_id: traceId, status: "", prompt_id: "" }); }).catch(function (reason) { setError(reason.message); }); }
     function openPrompt(id) { api.prompt(id).then(function (item) { setDrawer({ type: "prompt", item: item }); setView("prompts"); history.pushState({}, "", "/prompts?prompt_id=" + encodeURIComponent(id)); }).catch(function (reason) { setError(reason.message); }); }
     function savePrompt(id, content, note) { api.savePrompt(id, content, note).then(function (item) { setDrawer({ type: "prompt", item: item }); return loadHarness(); }).catch(function (reason) { setError(reason.message); }); }

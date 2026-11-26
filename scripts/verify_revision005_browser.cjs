@@ -56,7 +56,7 @@ function fixtureServer() {
   try {
     let base = options.url;
     if (!base) { server = fixtureServer(); await new Promise(resolve => server.listen(0, '127.0.0.1', resolve)); base = 'http://127.0.0.1:' + server.address().port; }
-    browser = await chromium.launch({ headless: true });
+    browser = await chromium.launch({ headless: true, ...(process.env.LOGRISK_CHROMIUM_PATH ? { executablePath: process.env.LOGRISK_CHROMIUM_PATH } : {}) });
     const context = await browser.newContext({ viewport: { width: 1600, height: 1000 }, timezoneId: 'America/Los_Angeles' });
     const page = await context.newPage();
     page.on('pageerror', error => report.page_errors.push(error.message));

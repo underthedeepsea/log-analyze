@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from logrisk.server_risk.contracts import cursor_encode, cursor_offset, digest, identifier, integer, query_contract
+from logrisk.server_risk.contracts import ServerRiskError, cursor_encode, cursor_offset, digest, identifier, integer, query_contract
 from logrisk.server_risk.daily import daily_series, day_evidence
 from logrisk.server_risk.repository import ServerRiskRepository
 from logrisk.server_risk.reports import ReportService
@@ -59,7 +59,20 @@ class ServerRiskService:
         identifier(node)
         self.repository.require_node(cluster, node)
         result = self.assessments.evaluate(cluster, node)
-        result["latest_risk_at"] = max((fact["last_seen"] for fact in self.repository.facts(cluster, node)), default=None)
+        if any(check.get("evidence_refs_bounded") for check in result["checks"]):
+            registered = self.repository.latest_registered_adverse(cluster, node)
+            try:
+                legacy = self.repository.facts(cluster, node, include_registered=False)
+            except ServerRiskError as exc:
+                if exc.code != "query_resource_limit":
+                    raise
+                legacy = []
+            times = [fact["last_seen"] for fact in legacy]
+            if registered:
+                times.append(registered)
+        else:
+            times = [fact["last_seen"] for fact in self.repository.facts(cluster, node)]
+        result["latest_risk_at"] = max(times, default=None)
         return result
 
     def query(self, payload: dict[str, Any]) -> dict[str, Any]:

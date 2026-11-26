@@ -5,6 +5,7 @@ import json
 import uuid
 from typing import Any
 
+from logrisk.entity_identity import entity_key as scoped_entity_key
 from logrisk.risk_engine import score_window,match_template_rule,level_of
 
 PAGE_ROWS = 100
@@ -89,7 +90,11 @@ class StreamingResultRepository:
                         break
                     consumed += size
                     window = json.loads(payload)
-                    canonical = [window.get(key) for key in ("window_start","window_end","cluster","entity_type","entity_id","component","template_hash","source_type","semantic_extractor_version")]+[window.get("semantic_dictionary_versions") or {},(window.get("risk_semantic") or {}).get("risk_type")]
+                    risk_identity = (window.get("risk_semantic") or {}).get("risk_type")
+                    if window.get("semantic_rule_revision") is not None:
+                        from logrisk.aggregator import risk_semantic_key
+                        risk_identity = [window["semantic_rule_revision"], risk_semantic_key(window)]
+                    canonical = [window.get(key) for key in ("window_start","window_end","cluster","entity_type","entity_id","component","template_hash","source_type","semantic_extractor_version")]+[window.get("semantic_dictionary_versions") or {},risk_identity]
                     window_key = _digest(canonical)
                     entity_key = _json(canonical[:5])
                     core,members = self._split(window)
@@ -122,7 +127,7 @@ class StreamingResultRepository:
                     top = [dict(json.loads(row["core_json"]),_window_key=row["window_key"]) for row in templates]
                     hints = [item.get("feature_hint") for item in top if item.get("feature_hint")]
                     entity = {"window_start":ws,"window_end":we,"cluster":cluster,"entity_type":etype,"entity_id":eid,"risk_score":score,"risk_level":level_of(score),"top_templates":top,"affected_entities":[],"summary":hints[0] if hints else "发现异常模板，需要结合时间线、指标和原始日志进一步确认。"}
-                    connection.execute("INSERT INTO streaming_result_entities(task_id,generation,entity_key,score,level,entity_id,entity_json) VALUES (?,?,?,?,?,?,?) ON CONFLICT(task_id,generation,entity_key) DO UPDATE SET score=excluded.score,level=excluded.level,entity_json=excluded.entity_json",(task_id,generation,key["entity_key"],score,level_of(score),eid,_json(entity)))
+                    connection.execute("INSERT INTO streaming_result_entities(task_id,generation,entity_key,score,level,entity_id,entity_json,identity_key) VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(task_id,generation,entity_key) DO UPDATE SET score=excluded.score,level=excluded.level,entity_json=excluded.entity_json,identity_key=excluded.identity_key",(task_id,generation,key["entity_key"],score,level_of(score),eid,_json(entity),scoped_entity_key(entity)))
                 after_entity = keys[-1]["entity_key"]
         with self.database.transaction() as connection:
             lock = " FOR UPDATE" if getattr(self.database,"provider","sqlite") == "postgres" else ""
@@ -190,43 +195,97 @@ class StreamingResultRepository:
                 raise ResultBudgetError("模板预览超过字节预算")
             return output
 
-    def feature_sources(self,reference: dict[str,Any]):
-        from logrisk.feature_jobs import _collapse_risk_entities
-        after_id=""
+    def feature_sources(self, reference: dict[str, Any]):
+        after = ""
+        scope = (reference["task_id"], reference["generation"])
         while True:
             with self.database.connect() as connection:
-                self._validate(connection,reference)
-                ids=connection.execute("SELECT DISTINCT entity_id FROM streaming_result_entities WHERE task_id=? AND generation=? AND entity_id>? ORDER BY entity_id LIMIT ?",(reference["task_id"],reference["generation"],after_id,PAGE_ROWS)).fetchall()
-            if not ids:
+                self._validate(connection, reference)
+                identities = connection.execute(
+                    "SELECT DISTINCT identity_key FROM streaming_result_entities "
+                    "WHERE task_id=? AND generation=? AND identity_key>? ORDER BY identity_key LIMIT ?",
+                    (*scope, after, PAGE_ROWS),
+                ).fetchall()
+            if not identities:
                 return
-            for row in ids:
-                entity_id=row[0]; after_key=""; current=None
-                while True:
-                    with self.database.connect() as connection:
-                        rows=connection.execute("SELECT entity_key,entity_json FROM streaming_result_entities WHERE task_id=? AND generation=? AND entity_id=? AND entity_key>? ORDER BY entity_key LIMIT ?",(reference["task_id"],reference["generation"],entity_id,after_key,PAGE_ROWS)).fetchall()
-                        for item in rows:
-                            entity=json.loads(item["entity_json"])
-                            for template in entity["top_templates"]:
-                                self._hydrate(connection,reference,template)
-                            entity["affected_entities"]=self._entity_pods(connection, reference, item["entity_key"])
-                            current=_collapse_risk_entities([current,entity] if current else [entity])[0]
-                            if len(_json(current).encode())>PAGE_BYTES:
-                                raise ResultBudgetError("单实体审批证据超过预算；需要拆分明确分析范围")
-                    if not rows:
-                        break
-                    after_key=rows[-1]["entity_key"]
+            for row in identities:
+                identity = row[0]
+                source = self._build_feature_source(reference, identity)
                 with self.database.transaction() as connection:
-                    connection.execute("INSERT INTO streaming_feature_entities(task_id,generation,entity_id,source_json) VALUES (?,?,?,?) ON CONFLICT(task_id,generation,entity_id) DO UPDATE SET source_json=excluded.source_json",(reference["task_id"],reference["generation"],entity_id,_json(current)))
-                yield dict(current,_source_ref=dict(reference,entity_id=entity_id))
-            after_id=ids[-1][0]
+                    connection.execute(
+                        "INSERT INTO streaming_scoped_feature_entities(task_id,generation,identity_key,source_json) "
+                        "VALUES (?,?,?,?) ON CONFLICT(task_id,generation,identity_key) DO UPDATE SET source_json=excluded.source_json",
+                        (*scope, identity, _json(source)),
+                    )
+                yield dict(source, _source_ref=dict(reference, entity_id=source["entity_id"], entity_key=identity))
+            after = identities[-1][0]
 
-    def feature_source(self,reference: dict[str,Any]) -> dict[str,Any]:
+    def _build_feature_source(self, reference: dict[str, Any], identity: str) -> dict[str, Any]:
+        from logrisk.feature_jobs import _collapse_risk_entities
+
+        after = ""
+        current = None
+        while True:
+            with self.database.connect() as connection:
+                rows = connection.execute(
+                    "SELECT entity_key,entity_json FROM streaming_result_entities WHERE task_id=? "
+                    "AND generation=? AND identity_key=? AND entity_key>? ORDER BY entity_key LIMIT ?",
+                    (reference["task_id"], reference["generation"], identity, after, PAGE_ROWS),
+                ).fetchall()
+                for row in rows:
+                    entity = json.loads(row["entity_json"])
+                    for template in entity["top_templates"]:
+                        self._hydrate(connection, reference, template)
+                    entity["affected_entities"] = self._entity_pods(connection, reference, row["entity_key"])
+                    current = _collapse_risk_entities([current, entity] if current else [entity])[0]
+                    if len(_json(current).encode()) > PAGE_BYTES:
+                        raise ResultBudgetError("单实体审批证据超过预算；需要拆分明确分析范围")
+            if not rows:
+                if current is None:
+                    raise ValueError("审批来源引用不存在")
+                return current
+            after = rows[-1]["entity_key"]
+
+    def feature_source(self, reference: dict[str, Any]) -> dict[str, Any]:
+        scope = (reference["task_id"], reference["generation"])
+        identity = reference.get("entity_key")
         with self.database.connect() as connection:
-            self._validate(connection,reference)
-            row=connection.execute("SELECT source_json FROM streaming_feature_entities WHERE task_id=? AND generation=? AND entity_id=?",(reference["task_id"],reference["generation"],reference["entity_id"])).fetchone()
-        if row is None:
+            self._validate(connection, reference)
+            if identity is not None:
+                row = connection.execute(
+                    "SELECT source_json FROM streaming_scoped_feature_entities WHERE task_id=? AND generation=? AND identity_key=?",
+                    (*scope, identity),
+                ).fetchone()
+            else:
+                from logrisk.feature_jobs import FeatureJobError
+                identities = connection.execute(
+                    "SELECT DISTINCT identity_key FROM streaming_result_entities "
+                    "WHERE task_id=? AND generation=? AND entity_id=? LIMIT 2",
+                    (*scope, reference["entity_id"]),
+                ).fetchall()
+                if len(identities) > 1:
+                    raise FeatureJobError(
+                        "旧任务的来源引用包含同名实体，请从原结果重新创建分析任务并选择具体实体",
+                        code="ambiguous_entity", status_code=409,
+                    )
+                if not identities:
+                    raise ValueError("审批来源引用不存在")
+                identity = identities[0][0]
+                row = connection.execute(
+                    "SELECT source_json FROM streaming_feature_entities WHERE task_id=? AND generation=? AND entity_id=?",
+                    (*scope, reference["entity_id"]),
+                ).fetchone()
+        if row is not None:
+            source = json.loads(row[0])
+        elif reference.get("entity_key") is None:
+            # The legacy ID resolved to exactly one projection identity.
+            # Recover evidence directly if the old collapsed cache is absent.
+            source = self._build_feature_source(reference, identity)
+        else:
             raise ValueError("审批来源引用不存在")
-        return json.loads(row[0])
+        if scoped_entity_key(source) != identity or source.get("entity_id") != reference["entity_id"]:
+            raise ValueError("审批来源实体范围不匹配")
+        return source
 
     def entities(self,reference: dict[str,Any],*,after: str="",limit: int=PAGE_ROWS) -> dict[str,Any]:
         limit=max(1,min(int(limit),PAGE_ROWS))
@@ -246,7 +305,7 @@ class StreamingResultRepository:
                     raise ResultBudgetError("单实体超过结果响应预算")
                 if consumed and consumed+size>PAGE_BYTES:
                     break
-                items.append(entity); consumed+=size; last=row["entity_key"]
+                items.append(dict(entity, entity_key=scoped_entity_key(entity))); consumed+=size; last=row["entity_key"]
             return {"items":items,"next_key":last if len(items)<len(rows) else None}
 
     def facts(self,reference: dict[str,Any],*,collection: str="windows",after: str="",window_key: str | None=None,limit: int=PAGE_ROWS) -> dict[str,Any]:

@@ -4,8 +4,9 @@ import json
 
 from django.http import HttpRequest, JsonResponse
 
+from logrisk.feature_jobs import FeatureJobError
 from logrisk.agentic import AgenticError
-from logrisk.agentic.models import validate_run_scope
+from logrisk.agentic.models import evidence_selection, scoped_evidence_summary, validate_run_scope
 from logrisk.orchestration import AirflowOrchestratorError
 from logrisk_django.service_factory import get_agent_workflow_airflow_orchestrator, get_config, get_container
 from logrisk_django.views.access import require_django_write_access
@@ -44,9 +45,9 @@ def workflow_detail(request: HttpRequest, workflow_id: str, view: str | None = N
         payload = json.loads(request.body.decode() or "{}")
         container = get_container()
         source_job_id, entity_id = validate_run_scope(payload.get("source_job_id"), payload.get("entity_id"))
-        evidence = container.feature_jobs.get_agent_evidence(source_job_id, entity_id)
+        evidence = container.feature_jobs.get_agent_evidence(source_job_id, entity_id, **evidence_selection(payload))
         profile = container.model_profiles.get(payload.get("model_profile_id")); connection = container.connections.get(profile.connection_id); prompt = container.prompt_registry.load(str(payload.get("prompt_id") or "agent_plan_v1"))
-        run = _service().create_run(workflow_id, source_job_id=source_job_id, entity_id=entity_id, entity_type=str(evidence["entity"].get("type") or ""), model_profile_id=profile.profile_id, prompt_id=prompt.prompt_id, actor=identity.actor or "unknown", roles=tuple(identity.roles), request_id=identity.request_id, idempotency_key=str(request.headers.get("Idempotency-Key") or payload.get("idempotency_key") or ""), evidence_summary={"entity": evidence["entity"], "risk_score": evidence["risk_score"], "template_count": len(evidence["templates"])}, runtime_snapshot={"profile_snapshot": profile.public_dict(), "connection_snapshot": connection, "prompt_id": prompt.prompt_id, "prompt_sha256": prompt.sha256})
+        run = _service().create_run(workflow_id, source_job_id=source_job_id, entity_id=entity_id, entity_type=str(evidence["entity"].get("type") or ""), model_profile_id=profile.profile_id, prompt_id=prompt.prompt_id, actor=identity.actor or "unknown", roles=tuple(identity.roles), request_id=identity.request_id, idempotency_key=str(request.headers.get("Idempotency-Key") or payload.get("idempotency_key") or ""), evidence_summary=scoped_evidence_summary(evidence), runtime_snapshot={"profile_snapshot": profile.public_dict(), "connection_snapshot": connection, "prompt_id": prompt.prompt_id, "prompt_sha256": prompt.sha256})
         if run.get("idempotent_replay"): return JsonResponse(run, status=202)
         airflow = get_agent_workflow_airflow_orchestrator()
         try: triggered = airflow.trigger_agent_workflow(run["workflow_run_id"], run["request_id"])
@@ -55,6 +56,9 @@ def workflow_detail(request: HttpRequest, workflow_id: str, view: str | None = N
             return JsonResponse({"workflow_run_id": failed["workflow_run_id"], "status": failed["status"], "code": exc.code, "error": str(exc)}, status=exc.status_code)
         return JsonResponse({**run, "external_dag_id": airflow.dag_id, "external_run_id": triggered.external_run_id}, status=202, json_dumps_params={"ensure_ascii": False})
     except AgenticError as exc: return _error(exc)
+    except FeatureJobError as exc:
+        return JsonResponse({"code": getattr(exc, "code", "workflow_evidence_invalid"), "error": str(exc)},
+                            status=getattr(exc, "status_code", 422), json_dumps_params={"ensure_ascii": False})
     except (json.JSONDecodeError, TypeError, ValueError) as exc: return JsonResponse({"code": "workflow_run_invalid", "error": str(exc)[:300]}, status=422)
 
 

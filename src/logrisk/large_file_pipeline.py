@@ -20,9 +20,12 @@ from logrisk.incremental_sources import (
     SourceDescriptor,
     SourceRecord,
 )
+from logrisk.aggregator import risk_semantic_key
+from logrisk.kafka_records import KafkaCursorAccumulator, KafkaCursorDelta
 from logrisk.operational_ledgers import canonical_ranges, ingestion_batch_id, source_identity
 from logrisk.partition_spool import spool_normalized_records, update_manifest_status
-from logrisk.miner_generations import prepare_generation, seal_generation
+from logrisk.miner_generations import MinerGenerationWorkspace
+from logrisk.drain_miner import miner_state_filename
 from logrisk.risk_engine import load_rules, match_template_rule, score_risk_entities
 from logrisk.stream_input_parser import iter_log_records_from_file
 from logrisk.streaming_drain_pipeline import mine_spooled_partitions
@@ -101,6 +104,24 @@ def _validate_batch_records(value: int) -> int:
     return normalized
 
 
+def _classify_events(risk_semantics: RiskSemanticService | None):
+    if risk_semantics is None:
+        return None, None
+    snapshot = getattr(risk_semantics, "snapshot", None)
+    matcher = snapshot() if callable(snapshot) else risk_semantics
+    revision = getattr(matcher, "revision", "")
+
+    def classify(event: dict[str, Any]) -> None:
+        event["semantic_rule_revision"] = revision
+        try:
+            event["risk_semantic"] = matcher.match(event)
+        except RiskSemanticError as exc:
+            if exc.code != "semantic_unclassified":
+                raise
+
+    return classify, revision
+
+
 def run_incremental_pipeline(
     *,
     input_job_id: str,
@@ -126,7 +147,8 @@ def run_incremental_pipeline(
     ledger_repository: Any | None = None,
     environment: str = "production",
     scope_key: str = "default",
-    parser_version: str = "stream_input_parser_v1",
+    parser_version: str = "stream_input_parser_v2",
+    record_unclassified: bool = True,
 ) -> dict[str, Any]:
     stream_batch_records = _validate_batch_records(stream_batch_records)
     config_hash = hashlib.sha256(Path(config_path).read_bytes()).hexdigest()
@@ -153,6 +175,8 @@ def run_incremental_pipeline(
     else:
         streaming_task = None
         previous_status = ""
+        if isinstance(source, FileIncrementalSource) and source.filename.lower().endswith(".gz"):
+            source.immutable_identity = True
     source_descriptor = source.descriptor()
     if streaming_task is None:
         streaming_task = streaming_repository.create_or_load(
@@ -200,6 +224,13 @@ def run_incremental_pipeline(
         streaming_repository.require_complete_prefix(task_id)
         pending_external_commit = SourceCursor.from_dict(streaming_task.get("pending_external_commit"))
         if pending_external_commit.value:
+            generation = streaming_task.get("miner_generation") or {}
+            if generation.get("format") == "rolling_v2":
+                batch = streaming_task.get("kafka_batch") or {}
+                MinerGenerationWorkspace(
+                    Path(state_dir) / "miner_generations" / str(batch.get("source_id") or task_id),
+                    config_hash, generation, set(),
+                ).reconcile()
             source.commit(pending_external_commit)
             streaming_task = streaming_repository.clear_pending_external_commit(
                 task_id, pending_external_commit, expected_lease_token=lease_token,
@@ -235,6 +266,7 @@ def run_incremental_pipeline(
             environment=environment,
             scope_key=scope_key,
             parser_version=parser_version,
+            record_unclassified=record_unclassified,
         )
     except BaseException as exc:
         interrupted = (not isinstance(exc, Exception) or isinstance(exc, FutureCancelledError)
@@ -293,7 +325,9 @@ def run_large_file_pipeline(
     ledger_repository: Any | None = None,
     environment: str = "production",
     scope_key: str = "default",
-    parser_version: str = "stream_input_parser_v1",
+    parser_version: str = "stream_input_parser_v2",
+    file_source: FileIncrementalSource | None = None,
+    record_unclassified: bool = True,
 ) -> dict[str, Any]:
     input_path = Path(input_path)
     started = time.monotonic()
@@ -303,7 +337,7 @@ def run_large_file_pipeline(
     streaming_task: dict[str, Any] | None = None
     source_cursor = SourceCursor.empty()
     current_cursor = source_cursor
-    source = FileIncrementalSource(
+    source = file_source or FileIncrementalSource(
         input_path,
         filename=filename,
         max_decompressed_bytes=max_decompressed_bytes,
@@ -314,6 +348,9 @@ def run_large_file_pipeline(
         immutable_identity=ledger_repository is not None,
     )
     if streaming_repository is not None:
+        source.max_decompressed_bytes = max_decompressed_bytes
+        source.max_compression_ratio = max_compression_ratio
+        source.max_line_bytes = max_line_bytes
         return run_incremental_pipeline(
             input_job_id=input_job_id,
             source=source,
@@ -339,6 +376,7 @@ def run_large_file_pipeline(
             environment=environment,
             scope_key=scope_key,
             parser_version=parser_version,
+            record_unclassified=record_unclassified,
         )
     if ledger_repository is not None:
         raise StreamingStateError(
@@ -404,6 +442,7 @@ def run_large_file_pipeline(
             ),
         )
 
+    classify, rule_revision = _classify_events(risk_semantics)
     template_windows, mining = mine_spooled_partitions(
         spool_dir=spool_dir,
         manifest=manifest,
@@ -415,19 +454,17 @@ def run_large_file_pipeline(
         reserve_cpu_cores=reserve_cpu_cores,
         process_start_method=process_start_method,
         progress_callback=report_mining,
+        enrich_event=classify,
     )
     semantic_matches = 0
     node_risk_ingestions = 0
     if risk_semantics:
         for window in template_windows:
-            try:
-                semantic_event = risk_semantics.match(window)
-            except RiskSemanticError as exc:
-                if exc.code != "semantic_unclassified":
-                    raise
-                risk_semantics.record_unclassified(window)
+            semantic_event = window.get("risk_semantic")
+            if semantic_event is None:
+                if record_unclassified:
+                    risk_semantics.record_unclassified(window)
                 continue
-            window["risk_semantic"] = semantic_event
             semantic_matches += int(window.get("count") or 1)
             if node_risks and window.get("entity_type") == "node":
                 source_record = dict(window, node=window.get("entity_id"))
@@ -474,6 +511,7 @@ def run_large_file_pipeline(
             "semantic_enrichment": semantic_snapshot is not None,
             "semantic_dictionary_versions": (semantic_snapshot or {}).get("versions", {}),
             "risk_semantic_matches": semantic_matches,
+            "semantic_rule_revision": rule_revision,
             "node_risk_ingestions": node_risk_ingestions,
             "multi_source": multi_source_result,
             "streaming_task_id": streaming_task.get("task_id") if streaming_task else None,
@@ -547,7 +585,10 @@ def _merge_template_windows(windows: list[dict[str, Any]]) -> list[dict[str, Any
         key = (
             window.get("window_start"), window.get("window_end"), window.get("cluster"),
             window.get("entity_type"), window.get("entity_id"), window.get("component"),
-            window.get("template_hash"), (window.get("risk_semantic") or {}).get("risk_type"),
+            window.get("template_hash"),
+            risk_semantic_key(window) if window.get("semantic_rule_revision") is not None
+            else (window.get("risk_semantic") or {}).get("risk_type"),
+            window.get("semantic_rule_revision"),
             window.get("source_type"), window.get("semantic_extractor_version"),
             json.dumps(window.get("semantic_dictionary_versions") or {}, sort_keys=True),
         )
@@ -639,6 +680,7 @@ def _run_checkpointed_source_batches(
     environment: str,
     scope_key: str,
     parser_version: str,
+    record_unclassified: bool,
 ) -> dict[str, Any]:
     """Process bounded source batches and advance the checkpoint only after commit.
 
@@ -681,7 +723,9 @@ def _run_checkpointed_source_batches(
     if ledger_repository is not None and ledger_source is None:
         raise IncrementalSourceError("来源缺少可验证的 immutable identity，不能记录 operational receipt")
     receipt_ids: list[str] = []
-    seen_positions: set[tuple[str, int, int]] = set()
+    kafka_frontier = {
+        str(partition): int(offset) for partition, offset in (source_cursor.value.get("partitions") or {}).items()
+    } if source_kind == "kafka" else {}
     overall_provenance = "verified"
     shared_executor: _LazyProcessPoolExecutor | None = None
     if requested_workers > 1:
@@ -715,22 +759,6 @@ def _run_checkpointed_source_batches(
         }
         payload.update(extra)
         progress_callback(payload)
-
-    def enrich_windows(windows: list[dict[str, Any]]) -> int:
-        matched = 0
-        if risk_semantics is None:
-            return matched
-        for window in windows:
-            try:
-                semantic_event = risk_semantics.match(window)
-            except RiskSemanticError as exc:
-                if exc.code != "semantic_unclassified":
-                    raise
-                risk_semantics.record_unclassified(window)
-                continue
-            window["risk_semantic"] = semantic_event
-            matched += int(window.get("count") or 1)
-        return matched
 
     def node_contributions(windows: list[dict[str, Any]], batch_id: str | None = None) -> list[dict[str, Any]]:
         contributions = []
@@ -771,14 +799,14 @@ def _run_checkpointed_source_batches(
     def process_batch(
         batch: list[dict[str, Any]],
         checkpoint: SourceCursor,
-        batch_ranges: list[dict[str, Any]],
         receipt_ranges: list[dict[str, Any]],
         batch_provenance: str,
+        rejected_records: list[dict[str, Any]],
         batch_spool_dir: Path,
     ) -> None:
-        nonlocal semantic_matches, node_risk_ingestions, newly_committed, unknown_template_count, streaming_task
+        nonlocal semantic_matches, newly_committed, unknown_template_count, streaming_task, shared_executor
         if not batch:
-            commit_receipt_only(checkpoint, receipt_ranges, batch_provenance)
+            commit_receipt_only(checkpoint, receipt_ranges, batch_provenance, rejected_records)
             return
         streaming_task = streaming_repository.mark_claim_stage(
             str(streaming_task["task_id"]), lease_token, "SPOOLING"
@@ -795,92 +823,114 @@ def _run_checkpointed_source_batches(
             str(streaming_task["task_id"]), lease_token, "MINING"
         )
         kafka_batch = (kafka.batch or {}) if kafka is not None else {}
-        generation_dir = prepare_generation(
+        shard_names = {
+            miner_state_filename(tuple(item["partition_key"])) for item in manifest["partitions"]
+        }
+        workspace = MinerGenerationWorkspace(
             Path(state_dir) / "miner_generations" / str(kafka_batch.get("source_id") or streaming_task["task_id"]),
+            streaming_task["config_hash"],
             streaming_task.get("miner_generation") or kafka_batch.get("miner_generation"),
+            shard_names,
         )
-        template_windows, mining = mine_spooled_partitions(
-            spool_dir=batch_spool_dir,
-            manifest=manifest,
-            config_path=config_path,
-            state_dir=generation_dir,
-            window_seconds=window_seconds,
-            requested_workers=requested_workers,
-            max_workers=max_drain_workers,
-            reserve_cpu_cores=reserve_cpu_cores,
-            process_start_method=process_start_method,
-            executor=shared_executor,
-        )
-        mining_totals["template_event_count"] += int(mining["template_event_count"])
-        mining_totals["partition_count"] += int(mining["partition_count"])
-        mining_totals["worker_count"] = max(int(mining_totals["worker_count"]), int(mining["worker_count"]))
-        mining_totals["parallel"] = bool(mining_totals["parallel"] or mining["parallel"])
-        matched = enrich_windows(template_windows)
-        semantic_matches += matched
-        unknown = [
-            _streaming_template_snapshot(window)
-            for window in template_windows
-            if not window.get("risk_semantic") and match_template_rule(window, rules) is None
-        ]
-        streaming_task = streaming_repository.mark_claim_stage(
-            str(streaming_task["task_id"]), lease_token, "AGGREGATING"
-        )
-        cursor_hash = hashlib.sha256(
-            json.dumps(checkpoint.to_dict(), ensure_ascii=False, sort_keys=True).encode("utf-8")
-        ).hexdigest()[:32]
-        window_id = f"{source_kind}-cursor:{cursor_hash}"
-        namespace = hashlib.sha256(json.dumps(source_descriptor.to_dict(),sort_keys=True).encode()).hexdigest()
-        for index,window in enumerate(template_windows):
-            window.update(
-                source_namespace=namespace,
-                source_item_id=str(index),
-                semantic_revision=(
-                    (semantic_snapshot or {}).get("versions")
-                    or (window.get("risk_semantic") or {}).get("semantic_rule_version")
-                ),
+        with workspace:
+            classify, rule_revision = _classify_events(risk_semantics)
+            try:
+                template_windows, mining = mine_spooled_partitions(
+                    spool_dir=batch_spool_dir,
+                    manifest=manifest,
+                    config_path=config_path,
+                    state_dir=workspace.work,
+                    window_seconds=window_seconds,
+                    requested_workers=requested_workers,
+                    max_workers=max_drain_workers,
+                    reserve_cpu_cores=reserve_cpu_cores,
+                    process_start_method=process_start_method,
+                    executor=shared_executor,
+                    enrich_event=classify,
+                )
+            except BaseException as exc:
+                if shared_executor is not None:
+                    _shutdown_executor(shared_executor, exc)
+                    shared_executor = None
+                raise
+            mining_totals["template_event_count"] += int(mining["template_event_count"])
+            mining_totals["partition_count"] += int(mining["partition_count"])
+            mining_totals["worker_count"] = max(int(mining_totals["worker_count"]), int(mining["worker_count"]))
+            mining_totals["parallel"] = bool(mining_totals["parallel"] or mining["parallel"])
+            matched = sum(int(window["count"]) for window in template_windows if window.get("risk_semantic"))
+            semantic_matches += matched
+            unknown = [
+                _streaming_template_snapshot(window)
+                for window in template_windows
+                if not window.get("risk_semantic") and match_template_rule(window, rules) is None
+            ]
+            streaming_task = streaming_repository.mark_claim_stage(
+                str(streaming_task["task_id"]), lease_token, "AGGREGATING"
             )
-        generation = seal_generation(generation_dir)
-        if kafka is not None:
-            kafka.before_durable_checkpoint(checkpoint)
-        committed = streaming_repository.commit_window(
-            str(streaming_task["task_id"]),
-            window_id=window_id,
-            cursor=checkpoint,
-            templates=unknown,
-            windows=template_windows,
-            summary={
-                "summary_schema_version": 2,
-                "record_count": len(batch),
-                "template_count": len(template_windows),
-                "unknown_template_count": len(unknown),
-                "risk_semantic_matches": matched,
-                "template_event_count": int(mining["template_event_count"]),
-                "partition_count": int(mining["partition_count"]),
-                "worker_count": int(mining["worker_count"]),
-                "parallel": bool(mining["parallel"]),
-                "node_risk_enabled": node_risks is not None,
-                "process_start_method": (
-                    str(mining["process_start_method"]) if mining["parallel"] else "not_applicable"
+            cursor_hash = hashlib.sha256(
+                json.dumps(checkpoint.to_dict(), ensure_ascii=False, sort_keys=True).encode("utf-8")
+            ).hexdigest()[:32]
+            window_id = f"{source_kind}-cursor:{cursor_hash}"
+            namespace = hashlib.sha256(json.dumps(source_descriptor.to_dict(), sort_keys=True).encode()).hexdigest()
+            for index, window in enumerate(template_windows):
+                window.update(
+                    source_namespace=namespace,
+                    source_item_id=str(index),
+                    semantic_revision=(
+                        {"dictionary_versions": (semantic_snapshot or {}).get("versions") or {},
+                         "risk_rule_registry": rule_revision}
+                        if rule_revision else (semantic_snapshot or {}).get("versions")
+                        or (window.get("risk_semantic") or {}).get("semantic_rule_version")
+                    ),
+                )
+            generation = workspace.seal()
+            if isinstance(source, (KafkaIncrementalSource, FileIncrementalSource)):
+                source.before_durable_checkpoint(checkpoint)
+            committed = streaming_repository.commit_window(
+                str(streaming_task["task_id"]),
+                window_id=window_id,
+                cursor=checkpoint,
+                templates=unknown,
+                windows=template_windows,
+                summary={
+                    "summary_schema_version": 2,
+                    "record_count": len(batch),
+                    "template_count": len(template_windows),
+                    "unknown_template_count": len(unknown),
+                    "risk_semantic_matches": matched,
+                    "semantic_rule_revision": rule_revision,
+                    **({"rejected_records": rejected_records} if rejected_records else {}),
+                    "template_event_count": int(mining["template_event_count"]),
+                    "partition_count": int(mining["partition_count"]),
+                    "worker_count": int(mining["worker_count"]),
+                    "parallel": bool(mining["parallel"]),
+                    "node_risk_enabled": node_risks is not None,
+                    "process_start_method": (
+                        str(mining["process_start_method"]) if mining["parallel"] else "not_applicable"
+                    ),
+                },
+                ledger_batch=(
+                    {
+                        "batch_id": ingestion_batch_id(input_job_id, window_id),
+                        "source": ledger_source,
+                        "input_job_id": input_job_id,
+                        "checkpoint_key": window_id,
+                        "parser_version": parser_version,
+                        "ranges": receipt_ranges,
+                        "actual_count": _range_count(receipt_ranges) if batch_provenance == "verified" else None,
+                        "provenance": batch_provenance,
+                    }
+                    if ledger_repository is not None
+                    else None
                 ),
-            },
-            ledger_batch=(
-                {
-                    "batch_id": ingestion_batch_id(input_job_id, window_id),
-                    "source": ledger_source,
-                    "input_job_id": input_job_id,
-                    "checkpoint_key": window_id,
-                    "parser_version": parser_version,
-                    "ranges": receipt_ranges,
-                    "actual_count": _range_count(receipt_ranges) if batch_provenance == "verified" else None,
-                    "provenance": batch_provenance,
-                }
-                if ledger_repository is not None
-                else None
-            ),
-            fencing_token=lease_token,
-            miner_generation=generation,
-            expected_cursor=streaming_task.get("cursor"),
-        )
+                **({"allow_missing_ledger": True} if ledger_repository is None
+                   and streaming_repository.ledger_repository is not None else {}),
+                fencing_token=lease_token,
+                miner_generation=generation,
+                expected_cursor=streaming_task.get("cursor"),
+            )
+            if committed:
+                workspace.activate(generation)
         source.commit(checkpoint)
         streaming_task = streaming_repository.clear_pending_external_commit(
             str(streaming_task["task_id"]), checkpoint, expected_lease_token=lease_token,
@@ -889,6 +939,10 @@ def _run_checkpointed_source_batches(
             newly_committed += 1
             unknown_template_count += len(unknown)
             deliver_node_effects(template_windows, window_id)
+            if risk_semantics is not None and record_unclassified:
+                for window in template_windows:
+                    if not window.get("risk_semantic"):
+                        risk_semantics.record_unclassified(window)
         if ledger_repository is not None:
             receipt_ids.append(ingestion_batch_id(input_job_id, window_id))
         update_manifest_status(batch_spool_dir, manifest, "COMPLETED")
@@ -898,14 +952,15 @@ def _run_checkpointed_source_batches(
         checkpoint: SourceCursor,
         ranges: list[dict[str, Any]],
         provenance: str,
+        rejected_records: list[dict[str, Any]] | None = None,
     ) -> None:
-        """Commit an empty/duplicate source window without mining it."""
+        """Commit an empty source window or quarantined records without mining."""
 
         nonlocal newly_committed, streaming_task
-        if ledger_repository is None and not (kafka is not None and kafka.batch is not None):
+        if ledger_repository is None and not rejected_records and not (kafka is not None and kafka.batch is not None):
             return
-        if kafka is not None:
-            kafka.before_durable_checkpoint(checkpoint)
+        if isinstance(source, (KafkaIncrementalSource, FileIncrementalSource)):
+            source.before_durable_checkpoint(checkpoint)
         cursor_hash = hashlib.sha256(
             json.dumps(checkpoint.to_dict(), ensure_ascii=False, sort_keys=True).encode("utf-8")
         ).hexdigest()[:32]
@@ -920,7 +975,8 @@ def _run_checkpointed_source_batches(
                      "record_count": 0, "template_count": 0, "unknown_template_count": 0,
                      "risk_semantic_matches": 0, "template_event_count": 0, "partition_count": 0,
                      "worker_count": 0, "parallel": False, "node_risk_enabled": node_risks is not None,
-                     "process_start_method": "not_applicable"},
+                     "process_start_method": "not_applicable",
+                     **({"rejected_records": rejected_records} if rejected_records else {})},
             ledger_batch={
                 "batch_id": ingestion_batch_id(input_job_id, window_id),
                 "source": ledger_source,
@@ -931,6 +987,8 @@ def _run_checkpointed_source_batches(
                 "actual_count": _range_count(ranges) if provenance == "verified" else None,
                 "provenance": provenance,
             } if ledger_repository is not None else None,
+            **({"allow_missing_ledger": True} if ledger_repository is None
+               and streaming_repository.ledger_repository is not None else {}),
             fencing_token=lease_token,
             expected_cursor=streaming_task.get("cursor"),
             miner_generation=(kafka.batch or {}).get("miner_generation") if kafka is not None
@@ -948,36 +1006,37 @@ def _run_checkpointed_source_batches(
     def flush(
         batch: list[dict[str, Any]],
         checkpoint: SourceCursor,
-        batch_ranges: list[dict[str, Any]],
         receipt_ranges: list[dict[str, Any]],
         batch_provenance: str,
+        rejected_records: list[dict[str, Any]],
     ) -> None:
-        if not batch and not receipt_ranges:
+        if not batch and not receipt_ranges and not rejected_records:
             return
         if source_kind == "kafka":
             with tempfile.TemporaryDirectory(prefix="logrisk-kafka-") as temporary_root:
                 process_batch(
                     batch,
                     checkpoint,
-                    batch_ranges,
                     receipt_ranges,
                     batch_provenance,
+                    rejected_records,
                     Path(temporary_root) / "spool",
                 )
             return
         process_batch(
             batch,
             checkpoint,
-            batch_ranges,
             receipt_ranges,
             batch_provenance,
+            rejected_records,
             persistent_spool_dir or Path(state_dir) / "input_jobs" / input_job_id / "spool",
         )
 
     batch: list[dict[str, Any]] = []
     batch_bytes = 0
-    batch_ranges: list[dict[str, Any]] = []
     receipt_ranges: list[dict[str, Any]] = []
+    rejected_records: list[dict[str, Any]] = []
+    cursor_accumulator: KafkaCursorAccumulator | None = None
     batch_provenance = "verified"
     batch_error: BaseException | None = None
     try:
@@ -993,46 +1052,48 @@ def _run_checkpointed_source_batches(
                 last = restored[-1]
                 after_key = (str(last["source_batch_id"]), int(last["_commit_item_index"]))
         for item in source.read(source_cursor):
-            current_cursor = _cursor_at_least(item.next_cursor, current_cursor)
+            if isinstance(item.next_cursor, KafkaCursorDelta):
+                if cursor_accumulator is None:
+                    cursor_accumulator = KafkaCursorAccumulator(item.next_cursor, current_cursor)
+                cursor_accumulator.apply(item.next_cursor)
+            else:
+                current_cursor = _cursor_at_least(item.next_cursor, current_cursor)
             position = _source_record_position(item, source_kind)
-            if ledger_repository is not None and position is None:
-                batch_provenance = "reported"
-                overall_provenance = "reported"
-            if position is not None:
-                position_key = (
-                    str(position["partition_key"]),
-                    int(position["start"]),
-                    int(position["end"]),
-                )
-                receipt_ranges.append(position)
-                if position_key in seen_positions:
+            if position is not None and source_kind == "kafka":
+                partition_key = position["partition_key"]
+                if position["start"] < kafka_frontier.get(partition_key, 0):
                     continue
-                seen_positions.add(position_key)
-                batch_ranges.append(position)
-            batch.append(item.record)
-            batch_bytes += len(json.dumps(item.record, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
-            parsed += 1
-            if len(batch) >= batch_records or batch_bytes >= MAX_STREAM_BATCH_BYTES:
-                flush(
-                    batch,
-                    current_cursor,
-                    canonical_ranges(batch_ranges),
-                    canonical_ranges(receipt_ranges),
-                    batch_provenance,
-                )
+                kafka_frontier[partition_key] = position["end"]
+            if item.rejection_code is not None:
+                if source_kind != "kafka" or position is None:
+                    raise IncrementalSourceError("被隔离的记录缺少可验证 Kafka 位置")
+                rejected_records.append({
+                    "partition": int(position["partition_key"]),
+                    "offset": position["start"],
+                    "reason_code": item.rejection_code,
+                })
+            else:
+                if ledger_repository is not None:
+                    if position is None:
+                        batch_provenance = overall_provenance = "reported"
+                    else:
+                        receipt_ranges.append(position)
+                batch.append(item.record)
+                batch_bytes += len(json.dumps(item.record, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+                parsed += 1
+            if len(batch) + len(rejected_records) >= batch_records or batch_bytes >= MAX_STREAM_BATCH_BYTES:
+                if cursor_accumulator is not None:
+                    current_cursor = cursor_accumulator.checkpoint()
+                flush(batch, current_cursor, canonical_ranges(receipt_ranges), batch_provenance, rejected_records)
                 batch = []
                 batch_bytes = 0
-                batch_ranges = []
                 receipt_ranges = []
+                rejected_records = []
                 batch_provenance = "verified"
-        if batch or receipt_ranges:
-            flush(
-                batch,
-                current_cursor,
-                canonical_ranges(batch_ranges),
-                canonical_ranges(receipt_ranges),
-                batch_provenance,
-            )
+        if cursor_accumulator is not None:
+            current_cursor = cursor_accumulator.checkpoint()
+        if batch or receipt_ranges or rejected_records:
+            flush(batch, current_cursor, canonical_ranges(receipt_ranges), batch_provenance, rejected_records)
         if kafka is not None and kafka.final_cursor is not None:
             if kafka.final_cursor.to_dict() != streaming_task.get("cursor"):
                 commit_receipt_only(kafka.final_cursor, [], "verified")
@@ -1113,19 +1174,20 @@ def _run_checkpointed_source_batches(
     multi_source_result = {"observations":0,"correlations":0,"unroutable":0}
     if multi_source:
         page = first_page
-        clusters: set[str] = set()
-        earliest = None
+        cluster_windows: dict[str, tuple[str, str]] = {}
         while True:
-            part=multi_source.ingest_risk_entities(page["items"],source_job_id=input_job_id,correlate=False)
-            for field in ("observations","unroutable"):
-                multi_source_result[field]+=part[field]
-            clusters.update(part.get("clusters") or [])
-            if part.get("earliest"):
-                earliest=min(earliest,part["earliest"]) if earliest else part["earliest"]
+            part = multi_source.ingest_risk_entities(page["items"], source_job_id=input_job_id, correlate=False)
+            for field in ("observations", "unroutable"):
+                multi_source_result[field] += part[field]
+            for cluster, (lower, upper) in (part.get("cluster_windows") or {}).items():
+                if cluster in cluster_windows:
+                    old_lower, old_upper = cluster_windows[cluster]
+                    lower, upper = min(old_lower, lower), max(old_upper, upper)
+                cluster_windows[cluster] = (lower, upper)
             if not page["next_key"]:
                 break
-            page=result_repository.entities(result_ref,after=page["next_key"])
-        multi_source_result["correlations"]=multi_source.correlate_clusters(clusters,earliest)
+            page = result_repository.entities(result_ref, after=page["next_key"])
+        multi_source_result.update(multi_source.correlate_windows(cluster_windows))
     reduced = max(0, parsed - int(result_totals["windows"]))
     result = {
         "summary": {
@@ -1222,10 +1284,6 @@ def _source_record_position(item: SourceRecord, source_kind: str) -> dict[str, A
                 raise IncrementalSourceError("Kafka 来源记录 offset 不能为负数")
             return {"partition_key": partition, "start": offset, "end": offset + 1}
         raise IncrementalSourceError("来源记录 position 缺少 partition/start/end")
-    if source_kind == "file":
-        line_no = item.record.get("_line_no")
-        if isinstance(line_no, int) and not isinstance(line_no, bool) and line_no >= 1:
-            return {"partition_key": "", "start": line_no, "end": line_no + 1}
     return None
 
 
@@ -1331,10 +1389,8 @@ def _ledger_source(
     descriptor = descriptor or source.descriptor()
     identity = dict(descriptor.identity or {})
     identity_digest = str(identity.get("identity_digest") or "").strip()
-    if descriptor.kind == "file":
-        digest = getattr(source, "content_digest", None)
-        if callable(digest):
-            identity_digest = str(digest()).strip()
+    if descriptor.kind == "kafka" and isinstance(source, KafkaIncrementalSource):
+        identity_digest = str((source.batch or {}).get("identity") or "").strip()
     if not identity_digest:
         return None
     source_id = source_identity(

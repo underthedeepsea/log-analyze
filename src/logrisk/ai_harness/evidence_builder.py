@@ -9,6 +9,8 @@ from logrisk.ai_harness.context_budget import EvidenceBudget, EvidenceBuildMeta,
 
 TEMPLATE_FIELDS = (
     "template_hash",
+    "base_template_hash",
+    "semantic_rule_revision",
     "template_fingerprint",
     "template_instance_hash",
     "hash_version",
@@ -29,6 +31,8 @@ TEMPLATE_FIELDS = (
 TRUNCATION_MARKER = "[...omitted... ]"
 _OPTIONAL_TEMPLATE_FIELDS = (
     "semantic_dictionary_versions",
+    "semantic_rule_revision",
+    "base_template_hash",
     "typed_parameters",
     "semantic_fields",
     "risk_semantic",

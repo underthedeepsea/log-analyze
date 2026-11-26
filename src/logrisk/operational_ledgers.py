@@ -426,6 +426,7 @@ class OperationalLedgerRepository:
         committed = _canonical_timestamp(committed_at, "committed_at") if committed_at is not None else utc_now()
 
         with self._write_context(connection) as current:
+            self._lock_source(current, normalized_source)
             existing = current.execute(
                 "SELECT * FROM operational_ingestion_batches WHERE input_job_id=? AND checkpoint_key=?",
                 (input_key, checkpoint),
@@ -449,16 +450,28 @@ class OperationalLedgerRepository:
             if by_id is not None:
                 raise OperationalLedgerConflict("batch_id 已绑定到不同窗口")
 
-            self._lock_source(current, normalized_source)
-            existing_rows = current.execute(
-                "SELECT partition_key, start_position, end_position FROM operational_source_ranges "
-                "WHERE source_id=? AND kind='ingested' ORDER BY partition_key, start_position, end_position",
-                (normalized_source["source_id"],),
-            ).fetchall()
-            existing_ranges = self._range_rows(existing_rows)
-            uncovered = subtract_ranges(range_payload, existing_ranges)
-            newly_count = _sum_lengths(uncovered)
-            stored_newly_count: int | None = newly_count if provenance == "verified" else None
+            uncovered = []
+            if provenance == "verified":
+                for interval in range_payload:
+                    # Ingested ranges for a source/partition are disjoint. Only
+                    # the immediate predecessor can cross this pair of bounds.
+                    params = (normalized_source["source_id"], interval["partition_key"])
+                    predecessor = current.execute(
+                        "SELECT partition_key, start_position, end_position FROM operational_source_ranges "
+                        "WHERE source_id=? AND kind='ingested' AND partition_key=? AND start_position<? "
+                        "ORDER BY start_position DESC LIMIT 1",
+                        (*params, interval["start"]),
+                    ).fetchone()
+                    occupied = current.execute(
+                        "SELECT partition_key, start_position, end_position FROM operational_source_ranges "
+                        "WHERE source_id=? AND kind='ingested' AND partition_key=? "
+                        "AND start_position>=? AND start_position<? ORDER BY start_position",
+                        (*params, interval["start"], interval["end"]),
+                    ).fetchall()
+                    if predecessor is not None and predecessor["end_position"] > interval["start"]:
+                        occupied.insert(0, predecessor)
+                    uncovered.extend(subtract_ranges([interval], self._range_rows(occupied)))
+            stored_newly_count = _sum_lengths(uncovered) if provenance == "verified" else None
             current.execute(
                 "INSERT INTO operational_ingestion_batches(batch_id, source_id, input_job_id, checkpoint_key, parser_version, "
                 "ranges_json, actual_count, newly_ingested_count, provenance, committed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",

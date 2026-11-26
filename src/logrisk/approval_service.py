@@ -7,6 +7,7 @@ import uuid
 from contextlib import contextmanager, nullcontext
 from typing import Any, Iterator
 
+from logrisk.entity_identity import entity_key
 from logrisk.approval_dedup import approval_identity
 from logrisk.database import utc_now
 
@@ -72,7 +73,7 @@ class ApprovalService:
             current_records = dict(entities._loaded)
             active = job.get("_active_record")
             if active is not None:
-                current_records[str(active["entity_id"])] = active
+                current_records[entity_key(active)] = active
             for key, record in list(saved_entities._loaded.items()):
                 if key in current_records:
                     current_records[key].clear()
@@ -97,10 +98,10 @@ class ApprovalService:
                     current_cache.extend(saved_cache)
                 saved[field] = collection
         else:
-            records = {item.get("entity_id"): item for item in entities or []}
+            records = {entity_key(item): item for item in entities or []}
             restored = []
             for record in saved.get("entities", []):
-                current_record = records.get(record.get("entity_id"))
+                current_record = records.get(entity_key(record))
                 if current_record is not None:
                     current_record.clear()
                     current_record.update(record)

@@ -10,6 +10,8 @@ from typing import Any
 from logrisk.artifact_storage import SharedArtifactStore, StagedArtifact
 from logrisk.database import Database
 
+from logrisk.version import __version__
+
 from .archive import ArchiveInspection, validate_archive
 from .asset_adapters import KnowledgeAssetAdapterRegistry
 from .errors import KnowledgePackageError
@@ -21,7 +23,7 @@ MAX_PACKAGE_BYTES = 100 * 1024 * 1024
 
 
 class KnowledgePackageService:
-    def __init__(self, database: Database, artifact_store: SharedArtifactStore, *, app_version: str = "1.38.0", adapters: KnowledgeAssetAdapterRegistry | None = None) -> None:
+    def __init__(self, database: Database, artifact_store: SharedArtifactStore, *, app_version: str = __version__, adapters: KnowledgeAssetAdapterRegistry | None = None) -> None:
         self.database = database
         self.artifact_store = artifact_store
         self.repository = KnowledgePackageRepository(database)

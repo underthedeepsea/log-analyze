@@ -7,7 +7,7 @@ from typing import Any, Callable
 from logrisk.database import Database, utc_now
 
 from .errors import AgenticError
-from .models import AgentPlan, AgentRunRequest
+from .models import enforce_replay_scope, AgentPlan, AgentRunRequest
 
 
 def _json(value: Any) -> str:
@@ -38,7 +38,10 @@ class AgentRepository:
     def create_run(self, request: AgentRunRequest, *, locked_snapshot: dict[str, Any]) -> dict[str, Any]:
         existing = self._by_idempotency(request.actor, request.idempotency_key)
         if existing:
-            return {**self.get_run(existing), "idempotent_replay": True}
+            saved = self.get_run(existing)
+            enforce_replay_scope(saved, request.source_job_id, request.entity_id, locked_snapshot,
+                                 code="agent_idempotency_scope_conflict")
+            return {**saved, "idempotent_replay": True}
         run_id = uuid.uuid4().hex
         now = utc_now()
         try:
@@ -61,7 +64,10 @@ class AgentRepository:
         except Exception:
             existing = self._by_idempotency(request.actor, request.idempotency_key)
             if existing:
-                return {**self.get_run(existing), "idempotent_replay": True}
+                saved = self.get_run(existing)
+                enforce_replay_scope(saved, request.source_job_id, request.entity_id, locked_snapshot,
+                                     code="agent_idempotency_scope_conflict")
+                return {**saved, "idempotent_replay": True}
             raise
         return {**self.get_run(run_id), "idempotent_replay": False}
 

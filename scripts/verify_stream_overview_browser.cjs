@@ -8,6 +8,7 @@ const root = path.resolve(__dirname, '..');
 const out = path.resolve(process.env.LOGRISK_FRONTEND_EVIDENCE || '/tmp/logrisk-stream-overview-browser');
 fs.mkdirSync(out, { recursive: true });
 let minute = 0, fail = false, disabled = false, irregular = false, noData = false, activeRun = false, budgetExhausted = false, usageComplete = false, budgetAttempts = 0, featureAttempts = 0, volumeMode = 'both', slowMode = false, slowReads = 0, slowRelease = null;
+let workflowSummaryMissing = false;
 const runA = '0123456789abcdef0123456789abcdef', runB = '11111111111111111111111111111111';
 function at() { return new Date(Date.UTC(2026, 10, 23, 3, minute)).toISOString(); }
 const block = data => ({ status: 'available', data });
@@ -26,6 +27,7 @@ function overview() {
   if (volumeMode === 'partial-batch') activity.committed_batch_records = { today_records: null, total_records: 100, seven_day_records: [{ date: '2026-11-22', records: 44 }, { date: '2026-11-23', records: null }] };
   if (volumeMode === 'zero-batch') activity.committed_batch_records = { today_records: 0, total_records: 0, seven_day_records: [{ date: '2026-11-23', records: 0 }] };
   if (usageComplete) Object.assign(payload.usage.data, { receipted_calls: 3, complete_calls: 3, output_tokens: 600, total_tokens: 3600 });
+  if (workflowSummaryMissing) payload.workflows = { status: 'unavailable', data: null, reason: '多专家运行记录暂时不可读取。' };
   return payload;
 }
 function detail(id) {
@@ -78,7 +80,22 @@ async function main() {
   const errors = []; page.on('pageerror', error => errors.push(error.message));
   await page.addInitScript(() => {
     const original = window.setInterval.bind(window);
-    window.setInterval = (fn, delay, ...args) => original(fn, window.__fastOverviewPoll && delay === 30000 ? 40 : delay, ...args);
+    window.setInterval = (fn, delay, ...args) => {
+      if (delay === 30000) window.__tickOverview = fn;
+      return original(fn, window.__fastOverviewPoll && delay === 30000 ? 40 : delay, ...args);
+    };
+    const realFetch = window.fetch.bind(window);
+    window.__detailReads = [];
+    window.fetch = (url, options) => {
+      const match = /\/api\/stream-overview\/workflow-runs\/([^/?]+)/.exec(String(url));
+      if (!window.__holdDetails || !match) return realFetch(url, options);
+      return new Promise(resolve => {
+        // Ignore cancellation in the transport so the component has to drop late replies itself.
+        window.__detailReads.push({ id: match[1], signal: options.signal, deliver(status, body) {
+          resolve(new Response(JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } }));
+        } });
+      });
+    };
   });
   await page.route('**/*', async route => {
     const url = new URL(route.request().url());
@@ -156,6 +173,64 @@ async function main() {
     assert.match(await page.locator('.ov-inspect').innerText(), /阻塞节点：规则专家/);
     assert.match(await page.locator('.ov-inspect').innerText(), /节点 ID feature/);
     assert.match(await page.locator('.ov-inspect').innerText(), new RegExp('运行 ID ' + runA));
+    const runRead = page.locator('.ov-run-info [role=status]');
+    const runSelect = page.getByLabel('工作流运行');
+    const releaseDetail = (index, status, body) => page.evaluate(([i, code, response]) => window.__detailReads[i].deliver(code, response), [index, status, body]);
+    await page.evaluate(() => { window.__holdDetails = true; window.__tickOverview(); });
+    await page.waitForFunction(() => window.__detailReads.length === 1);
+    const duringRefresh = await runRead.innerText();
+    assert.match(duringRefresh, /^正在刷新 · 上次成功读取 \d{4}/);
+    assert.equal(await page.locator('.ov-node[data-tone=fault]').count(), 1);
+    assert.match(await page.locator('.ov-inspect').innerText(), new RegExp('运行 ID ' + runA));
+    await releaseDetail(0, 503, {});
+    await page.getByText('运行详情刷新失败，以下为此前读取的节点状态。').waitFor();
+    const retainedRead = duringRefresh.replace('正在刷新 · ', '展示');
+    assert.equal(await runRead.innerText(), retainedRead);
+    assert.equal(await page.locator('.ov-node[data-tone=fault]').count(), 1);
+
+    workflowSummaryMissing = true;
+    await page.evaluate(() => window.__tickOverview());
+    await page.getByText('正在查看此前读取的运行列表').waitFor();
+    assert.equal(await page.locator('.ov').getAttribute('data-overview-state'), 'ready');
+    assert.equal(await runSelect.getAttribute('title'), runA);
+    assert.equal(await runRead.innerText(), retainedRead);
+    assert.equal(await page.locator('.ov-node[data-tone=fault]').count(), 1);
+    assert.match(await page.locator('.ov-rollup').innerText(), /排队 未知 · 运行 未知 · 等待 未知/);
+    assert.match(await page.locator('.ov-rollup').innerText(), /启动 未知 · 完成 未知 · 失败 未知 · 等待人工 未知/);
+    assert.match(await page.locator('.ov-fleet').innerText(), /待调度工作流\s*未知/);
+    assert.match(await page.locator('.ov-fleet').innerText(), /当前待审批\s*4/);
+    assert.equal(await page.evaluate(() => window.__detailReads.length), 1);
+    workflowSummaryMissing = false;
+    await page.evaluate(() => window.__tickOverview());
+    await page.waitForFunction(() => window.__detailReads.length === 2);
+    await runSelect.selectOption(runB);
+    await page.waitForFunction(() => window.__detailReads.length === 3);
+    assert.equal(await runSelect.getAttribute('title'), runB);
+    assert.equal(await page.locator('.ov-node[data-tone=fault]').count(), 0);
+    assert.match(await page.locator('.ov-run-info').innerText(), /正在读取运行详情/);
+    assert.deepEqual(await page.evaluate(() => window.__detailReads.slice(1).map(item => [item.id, item.signal.aborted])), [[runA, true], [runB, false]]);
+    await releaseDetail(2, 200, detail(runB));
+    await page.locator('.ov-expert-graph').waitFor();
+    await releaseDetail(1, 200, detail(runA));
+    await page.evaluate(() => new Promise(requestAnimationFrame));
+    assert.equal(await page.locator('.ov-expert-graph').count(), 1);
+    assert.equal(await page.locator('.ov-node[data-tone=fault]').count(), 0);
+
+    await runSelect.selectOption(runA);
+    await page.waitForFunction(() => window.__detailReads.length === 4);
+    assert.match(await page.locator('.ov-run-info').innerText(), /正在读取运行详情/);
+    assert.equal(await page.locator('.ov-node[data-tone=fault]').count(), 0);
+    await releaseDetail(3, 200, detail(runA));
+    await page.locator('.ov-node[data-tone=fault]').waitFor();
+    await page.evaluate(() => window.__tickOverview());
+    await page.waitForFunction(() => window.__detailReads.length === 5);
+    await releaseDetail(4, 403, {});
+    await page.getByText('运行详情读取失败，节点状态未知。').waitFor();
+    assert.equal(await page.locator('.ov-node[data-tone=fault]').count(), 0);
+    assert.equal(await runRead.count(), 0);
+    await page.evaluate(() => { window.__holdDetails = false; window.__tickOverview(); });
+    await page.locator('.ov-node[data-tone=fault]').waitFor();
+    await page.getByRole('button', { name: /特征专家/ }).click();
     activeRun = true; await page.getByRole('button', { name: '刷新快照' }).click();
     await page.locator('.ov-feature-place .ov-node').getByText('等待执行').waitFor();
     assert.equal(await page.locator('.ov-feature-place .ov-node').getAttribute('data-tone'), 'wait');
@@ -184,6 +259,9 @@ async function main() {
     assert.match(await page.locator('.ov-plain-plot path').getAttribute('d'), / L /, 'consecutive session samples connect');
     fail = true; minute = 2; await page.getByRole('button', { name: '刷新快照' }).click();
     await page.locator('.ov[data-overview-state=error]').waitFor();
+    assert.match(await runRead.innerText(), /^展示上次成功读取 \d{4}/);
+    assert.equal(await page.locator('.ov-node[data-tone=fault]').count(), 1);
+    await page.getByText('正在查看此前读取的运行列表').waitFor();
     fail = false; minute = 3; await page.getByRole('button', { name: '刷新快照' }).click();
     await page.waitForFunction(() => document.querySelectorAll('.ov-plain-plot circle').length === 3);
     assert.equal((await page.locator('.ov-plain-plot path').getAttribute('d')).match(/ M /g).length, 2, 'failed reads break the approval line');
@@ -249,7 +327,7 @@ async function main() {
     await page.goto('http://fixture.invalid/streaming'); await page.locator('.so-heading h1').waitFor();
     assert.equal(await page.locator('.so-heading h1').innerText(), '流运行总览');
     assert.deepEqual(errors, []);
-    console.log('PASS: real/unknown data, gap-safe history, actual workflow topology and gates, text safety, dark/mobile');
+    console.log('PASS: gap-safe history, workflow topology and gates, retained detail, stale/denied reads, selection races, text safety, dark/mobile');
   } finally { await browser.close(); }
 }
 main().catch(error => { console.error(error); process.exitCode = 1; });

@@ -15,6 +15,10 @@ from .template_identity import HASH_VERSION, template_fingerprint, template_inst
 from .multi_source.router import route_entities
 
 
+def miner_state_filename(key: tuple[str, ...]) -> str:
+    return "__".join(value.replace("/", "_").replace(" ", "_") for value in key) + ".bin"
+
+
 class Drain3ShardManager:
     def __init__(self, config_path: str | Path, state_dir: str | Path):
         self.config_path = Path(config_path)
@@ -47,8 +51,7 @@ class Drain3ShardManager:
         )
         if key in self._miners:
             return self._miners[key]
-        safe = "__".join(x.replace("/", "_").replace(" ", "_") for x in key)
-        state_file = self.state_dir / f"{safe}.bin"
+        state_file = self.state_dir / miner_state_filename(key)
         miner = TemplateMiner(
             persistence_handler=FilePersistence(str(state_file)),
             config=self._load_config(),

@@ -978,9 +978,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
             if workflow_run_match:
                 if not self.server.agent_workflows_enabled:  # type: ignore[attr-defined]
                     raise AgenticError("Agent 工作流功能未启用", code="agent_workflows_disabled", status_code=404)
-                from logrisk.agentic.models import validate_run_scope
+                from logrisk.agentic.models import evidence_selection, scoped_evidence_summary, validate_run_scope
                 job_id, entity_id = validate_run_scope(payload.get("source_job_id"), payload.get("entity_id"))
-                evidence = self.server.manager.get_agent_evidence(job_id, entity_id)  # type: ignore[attr-defined]
+                evidence = self.server.manager.get_agent_evidence(job_id, entity_id, **evidence_selection(payload))  # type: ignore[attr-defined]
                 profile = self.server.model_profiles.get(payload.get("model_profile_id"))  # type: ignore[attr-defined]
                 connection = self.server.connections.get(profile.connection_id)  # type: ignore[attr-defined]
                 prompt = self.server.prompt_registry.load(str(payload.get("prompt_id") or "agent_plan_v1"))  # type: ignore[attr-defined]
@@ -989,7 +989,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     entity_type=str(evidence["entity"].get("type") or ""), model_profile_id=profile.profile_id,
                     prompt_id=prompt.prompt_id, actor=str(identity.actor or "unknown"), roles=tuple(identity.roles),
                     request_id=identity.request_id, idempotency_key=str(self.headers.get("Idempotency-Key") or payload.get("idempotency_key") or ""),
-                    evidence_summary={"entity": evidence["entity"], "risk_score": evidence["risk_score"], "template_count": len(evidence["templates"])},
+                    evidence_summary=scoped_evidence_summary(evidence),
                     runtime_snapshot={"profile_snapshot": profile.public_dict(), "connection_snapshot": connection,
                                       "prompt_id": prompt.prompt_id, "prompt_sha256": prompt.sha256},
                 )
@@ -1024,9 +1024,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
                     raise AgenticError("Agent 功能未启用", code="agentic_disabled", status_code=404)
                 if not isinstance(payload, dict):
                     raise AgenticError("请求体必须是 JSON object")
-                from logrisk.agentic.models import validate_run_scope
+                from logrisk.agentic.models import evidence_selection, scoped_evidence_summary, validate_run_scope
                 job_id, entity_id = validate_run_scope(payload.get("source_job_id"), payload.get("entity_id"))
-                evidence = self.server.manager.get_agent_evidence(job_id, entity_id)  # type: ignore[attr-defined]
+                evidence = self.server.manager.get_agent_evidence(job_id, entity_id, **evidence_selection(payload))  # type: ignore[attr-defined]
                 profile = self.server.model_profiles.get(payload.get("model_profile_id"))  # type: ignore[attr-defined]
                 connection = self.server.connections.get(profile.connection_id)  # type: ignore[attr-defined]
                 prompt = self.server.prompt_registry.load(str(payload.get("prompt_id") or "agent_plan_v1"))  # type: ignore[attr-defined]
@@ -1042,7 +1042,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 if not request.idempotency_key:
                     raise AgenticError("缺少幂等键", code="idempotency_required")
                 locked = {"schema_version": "1.0", "goal": str(payload.get("goal") or "提取可审批日志特征"),
-                          "evidence_summary": {"entity": evidence["entity"], "risk_score": evidence["risk_score"], "template_count": len(evidence["templates"])},
+                          "evidence_summary": scoped_evidence_summary(evidence),
                           "profile_snapshot": profile.public_dict(), "connection_snapshot": connection,
                           "prompt_id": prompt.prompt_id, "prompt_sha256": prompt.sha256}
                 run = self.server.agent_runs.create_run(request, locked_snapshot=locked)  # type: ignore[attr-defined]
@@ -1576,7 +1576,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 return
             match = re.fullmatch(r"/api/jobs/([a-f0-9]+)/entities/([^/]+)/retry", path)
             if match:
-                self.server.manager.retry_entity(match.group(1), match.group(2))  # type: ignore[attr-defined]
+                from logrisk.agentic.models import evidence_selection
+                self.server.manager.retry_entity(match.group(1), unquote(match.group(2)), **evidence_selection(payload))  # type: ignore[attr-defined]
                 self._json(HTTPStatus.ACCEPTED, {"status": "queued"})
                 return
             match = re.fullmatch(r"/api/jobs/([a-f0-9]+)/export", path)
@@ -1617,7 +1618,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 {"error": str(exc), "code": code, "error_code": code, "request_id": self._runtime_request_identity().request_id},
             )
         except (FeatureJobError, ProcessingMetricsError, DrainQualityError, SemanticValidationError) as exc:
-            self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc), "code": "invalid_request", "error_code": "invalid_request", "request_id": self._runtime_request_identity().request_id})
+            code = getattr(exc, "code", "invalid_request")
+            self._json(getattr(exc, "status_code", HTTPStatus.BAD_REQUEST), {"error": str(exc), "code": code, "error_code": code, "request_id": self._runtime_request_identity().request_id})
         except (TypeError, ValueError) as exc:
             self._json(HTTPStatus.BAD_REQUEST, {"error": str(exc), "code": "invalid_request", "error_code": "invalid_request", "request_id": self._runtime_request_identity().request_id})
         except Exception:

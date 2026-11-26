@@ -132,13 +132,19 @@ def aggregate_gaps(
 
 def durable_rate(current_sample: Mapping[str, Any], previous: Mapping[str, Any], now: str) -> dict[str, Any]:
     value = None
-    seconds = elapsed(current_sample.get("sampled_at"), previous.get("sampled_at"))
+    sample_seconds = elapsed(current_sample.get("sampled_at"), previous.get("sampled_at"))
+    seconds = elapsed(current_sample.get("durable_at"), previous.get("durable_at"))
     count, prior = current_sample.get("records_processed"), previous.get("records_processed")
-    if (current(now, current_sample.get("sampled_at")) and seconds is not None and 0 < seconds <= FRESH_SECONDS
+    epoch = current_sample.get("epoch")
+    partitions = current_sample.get("partitions")
+    if (current(now, current_sample.get("sampled_at")) and sample_seconds is not None
+            and 0 < sample_seconds <= FRESH_SECONDS
+            and current(now, current_sample.get("durable_at")) and seconds is not None and 0 < seconds <= FRESH_SECONDS
             and current_sample.get("worker_epoch") and current_sample["worker_epoch"] == previous.get("worker_epoch")
-            and current_sample.get("epoch") and current_sample["epoch"] == previous.get("epoch")
-            and current_sample.get("partitions") == previous.get("partitions")
-            and type(count) is int and type(prior) is int and count >= prior):
+            and current_sample.get("durable_task_id") and current_sample["durable_task_id"] == previous.get("durable_task_id")
+            and epoch and epoch == previous.get("epoch") == current_sample.get("durable_epoch") == previous.get("durable_epoch")
+            and partitions and partitions == previous.get("partitions")
+            and type(count) is int and type(prior) is int and count >= prior >= 0):
         rate = (count - prior) / seconds
         if math.isfinite(rate):
             value = round(rate, 3)
@@ -178,7 +184,8 @@ def states(
     elif task.get("status") == "running" and worker.get("last_heartbeat_at"):
         worker_axis = axis("running") if current(now, worker["last_heartbeat_at"]) else axis("stale", "heartbeat_expired")
     elif scheduler.get("state") == "active":
-        worker_axis = axis("waiting", "scheduler_waiting" if scheduler.get("phase") == "awaiting_batch" else "scheduler_checking")
+        reason = {"awaiting_batch": "scheduler_waiting", "retry_backoff": "scheduler_retry_backoff"}
+        worker_axis = axis("waiting", reason.get(scheduler.get("phase"), "scheduler_checking"))
     elif scheduler.get("state") == "stale":
         worker_axis = axis("stale", "scheduler_heartbeat_expired")
     elif task.get("status") == "running":

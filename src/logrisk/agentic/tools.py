@@ -51,7 +51,8 @@ _FEATURE_SCHEMA = {
 
 def build_agent_tool_registry(feature_jobs: Any, rule_governance: Any, knowledge_packages: Any) -> ToolRegistry:
     def load_evidence(context: AgentToolContext) -> dict[str, Any]:
-        value = feature_jobs.get_agent_evidence(context.source_job_id, context.entity_id)
+        selection = {"entity_scope_key": context.entity_scope_key} if context.entity_scope_key is not None else {}
+        value = feature_jobs.get_agent_evidence(context.source_job_id, context.entity_id, **selection)
         _reject_sensitive(value)
         from .models import validate_evidence_scope
         validate_evidence_scope(value, context.source_job_id, context.entity_id, code="tool_scope_violation")
@@ -71,8 +72,14 @@ def build_agent_tool_registry(feature_jobs: Any, rule_governance: Any, knowledge
         hashes = set(map(str, arguments.get("template_hashes") or []))
 
         cluster = context.cluster
-        if cluster is None:
-            cluster = load_evidence(context).get("entity", {}).get("cluster")
+        if cluster is None or any(value.startswith("semantic-") for value in hashes):
+            scoped_evidence = load_evidence(context)
+            cluster = cluster or scoped_evidence.get("entity", {}).get("cluster")
+            hashes.update(
+                str(template[key])
+                for template in scoped_evidence["templates"] if template.get("template_hash") in hashes
+                for key in ("base_template_hash", "template_fingerprint") if template.get(key)
+            )
 
         def summary(rule: dict[str, Any]) -> dict[str, Any] | None:
             return approved_rule_summary(rule, cluster)
@@ -180,6 +187,8 @@ def build_agent_tool_registry(feature_jobs: Any, rule_governance: Any, knowledge
     def register_candidate(arguments: dict[str, Any], context: AgentToolContext) -> dict[str, Any]:
         load_evidence(context)
         kwargs: dict[str, Any] = {"run_id": context.run_id}
+        if context.entity_scope_key is not None:
+            kwargs["entity_scope_key"] = context.entity_scope_key
         if context.rule_bindings:
             kwargs["precondition"] = lambda connection: registry.validate_rule_bindings(context.rule_bindings, context, connection=connection)
         return feature_jobs.register_agent_candidate(

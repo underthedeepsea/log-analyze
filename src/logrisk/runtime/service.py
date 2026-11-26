@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from threading import Lock
+from time import monotonic
 from typing import Any, Mapping
 
 from logrisk.database import Database
@@ -9,6 +11,9 @@ from logrisk.runtime.config import RuntimeConfig
 from logrisk.runtime.health import directory_writable, liveness
 from logrisk.runtime.repository import RuntimeRepository
 from logrisk.runtime.retention import delete_candidates, retention_candidates
+
+
+STORAGE_READ_TTL_SECONDS = 30
 
 
 class RuntimeQuotaError(RuntimeError):
@@ -46,6 +51,8 @@ class RuntimeService:
         self.output_root.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.config = config
         self.repository = repository or RuntimeRepository(database)
+        self._storage_lock = Lock()
+        self._storage_snapshot: tuple[float, dict[str, Any]] | None = None
 
     def retention_policy(self) -> dict[str, Any]:
         """Return the effective retention policy without exposing runtime internals."""
@@ -109,74 +116,77 @@ class RuntimeService:
     ) -> dict[str, Any]:
         page = max(1, int(page))
         page_size = max(1, min(int(page_size), 200))
-        items = self._feature_tasks() + self._input_tasks() + self._streaming_tasks() + self._benchmark_tasks() + self._replay_tasks()
-        if kind:
-            items = [item for item in items if item["kind"] == kind]
-        if status:
-            items = [item for item in items if item["status"] == status]
-        items.sort(key=lambda item: (str(item["updated_at"]), str(item["task_id"])), reverse=True)
+        tables = {
+            "feature_job": ("feature_jobs", "job_id", "job_json, NULL AS stage"),
+            "input_job": ("input_jobs", "input_job_id", "progress_json, stage"),
+            "streaming": ("streaming_tasks", "task_id", "task_json, stage"),
+            "benchmark": ("benchmark_runs", "run_id", "progress_completed, progress_total, error"),
+            "replay": ("replay_runs", "replay_id", "error_code, error_message"),
+        }
+        choices = [name for name in tables if not kind or name == kind]
+        page_result = {"items": [], "total": 0, "page": page, "page_size": page_size}
+        if not choices:
+            return page_result
+        where = " WHERE status=?" if status else ""
+        parameters = [status] if status else []
         start = (page - 1) * page_size
-        return {"items": items[start:start + page_size], "total": len(items), "page": page, "page_size": page_size}
-
-    def _feature_tasks(self) -> list[dict[str, Any]]:
         with self.database.connect() as connection:
-            rows = connection.execute("SELECT job_id, status, job_json, created_at, completed_at, updated_at FROM feature_jobs").fetchall()
-        return [
-            self._task(
-                row["job_id"], "feature_job", row["status"], _object(row["job_json"]).get("stage"),
-                _object(row["job_json"]).get("progress"), row["created_at"], row["updated_at"], None,
-                ["view"],
-            )
-            for row in rows
-        ]
+            counts = [f"SELECT COUNT(*) AS count FROM {tables[name][0]}{where}" for name in choices]
+            total = int(connection.execute(
+                "SELECT SUM(count) FROM (" + " UNION ALL ".join(counts) + ") counted",
+                parameters * len(choices),
+            ).fetchone()[0])
+            page_result["total"] = total
+            if start >= total:
+                return page_result
+            heads = [
+                f"SELECT {tables[name][1]} AS task_id, updated_at, '{name}' AS kind, {order} AS kind_order "
+                f"FROM {tables[name][0]}{where}"
+                for order, name in enumerate(choices)
+            ]
+            rows = connection.execute(
+                "SELECT task_id, kind FROM (" + " UNION ALL ".join(heads) + ") tasks "
+                "ORDER BY updated_at DESC, task_id DESC, kind_order LIMIT ? OFFSET ?",
+                (*parameters * len(choices), page_size, start),
+            ).fetchall()
+            details_by_key = {}
+            for name in choices:
+                task_ids = [head["task_id"] for head in rows if head["kind"] == name]
+                if not task_ids:
+                    continue
+                table, key, details = tables[name]
+                marks = ",".join("?" for _ in task_ids)
+                details_by_key.update(((name, row["task_id"]), row) for row in connection.execute(
+                    f"SELECT {key} AS task_id, status, created_at, updated_at, {details} FROM {table} WHERE {key} IN ({marks})",
+                    task_ids,
+                ))
+            for head in rows:
+                name, task_id = head["kind"], head["task_id"]
+                row = details_by_key.get((name, task_id))
+                if row is not None:
+                    page_result["items"].append(self._task_row(name, task_id, row))
+        return page_result
 
-    def _input_tasks(self) -> list[dict[str, Any]]:
-        with self.database.connect() as connection:
-            rows = connection.execute("SELECT input_job_id, status, stage, progress_json, created_at, updated_at FROM input_jobs").fetchall()
-        return [
-            self._task(
-                row["input_job_id"], "input_job", row["status"], row["stage"],
-                _object(row["progress_json"]).get("progress"), row["created_at"], row["updated_at"],
-                _object(row["progress_json"]).get("error"), ["view"],
-            )
-            for row in rows
-        ]
-
-    def _streaming_tasks(self) -> list[dict[str, Any]]:
-        with self.database.connect() as connection:
-            rows = connection.execute("SELECT task_id, status, stage, task_json, created_at, updated_at FROM streaming_tasks").fetchall()
-        items: list[dict[str, Any]] = []
-        for row in rows:
-            value = _object(row["task_json"])
-            actions = ["view"] + (["resume"] if str(row["status"]) in {"failed", "interrupted"} else [])
-            items.append(self._task(
-                row["task_id"], "streaming", row["status"], row["stage"], value.get("progress"),
-                row["created_at"], row["updated_at"], value.get("error"), actions,
-            ))
-        return items
-
-    def _benchmark_tasks(self) -> list[dict[str, Any]]:
-        with self.database.connect() as connection:
-            rows = connection.execute("SELECT run_id, status, progress_completed, progress_total, error, created_at, updated_at FROM benchmark_runs").fetchall()
-        return [
-            self._task(
-                row["run_id"], "benchmark", row["status"], "benchmark",
-                self._ratio(row["progress_completed"], row["progress_total"]), row["created_at"], row["updated_at"], row["error"],
-                ["view"] + (["cancel"] if str(row["status"]) in {"pending", "running"} else []),
-            )
-            for row in rows
-        ]
-
-    def _replay_tasks(self) -> list[dict[str, Any]]:
-        with self.database.connect() as connection:
-            rows = connection.execute("SELECT replay_id, status, error_code, error_message, created_at, updated_at FROM replay_runs").fetchall()
-        return [
-            self._task(
-                row["replay_id"], "replay", row["status"], "replay", None,
-                row["created_at"], row["updated_at"], row["error_message"], ["view"], row["error_code"],
-            )
-            for row in rows
-        ]
+    def _task_row(self, kind: str, task_id: str, row: Any) -> dict[str, Any]:
+        state = str(row["status"])
+        stage = progress = error = error_code = None
+        actions = ["view"]
+        if kind == "feature_job":
+            data = _object(row["job_json"])
+            stage, progress = data.get("stage"), data.get("progress")
+        elif kind in {"input_job", "streaming"}:
+            data = _object(row["progress_json"] if kind == "input_job" else row["task_json"])
+            stage, progress, error = row["stage"], data.get("progress"), data.get("error")
+            if kind == "streaming" and state in {"failed", "interrupted"}:
+                actions.append("resume")
+        elif kind == "benchmark":
+            stage, error = "benchmark", row["error"]
+            progress = self._ratio(row["progress_completed"], row["progress_total"])
+            if state in {"pending", "running"}:
+                actions.append("cancel")
+        else:
+            stage, error, error_code = "replay", row["error_message"], row["error_code"]
+        return self._task(task_id, kind, state, stage, progress, row["created_at"], row["updated_at"], error, actions, error_code)
 
     @staticmethod
     def _ratio(completed: Any, total: Any) -> float | None:
@@ -204,6 +214,13 @@ class RuntimeService:
         }
 
     def storage_usage(self) -> dict[str, Any]:
+        with self._storage_lock:
+            if self._storage_snapshot is None or monotonic() >= self._storage_snapshot[0]:
+                usage = self._measure_storage_usage()
+                self._storage_snapshot = (monotonic() + STORAGE_READ_TTL_SECONDS, usage)
+            return dict(self._storage_snapshot[1])
+
+    def _measure_storage_usage(self) -> dict[str, Any]:
         state_bytes, state_files = self._directory_usage(self.state_root)
         output_bytes, output_files = self._directory_usage(self.output_root)
         total = state_bytes + output_bytes
@@ -234,7 +251,7 @@ class RuntimeService:
     def require_capacity(self, operation: str, *, additional_bytes: int = 0) -> None:
         if isinstance(additional_bytes, bool) or not isinstance(additional_bytes, int) or additional_bytes < 0:
             raise ValueError("additional_bytes 必须是非负整数")
-        usage = self.storage_usage()
+        usage = self._measure_storage_usage()
         self.repository.record_quota_snapshot(usage)
         total = int(usage.get("total_bytes", usage.get("state_bytes", 0)) or 0)
         hard = int(usage.get("hard_limit_bytes", self.config.quota.hard_limit_bytes) or self.config.quota.hard_limit_bytes)

@@ -43,10 +43,15 @@ def _process_records(
     )
     semantic_matches = 0
     node_risk_ingestions = 0
+    rule_revision = None
     if risk_semantics:
+        snapshot = getattr(risk_semantics, "snapshot", None)
+        matcher = snapshot() if callable(snapshot) else risk_semantics
+        rule_revision = getattr(matcher, "revision", "")
         for event in template_events:
+            event["semantic_rule_revision"] = rule_revision
             try:
-                semantic_event = risk_semantics.match(event)
+                semantic_event = matcher.match(event)
             except RiskSemanticError as exc:
                 if exc.code != "semantic_unclassified":
                     raise
@@ -91,6 +96,7 @@ def _process_records(
             "semantic_enrichment": semantic_snapshot is not None,
             "semantic_dictionary_versions": (semantic_snapshot or {}).get("versions", {}),
             "risk_semantic_matches": semantic_matches,
+            "semantic_rule_revision": rule_revision,
             "node_risk_ingestions": node_risk_ingestions,
         },
         "risk_entities": risk_entities,

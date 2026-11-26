@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import copy
 
-from .models import AgentRunRequest, validate_evidence_scope
+from .models import AgentRunRequest, enforce_replay_scope, validate_evidence_scope
 from .tool_registry import AgentToolContext
 from .errors import AgenticError
 from .repository import AgentRepository
@@ -18,7 +18,8 @@ class AgentService:
         value = copy.deepcopy(summary)
         validate_evidence_scope(value, source_job_id, entity_id, code="agent_scope_invalid")
         cluster = (value.get("entity") or {}).get("cluster")
-        context = AgentToolContext("scope-lock", source_job_id, entity_id, frozenset(), actor, request_id, cluster=cluster)
+        context = AgentToolContext("scope-lock", source_job_id, entity_id, frozenset(), actor, request_id, cluster=cluster,
+                                   entity_scope_key=value.get("entity_key"))
         locked = self.runtime.tools.lock_evidence(context)
         if locked is not None:
             if value.get("locked_evidence_hash") not in (None, locked["evidence_hash"]):
@@ -31,10 +32,12 @@ class AgentService:
         existing = self.repository._by_idempotency(request.actor, request.idempotency_key)
         if existing:
             saved = self.repository.get_run(existing)
-            if saved["source_job_id"] != request.source_job_id or saved["entity_id"] != request.entity_id:
-                raise AgenticError("幂等键跨实体复用", code="agent_idempotency_scope_conflict")
+            enforce_replay_scope(saved, request.source_job_id, request.entity_id, locked_snapshot,
+                                 code="agent_idempotency_scope_conflict")
             return {**saved, "idempotent_replay": True}
         value = copy.deepcopy(locked_snapshot)
+        validate_evidence_scope(value.get("evidence_summary") or {}, request.source_job_id, request.entity_id,
+                                code="agent_scope_invalid")
         if value.get("workflow_role_id"):
             value["evidence_summary"] = self.lock_evidence_summary(value.get("evidence_summary") or {}, source_job_id=request.source_job_id, entity_id=request.entity_id, actor=request.actor, request_id=request.request_id)
         return self.repository.create_run(request, locked_snapshot=value)

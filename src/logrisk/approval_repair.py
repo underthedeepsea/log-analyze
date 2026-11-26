@@ -194,11 +194,10 @@ def repair_pending_candidates(database: Database, *, apply: bool = False) -> dic
                  snapshot["occurrence_count"], snapshot["first_seen"], snapshot["last_seen"], now, group_id),
             )
         for job_id in job_ids:
-            for row in connection.execute("SELECT entity_id, entity_json FROM feature_job_entities WHERE job_id=?", (job_id,)).fetchall():
+            for row in connection.execute("SELECT entity_key, entity_json FROM feature_job_entities WHERE job_id=?", (job_id,)).fetchall():
                 entity = json.loads(row["entity_json"])
                 entity["feature_ids"] = [child for cid in entity.get("feature_ids", []) for child in expansions.get(cid, [cid])]
-                connection.execute("UPDATE feature_job_entities SET entity_json=?, updated_at=? WHERE job_id=? AND entity_id=?",
-                                   (json.dumps(entity, ensure_ascii=False), now, job_id, row["entity_id"]))
+                SQLiteFeatureJobStore._upsert_entity(connection, job_id, entity, now, replace_candidate_links=True)
             job = SQLiteFeatureJobStore(database).bind(connection).load_job(job_id)
             if job is None:
                 raise ValueError("修复任务不存在，修复已回滚")

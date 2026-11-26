@@ -3,7 +3,7 @@ from __future__ import annotations
 import threading
 from typing import Any
 
-from logrisk.server_risk.contracts import ServerRiskError, decode, digest, json_text, typed_fields
+from logrisk.server_risk.contracts import ServerRiskError, decode, digest, json_text, typed_fields, utc
 from logrisk.server_risk.replay import EvaluationContext
 
 MAX_COMMITS = 16
@@ -67,13 +67,23 @@ class CommittedObservationAdapter:
                 raise ServerRiskError("commit_incomplete", "提交窗口不完整", 409) from None
             if not commit["payload_hash"] or actual != commit["payload_hash"] or summary.get("template_count") != count:
                 raise ServerRiskError("commit_integrity_invalid", "提交内容摘要或完整数量不匹配", 409)
-            old = conn.execute("SELECT input_revision,status FROM server_risk_projection_state WHERE input_namespace=?", (namespace,)).fetchone()
-            if old:
-                if old["input_revision"] != actual:
-                    raise ServerRiskError("commit_revision_conflict", "已派生提交发生变化", 409)
-                if old["status"] == "complete":
-                    return {"commit_ref": commit_id, "projection_complete": True, "idempotent_replay": True}
-            conn.execute("INSERT INTO server_risk_projection_state(input_namespace,input_revision,status,updated_at) VALUES (?,?,'pending',?) ON CONFLICT(input_namespace) DO NOTHING", (namespace, actual, self.clock()))
+            now = self.clock()
+            conn.execute(
+                "INSERT INTO server_risk_projection_state(input_namespace,input_revision,status,updated_at) "
+                "VALUES (?,?,'pending',?) ON CONFLICT(input_namespace) DO NOTHING", (namespace, actual, now),
+            )
+            lock = " FOR UPDATE" if self.repository.database.provider == "postgres" else ""
+            old = conn.execute(
+                "SELECT input_revision,status FROM server_risk_projection_state WHERE input_namespace=?" + lock, (namespace,),
+            ).fetchone()
+            if old["input_revision"] != actual:
+                raise ServerRiskError("commit_revision_conflict", "已派生提交发生变化", 409)
+            if old["status"] == "complete":
+                complete = self.observations.resume_projection(
+                    conn, namespace, actual, now, before_scope=self._before_scope,
+                )
+                self._check_cancelled()
+                return {"commit_ref": commit_id, "projection_complete": complete, "idempotent_replay": True}
             items, physicals, subjects = [], [], set()
             after = -1
             while True:
@@ -122,13 +132,14 @@ class CommittedObservationAdapter:
                         if not isinstance(certificate, dict):
                             raise ServerRiskError("commit_coverage_missing", "提交缺少独立覆盖证明")
                         item["coverage"] = dict(certificate)
-                    subjects.add((identity["cluster"], identity["node_id"]))
+                    subjects.add((self.observations.subject_key(source, item), identity["cluster"], identity["node_id"]))
                     items.append(item)
                     physicals.append(physical)
                     if len(items) > 10000:
                         raise ServerRiskError("commit_resource_limit", "单次派生超过观测资源上限")
             if len(set(physicals)) != len(physicals):
                 raise ServerRiskError("commit_contribution_conflict", "提交物理贡献重复", 409)
+            self.repository.lock_current_scopes({(cluster, node, subject) for subject, cluster, node in subjects}, conn)
             for part in range(0, len(items), 500):
                 if self.cancelled():
                     raise ServerRiskError("commit_cancelled", "提交派生已取消")
@@ -139,18 +150,56 @@ class CommittedObservationAdapter:
                         item["coverage"]["input_frontier_ref"] = "batch:" + key
                 self.observations.submit(payload, adapter["actor"], connection=conn, physical_keys=physicals[part:part + 500], defer_persist=True)
                 self.hit("commit_part_complete", part=part // 500, count=len(payload["observations"]))
-            end = max((item.get("interval_end", item.get("occurred_at")) for item in items), default=None)
-            conn.execute("UPDATE server_risk_projection_state SET status='complete',last_fact_ref=?,evaluated_through=?,updated_at=? WHERE input_namespace=?", (json_text({"task_ref": task_id, "commit_ref": commit_id, "parts": (len(items) + 499) // 500, "row_count": count, "observations": len(items)}), end, self.clock(), namespace))
+            end = max((item.get("interval_end", item.get("occurred_at")) for item in items), key=utc, default=None)
+            now = self.clock()
+            conn.execute("UPDATE server_risk_projection_state SET status='complete',last_fact_ref=?,evaluated_through=?,updated_at=? WHERE input_namespace=?", (json_text({"task_ref": task_id, "commit_ref": commit_id, "parts": (len(items) + 499) // 500, "row_count": count, "observations": len(items)}), end, now, namespace))
             context = EvaluationContext.historical(end) if end and adapter.get("mode") == "historical" else None
-            for cluster, node in subjects:
-                self.hit("deterministic_recovery_and_expiry", cluster=cluster, node=node)
-                self.observations.assessment.persist(cluster, node, conn, self.clock(), context=context)
+            assessments_complete = self.observations.project_admitted(
+                conn, namespace, actual, now, end, {(cluster, node, subject): None for subject, cluster, node in subjects},
+                context=context, before_scope=self._before_scope,
+                commit={"source_id": source_id, "epoch": source["source_epoch"], "config_revision": source["config_revision"],
+                        "task_id": task_id, "commit_id": commit_id},
+            )
+            self._check_cancelled()
             self.hit("commit_frontier_complete", commit_ref=commit_id, count=count)
-        return {"commit_ref": commit_id, "projection_complete": True, "idempotent_replay": False, "accepted_count": len(items)}
+        return {"commit_ref": commit_id, "projection_complete": assessments_complete, "idempotent_replay": False, "accepted_count": len(items)}
+
+    def _check_cancelled(self) -> None:
+        if self.cancelled():
+            raise ServerRiskError("commit_cancelled", "提交派生已取消")
+
+    def _before_scope(self, cluster: str, node: str) -> None:
+        self._check_cancelled()
+        self.hit("deterministic_recovery_and_expiry", cluster=cluster, node=node)
+
+    def _due(self, source: dict[str, Any], conn: Any, limit: int) -> list[tuple[str, str]]:
+        if self.repository.database.provider == "postgres":
+            path = lambda field: f"(last_fact_ref::jsonb->'commit'->>'{field}')"
+        else:
+            path = lambda field: f"(CASE WHEN json_valid(last_fact_ref) THEN json_extract(last_fact_ref,'$.commit.{field}') END)"
+        rows = conn.execute(
+            f"SELECT {path('task_id')} AS task_id,{path('commit_id')} AS commit_id FROM server_risk_projection_state "
+            "WHERE status='pending' AND input_namespace LIKE 'assessment-commit:%' "
+            f"AND evaluated_through<=? AND {path('source_id')}=? AND {path('epoch')}=? AND {path('config_revision')}=? "
+            "ORDER BY evaluated_through,input_namespace LIMIT ?",
+            (utc(self.clock()).isoformat(timespec="microseconds"), source["source_id"], source["source_epoch"],
+             source["config_revision"], limit),
+        ).fetchall()
+        return [(row["task_id"], row["commit_id"]) for row in rows if row["task_id"] and row["commit_id"]]
 
     def tick(self) -> list[dict[str, Any]]:
         results = []
         for source, adapter in self.registrations():
+            remaining = MAX_COMMITS - len(results)
+            if remaining <= 0 or self.cancelled():
+                break
+            with self.repository.database.connect() as conn:
+                due = self._due(source, conn, min(remaining, MAX_COMMITS // 2))
+            seen = set(due)
+            for task_id, commit_id in due:
+                if self.cancelled():
+                    return results
+                results.append(self._attempt(source["source_id"], adapter, task_id, commit_id))
             remaining = MAX_COMMITS - len(results)
             if remaining <= 0:
                 break
@@ -163,15 +212,21 @@ class CommittedObservationAdapter:
                 self.scan_after.pop(source["source_id"], None)
                 continue
             for commit in commits:
-                self.scan_after[source["source_id"]] = (commit["committed_at"], commit["task_id"], commit["window_id"])
-                if adapter.get("task_ids") and commit["task_id"] not in adapter["task_ids"]:
-                    results.append({"commit_ref": commit["window_id"], "projection_complete": False, "skipped": True})
-                    continue
-                try:
-                    results.append(self.advance(source["source_id"], commit["task_id"], commit["window_id"]))
-                except ServerRiskError as exc:
-                    results.append({"commit_ref": commit["window_id"], "projection_complete": False, "error_code": exc.code})
+                if self.cancelled():
+                    return results
+                task_id, commit_id = commit["task_id"], commit["window_id"]
+                self.scan_after[source["source_id"]] = (commit["committed_at"], task_id, commit_id)
+                if (task_id, commit_id) not in seen:
+                    results.append(self._attempt(source["source_id"], adapter, task_id, commit_id))
         return results
+
+    def _attempt(self, source_id: str, adapter: dict[str, Any], task_id: str, commit_id: str) -> dict[str, Any]:
+        if adapter.get("task_ids") and task_id not in adapter["task_ids"]:
+            return {"commit_ref": commit_id, "projection_complete": False, "skipped": True}
+        try:
+            return self.advance(source_id, task_id, commit_id)
+        except ServerRiskError as exc:
+            return {"commit_ref": commit_id, "projection_complete": False, "error_code": exc.code}
 
 
 class CommittedObservationWorker:

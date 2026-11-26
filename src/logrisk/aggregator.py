@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -59,6 +60,19 @@ def aggregate_template_events(
     return aggregator.finalize()
 
 
+def risk_semantic_key(record: dict[str, Any]) -> tuple[Any, ...] | None:
+    semantic = record.get("risk_semantic")
+    if not semantic:
+        return None
+    return (
+        semantic.get("semantic_rule_id"),
+        semantic.get("semantic_rule_version"),
+        semantic.get("risk_type"),
+        json.dumps(semantic.get("semantic_fields") or {}, ensure_ascii=False, sort_keys=True),
+        json.dumps(record.get("device"), ensure_ascii=False, sort_keys=True),
+    )
+
+
 class TemplateEventAggregator:
     def __init__(self, window_seconds: int = 300, max_samples_per_template: int = 3) -> None:
         self.window_seconds = window_seconds
@@ -83,7 +97,8 @@ class TemplateEventAggregator:
             event.get("source_type"),
             event.get("semantic_extractor_version"),
             repr(sorted((event.get("semantic_dictionary_versions") or {}).items())),
-            (event.get("risk_semantic") or {}).get("risk_type"),
+            risk_semantic_key(event),
+            event.get("semantic_rule_revision"),
             (event.get("semantic_fields") or {}).get("unit") if event.get("component") == "systemd" else None,
         )
 
@@ -123,6 +138,7 @@ class TemplateEventAggregator:
                 "semantic_extractor_version": event.get("semantic_extractor_version"),
                 "semantic_dictionary_versions": event.get("semantic_dictionary_versions") or {},
                 "risk_semantic": event.get("risk_semantic"),
+                **({"semantic_rule_revision": event["semantic_rule_revision"]} if "semantic_rule_revision" in event else {}),
             }
 
         w = self.windows[key]

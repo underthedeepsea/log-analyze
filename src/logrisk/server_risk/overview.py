@@ -9,7 +9,7 @@ from zoneinfo import ZoneInfo
 
 from logrisk.server_risk.contracts import ServerRiskError, day_bounds, decode, digest, identifier, integer, utc
 from logrisk.server_risk.daily import covers_day
-from logrisk.server_risk.repository import MAX_SCOPE_ROWS
+from logrisk.server_risk.repository import MAX_SCOPE_ROWS, PAGE_ROWS
 
 LEVELS = {"high": 3, "medium": 2, "low": 1, "unknown": 0}
 RECOVERY_STATES = ("unrecovered", "recovered", "unknown")
@@ -110,10 +110,8 @@ class RiskOverview:
     def overview(self, first: str | None = None, last: str | None = None, zone: str = "Asia/Shanghai", **filters: Any) -> dict[str, Any]:
         query, start, end = normalized_query(first, last, zone, self.clock(), **filters)
         hosts, all_groups = [], []
-        for node in self.repository.nodes():
-            if query["q"] and query["q"].casefold() not in (node["cluster"] + " " + node["node_id"] + " " + node["label"]).casefold():
-                continue
-            groups = self._groups(node["cluster"], node["node_id"], query, start, end)
+        for node, snapshot in self.repository.overview_snapshots((start, end), query=query["q"]):
+            groups = self._groups(node["cluster"], node["node_id"], query, start, end, snapshot=snapshot)
             if not groups:
                 continue
             all_groups.extend(groups)
@@ -143,7 +141,10 @@ class RiskOverview:
         bounds = [day_bounds(day, "Asia/Shanghai") for day in dates]
         daily_hosts: list[list[dict[str, Any]]] = [[] for _ in bounds]
         daily_groups: list[list[dict[str, Any]]] = [[] for _ in bounds]
-        for node, snapshot in self.repository.overview_snapshots():
+        if not bounds:
+            return []
+        span = min(start for start, _ in bounds), max(end for _, end in bounds)
+        for node, snapshot in self.repository.overview_snapshots(span):
             cluster, node_id = node["cluster"], node["node_id"]
             source = self._prepare_facts(cluster, node_id, snapshot)
             for (start, end), hosts, groups in zip(bounds, daily_hosts, daily_groups):
@@ -174,18 +175,38 @@ class RiskOverview:
             "items": hosts[:today_limit] if index == len(bounds) - 1 else [],
         } for index, (hosts, groups) in enumerate(zip(daily_hosts, daily_groups))]
 
-    def _metadata(self, snapshot: Any, cluster: str, node: str) -> dict[str, Any]:
+    def _metadata(self, snapshot: Any, cluster: str, node: str, facts: list[dict[str, Any]]) -> dict[str, Any]:
         metadata: dict[str, Any] = {}
+        legacy = [fact for fact in facts if fact["fact_ref"].startswith("legacy:")]
+        event_ids = sorted({fact["risk_ref"] for fact in legacy})
+        contribution_ids = sorted({
+            fact["fact_ref"].removeprefix("legacy:") for fact in legacy
+            if fact["fact_ref"] != "legacy:" + fact["risk_ref"]
+        })
+        by_event: dict[str, Any] = {}
         with self.repository.database.connect() as conn:
-            events = conn.execute("SELECT event_id,source_job_id,semantic_rule_id,semantic_rule_version FROM node_risk_events WHERE cluster=? AND node_id=? AND derivation_status='current' LIMIT 10001", (cluster, node)).fetchall()
-            contributions = conn.execute("SELECT i.source_event_fingerprint,i.event_id,i.source_job_id FROM node_risk_ingestions i JOIN node_risk_events e ON e.event_id=i.event_id WHERE e.cluster=? AND e.node_id=? AND e.derivation_status='current' AND i.is_current=1 LIMIT 10001", (cluster, node)).fetchall()
-        if len(events) > MAX_SCOPE_ROWS or len(contributions) > MAX_SCOPE_ROWS:
-            raise ServerRiskError("query_resource_limit", "概览来源超过资源上限")
-        by_event = {row["event_id"]: dict(row) for row in events}
-        for key, value in by_event.items():
-            metadata["legacy:" + key] = value
-        for row in contributions:
-            metadata["legacy:" + row["source_event_fingerprint"]] = {**by_event[row["event_id"]], "source_job_id": row["source_job_id"] or by_event[row["event_id"]]["source_job_id"]}
+            for start in range(0, len(event_ids), PAGE_ROWS):
+                keys = event_ids[start:start + PAGE_ROWS]
+                slots = ",".join("?" for _ in keys)
+                for row in conn.execute(
+                    "SELECT event_id,source_job_id,semantic_rule_id,semantic_rule_version FROM node_risk_events "
+                    f"WHERE cluster=? AND node_id=? AND derivation_status='current' AND event_id IN ({slots})",
+                    (cluster, node, *keys),
+                ):
+                    by_event[row["event_id"]] = dict(row)
+                    metadata["legacy:" + row["event_id"]] = dict(row)
+            for start in range(0, len(contribution_ids), PAGE_ROWS):
+                keys = contribution_ids[start:start + PAGE_ROWS]
+                slots = ",".join("?" for _ in keys)
+                for row in conn.execute(
+                    "SELECT source_event_fingerprint,event_id,source_job_id FROM node_risk_ingestions "
+                    f"WHERE is_current=1 AND source_event_fingerprint IN ({slots})", keys,
+                ):
+                    event = by_event.get(row["event_id"])
+                    if event:
+                        metadata["legacy:" + row["source_event_fingerprint"]] = {
+                            **event, "source_job_id": row["source_job_id"] or event["source_job_id"],
+                        }
         for row, window, physical in snapshot.historical_projection(cluster, node)["windows"]:
             ref = "window:" + digest([row["task_id"], row["window_id"], row["item_index"], physical])
             semantic = window.get("risk_semantic") or {}
@@ -201,8 +222,11 @@ class RiskOverview:
             item["environment"] = (descriptor.get("identity") or {}).get("environment")
         return metadata
 
-    def _groups(self, cluster: str, node: str, query: dict[str, Any], start: Any, end: Any) -> list[dict[str, Any]]:
-        snapshot = self.repository.snapshot(cluster, node)
+    def _groups(
+        self, cluster: str, node: str, query: dict[str, Any], start: Any, end: Any, *, snapshot: Any = None,
+    ) -> list[dict[str, Any]]:
+        if snapshot is None:
+            snapshot = self.repository.snapshot(cluster, node, bounds=(start, end))
         source = self._prepare_facts(cluster, node, snapshot)
         groups = self._group_facts(cluster, node, source, start, end)
         return [group for group in groups if (query["level"] == "all" or group["level"] == query["level"]) and (query["recovery"] == "all" or group["recovery_state"] == query["recovery"])]
@@ -210,7 +234,8 @@ class RiskOverview:
     def _prepare_facts(self, cluster: str, node: str, snapshot: Any) -> _OverviewFacts:
         policies = snapshot.assessment.policies if snapshot.assessment is not None else None
         observations = {row["observation_id"]: row for row in snapshot.observations(cluster, node)}
-        metadata = self._metadata(snapshot, cluster, node)
+        facts = snapshot.facts(cluster, node)
+        metadata = self._metadata(snapshot, cluster, node, facts)
         bindings = [source for source in policies.sources.values() if source.get("cluster") == cluster and node in source.get("node_ids", [])] if policies is not None else []
         synthetic_only = bool(bindings) and all(str(source.get("environment", "")).casefold() in SYNTHETIC_ENVIRONMENTS for source in bindings)
         def is_real(row: dict[str, Any]) -> bool:
@@ -218,7 +243,7 @@ class RiskOverview:
             return bool(source and str(source.get("environment", "")).casefold() not in SYNTHETIC_ENVIRONMENTS)
         safe_observations = {key: row for key, row in observations.items() if is_real(row)}
         intervals = []
-        for fact in snapshot.facts(cluster, node):
+        for fact in facts:
             if fact.get("cluster") != cluster or fact.get("node_id") != node:
                 continue
             info = metadata.get(fact["fact_ref"], {})
@@ -234,8 +259,7 @@ class RiskOverview:
             exclusive = fact["provenance"] == "registered_observation" and left != right
             if right >= left:
                 intervals.append((fact, left, right, exclusive))
-        assessment = snapshot.assessment.evaluate(cluster, node) if snapshot.assessment is not None else {"checks": []}
-        checks = {check["subject_key"]: check for check in assessment["checks"]}
+        checks = {check["subject_key"]: check for check in snapshot.overview_checks(cluster, node)}
         return _OverviewFacts(
             snapshot, metadata, safe_observations, checks, intervals,
             snapshot.historical_projection(cluster, node)["projection_complete"],

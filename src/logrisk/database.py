@@ -16,6 +16,24 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def risk_window_physical(window: object, window_id: str) -> str | None:
+    """Canonical key also used by the deterministic SQLite lookup index."""
+    try:
+        value = json.loads(window) if isinstance(window, str) else window
+        if not isinstance(value, Mapping):
+            return None
+        item = value.get("source_item_id") or value.get("raw_log_id") or value.get("template_instance_hash")
+        namespace = value.get("source_namespace")
+        stamp = value.get("window_start")
+        if not namespace or item is None or not stamp:
+            return None
+        identity = [namespace, value.get("source_batch_id") or window_id, stamp, item]
+        encoded = json.dumps(identity, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+        return hashlib.sha256(encoded).hexdigest()
+    except (ValueError, TypeError, RecursionError):
+        return None
+
+
 class DatabaseError(RuntimeError):
     """A storage error that is safe to expose without a connection URL."""
 
@@ -327,6 +345,7 @@ class SQLiteDatabase:
     def connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=5.0, factory=ClosingSQLiteConnection)
         connection.row_factory = sqlite3.Row
+        connection.create_function("logrisk_window_physical", 2, risk_window_physical, deterministic=True)
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA busy_timeout = 5000")
         connection.execute("PRAGMA journal_mode = WAL")

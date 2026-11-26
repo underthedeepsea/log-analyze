@@ -283,7 +283,7 @@ def test_overview_workload_includes_batches_from_normal_input_job(tmp_path):
     assert committed["today_records"] == committed["total_records"] == 3
     assert committed["seven_day_records"][-1]["records"] == 3
     assert activity["drain"]["template_windows"] == summary["template_count"]
-    assert activity["today_records"] is activity["total_records"] is None
+    assert activity["today_records"] == activity["total_records"] == 3
 
 
 def test_workflow_detail_links_gate_evidence_only_to_the_selected_child(tmp_path):
@@ -399,6 +399,9 @@ def test_risk_overview_scans_indexed_rows_once_and_preserves_physical_link_order
             "INSERT INTO node_risk_ingestions(source_event_fingerprint,event_id,occurrence_count,ingested_at,physical_key) VALUES (?,?,?,?,?)",
             ("legacy-contribution", "legacy-physical", 7, old, key),
         )
+    # A cold commit with unrelated physical positions never enters the hot read.
+    cold = [committed_window(5000 + index, "2026-10-01T00:00:00+00:00", entity_id="cold-node") for index in range(1100)]
+    seed_committed(database, "cold-history", cold)
     dates = ["2026-11-22", "2026-11-23"]
     expected = [risk.overview(date, date)["summary"] for date in dates]
     assert expected[0]["host_count"] == 1
@@ -406,9 +409,10 @@ def test_risk_overview_scans_indexed_rows_once_and_preserves_physical_link_order
     calls, read = [], []
     source = risk.repository._window_pages
 
-    def count_scan():
+    def count_scan(**kwargs):
         calls.append(True)
-        for row in source():
+        assert kwargs.get("bounds") is not None
+        for row in source(**kwargs):
             read.append(row["item_index"])
             yield row
 
@@ -431,6 +435,7 @@ def test_risk_overview_scans_indexed_rows_once_and_preserves_physical_link_order
     assert fallback == summaries
     assert 2 < len(calls) <= 12
     assert sorted(hashed) == [("a-initial", 1), ("z-duplicate", 201)]
+    monkeypatch.setattr(risk.repository, "_window_pages", source)
     assert risk.overview_detail("prod-a", "linked-node", "2026-11-23", "2026-11-23")["groups"]
 
 

@@ -6,11 +6,27 @@ import uuid
 import base64
 import os
 import shutil
+import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from logrisk.artifact_storage import SharedArtifactStore
+
+
+def is_retryable_input_error(exc: BaseException) -> bool:
+    if isinstance(exc, OSError):
+        return not isinstance(exc, FileNotFoundError)
+    if not isinstance(exc, sqlite3.OperationalError):
+        return False
+    code = getattr(exc, "sqlite_errorcode", None)
+    if code is not None:
+        busy = getattr(sqlite3, "SQLITE_BUSY", 5)
+        locked = getattr(sqlite3, "SQLITE_LOCKED", 6)
+        return code & 0xff in {busy, locked}
+    # Python 3.10 exposes lock failures as messages, without SQLite result codes.
+    message = str(exc).partition(":")[0].strip().lower()
+    return message in {"database is locked", "database table is locked", "database schema is locked"}
 
 
 @dataclass(frozen=True)

@@ -34,6 +34,7 @@ from logrisk.feature_jobs import (
     _sanitize_job_payload,
     _validate_candidate_review_changes,
 )
+from logrisk.entity_identity import SCOPED_FEATURE_ENTITY_VERSION, candidate_entity_identity, entity_identity, entity_key
 from logrisk.input_jobs import InputJobConfig, InputJobStore
 from logrisk.upload_sessions import UploadConfig, UploadSessionStore
 from logrisk.semantic.store import SemanticDictionaryStore
@@ -171,7 +172,7 @@ class SQLitePagedFeatureEntities:
                 return
             for entity in page:
                 yield entity
-            after = str(page[-1]["entity_id"])
+            after = entity_key(page[-1])
 
     def __len__(self) -> int:
         return self.store.entity_count(self.job_id)
@@ -186,12 +187,12 @@ class SQLitePagedFeatureEntities:
         entity = self.store.load_entity_at(self.job_id, offset)
         if entity is None:
             raise IndexError(index)
-        self._loaded[str(entity["entity_id"])] = entity
+        self._loaded[entity_key(entity)] = entity
         return entity
 
     def remember(self, entities: list[dict[str, Any]]) -> None:
         for entity in entities:
-            self._loaded[str(entity["entity_id"])] = entity
+            self._loaded[entity_key(entity)] = entity
 
     def drain_loaded(self) -> list[dict[str, Any]]:
         entities = list(self._loaded.values())
@@ -279,16 +280,112 @@ class SQLiteFeatureJobStore(_ApprovalTransactionStore):
         self, job_id: str, *, after: str = "", limit: int = 100
     ) -> list[dict[str, Any]]:
         return self._bounded_json_page(
-            job_id, "feature_job_entities", "entity_id", "entity_json",
+            job_id, "feature_job_entities", "entity_key", "entity_json",
             after=after, limit=max(1, min(int(limit), 1000)),
         )
 
     def load_entity_at(self, job_id: str, offset: int) -> dict[str, Any] | None:
         page = self._bounded_json_page(
-            job_id, "feature_job_entities", "entity_id", "entity_json",
+            job_id, "feature_job_entities", "entity_key", "entity_json",
             limit=1, offset=max(0, int(offset)),
         )
         return page[0] if page else None
+
+    def find_entities(self, job_id: str, entity_id: str, *, key: str | None = None) -> list[dict[str, Any]]:
+        key_filter = " AND entity_key=?" if key is not None else ""
+        parameters = (str(job_id), entity_id, key) if key is not None else (str(job_id), entity_id)
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT entity_key FROM feature_job_entities WHERE job_id=? AND entity_id=?"
+                + key_filter + " ORDER BY entity_key LIMIT 2",
+                parameters,
+            ).fetchall()
+            result = []
+            for row in rows:
+                limit = ("octet_length(CAST(entity_json AS TEXT))" if self.database.provider == "postgres"
+                         else "length(CAST(entity_json AS BLOB))")
+                payload = connection.execute(
+                    "SELECT entity_json FROM feature_job_entities WHERE job_id=? AND entity_key=? AND " + limit + "<=?",
+                    (str(job_id), row[0], 1024 * 1024),
+                ).fetchone()
+                if payload is None:
+                    raise FeatureJobError("FeatureJob entity changed or exceeds page byte budget")
+                result.append(_sanitize_feature_payload(self._decode_json(payload[0], {})))
+        return result
+
+    @staticmethod
+    def _upsert_entity(
+        connection: Any, job_id: str, entity: dict[str, Any], now: str, *, replace_candidate_links: bool = False,
+    ) -> None:
+        key = entity_key(entity)
+        candidate_ids = list(dict.fromkeys(str(value) for value in entity.get("feature_ids", []) if value))
+        if replace_candidate_links:
+            connection.execute(
+                "DELETE FROM feature_job_candidate_entities WHERE job_id=? AND entity_key=?", (str(job_id), key),
+            )
+        else:
+            persisted = connection.execute(
+                "SELECT candidate_id FROM feature_job_candidate_entities WHERE job_id=? AND entity_key=? ORDER BY candidate_id",
+                (str(job_id), key),
+            ).fetchall()
+            candidate_ids = list(dict.fromkeys([*candidate_ids, *(row[0] for row in persisted)]))
+        if candidate_ids or "feature_ids" in entity:
+            entity["feature_ids"] = candidate_ids
+        connection.execute(
+            "INSERT INTO feature_job_entities(job_id, entity_key, entity_id, status, risk_score, entity_json, updated_at, scope_verified) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(job_id, entity_key) DO UPDATE SET "
+            "status=excluded.status, risk_score=excluded.risk_score, entity_json=excluded.entity_json, "
+            "updated_at=excluded.updated_at, scope_verified=feature_job_entities.scope_verified OR excluded.scope_verified",
+            (str(job_id), entity_key(entity), str(entity["entity_id"]), entity.get("status", "unknown"),
+             entity.get("risk_score"), _json(entity), now, entity.get("entity_scope_version") == SCOPED_FEATURE_ENTITY_VERSION),
+        )
+
+        connection.executemany(
+            "INSERT INTO feature_job_candidate_entities(job_id,candidate_id,entity_key) VALUES (?,?,?) ON CONFLICT DO NOTHING",
+            [(str(job_id), candidate_id, key) for candidate_id in candidate_ids],
+        )
+
+    @classmethod
+    def _candidate_entity(cls, connection: Any, job_id: str, candidate: dict[str, Any]) -> dict[str, Any] | None:
+        rows = connection.execute(
+            "SELECT e.scope_verified,e.scope_ambiguous,e.entity_key,e.entity_json FROM feature_job_candidate_entities l "
+            "JOIN feature_job_entities e ON e.job_id=l.job_id AND e.entity_key=l.entity_key "
+            "WHERE l.job_id=? AND l.candidate_id=? LIMIT 2",
+            (str(job_id), str(candidate["candidate_id"])),
+        ).fetchall()
+        if len(rows) != 1 or not rows[0]["scope_verified"] or rows[0]["scope_ambiguous"]:
+            return None
+        record = _sanitize_feature_payload(cls._decode_json(rows[0]["entity_json"], {}))
+        claimed = candidate_entity_identity(candidate)
+        source = record.get("source") or {}
+        if not claimed[2] or claimed != entity_identity(record) or not source:
+            return None
+        reference = source.get("_source_ref")
+        if reference:
+            key = rows[0]["entity_key"]
+            explicit_key = reference.get("entity_key")
+            if reference.get("entity_id") != claimed[2] or explicit_key not in {None, key}:
+                return None
+            parameters = [reference.get("task_id"), reference.get("generation"), claimed[2]]
+            scoped_clause = ""
+            if explicit_key is not None:
+                scoped_clause = " AND e.identity_key=?"
+                parameters.append(key)
+            identities = connection.execute(
+                "SELECT DISTINCT e.identity_key FROM streaming_result_entities e "
+                "JOIN streaming_result_generations g ON g.task_id=e.task_id AND g.generation=e.generation "
+                "WHERE e.task_id=? AND e.generation=? AND e.entity_id=? AND g.status='ready'"
+                + scoped_clause + " LIMIT 2", parameters,
+            ).fetchall()
+            if len(identities) != 1 or identities[0][0] != key:
+                return None
+        elif entity_identity(source) != claimed or record.get("entity_scope_version") != SCOPED_FEATURE_ENTITY_VERSION:
+            return None
+        return record
+
+    def candidate_entity(self, job_id: str, candidate: dict[str, Any]) -> dict[str, Any] | None:
+        with self._connect() as connection:
+            return self._candidate_entity(connection, job_id, candidate)
 
     def append_entities(self, job_id: str, entities: list[dict[str, Any]]) -> None:
         if not entities:
@@ -296,17 +393,7 @@ class SQLiteFeatureJobStore(_ApprovalTransactionStore):
         now = utc_now()
         with self._transaction() as connection:
             for entity in entities:
-                safe = _sanitize_feature_payload(entity)
-                connection.execute(
-                    "INSERT INTO feature_job_entities(job_id, entity_id, status, risk_score, entity_json, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?) "
-                    "ON CONFLICT(job_id, entity_id) DO UPDATE SET status=excluded.status, "
-                    "risk_score=excluded.risk_score, entity_json=excluded.entity_json, updated_at=excluded.updated_at",
-                    (
-                        str(job_id), str(safe["entity_id"]), safe.get("status", "unknown"),
-                        safe.get("risk_score"), _json(safe), now,
-                    ),
-                )
+                self._upsert_entity(connection, job_id, _sanitize_feature_payload(entity), now)
 
     @classmethod
     def _candidate_from_row(cls, row: Any, job_metadata: dict[str, Any] | None = None) -> dict[str, Any] | None:
@@ -400,7 +487,8 @@ class SQLiteFeatureJobStore(_ApprovalTransactionStore):
             merged.update({"status": "pending", "approved_at": None, "rule_id": None,
                            "resolved_rule_id": None, "resolution_type": "manual"})
         if merged.get("status") == "pending" and rule_store is not None:
-            matches = rule_store.match_feature(merged)
+            source_record = cls._candidate_entity(connection, job_id, merged)
+            matches = rule_store.match_feature(merged, source_record.get("source")) if source_record else []
             if matches:
                 rule = matches[0]
                 merged.update({"status": "approved", "approved_at": rule.get("approved_at") or now,
@@ -483,14 +571,16 @@ class SQLiteFeatureJobStore(_ApprovalTransactionStore):
                 ),
             )
             if not paged_entities:
-                connection.execute("DELETE FROM feature_job_entities WHERE job_id=?", (safe_job["job_id"],))
-            for entity in dirty_entities if paged_entities else safe_job.get("entities", []):
-                connection.execute(
-                    "INSERT INTO feature_job_entities(job_id, entity_id, status, risk_score, entity_json, updated_at) "
-                    "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(job_id, entity_id) DO UPDATE SET "
-                    "status=excluded.status, risk_score=excluded.risk_score, entity_json=excluded.entity_json, updated_at=excluded.updated_at",
-                    (safe_job["job_id"], entity["entity_id"], entity.get("status", "unknown"), entity.get("risk_score"), _json(entity), now),
+                historical_keys = connection.execute(
+                    "SELECT entity_key FROM feature_job_entities WHERE job_id=?", (safe_job["job_id"],)
+                ).fetchall()
+                current_keys = {entity_key(entity) for entity in safe_job.get("entities", [])}
+                connection.executemany(
+                    "DELETE FROM feature_job_entities WHERE job_id=? AND entity_key=?",
+                    [(safe_job["job_id"], row[0]) for row in historical_keys if row[0] not in current_keys],
                 )
+            for entity in dirty_entities if paged_entities else safe_job.get("entities", []):
+                self._upsert_entity(connection, safe_job["job_id"], entity, now)
             persisted_features: dict[str, dict[str, Any]] = {}
             for candidate_id, candidate in (safe_job.get("features") or {}).items():
                 if not isinstance(candidate, dict):
@@ -566,8 +656,7 @@ class SQLiteFeatureJobStore(_ApprovalTransactionStore):
                 pass
             connection.execute("INSERT INTO feature_jobs(job_id,status,model_profile_id,connection_snapshot_json,profile_snapshot_json,job_json,created_at,completed_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?) ON CONFLICT(job_id) DO UPDATE SET status=excluded.status,job_json=excluded.job_json,completed_at=excluded.completed_at,updated_at=excluded.updated_at", (job["job_id"], job["status"], job.get("model_profile_id"), _json(job.get("connection_snapshot")), _json(job.get("profile_snapshot")), _json(snapshot), job["created_at"], job.get("completed_at"), now))
             for entity in entities:
-                safe = _sanitize_feature_payload(entity)
-                connection.execute("INSERT INTO feature_job_entities(job_id,entity_id,status,risk_score,entity_json,updated_at) VALUES (?,?,?,?,?,?) ON CONFLICT(job_id,entity_id) DO UPDATE SET status=excluded.status,risk_score=excluded.risk_score,entity_json=excluded.entity_json,updated_at=excluded.updated_at", (job["job_id"], safe["entity_id"], safe["status"], safe.get("risk_score"), _json(safe), now))
+                self._upsert_entity(connection, job["job_id"], _sanitize_feature_payload(entity), now)
             for candidate in dirty_features.values():
                 self._upsert_generated_candidate(connection, job["job_id"], candidate, now, for_update=getattr(self.database, "provider", "sqlite") == "postgres", rule_store=SQLiteApprovedRuleStore(self.database).bind(connection))
             for event in dirty_events:
@@ -598,7 +687,7 @@ class SQLiteFeatureJobStore(_ApprovalTransactionStore):
             job["entities"] = [
                 _sanitize_feature_payload(self._decode_json(item[0], {}))
                 for item in connection.execute(
-                    "SELECT entity_json FROM feature_job_entities WHERE job_id=? ORDER BY updated_at, entity_id",
+                    "SELECT entity_json FROM feature_job_entities WHERE job_id=? ORDER BY updated_at, entity_key",
                     (row["job_id"],),
                 )
             ]
@@ -866,7 +955,9 @@ class SQLiteFeatureJobStore(_ApprovalTransactionStore):
         review_key = reference_groups[0]["review_key"]
         rows = self.connection.execute(
             "SELECT c.* FROM feature_candidates c JOIN approval_candidate_projection p ON p.candidate_id=c.candidate_id "
-            "WHERE p.status='pending' AND p.review_key=? ORDER BY c.candidate_id", (review_key,),
+            "WHERE p.status='pending' AND p.review_key=? AND EXISTS ("
+            "SELECT 1 FROM feature_job_candidate_entities l WHERE l.job_id=c.job_id AND l.candidate_id=c.candidate_id) "
+            "ORDER BY c.candidate_id", (review_key,),
         )
         matches = [item for row in rows if (item := self._candidate_from_row(row)) is not None and matches_reference(item)]
         updated: list[dict[str, Any]] = []
@@ -892,7 +983,9 @@ class SQLiteFeatureJobStore(_ApprovalTransactionStore):
                 updates = []
                 for row in rows:
                     feature = self._candidate_from_row(row)
-                    if feature is None or not matches_reference(feature):
+                    if feature is None or not matches_reference(feature) or not self._candidate_entity(
+                        connection, str(feature["job_id"]), feature,
+                    ):
                         continue
                     feature.update({
                         "status": status,

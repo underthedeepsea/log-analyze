@@ -5,6 +5,13 @@ from pathlib import Path
 from typing import Any
 
 from logrisk.application import ApplicationConfig, ApplicationContainer, build_application_container
+from logrisk.input_jobs import is_retryable_input_error
+from logrisk.orchestration import InputOrchestrationConflict
+from logrisk.streaming_state import StreamingTaskBusyError
+
+
+class InputPreprocessTerminalError(RuntimeError):
+    """The persisted preprocessing run reached a terminal non-success state."""
 
 
 def build_worker_container(*, agentic_enabled: bool = False, agent_workflows_enabled: bool = False) -> ApplicationContainer:
@@ -98,49 +105,72 @@ def preprocess_uploaded_input(
     request_id: str,
     *,
     container: ApplicationContainer | None = None,
+    final_attempt: bool = False,
 ) -> dict[str, str]:
-    """Run Drain3 preprocessing in the Airflow worker, passing no file data through XCom."""
+    """Run the existing input job and let Airflow retry an interrupted attempt."""
     services = container or build_worker_container()
-    run = services.input_orchestration.get(input_orchestration_run_id)
-    if run["input_job_id"] != str(input_job_id) or run["request_id"] != str(request_id):
+    orchestration = services.input_orchestration
+    run_id, job_id = str(input_orchestration_run_id), str(input_job_id)
+    run = orchestration.get(run_id)
+    if run["input_job_id"] != job_id or run["request_id"] != str(request_id):
         raise ValueError("输入编排运行与任务标识不匹配")
     if run["status"] == "dispatched":
-        run = services.input_orchestration.mark_running(
-            input_orchestration_run_id,
-            expected_version=run["state_version"],
-        )
+        try:
+            run = orchestration.mark_running(run_id, expected_version=run["state_version"])
+        except InputOrchestrationConflict:
+            run = orchestration.get(run_id)
+
+    completed = {"input_job_id": job_id, "input_orchestration_run_id": run_id, "status": "completed"}
+    if run["status"] == "completed":
+        if services.input_jobs.get_job(job_id)["status"] != "completed":
+            raise InputPreprocessTerminalError("输入编排已结束，输入任务未提交成功")
+        return completed
+    if run["status"] in {"failed", "cancelled", "cancel_requested"}:
+        raise InputPreprocessTerminalError("输入编排已失败或取消")
     if run["status"] != "running":
         raise ValueError("输入编排运行不处于可执行状态")
     if services.run_input_job is None:
-        raise RuntimeError("输入任务执行器未配置")
-    try:
-        services.run_input_job(str(input_job_id))
-    except Exception:
-        current = services.input_orchestration.get(input_orchestration_run_id)
-        if current["status"] == "running":
-            services.input_orchestration.mark_finished(
-                input_orchestration_run_id,
-                "failed",
-                expected_version=current["state_version"],
-                error_code="input_job_failed",
-                error_summary="输入日志预处理失败",
-            )
-        raise
-    job = services.input_jobs.get_job(str(input_job_id))
-    target = "completed" if job.get("status") == "completed" else "failed"
-    current = services.input_orchestration.get(input_orchestration_run_id)
-    finished = services.input_orchestration.mark_finished(
-        input_orchestration_run_id,
-        target,
-        expected_version=current["state_version"],
-        error_code="input_job_failed" if target == "failed" else None,
-        error_summary="输入日志预处理失败" if target == "failed" else None,
-    )
-    return {
-        "input_job_id": str(input_job_id),
-        "input_orchestration_run_id": str(input_orchestration_run_id),
-        "status": str(finished["status"]),
-    }
+        raise InputPreprocessTerminalError("输入任务执行器未配置")
+
+    def finish(status: str, *, error_code: str | None = None) -> dict[str, Any]:
+        while True:
+            current = orchestration.get(run_id)
+            if current["status"] != "running":
+                return current
+            try:
+                return orchestration.mark_finished(
+                    run_id, status, expected_version=current["state_version"], error_code=error_code,
+                    error_summary="输入日志预处理失败" if error_code else None,
+                )
+            except InputOrchestrationConflict:
+                continue
+
+    job = services.input_jobs.get_job(job_id)
+    if job.get("status") == "failed":
+        finish("failed", error_code="input_job_failed")
+        raise InputPreprocessTerminalError("输入日志预处理失败")
+    if job.get("status") != "completed":
+        try:
+            services.run_input_job(job_id, raise_retryable=True)
+        except StreamingTaskBusyError:
+            # A different attempt owns the job. Leave its status untouched.
+            raise
+        except Exception as exc:
+            if is_retryable_input_error(exc):
+                if final_attempt:
+                    finish("failed", error_code="input_job_retries_exhausted")
+                raise
+            finish("failed", error_code="input_job_failed")
+            raise InputPreprocessTerminalError("输入日志预处理失败") from exc
+        job = services.input_jobs.get_job(job_id)
+    if job.get("status") == "completed":
+        if finish("completed")["status"] == "completed":
+            return completed
+        raise InputPreprocessTerminalError("输入预处理已完成，编排已失败或取消")
+    if job.get("status") == "failed":
+        finish("failed", error_code="input_job_failed")
+        raise InputPreprocessTerminalError("输入日志预处理失败")
+    raise StreamingTaskBusyError("输入任务正在处理或等待恢复")
 
 
 def list_drain_partitions(job_id: str, orchestration_run_id: str, *, container: ApplicationContainer | None = None) -> dict[str, Any]:

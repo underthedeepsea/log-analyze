@@ -68,6 +68,8 @@
     return "idle";
   }
   function blockData(block) { return block && block.data && typeof block.data === "object" && !Array.isArray(block.data) ? block.data : {}; }
+  function workflowSummaryUnavailable(block) { return Boolean(block && block.status === "unavailable" && block.data === null); }
+  function unavailableToViewer(error) { return error && [401, 403, 404].includes(error.status); }
   function blockState(block, loading) {
     if (loading) return "读取中";
     if (!block || block.status === "unavailable") return "数据不可用";
@@ -224,26 +226,48 @@
     return { name: "人工审批", status: waiting ? "有候选等待人工" : run && run.status === "awaiting_human" ? "运行等待人工" : recorded ? "已有审批记录" : "独立回执未记录", dependency: "经确定性校验并登记的候选。", impact: "只有人工批准后才能成为批准资产。", evidence: recorded ? "待审批 " + number(gate.pending) + " · 已批准 " + number(gate.approved) + " · 已拒绝 " + number(gate.rejected) + " · 无人工决议的批准结果 " + number(gate.resolved) : "审批回执未记录；运行状态 " + (run ? stateName(run.status) : "未知") + "。", tone: waiting || run && run.status === "awaiting_human" ? "wait" : "idle", destination: "review" };
   }
   function Workflow(props) {
-    const data = blockData(props.block), runs = Array.isArray(data.runs) ? data.runs : [], active = data.active_nodes || {}, hour = data.last_hour || {};
-    const [runId, setRunId] = useState(""), [run, setRun] = useState(null), [failure, setFailure] = useState(""), [detailLoading, setDetailLoading] = useState(false), [selection, setSelection] = useState({ kind: "main", id: "risk" });
-    const seq = useRef(0);
+    const data = blockData(props.block), runs = Array.isArray(data.runs) ? data.runs : [];
+    const summary = props.summaryUnavailable ? {} : data;
+    const active = summary.active_nodes || {}, hour = summary.last_hour || {}, enabled = summary.enabled;
+    const [selectedRunId, setSelectedRunId] = useState("");
+    const [details, setDetails] = useState(null);
+    const [selection, setSelection] = useState({ kind: "main", id: "risk" });
+    const runId = runs.some(function (item) { return item.run_id === selectedRunId; }) ? selectedRunId : runs.length ? String(runs[0].run_id) : "";
+    const detail = details && details.runId === runId ? details : null;
+    const run = detail && detail.run;
+    const detailLoading = Boolean(runId && (!detail || detail.block !== props.block || detail.loading));
+    const detailFailed = detail && detail.failed;
+    useEffect(function () { setSelectedRunId(runId); }, [runId]);
     useEffect(function () {
-      setRunId(function (old) { return runs.some(function (item) { return item.run_id === old; }) ? old : runs.length ? String(runs[0].run_id) : ""; });
-    }, [props.block]);
-    useEffect(function () {
-      const current = ++seq.current;
-      setRun(null); setFailure("");
-      if (!runId) { setDetailLoading(false); return; }
-      const controller = new AbortController(); setDetailLoading(true);
+      if (!runId) { setDetails(null); return; }
+      const controller = new AbortController();
+      setDetails(function (previous) {
+        const retained = previous && previous.runId === runId ? previous : null;
+        return { runId: runId, block: props.block, run: retained && retained.run, receivedAt: retained && retained.receivedAt, loading: true };
+      });
       props.request(ROOT + "/workflow-runs/" + encodeURIComponent(runId), { signal: controller.signal }).then(function (value) {
-        if (current !== seq.current) return;
+        if (controller.signal.aborted) return;
         if (!value || value.run_id !== runId || !Array.isArray(value.nodes)) throw new Error("run identity mismatch");
-        setRun(value);
-      }).catch(function (error) { if (current === seq.current && error.name !== "AbortError") setFailure("运行详情读取失败，节点状态未知。"); }).finally(function () { if (current === seq.current) setDetailLoading(false); });
+        const receivedAt = new Date().toISOString();
+        setDetails(function (previous) {
+          if (controller.signal.aborted) return previous;
+          return { runId: runId, block: props.block, run: value, receivedAt: receivedAt, loading: false };
+        });
+      }).catch(function (error) {
+        if (controller.signal.aborted) return;
+        const inaccessible = unavailableToViewer(error);
+        setDetails(function (previous) {
+          if (controller.signal.aborted) return previous;
+          const retained = !inaccessible && previous && previous.runId === runId ? previous : null;
+          return { runId: runId, block: props.block, run: retained && retained.run, receivedAt: retained && retained.receivedAt, loading: false, failed: true };
+        });
+      });
       return function () { controller.abort(); };
-    }, [runId, props.request, props.refreshKey, props.block]);
+    }, [runId, props.request, props.block]);
+    const lastRead = run && (detailLoading || detailFailed || props.summaryUnavailable) ?
+      (detailFailed || props.summaryUnavailable ? "展示上次成功读取 " : "正在刷新 · 上次成功读取 ") + stamp(detail.receivedAt) : "";
     const nodes = run && Array.isArray(run.nodes) ? run.nodes : [];
-    const structureStatus = runId || !Array.isArray(data.runs) || props.block && props.block.status === "unavailable" && data.enabled !== false ? "状态未知" : "暂无运行";
+    const structureStatus = runId || props.summaryUnavailable || !Array.isArray(data.runs) || props.block && props.block.status === "unavailable" && enabled !== false ? "状态未知" : "暂无运行";
     const schematic = [
       { id: "structure-evidence", role: "evidence_specialist", depends_on: [], status: structureStatus, structure: true },
       { id: "structure-rules", role: "rule_specialist", depends_on: [], status: structureStatus, structure: true },
@@ -261,6 +285,13 @@
       return h("button", { className: "ov-node", type: "button", key: node.id, "data-tone": nodeTone(node, run), "aria-pressed": selection.kind === "node" && selection.id === node.id, onClick: function () { setSelection({ kind: "node", id: node.id }); } }, h("b", null, roleName(node.role)), h("small", null, h("i", { className: "ov-state-mark" }), nodeStatus(node, run)), !node.structure && h("span", null, "依赖 ", deps ? (deps.length ? nodeNames(deps, displayedNodes) : "无") : "未知"));
     }
     function gateButton(id) { const item = GateFact(id, run); return h("button", { type: "button", key: id, className: "ov-gate", "data-tone": item.tone, "aria-pressed": selection.kind === "gate" && selection.id === id, onClick: function () { setSelection({ kind: "gate", id: id }); } }, h("b", null, item.name), h("small", null, item.status)); }
+    function selectRun(event) {
+      const id = event.target.value;
+      if (id === runId) return;
+      setSelectedRunId(id);
+      setDetails(null);
+      setSelection({ kind: "main", id: "risk" });
+    }
     let fact = selection.kind === "main" ? mainFact(selection.id, props.risk, props.activity) : selection.kind === "gate" ? GateFact(selection.id, run) : null;
     if (selection.kind === "node") { const node = displayedNodes.find(function (item) { return item.id === selection.id; }); if (node) fact = nodeFact(node, run); }
     if (!fact) fact = { name: "选择流程节点", status: "未选择", dependency: "选择当前运行中的节点查看依赖。", impact: "状态取自所选运行记录。", evidence: "当前节点详情未提供。", tone: "idle", destination: "agentWorkflows" };
@@ -268,10 +299,10 @@
       h("div", { className: "ov-section-title" }, h("div", null, h("h2", { id: "ov-flow-title" }, "风险识别与特征流转"), h("p", null, "主链生成风险事实，按配置可进入专家分析。"))),
       h("div", { className: "ov-flow-frame" },
         h("div", { className: "ov-main-lane" }, h("div", { className: "ov-lane-label" }, h("i"), "确定性主链"), h("div", { className: "ov-main-chain" }, MAIN.map(function (item) { return h("button", { type: "button", key: item.id, "aria-pressed": selection.kind === "main" && selection.id === item.id, onClick: function () { setSelection({ kind: "main", id: item.id }); } }, h("b", null, item.name), h("small", null, item.hint)); }))),
-        h("div", { className: "ov-branch" }, h("div", { className: "ov-branch-header" }, h("div", null, h("div", { className: "ov-lane-label accent" }, "⑂ 按需分析分支"), h("h3", null, "多专家工作流")), h("label", { className: "ov-run-select" }, h("span", null, "工作流运行"), h("select", { value: runId, title: runId || "暂无运行", disabled: !runs.length, onChange: function (event) { setRunId(event.target.value); setSelection({ kind: "main", id: "risk" }); } }, !runs.length && h("option", { value: "" }, "暂无运行"), runs.map(function (item) { const at = item.updated_at || item.created_at; return h("option", { key: item.run_id, value: item.run_id, title: String(item.run_id) }, shortRun(item.run_id) + (at ? " · " + stamp(at) : "") + " · " + stateName(item.status)); })))),
-          (data.enabled === false ? h("p", { className: "ov-availability" }, "未启用 · 历史运行仍可查看") : h(Notice, { block: props.block, loading: props.loading })),
-          h("div", { className: "ov-run-info" }, h("span", null, data.enabled === true ? "专家工作流已启用" : data.enabled === false ? "专家工作流已关闭" : "专家工作流启用状态未知"), h("span", null, run ? "所选运行 · " + stateName(run.status) : detailLoading ? "正在读取运行详情" : runId ? "运行状态未知" : "暂无所选运行"), run && h("span", null, "更新 " + stamp(run.updated_at))),
-          failure && h("p", { className: "ov-inline-error", role: "alert" }, failure),
+        h("div", { className: "ov-branch" }, h("div", { className: "ov-branch-header" }, h("div", null, h("div", { className: "ov-lane-label accent" }, "⑂ 按需分析分支"), h("h3", null, "多专家工作流")), h("label", { className: "ov-run-select" }, h("span", null, "工作流运行"), h("select", { value: runId, title: runId || "暂无运行", disabled: !runs.length, onChange: selectRun }, !runs.length && h("option", { value: "" }, "暂无运行"), runs.map(function (item) { const at = item.updated_at || item.created_at; return h("option", { key: item.run_id, value: item.run_id, title: String(item.run_id) }, shortRun(item.run_id) + (at ? " · " + stamp(at) : "") + " · " + stateName(item.status)); })))),
+          (props.summaryUnavailable && runs.length ? h("p", { className: "ov-availability" }, "正在查看此前读取的运行列表") : enabled === false ? h("p", { className: "ov-availability" }, "未启用 · 历史运行仍可查看") : h(Notice, { block: props.block, loading: props.loading })),
+          h("div", { className: "ov-run-info" }, h("span", null, enabled === true ? "专家工作流已启用" : enabled === false ? "专家工作流已关闭" : "专家工作流启用状态未知"), h("span", null, run ? "所选运行 · " + stateName(run.status) : detailLoading ? "正在读取运行详情" : runId ? "运行状态未知" : "暂无所选运行"), run && h("span", null, "更新 " + stamp(run.updated_at)), lastRead && h("span", { role: "status" }, lastRead)),
+          detailFailed && h("p", { className: "ov-inline-error", role: "alert" }, run ? "运行详情刷新失败，以下为此前读取的节点状态。" : "运行详情读取失败，节点状态未知。"),
           !nodes.length && h("p", { className: "ov-structure-note" }, structureStatus === "状态未知" ? "示意结构 · 运行节点状态未知" : "示意结构 · 尚无所选运行"),
           standard ? h("div", { className: "ov-dag", "aria-label": nodes.length ? "所选运行的专家依赖与后续门禁" : "专家流程示意结构" },
             h("div", { className: "ov-fork-pair" }, nodeButton(evidenceNode), nodeButton(ruleNode)),
@@ -286,7 +317,7 @@
           h("div", { className: "ov-inspect", "data-tone": fact.tone, "aria-live": "polite" }, h("div", null, h("small", null, fact.status), h("h4", null, fact.name)), h("dl", null,
             [["直接依赖", fact.dependency], ["影响", fact.impact], ["记录证据", fact.evidence]].map(function (entry) { return h("div", { key: entry[0] }, h("dt", null, entry[0]), h("dd", null, entry[1])); })), h("button", { type: "button", className: "ov-text-link", onClick: function () { props.onNavigate(fact.destination); } }, "查看详情 ↗"))),
         h("div", { className: "ov-fleet-summary" }, h("h4", null, "工作台运行汇总"), h("div", { className: "ov-rollup" }, h("div", null, h("small", null, "专家节点 · 当前"), h("p", null, "排队 " + number(active.queued) + " · 运行 " + number(active.running) + " · 等待 " + number(active.waiting))), h("div", null, h("small", null, "多专家分支 · 近 1 小时"), h("p", null, "启动 " + number(hour.started) + " · 完成 " + number(hour.completed) + " · 失败 " + number(hour.failed) + " · 等待人工 " + number(hour.awaiting_human)))),
-          h("div", { className: "ov-fleet" }, h("span", null, "待调度工作流 ", h("b", null, number(data.queued))), h("span", null, "当前待审批 ", h("b", null, number(props.approvals.pending_groups))), h("span", null, "近 1 小时人工通过 ", h("b", null, number(props.approvals.approved_last_hour)))))));
+          h("div", { className: "ov-fleet" }, h("span", null, "待调度工作流 ", h("b", null, number(summary.queued))), h("span", null, "当前待审批 ", h("b", null, number(props.approvals.pending_groups))), h("span", null, "近 1 小时人工通过 ", h("b", null, number(props.approvals.approved_last_hour)))))));
   }
   function Activity(props) {
     const data = blockData(props.block), drain = data.drain || {}, approvals = props.approvals || {}, volume = volumeSets(data);
@@ -307,6 +338,7 @@
   }
   function App(props) {
     const [snapshot, setSnapshot] = useState(null), [failure, setFailure] = useState(""), [loading, setLoading] = useState(true);
+    const [workflowBlock, setWorkflowBlock] = useState(null);
     const sequence = useRef(0), approvalHistory = useRef({ day: "", points: [], lastAt: null });
     function appendApprovalGap() {
       const state = approvalHistory.current;
@@ -349,9 +381,12 @@
           if (disposed || seq !== sequence.current) return;
           if (!value || typeof value !== "object") throw new Error("overview unavailable");
           recordApproval(value);
-          setSnapshot(value); setFailure(""); setLoading(false);
+          setSnapshot(value);
+          if (!workflowSummaryUnavailable(value.workflows)) setWorkflowBlock(value.workflows || null);
+          setFailure(""); setLoading(false);
         }).catch(function (error) {
           if (disposed || seq !== sequence.current || error.name === "AbortError") return;
+          if (unavailableToViewer(error)) setWorkflowBlock(null);
           appendApprovalGap(); setSnapshot(null); setFailure("总览数据读取失败，请刷新重试；各项当前状态未知。"); setLoading(false);
         }).finally(function () { if (active === controller) active = null; });
       }
@@ -365,10 +400,11 @@
       return function () { disposed = true; if (active) active.abort(); clearInterval(timer); document.removeEventListener("visibilitychange", visibility); };
     }, [props.request, props.refreshKey]);
     const data = snapshot || {}, risk = blockData(data.risk), activity = blockData(data.activity), approvals = blockData(data.approvals);
+    const summaryUnavailable = Boolean(failure) || workflowSummaryUnavailable(data.workflows);
     return h("div", { className: "ov", "data-overview-state": loading ? "loading" : failure ? "error" : "ready" },
       h("div", { className: "ov-asof" }, h("span", null, failure || (snapshot && snapshot.as_of ? "数据截至 " + stamp(snapshot.as_of) + " · Asia/Shanghai" : loading ? "正在读取工作台数据…" : "数据时间未知"))),
       h("div", { className: "ov-lead" }, h(RiskCard, { block: data.risk, loading: loading, onNavigate: props.onNavigate }), h(UsageCard, { block: data.usage, loading: loading, onNavigate: props.onNavigate })),
-      h(Workflow, { block: data.workflows, risk: risk, activity: activity, approvals: approvals, request: props.request, refreshKey: props.refreshKey, loading: loading, onNavigate: props.onNavigate }),
+      h(Workflow, { block: workflowBlock || data.workflows, summaryUnavailable: summaryUnavailable, risk: risk, activity: activity, approvals: approvals, request: props.request, loading: loading, onNavigate: props.onNavigate }),
       h(Activity, { block: data.activity, approvals: approvals, approvalBlock: data.approvals, approvalHistory: approvalHistory.current.points, loading: loading, onNavigate: props.onNavigate }));
   }
   window.LOGRISKStreamOverview = App;

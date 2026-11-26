@@ -85,7 +85,7 @@ def test_feature_pages_budget_before_payload_fetch_and_decode(tmp_path, monkeypa
     database, manager, document = reference_manager(tmp_path)
     job_id = manager.create_job(document, model="fake", min_score=0)
     manager.run_job(job_id)
-    table, key, payload = (("feature_job_entities", "entity_id", "entity_json") if collection == "entities"
+    table, key, payload = (("feature_job_entities", "entity_key", "entity_json") if collection == "entities"
                            else ("feature_candidates", "candidate_id", "candidate_json"))
     with database.transaction() as connection:
         rows = connection.execute(f"SELECT {key},{payload} FROM {table} WHERE job_id=? ORDER BY {key}", (job_id,)).fetchall()

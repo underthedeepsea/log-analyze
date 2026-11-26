@@ -25,6 +25,7 @@ class AgentToolContext:
     evidence_hash: str | None = None
     cluster: str | None = None
     rule_bindings: tuple[dict[str, Any], ...] = ()
+    entity_scope_key: str | None = None
 
 
 @dataclass(frozen=True)

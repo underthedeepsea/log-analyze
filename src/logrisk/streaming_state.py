@@ -9,6 +9,7 @@ from typing import Any, Mapping
 
 from logrisk.database import Database, utc_now
 from logrisk.incremental_sources import SourceCursor, SourceDescriptor
+from logrisk.kafka_records import REJECTION_CODES
 from logrisk.streaming_observability.contracts import offset_vector
 from logrisk.streaming_observability.kafka_offsets import KafkaBoundaryError
 from logrisk.streaming_observability.repository import ObservabilityRepository, assignment_key, writer_key
@@ -506,6 +507,7 @@ class StreamingStateRepository:
         windows: list[Mapping[str, Any]] | None = None,
         summary: Mapping[str, Any] | None = None,
         ledger_batch: Mapping[str, Any] | None = None,
+        allow_missing_ledger: bool = False,
         fencing_token: str | None = None,
         miner_generation: Mapping[str, Any] | None = None,
         expected_cursor: SourceCursor | Mapping[str, Any] | None = None,
@@ -531,7 +533,7 @@ class StreamingStateRepository:
             ):
                 raise StreamingConflictError("流式任务租约已变化，迟到 Worker 不能提交")
             self._check_kafka_owner(connection, task)
-            if self.ledger_repository is not None and ledger_batch is None:
+            if self.ledger_repository is not None and ledger_batch is None and not allow_missing_ledger:
                 raise StreamingStateError("启用 operational ledger 时窗口缺少 ingestion receipt")
             if self.ledger_repository is not None and ledger_batch is not None:
                 receipt_payload = dict(ledger_batch)
@@ -551,6 +553,7 @@ class StreamingStateRepository:
                     raise StreamingConflictError("流式提交前沿已变化")
             if not _cursor_is_at_least(cursor_value, current_cursor):
                 raise StreamingConflictError("新批次不能回退检查点")
+            _validate_rejected_positions(commit_summary, current_cursor, cursor_value, task)
             state_manifest = miner_generation if miner_generation is not None else task.get("miner_generation")
             sequence = int(task.get("windows_committed") or 0) + 1
             connection.execute(
@@ -597,6 +600,9 @@ class StreamingStateRepository:
                     "updated_at": now,
                 }
             )
+            rejected_count = len(commit_summary.get("rejected_records") or [])
+            if rejected_count:
+                task["records_rejected"] = int(task.get("records_rejected") or 0) + rejected_count
             if cursor_value["kind"] == "kafka":
                 previous = offset_vector(current_cursor.value.get("partitions"))
                 positions = offset_vector(cursor_value["value"].get("partitions"))
@@ -609,7 +615,11 @@ class StreamingStateRepository:
                 "UPDATE streaming_tasks SET status=?, stage=?, cursor_json=?, task_json=?, updated_at=? WHERE task_id=?",
                 (task["status"], task["stage"], _json(cursor_value), _json(task), now, task_id),
             )
-            self._append_event(connection, task, "window_committed", {"window_id": window_id, "template_count": len(sanitized_templates)}, now)
+            details = {"window_id": window_id, "template_count": len(sanitized_templates)}
+            if rejected_count:
+                details["rejected_records"] = rejected_count
+                details["rejected_positions"] = commit_summary["rejected_records"][:20]
+            self._append_event(connection, task, "window_committed", details, now)
         return True
 
     def list_unknown_templates(self, *, task_id: str | None = None, limit: int = 200) -> list[dict[str, Any]]:
@@ -1004,7 +1014,46 @@ def _canonical_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
 
 
+def _validate_rejected_positions(
+    summary: Mapping[str, Any], current: SourceCursor, incoming: Mapping[str, Any], task: Mapping[str, Any],
+) -> None:
+    records = summary.get("rejected_records", [])
+    if not records:
+        return
+    if incoming["kind"] != "kafka":
+        raise StreamingStateError("拒收位置仅适用于 Kafka")
+    start = offset_vector(current.value.get("partitions"))
+    if not start:
+        start = offset_vector((task.get("kafka_batch") or {}).get("start"))
+    end = offset_vector(incoming["value"].get("partitions"))
+    if any(
+        record["partition"] not in end
+        or not start.get(record["partition"], 0) <= record["offset"] < end[record["partition"]]
+        for record in records
+    ):
+        raise StreamingStateError("拒收位置超出提交前沿")
+
+
+def _validate_rejected_records(records: Any) -> None:
+    if not isinstance(records, list) or len(records) > 10_000:
+        raise StreamingStateError("批摘要拒收记录超出限制")
+    positions: set[tuple[int, int]] = set()
+    for record in records:
+        if (
+            not isinstance(record, dict) or set(record) != {"partition", "offset", "reason_code"}
+            or not _is_nonnegative_int(record["partition"]) or not _is_nonnegative_int(record["offset"])
+            or not isinstance(record["reason_code"], str) or record["reason_code"] not in REJECTION_CODES
+        ):
+            raise StreamingStateError("批摘要拒收记录无效")
+        position = (record["partition"], record["offset"])
+        if position in positions:
+            raise StreamingStateError("批摘要拒收位置重复")
+        positions.add(position)
+
+
 def _validate_new_summary(summary: Mapping[str, Any]) -> None:
+    if "rejected_records" in summary:
+        _validate_rejected_records(summary["rejected_records"])
     if summary.get("summary_schema_version") is None:
         return
     if summary.get("summary_schema_version") != 2:

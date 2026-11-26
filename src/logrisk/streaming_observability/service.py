@@ -143,7 +143,12 @@ class ObservabilityService:
                 ),
             })
         derived = aggregate_gaps(rows, partition_count, exclusive=exclusive)
-        derived["durable_records_per_second"] = durable_rate(sample, sample.get("previous") or {}, now)
+        lease = task.get("lease_token")
+        same_rate_series = sample.get("durable_task_id") == task.get("task_id") and (
+            not lease or sample.get("worker_epoch") == lease
+        )
+        baseline = (sample.get("previous") or {}) if same_rate_series else {}
+        derived["durable_records_per_second"] = durable_rate(sample, baseline, now)
         coverage = result_coverage(task, completed, evidence, now)
         if changed_topic:
             coverage.update(status="unknown", reason_code="topic_identity_changed", coverage_checked_at=None,
@@ -166,7 +171,8 @@ class ObservabilityService:
         worker_public.update(last_durable_commit_at=durable_changed_at, last_external_commit_at=confirmed_at,
                              assignment_mode="manual", group_membership="not_applicable")
         task_public = {key: task.get(key) for key in (
-            "task_id", "status", "stage", "records_processed", "windows_committed", "pending_external_commit_at", "updated_at",
+            "task_id", "status", "stage", "records_processed", "records_rejected", "windows_committed",
+            "pending_external_commit_at", "updated_at",
         )} if task else None
         axes, action = states(
             source=source, worker=worker_public, task=task_public, sample=sample,

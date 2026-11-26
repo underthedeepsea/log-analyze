@@ -9,9 +9,10 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta
 from typing import Any, Callable, Iterator, Mapping
 
+from logrisk.kafka_records import REJECTION_CODES
 from logrisk.database import Database, utc_now
 from logrisk.incremental_sources import SourceDescriptor
-from logrisk.streaming_observability.contracts import MAX_SNAPSHOT_BYTES, broker_sample_current, elapsed
+from logrisk.streaming_observability.contracts import ALIGN_SECONDS, MAX_SNAPSHOT_BYTES, broker_sample_current, current, elapsed
 
 
 SAFE_ID = re.compile(r"^[A-Za-z0-9_.:-]{1,249}$")
@@ -179,7 +180,9 @@ class ObservabilityRepository:
         }
 
     def set_enabled(self, source_id: str, enabled: bool) -> None:
-        with self.database.transaction() as connection:
+        if self.database.provider == "sqlite":
+            self.get(source_id)
+        with self._sqlite_commit_gate(source_id), self.database.transaction() as connection:
             row = self.get(source_id, connection, lock=True)
             if row["mode"] != "continuous_bounded":
                 raise ObservabilityError("source_not_continuous", "该来源仅支持原固定高水位任务", 409)
@@ -188,6 +191,25 @@ class ObservabilityRepository:
                 "scheduler_phase=NULL, scheduler_control_epoch=NULL WHERE source_id=? AND enabled<>?",
                 (int(enabled), source_id, int(enabled)),
             )
+
+    @contextmanager
+    def _sqlite_commit_gate(self, source_id: str) -> Iterator[None]:
+        if self.database.provider == "sqlite":
+            with self._sqlite_lock("commit:" + source_id, wait=True):
+                yield
+        else:
+            # PostgreSQL serializes the control change using the source row.
+            yield
+
+    @contextmanager
+    def commit_control(self, source_id: str) -> Iterator[Mapping[str, Any]]:
+        """Serialize a Broker commit with the enabled/epoch transition."""
+        if self.database.provider == "postgres":
+            with self.database.transaction() as connection:
+                yield self.get(source_id, connection, lock=True)
+        else:
+            with self._sqlite_commit_gate(source_id):
+                yield self.get(source_id)
 
     def start_scheduler(self, source_id: str, control_epoch: int) -> str | None:
         token = uuid.uuid4().hex
@@ -239,8 +261,8 @@ class ObservabilityRepository:
     @contextmanager
     def control_lock(self, key: str) -> Iterator[Callable[[], None]]:
         """Hold ownership on the database's lock namespace until work exits."""
-        key_hash = hashlib.sha256(("logrisk-kafka-writer:" + key).encode()).digest()
         if self.database.provider == "postgres":
+            key_hash = hashlib.sha256(("logrisk-kafka-writer:" + key).encode()).digest()
             lock_id = int.from_bytes(key_hash[:8], byteorder="big", signed=True)
             with self.database.connect() as connection:
                 result = connection.execute("SELECT pg_try_advisory_lock(?)", (lock_id,)).fetchone()
@@ -254,15 +276,22 @@ class ObservabilityRepository:
                 yield check
             return
 
+        with self._sqlite_lock(key):
+            yield lambda: None
+
+    @contextmanager
+    def _sqlite_lock(self, key: str, *, wait: bool = False) -> Iterator[None]:
         import fcntl
+
+        key_hash = hashlib.sha256(("logrisk-kafka-writer:" + key).encode()).hexdigest()
         path = self.database.path.resolve()
-        lock_path = path.with_name(f".{path.name}.kafka-{key_hash.hex()[:32]}.lock")
+        lock_path = path.with_name(f".{path.name}.kafka-{key_hash[:32]}.lock")
         with lock_path.open("a") as lock:
             try:
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(lock, fcntl.LOCK_EX if wait else fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError as exc:
                 raise ObservabilityError("source_busy", "Kafka 来源已有运行中的 Worker", 409) from exc
-            yield lambda: None
+            yield
 
     def observer_claim(self, source_id: str, *, lease_seconds: int = 60) -> str | None:
         now = self.clock()
@@ -372,10 +401,15 @@ class ObservabilityRepository:
                 connection.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY")
             else:
                 connection.execute("BEGIN")
+            # The first SELECT pins the snapshot. A slow round trip leaves its
+            # exact timing uncertain even if the rest of the reads are quick.
+            started_at = self.clock()
             source = self.get(source_id, connection)
+            returned_at = self.clock()
+            evidence = {"durable_observed_at": returned_at if current(returned_at, started_at, ALIGN_SECONDS) else None}
             ids = [value for value in (source["active_task_id"], source["completed_task_id"]) if value]
             if not ids:
-                return source, self.observer_snapshot(connection, source_id), {}, {}, {}, {}
+                return source, self.observer_snapshot(connection, source_id), {}, {}, {}, evidence
             rows = connection.execute(
                 "SELECT t.task_json, w.worker_epoch, w.snapshot_json FROM streaming_tasks t "
                 "LEFT JOIN kafka_worker_observations w ON w.task_id=t.task_id "
@@ -395,7 +429,7 @@ class ObservabilityRepository:
                 commit_time = connection.execute(
                     "SELECT MIN(committed_at) FROM streaming_window_commits WHERE task_id=?", (task["task_id"],),
                 ).fetchone()[0]
-            evidence = {"first_durable_commit_at": commit_time}
+            evidence["first_durable_commit_at"] = commit_time
             if result.get("task_id") == task.get("task_id") and result.get("covered_commit_at"):
                 evidence["first_uncovered_at"] = connection.execute(
                     "SELECT MIN(committed_at) FROM streaming_window_commits WHERE task_id=? AND committed_at>?",
@@ -443,11 +477,23 @@ class ObservabilityRepository:
             detail = json_dict(row["event_json"])
             nested = detail.get("details")
             reason = nested.get("error_code") if isinstance(nested, Mapping) else None
-            events.append({
+            event = {
                 "event_type": row["event_type"],
                 "reason_code": reason if isinstance(reason, str) and reason in ERROR_CODES else None,
                 "created_at": row["created_at"], "task_id": row["task_id"],
-            })
+            }
+            rejected = detail.get("rejected_records")
+            sample = detail.get("rejected_positions")
+            if type(rejected) is int and 0 < rejected <= 10_000 and isinstance(sample, list):
+                event["rejected_records"] = rejected
+                event["rejected_positions"] = [
+                    {"partition": item["partition"], "offset": str(item["offset"]), "reason_code": item["reason_code"]}
+                    for item in sample[:20] if isinstance(item, dict)
+                    and type(item.get("partition")) is int and 0 <= item["partition"] < 2**31
+                    and type(item.get("offset")) is int and 0 <= item["offset"] < 2**63
+                    and isinstance(item.get("reason_code"), str) and item["reason_code"] in REJECTION_CODES
+                ]
+            events.append(event)
         last = rows[limit - 1] if len(rows) > limit else None
         return {"events": events, "next_cursor": encode_cursor(
             [source_id, last["created_at"], last["task_id"], last["sequence"]]

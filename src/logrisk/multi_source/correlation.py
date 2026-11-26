@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import hashlib
 from bisect import bisect_left, bisect_right
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Mapping
 
 
 def _timestamp(value: Any) -> float:
-    return datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+    parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    return (parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed).timestamp()
 
 
 def _has_timestamp(value: Any) -> bool:
@@ -25,6 +26,7 @@ def _pair_allowed(first: str, second: str, allowed: set[frozenset[str]]) -> bool
 def correlate_observations(
     observations: list[Mapping[str, Any]],
     rule: Mapping[str, Any],
+    *, diagnostics: dict[str, bool] | None = None,
 ) -> list[dict[str, Any]]:
     if not rule.get("enabled", True):
         return []
@@ -63,16 +65,17 @@ def correlate_observations(
             buckets.setdefault(key, []).append((_timestamp(item["window_start"]), index))
     for bucket in buckets.values():
         bucket.sort()
+    ordered_pairs = sorted(tuple(sorted(pair)) for pair in allowed)
     for left, first in enumerate(valid):
         timestamp = _timestamp(first["window_start"])
         candidates: set[int] = set()
         remaining = pair_budget - comparisons
         family = str(first.get("source_family"))
-        for pair in allowed:
+        for pair in ordered_pairs:
             if family not in pair:
                 continue
-            for other_family in pair - {family}:
-                for entity in set(first["entity_keys"]):
+            for other_family in (item for item in pair if item != family):
+                for entity in sorted(set(first["entity_keys"])):
                     bucket = buckets.get((str(first.get("cluster")), str(entity), other_family), [])
                     start = bisect_left(bucket, (timestamp - maximum_gap, -1))
                     end = bisect_right(bucket, (timestamp + maximum_gap, len(valid)))
@@ -122,6 +125,9 @@ def correlate_observations(
             })
         if partial:
             break
+
+    if partial and diagnostics is not None:
+        diagnostics["partial"] = True
 
     groups: dict[int, list[dict[str, Any]]] = {}
     for index, item in enumerate(valid):

@@ -29,11 +29,13 @@
     delivered_not_durable: "已交付，尚未持久化", insufficient_evidence: "证据不足", partition_limit: "分区超过采样上限",
     coverage_unverified: "结果覆盖尚未核对", sample_recovery_pending: "已有一次有效采样，等待下一次确认",
     result_frontier_behind: "结果尚未覆盖已落库数据", missing_partition: "采样缺少分区", worker_epoch_expired: "消费进程心跳已过期",
-    scheduler_waiting: "调度器等待下一批", scheduler_checking: "调度器正在检查下一批",
+    scheduler_waiting: "调度器等待下一批", scheduler_checking: "调度器正在检查来源",
+    scheduler_retry_backoff: "Broker 暂时不可用，等待重试",
     scheduler_heartbeat_expired: "调度器心跳已过期", external_commit_failed: "外部提交失败",
     batch_time_budget_exceeded: "本轮时间预算已到，保留原批次目标待续",
     topic_identity_changed: "主题身份已变化", partition_set_changed: "分区集合已变化",
     offset_out_of_range: "位点超出保留范围", authentication: "身份验证失败", authorization: "权限不足",
+    record_decode_failed: "日志无法解码", record_shape_invalid: "日志字段格式无效",
   };
   const actionText = {
     check_sampler: "检查采样器和 API，确认最近一次采样是否成功。",
@@ -125,14 +127,15 @@
   function workerStateLabel(axis, stale) {
     if (!stale && axis && axis.status === "running") return "运行中";
     if (!stale && axis && axis.status === "stopped") return "已停止";
-    if (!stale && axis && axis.status === "waiting" && axis.reason_code === "scheduler_checking") return "调度器检查下一批";
+    if (!stale && axis && axis.status === "waiting" && axis.reason_code === "scheduler_checking") return "调度器检查来源";
+    if (!stale && axis && axis.status === "waiting" && axis.reason_code === "scheduler_retry_backoff") return "等待重试";
     if (!stale && axis && axis.status === "stale" && axis.reason_code === "scheduler_heartbeat_expired") return "调度器心跳陈旧";
     return stateLabel(axis, stale);
   }
   function schedulerDescription(scheduler) {
     if (!scheduler) return "";
     const states = { active: "运行中", stale: "心跳陈旧", inactive: "未运行" };
-    const phases = { checking: "检查下一批", awaiting_batch: "等待下一批" };
+    const phases = { checking: "检查来源", awaiting_batch: "等待下一批", retry_backoff: "等待重试" };
     return "调度器 " + (states[scheduler.state] || "未知") + (phases[scheduler.phase] ? " · " + phases[scheduler.phase] : "") + " · 调度心跳 " + stamp(scheduler.last_heartbeat_at);
   }
   function sourcePath(id) { return ROOT + "/" + encodeURIComponent(id); }
@@ -430,6 +433,7 @@
             h("div", { className: "so-disclosure-body so-evidence-grid" },
               h("section", null, h("h3", null, "任务与结果"), h("dl", { className: "so-definition" },
                 h("dt", null, "任务"), h("dd", null, task && task.task_id || "未知"), h("dt", null, "状态 / 阶段"), h("dd", null, task ? (task.status || "未知") + " / " + (task.stage || "未知") : "未知"), h("dt", null, "最后更新"), h("dd", null, stamp(task && task.updated_at)),
+                task && task.records_rejected > 0 && h("dt", null, "已隔离消息"), task && task.records_rejected > 0 && h("dd", null, String(task.records_rejected)),
                 h("dt", null, "结果代次"), h("dd", null, result.generation == null ? "未知" : String(result.generation)), h("dt", null, "结果发布时间"), h("dd", null, stamp(result.published_at)), h("dt", null, "覆盖核对时间"), h("dd", null, stamp(result.coverage_checked_at)), h("dt", null, "覆盖目标"), h("dd", null, result.coverage_target_seconds == null ? "未知" : result.coverage_target_seconds + " 秒"),
                 result.oldest_uncovered_commit_at && h(React.Fragment, null, h("dt", null, "最早未覆盖"), h("dd", null, stamp(result.oldest_uncovered_commit_at) + (result.wait_seconds == null ? "" : " · 等待 " + result.wait_seconds + " 秒")))), h("button", { type: "button", onClick: props.onTasks }, "查看任务与未知模板")),
               h("section", null, h("h3", null, "运行证据"), h("dl", { className: "so-definition" },
@@ -440,7 +444,7 @@
                 h("dt", null, "最近拉取返回"), h("dd", null, stamp(worker.last_poll_returned_at)), h("dt", null, "最近持久化"), h("dd", null, stamp(worker.last_durable_commit_at)), h("dt", null, "最近外部提交"), h("dd", null, stamp(worker.last_external_commit_at)), h("dt", null, "落库速率"), h("dd", null, rateReading(rate, sourceStale).value),
                 source.block_reason && h(React.Fragment, null, h("dt", null, "阻塞原因"), h("dd", null, explanation(source.block_reason) + (source.block_stage ? " · " + (blockStageText[source.block_stage] || source.block_stage) : ""))), h("dt", null, "下一步"), h("dd", null, nextCopy))))),
           h("details", { className: "so-disclosure so-recent" }, h("summary", { "aria-label": "最近事件" }, h("span", null, "最近事件"), h("span", { "aria-hidden": "true" }, events.length ? events.length + " 条" : "查看事件")),
-            h("div", { className: "so-disclosure-body" }, eventsFailure ? h("p", { className: "so-meta" }, "事件读取失败，请稍后重试。") : !events.length && h("p", { className: "so-meta" }, "暂无事件。"), h("div", { className: "so-events-scroll", tabIndex: 0, role: "region", "aria-label": "最近事件，可滚动" }, h("ul", { className: "so-events" }, events.map(function (event, index) { return h("li", { key: String(event.created_at) + ":" + index }, h("b", null, event.event_type || "事件"), h("span", null, explanation(event.reason_code) || "无原因码"), h("small", null, stamp(event.created_at) + (event.task_id ? " · " + event.task_id : ""))); }))))))));
+            h("div", { className: "so-disclosure-body" }, eventsFailure ? h("p", { className: "so-meta" }, "事件读取失败，请稍后重试。") : !events.length && h("p", { className: "so-meta" }, "暂无事件。"), h("div", { className: "so-events-scroll", tabIndex: 0, role: "region", "aria-label": "最近事件，可滚动" }, h("ul", { className: "so-events" }, events.map(function (event, index) { return h("li", { key: String(event.created_at) + ":" + index }, h("b", null, event.event_type || "事件"), h("span", null, event.rejected_records ? "已隔离 " + event.rejected_records + " 条消息" : explanation(event.reason_code) || "无原因码"), event.rejected_positions && event.rejected_positions.length > 0 && h("small", null, event.rejected_positions.map(function (item) { return "分区 " + item.partition + " / 位点 " + item.offset + " · " + (explanation(item.reason_code) || "原因未知"); }).join("、")), h("small", null, stamp(event.created_at) + (event.task_id ? " · " + event.task_id : ""))); }))))))));
   }
   window.LOGRISKStreamingObservability = App;
 }());

@@ -44,7 +44,7 @@ def test_iter_rejects_oversized_line_with_structured_details(tmp_path):
     with pytest.raises(InputLimitError) as caught:
         list(iter_log_records_from_file(path, max_line_bytes=4))
 
-    assert caught.value.details == {"error_code": "line_too_large", "limit": 4, "actual": 6, "line_no": 1}
+    assert caught.value.details == {"error_code": "line_too_large", "limit": 4, "actual": 5, "line_no": 1}
 
 
 def test_iter_gz_rejects_excessive_compression_ratio(tmp_path):

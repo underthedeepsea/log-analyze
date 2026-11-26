@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import hashlib
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping
 
 from .correlation import correlate_observations
@@ -9,6 +9,7 @@ from .repository import MultiSourceRepository
 from .router import route_entities
 
 
+MAX_CORRELATION_OBSERVATIONS = 10_000
 KNOWN_SOURCE_FAMILIES = {"audit", "containerd", "journal", "kernel", "kubelet", "podlog"}
 
 
@@ -94,8 +95,7 @@ class MultiSourceService:
             return {"observations": 0, "correlations": 0, "unroutable": 0}
         saved = 0
         unroutable = 0
-        clusters: set[str] = set()
-        earliest: datetime | None = None
+        cluster_windows: dict[str, tuple[str, str]] = {}
         for entity in risk_entities:
             risk_score = float(entity.get("risk_score") or 0)
             risk_level = str(entity.get("risk_level") or "unknown")
@@ -125,8 +125,10 @@ class MultiSourceService:
                 window_end = str(raw_window_end)
                 try:
                     value = datetime.fromisoformat(window_start.replace("Z", "+00:00"))
+                    value = (value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc))
+                    instant = value.isoformat(timespec="microseconds")
                     datetime.fromisoformat(window_end.replace("Z", "+00:00"))
-                except ValueError:
+                except (ValueError, OverflowError):
                     unroutable += 1
                     continue
                 observation = {
@@ -149,27 +151,42 @@ class MultiSourceService:
                 }
                 self.repository.save_observation(observation)
                 saved += 1
-                clusters.add(cluster)
-                earliest = value if earliest is None else min(earliest, value)
+                first, last = cluster_windows.get(cluster, (instant, instant))
+                cluster_windows[cluster] = (min(first, instant), max(last, instant))
 
-        correlations=self.correlate_clusters(clusters,earliest.isoformat() if earliest else None) if correlate else 0
-        result = {"observations": saved, "correlations": correlations, "unroutable": unroutable}
-        if not correlate:
-            result.update({"clusters": sorted(clusters), "earliest": earliest.isoformat() if earliest else None})
+        result = {"observations": saved, "correlations": 0, "unroutable": unroutable}
+        if correlate:
+            result.update(self.correlate_windows(cluster_windows))
+        else:
+            result["cluster_windows"] = cluster_windows
         return result
 
-    def correlate_clusters(self,clusters: set[str],earliest: str | None) -> int:
+    def correlate_windows(self, cluster_windows: Mapping[str, tuple[str, str]]) -> dict[str, Any]:
         correlation_ids: set[str] = set()
-        stored_rules = self.repository.list_rules()["items"]
-        maximum_gap = max((int(rule.get("max_gap_seconds") or 0) for rule in stored_rules), default=0)
-        since = (datetime.fromisoformat(earliest) - timedelta(seconds=maximum_gap)).isoformat() if earliest else ""
-        for cluster in clusters:
-            candidates = self.repository.recent_observations(cluster=cluster, since=since)
-            for stored_rule in stored_rules:
-                for correlation in correlate_observations(candidates, stored_rule):
+        rules = [rule for rule in self.repository.list_rules()["items"] if rule.get("enabled")]
+        diagnostics: dict[str, bool] = {}
+        for cluster, (first, last) in sorted(cluster_windows.items()):
+            for rule in rules:
+                families = {family for pair in rule["source_pairs"] for family in pair}
+                if len(families) < 2:
+                    continue
+                gap = timedelta(seconds=int(rule["max_gap_seconds"]))
+                since, through = datetime.fromisoformat(first) - gap, datetime.fromisoformat(last) + gap
+                candidates = self.repository.correlation_observations(
+                    cluster=cluster, since=since, through=through, families=families,
+                    min_risk=float(rule["min_risk_score"]), min_count=int(rule["min_count"]),
+                    limit=MAX_CORRELATION_OBSERVATIONS,
+                )
+                if candidates is None:
+                    diagnostics["partial"] = True
+                    continue
+                for correlation in correlate_observations(candidates, rule, diagnostics=diagnostics):
                     self.repository.save_correlation(correlation)
                     correlation_ids.add(str(correlation["correlation_id"]))
-        return len(correlation_ids)
+        result: dict[str, Any] = {"correlations": len(correlation_ids)}
+        if diagnostics.get("partial"):
+            result["correlation_complete"] = False
+        return result
 
     def summary(self) -> dict[str, Any]:
         return self.repository.summary()

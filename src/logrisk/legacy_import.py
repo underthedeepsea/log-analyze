@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from logrisk.entity_identity import SCOPED_FEATURE_ENTITY_VERSION, entity_key
 from logrisk.approved_rules import (
     ApprovedRuleError,
     RuleFormat,
@@ -195,8 +196,16 @@ class LegacyStateImporter:
             )
             for entity in job.get("entities", []):
                 connection.execute(
-                    "INSERT INTO feature_job_entities(job_id, entity_id, status, risk_score, entity_json, updated_at) VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
-                    (job["job_id"], entity["entity_id"], entity.get("status", "unknown"), entity.get("risk_score"), json.dumps(entity, ensure_ascii=False), utc_now()),
+                    "INSERT INTO feature_job_entities(job_id, entity_key, entity_id, status, risk_score, entity_json, updated_at, scope_verified) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
+                    (job["job_id"], entity_key(entity), entity["entity_id"], entity.get("status", "unknown"),
+                     entity.get("risk_score"), json.dumps(entity, ensure_ascii=False), utc_now(),
+                     entity.get("entity_scope_version") == SCOPED_FEATURE_ENTITY_VERSION),
+                )
+                connection.executemany(
+                    "INSERT INTO feature_job_candidate_entities(job_id,candidate_id,entity_key) VALUES (?,?,?) ON CONFLICT DO NOTHING",
+                    [(job["job_id"], str(candidate_id), entity_key(entity))
+                     for candidate_id in entity.get("feature_ids", []) if candidate_id],
                 )
             for candidate_id, candidate in (job.get("features") or {}).items():
                 connection.execute(

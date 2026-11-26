@@ -807,6 +807,6 @@ def test_background_review_submission_queue_behavior():
     source = (FRONTEND / "src" / "app.js").read_text(encoding="utf-8")
     workspace = source[source.index('view === "review" && h("section"'):]
     assert 'reviewNotice && h(' not in workspace
-    save = source[source.index('    function saveReview(changes) {'):source.index('    function retry(entityId)')]
+    save = source[source.index('    function saveReview(changes) {'):source.index('    function retry(entityId,')]
     assert "loadApprovalQueue" not in save
     assert "await" not in save

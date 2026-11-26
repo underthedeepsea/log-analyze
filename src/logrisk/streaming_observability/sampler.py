@@ -10,6 +10,10 @@ from logrisk.streaming_observability.repository import ObservabilityError, Obser
 
 
 LOG = logging.getLogger(__name__)
+RATE_BASELINE_FIELDS = (
+    "sampled_at", "durable_at", "records_processed", "worker_epoch", "epoch",
+    "durable_epoch", "durable_task_id", "partitions",
+)
 
 
 def task_cursor(task: Mapping[str, Any]) -> dict[str, Any]:
@@ -41,7 +45,7 @@ class KafkaSampler:
         token = self.repository.observer_claim(source_id)
         if not token:
             return False
-        source, previous, task, completed, worker, _ = self.repository.facts(source_id)
+        source, previous, *_ = self.repository.facts(source_id)
         configuration = json_dict(source["descriptor_json"])["configuration"]
         try:
             measured = self.reader.read(configuration)
@@ -59,8 +63,8 @@ class KafkaSampler:
 
         # Read actual DB and worker evidence after the Broker operations and
         # retain the separate observation times for the comparison budget.
-        source, _, task, completed, worker, _ = self.repository.facts(source_id)
-        at = self.repository.clock()
+        _, _, task, completed, worker, evidence = self.repository.facts(source_id)
+        at = evidence["durable_observed_at"]
         identity = (task.get("kafka_batch") or completed.get("kafka_batch") or {}).get("identity")
         positions = durable_vector(task, completed)
         prior = previous.get("last_success") or {}
@@ -78,15 +82,14 @@ class KafkaSampler:
             "reason_code": measured.end_error,
             "epoch": measured.identity, "identity_verified": measured.identity_verified,
             "partitions": list(measured.partitions), "partition_count": measured.partition_count,
-            "sampled_at": measured.end_at or measured.group_at or at,
+            "sampled_at": measured.end_at or measured.group_at or at or self.repository.clock(),
             "end": measured.end, "end_at": measured.end_at, "end_error": measured.end_error,
             "group": measured.group, "group_at": measured.group_at, "group_error": measured.group_error,
             "durable": compact_durable, "durable_at": at, "durable_epoch": identity,
             "durable_task_id": task.get("task_id") or completed.get("task_id"),
             "records_processed": record_count,
             "worker_epoch": worker.get("worker_epoch"),
-            "previous": {key: previous.get(key) for key in ("sampled_at", "records_processed", "worker_epoch", "epoch", "partitions")}
-                if same_series else {},
+            "previous": {key: previous.get(key) for key in RATE_BASELINE_FIELDS} if same_series else {},
         }
 
         if same_identity:

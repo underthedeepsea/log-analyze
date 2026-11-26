@@ -51,6 +51,7 @@ def mine_spooled_partitions(
     parameter_extraction_mode: str = "off",
     progress_callback=None,
     executor: Any | None = None,
+    enrich_event=None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     root = Path(spool_dir)
     event_dir = root.parent / "template_events"
@@ -118,7 +119,10 @@ def mine_spooled_partitions(
     for result in results:
         with Path(result["output_path"]).open("r", encoding="utf-8") as handle:
             for line in handle:
-                aggregator.add(json.loads(line))
+                event = json.loads(line)
+                if enrich_event is not None:
+                    enrich_event(event)
+                aggregator.add(event)
     return aggregator.finalize(), {
         "partition_count": len(partitions),
         "worker_count": worker_count,

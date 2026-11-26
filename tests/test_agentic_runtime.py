@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from logrisk.ai_harness.evaluator import EVALUATOR_VERSION
+from logrisk.agentic.errors import AgenticError
 from logrisk.agentic.artifacts import canonical_fingerprint
 from logrisk.agentic.models import AgentPlan, AgentRunRequest, AgentStepPlan
 from logrisk.agentic.planner import FakeAgentPlanner
@@ -245,9 +246,14 @@ def test_preplanned_agent_run_rejects_conflicting_scope_after_resume_or_recovery
     }),))
     repository, runtime = _runtime(tmp_path, plan)
     service = AgentService(repository, runtime)
-    run = service.create_run(_request(f"scope-{state}"), locked_snapshot={
-        "evidence_summary": {"source_job_id": "job-other", "entity": {"id": "node-a"}},
-    })
+    request = _request(f"scope-{state}")
+    snapshot = {"evidence_summary": {"source_job_id": "job-other", "entity": {"id": "node-a"}}}
+    with pytest.raises(AgenticError) as rejected:
+        service.create_run(request, locked_snapshot=snapshot)
+    assert rejected.value.code == "agent_scope_invalid"
+    assert repository.list_runs() == []
+    # Model a persisted run created by a legacy writer before ingress validation.
+    run = repository.create_run(request, locked_snapshot=snapshot)
     repository.transition(run["run_id"], "planning", allowed_from={"queued"})
     repository.replace_plan(run["run_id"], plan)
     if state == "resumed":

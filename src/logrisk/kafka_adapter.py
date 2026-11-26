@@ -8,9 +8,12 @@ import threading
 import time
 from collections.abc import Iterator, Mapping
 from importlib.util import find_spec
+from types import MappingProxyType
 from typing import Any, Callable
 
 from logrisk.incremental_sources import IncrementalSourceError, SourceCursor, SourceRecord
+from logrisk.kafka_records import KafkaCursorBounds, KafkaCursorDelta
+from logrisk.normalizer import _identity_text
 from logrisk.streaming_observability.contracts import offset_vector
 from logrisk.streaming_observability.kafka_offsets import (
     KafkaBoundaryError, KafkaOffsetReader, REQUEST_TIMEOUT_MS, classify,
@@ -32,6 +35,41 @@ def decode_kafka_value(value: bytes | bytearray | str | None) -> dict[str, Any]:
     except json.JSONDecodeError:
         return {"message": text}
     return dict(decoded) if isinstance(decoded, dict) else {"message": text}
+
+
+def _source_record(
+    value: bytes | bytearray | str | None,
+    cursor: SourceCursor | KafkaCursorDelta,
+    metadata: dict[str, int],
+    configuration: Mapping[str, str],
+) -> SourceRecord:
+    try:
+        record = decode_kafka_value(value)
+        # Escaped surrogate code points can decode into a Python string that
+        # cannot be represented as UTF-8 on the normalization/spooling path.
+        if isinstance(value, (bytes, bytearray, str)) and (
+            ("\\" in value if isinstance(value, str) else b"\\" in value) or isinstance(value, str)
+        ):
+            json.dumps(record, ensure_ascii=False).encode("utf-8")
+    except (RecursionError, ValueError):
+        return SourceRecord({}, cursor, metadata, rejection_code="record_decode_failed")
+    # The default profile passes the first supplied host identity to the
+    # window grouping key. The configured cloud profile resolves host hints
+    # itself and can still use a later valid alias or source metadata.
+    host = None if configuration.get("source_profile") else (
+        record.get("node") or record.get("host") or record.get("hostname")
+    )
+    identity = host or record.get("pod")
+    if (
+        (identity and not isinstance(identity, (str, int, float, bool)))
+        or (record.get("labels") and not isinstance(record["labels"], Mapping))
+        or (
+            (configuration.get("source_profile") or configuration.get("cluster_id"))
+            and record.get("cluster") is not None and not _identity_text(record["cluster"])
+        )
+    ):
+        return SourceRecord({}, cursor, metadata, rejection_code="record_shape_invalid")
+    return SourceRecord(record, cursor, metadata)
 
 
 class KafkaPythonConsumerAdapter:
@@ -113,8 +151,8 @@ class KafkaPythonConsumerAdapter:
                         if message.offset >= end_offsets[partition]:
                             continue
                         current[str(partition.partition)] = int(message.offset) + 1
-                        yield SourceRecord(
-                            decode_kafka_value(message.value),
+                        yield _source_record(
+                            message.value,
                             SourceCursor("kafka", {
                                 "partitions": dict(current),
                                 "high_water": {
@@ -127,6 +165,7 @@ class KafkaPythonConsumerAdapter:
                                 "partition": int(getattr(message, "partition", partition.partition)),
                                 "offset": int(message.offset),
                             },
+                            configuration=configuration,
                         )
                 if all(consumer.position(partition) >= end_offsets[partition] for partition in partitions):
                     break
@@ -241,6 +280,7 @@ class KafkaPythonConsumerAdapter:
                 "topic_identity": source.batch["identity"],
             })
 
+        bounds = KafkaCursorBounds(MappingProxyType(dict(positions)), MappingProxyType(target), source.batch["identity"])
         if positions == target:
             source.final_cursor = checkpoint()
             return
@@ -270,9 +310,9 @@ class KafkaPythonConsumerAdapter:
                     for message in messages:
                         if positions[number] <= message.offset < target[number]:
                             positions[number] = message.offset + 1
-                            yield SourceRecord(
-                                decode_kafka_value(message.value), checkpoint(),
-                                {"partition": number, "offset": message.offset},
+                            yield _source_record(
+                                message.value, KafkaCursorDelta(bounds, number, message.offset + 1),
+                                {"partition": number, "offset": message.offset}, configuration,
                             )
                 scanned = {**positions, **{
                     partition.partition: min(consumer.position(partition), target[partition.partition])

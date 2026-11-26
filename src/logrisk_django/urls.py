@@ -117,7 +117,7 @@ urlpatterns = [
     path("api/semantic/dictionaries/<str:dictionary_id>/<str:action>", dictionary_action),
     path("api/semantic/test", dictionary_test),
     path("api/jobs/<str:job_id>/features/<str:candidate_id>", update_feature),
-    path("api/jobs/<str:job_id>/entities/<str:entity_id>/analysis", entity_analysis),
+    path("api/jobs/<str:job_id>/entities/<path:entity_id>/analysis", entity_analysis),
     path("api/jobs/<str:job_id>/features/<str:candidate_id>/expert-opinions", feature_expert_opinions),
     path("api/jobs/<str:job_id>/export", export_approved),
     path("api/feature-approvals", core_read, {"endpoint": "feature-approvals"}),

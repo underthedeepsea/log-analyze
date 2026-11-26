@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from logrisk.entity_identity import entity_key
+
 from .errors import AgenticError
 
 
@@ -18,6 +20,41 @@ def validate_run_scope(source_job_id: Any, entity_id: Any) -> tuple[str, str]:
     if not isinstance(entity_id, str) or not entity_id.strip():
         raise ValueError("entity_id 必须是非空字符串")
     return source_job_id, entity_id
+
+
+def evidence_entity_key(entity: dict[str, Any]) -> str:
+    return entity_key({"entity_id": entity.get("id"), "entity_type": entity.get("type"), "cluster": entity.get("cluster")})
+
+
+def scoped_evidence_summary(evidence: dict[str, Any]) -> dict[str, Any]:
+    entity = evidence["entity"]
+    return {"entity": entity, "entity_key": evidence_entity_key(entity),
+            "risk_score": evidence["risk_score"], "template_count": len(evidence["templates"])}
+
+
+def evidence_selection(payload: dict[str, Any]) -> dict[str, str]:
+    key = payload.get("entity_key")
+    if key is None:
+        return {}
+    if not isinstance(key, str) or not key:
+        raise ValueError("entity_key 必须是任务实体详情中的非空字符串")
+    return {"entity_scope_key": key}
+
+
+def run_evidence_key(snapshot: dict[str, Any]) -> str | None:
+    summary = snapshot.get("evidence_summary") or {}
+    entity = summary.get("entity") or {}
+    if isinstance(entity, dict) and entity.get("id") and "cluster" in entity and "type" in entity:
+        return evidence_entity_key(entity)
+    return None
+
+
+def enforce_replay_scope(saved: dict[str, Any], source_job_id: str, entity_id: str,
+                         snapshot: dict[str, Any], *, code: str) -> None:
+    if (saved["source_job_id"], saved["entity_id"], run_evidence_key(saved["locked_snapshot"])) != (
+        source_job_id, entity_id, run_evidence_key(snapshot),
+    ):
+        raise AgenticError("幂等键跨实体复用", code=code, status_code=409)
 
 
 def validate_evidence_scope(
@@ -50,6 +87,10 @@ def validate_evidence_scope(
             and (not isinstance(entity["id"], str) or entity["id"] != canonical_entity_id)
         ):
             raise AgenticError("Agent Run Evidence 范围与持久化范围不一致", code=code)
+    if "entity_key" in evidence_summary and (
+        not isinstance(entity, dict) or evidence_summary["entity_key"] != evidence_entity_key(entity)
+    ):
+        raise AgenticError("Agent Run Evidence 实体键与范围不一致", code=code)
 
 
 @dataclass(frozen=True)

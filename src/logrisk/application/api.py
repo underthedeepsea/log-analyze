@@ -53,7 +53,8 @@ class ApiFacade:
             return server_risk
         parts = path.split("/")
         if len(parts) == 7 and parts[:3] == ["", "api", "jobs"] and parts[4] == "entities" and parts[6] == "analysis":
-            return self.entity_analysis(parts[3], unquote(parts[5]), run_id=self._query(query or {}, "run_id"))
+            return self.entity_analysis(parts[3], unquote(parts[5]), run_id=self._query(query or {}, "run_id"),
+                                        entity_scope_key=self._query(query or {}, "entity_key"))
         if len(parts) == 7 and parts[:3] == ["", "api", "jobs"] and parts[4] == "features" and parts[6] == "expert-opinions":
             return self.feature_expert_opinions(parts[3], parts[5])
         if path == "/api/streaming/sources":
@@ -851,11 +852,13 @@ class ApiFacade:
         manager.refresh_from_persistence(str(job_id))
         return ApiResult(200, manager.get_job(str(job_id), cursor=cursor))
 
-    def entity_analysis(self, job_id: str, entity_id: str, *, run_id: str | None = None) -> ApiResult:
+    def entity_analysis(self, job_id: str, entity_id: str, *, run_id: str | None = None,
+                        entity_scope_key: str | None = None) -> ApiResult:
         from logrisk.agentic.analysis_view import entity_analysis_view
         from logrisk.agentic.errors import AgenticError
         try:
-            result = entity_analysis_view(self._service("feature_jobs", self.container.feature_jobs), self._service("agent_runs", self.container.agent_runs), job_id, entity_id, run_id)
+            result = entity_analysis_view(self._service("feature_jobs", self.container.feature_jobs), self._service("agent_runs", self.container.agent_runs), job_id, entity_id, run_id,
+                                          entity_scope_key=entity_scope_key)
             return ApiResult(200, result)
         except (FeatureJobError, AgenticError, KeyError, ValueError) as exc:
             return ApiResult(getattr(exc, "status_code", 404), {"code": getattr(exc, "code", "entity_analysis_not_found"), "error": str(exc)})

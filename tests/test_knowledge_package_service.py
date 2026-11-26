@@ -13,6 +13,7 @@ def _source(
     prompt: bytes = b"prompt",
     package_id: str = "demo-package",
     dependencies: list[dict[str, str]] | None = None,
+    platform_min: str = "1.32.0",
 ) -> Path:
     from logrisk.knowledge_packages.archive import build_archive
 
@@ -25,7 +26,7 @@ def _source(
         "name": "演示知识包",
         "version": "1.0.0",
         "description": "测试包",
-        "platform": {"min_version": "1.32.0", "max_version_exclusive": "2.0.0"},
+        "platform": {"min_version": platform_min, "max_version_exclusive": "2.0.0"},
         "dependencies": dependencies or [],
         "assets": [{
             "asset_id": "demo-prompt",
@@ -109,3 +110,16 @@ def test_install_requires_each_exact_dependency_to_be_installed(tmp_path: Path) 
     preview = service.inspect_upload(upload["upload_id"])
     assert preview["status"] == "rejected"
     assert preview["inspection"]["conflicts"][0]["code"] == "package_dependency_missing"
+
+
+def test_container_uses_canonical_version_for_knowledge_preview(tmp_path: Path) -> None:
+    from logrisk.application import ApplicationConfig, build_application_container
+    from logrisk.version import __version__
+
+    archive = _source(tmp_path, platform_min="1.48.0")
+    app = build_application_container(ApplicationConfig.for_test(project_root=Path.cwd(), state_root=tmp_path / "state"))
+    service = app.knowledge_packages
+    upload = service.upload(archive.name, archive.read_bytes())
+    preview = service.inspect_upload(upload["upload_id"])
+    assert preview["status"] == "validated"
+    assert preview["inspection"]["compatibility"]["current_version"] == __version__

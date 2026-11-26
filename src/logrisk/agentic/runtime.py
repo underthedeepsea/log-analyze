@@ -139,7 +139,8 @@ class AgentRuntime:
             planner_evidence_summary = self._planner_evidence_summary(run)
             snapshot = run["locked_snapshot"]
             summary = snapshot.get("evidence_summary") or {}
-            context = AgentToolContext(run_id=run_id,source_job_id=run["source_job_id"],entity_id=run["entity_id"],allowed_tools=frozenset(run["allowed_tools"]),actor=run["actor"],request_id=run["request_id"],evidence_hash=summary.get("locked_evidence_hash"),cluster=summary.get("locked_evidence_cluster"))
+            context = AgentToolContext(run_id=run_id,source_job_id=run["source_job_id"],entity_id=run["entity_id"],allowed_tools=frozenset(run["allowed_tools"]),actor=run["actor"],request_id=run["request_id"],evidence_hash=summary.get("locked_evidence_hash"),cluster=summary.get("locked_evidence_cluster"),
+                                       entity_scope_key=summary.get("entity_key"))
             evidence_hash = self.tools.current_evidence_hash(context)
             context = replace(context,evidence_hash=evidence_hash or _fingerprint(summary))
             planner = self.planner(run) if callable(self.planner) and not hasattr(self.planner,"plan") else self.planner

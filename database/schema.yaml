@@ -57,10 +57,18 @@ tables:
     foreign_keys: {model_profile_id: model_profiles.profile_id}
     columns: {job_id: 任务标识, status: 任务状态, model_profile_id: 所选 Profile, connection_snapshot_json: 创建时连接快照, profile_snapshot_json: 创建时 Profile 快照, job_json: 完整任务聚合状态, created_at: 创建时间, completed_at: 完成时间, updated_at: 更新时间}
   feature_job_entities:
-    description: 任务内风险实体识别状态
-    primary_key: [job_id, entity_id]
+    description: 按集群、类型和原标识隔离的任务实体状态
+    primary_key: [job_id, entity_key]
     foreign_keys: {job_id: feature_jobs.job_id ON DELETE CASCADE}
-    columns: {job_id: 所属任务, entity_id: 风险实体标识, status: 实体处理状态, risk_score: 风险分, entity_json: 聚合且脱敏的实体证据, updated_at: 更新时间}
+    indexes: ["idx_feature_job_entities_id(job_id, entity_id, entity_key)"]
+    columns: {job_id: 所属任务, entity_key: 复合实体标识, entity_id: 原风险实体标识, scope_ambiguous: 已证实旧来源混用实体范围, scope_verified: 可证明当前证据的实体范围, status: 实体处理状态, risk_score: 风险分, entity_json: 聚合且脱敏的实体证据, updated_at: 更新时间}
+
+  feature_job_candidate_entities:
+    description: 候选特征与实体证据的持久关联，审批需证明唯一范围
+    primary_key: [job_id, candidate_id, entity_key]
+    foreign_keys: {"job_id, entity_key": "feature_job_entities(job_id, entity_key) ON DELETE CASCADE"}
+    indexes: ["idx_feature_job_candidate_entities_entity(job_id, entity_key)"]
+    columns: {job_id: 所属任务, candidate_id: 候选特征标识, entity_key: 复合实体标识}
   feature_candidates:
     description: 模型或规则产生的待审批特征
     primary_key: candidate_id
@@ -199,7 +207,7 @@ tables:
   multi_source_observations:
     description: 从聚合模板窗口生成的脱敏多来源观察；不保存样例、原始日志或 message_core
     primary_key: observation_id
-    indexes: [idx_multi_source_observation_time(cluster, window_start DESC), idx_multi_source_observation_source(source_family, window_start DESC)]
+    indexes: ["idx_multi_source_observation_time(cluster, window_start DESC)", "idx_multi_source_observation_source(source_family, window_start DESC)", "idx_correlation_candidates"]
     columns: {observation_id: 稳定观察摘要, source_job_id: 来源任务, cluster: 集群, source_type: 原始来源类型, source_family: 规范来源族, component: 组件, severity: 严重度, template_hash: Drain3 模板摘要, template: 脱敏模板, occurrence_count: 聚合次数, risk_score: 实体风险分, risk_level: 风险等级, window_start: 窗口开始, window_end: 窗口结束, entity_keys_json: 规范实体键, relations_json: 显式实体层级关系, schema_version: 结构版本, created_at: 创建时间, updated_at: 更新时间}
   multi_source_correlations:
     description: 满足确定性规则的跨来源证据链头信息
@@ -262,12 +270,12 @@ tables:
     primary_key: [task_id, window_id]
     foreign_keys: {task_id: streaming_tasks.task_id ON DELETE CASCADE}
     indexes: ["idx_streaming_commits_time(task_id, committed_at)", "idx_streaming_commits_sequence(task_id, commit_sequence)"]
-    columns: {task_id: 流式任务标识, window_id: 稳定窗口标识, cursor_json: 本窗口提交后的来源游标, summary_json: 窗口聚合摘要, committed_at: 提交时间, payload_hash: 游标/完整窗口/摘要的规范摘要, state_manifest_json: 与本批游标同事务绑定的 miner generation manifest（TEXT 可空；旧行不回填）, commit_sequence: 同任务的提交序列（旧行保留历史排序）}
+    columns: {task_id: 流式任务标识, window_id: 稳定窗口标识, cursor_json: 本窗口提交后的来源游标, summary_json: 窗口聚合摘要及 Kafka 脱敏拒绝位点, committed_at: 提交时间, payload_hash: 游标/完整窗口/摘要的规范摘要, state_manifest_json: 与本批游标同事务绑定的 miner generation manifest（TEXT 可空；旧行不回填）, commit_sequence: 同任务的提交序列（旧行保留历史排序）}
   streaming_batch_windows:
     description: 已提交批次的完整脱敏窗口事实；恢复和最终归约不依赖进程内历史列表
     primary_key: [task_id, window_id, item_index]
     foreign_keys: {task_id: streaming_tasks.task_id ON DELETE CASCADE, "[task_id, window_id]": "streaming_window_commits.[task_id, window_id] ON DELETE CASCADE"}
-    indexes: [idx_streaming_batch_windows_iteration(task_id, window_id, item_index)]
+    indexes: ["idx_streaming_batch_windows_iteration(task_id, window_id, item_index)", "idx_streaming_windows_risk_time", "idx_streaming_windows_risk_node", "idx_streaming_windows_risk_physical", "idx_streaming_windows_physical_lookup"]
     columns: {task_id: 流式任务标识, window_id: 稳定批次标识, item_index: 批次内顺序, window_json: 完整脱敏窗口事实}
   unknown_template_queue:
     description: 未命中风险语义或风险规则的 Drain3 脱敏模板治理队列
@@ -610,30 +618,43 @@ tables:
   streaming_result_entities:
     description: 完整风险实体分页投影；top模板引用有界
     primary_key: [task_id, generation, entity_key]
-    columns: {task_id: 任务, generation: 代次, entity_key: 实体窗口规范key, entity_id: 现有审批collapse身份, score: 分数, level: 等级, entity_json: 实体核心}
+    columns: {task_id: 任务, generation: 代次, entity_key: 实体窗口规范key, entity_id: 原风险实体标识, identity_key: 复合审批实体标识, score: 分数, level: 等级, entity_json: 实体核心}
   streaming_feature_entities:
-    description: 沿用现有collapse规则生成的审批来源；FeatureJob存引用并按当前实体加载
+    description: 按旧实体标识保存的历史审批来源
     primary_key: [task_id, generation, entity_id]
     columns: {task_id: 任务, generation: 代次, entity_id: 实体, source_json: 完整脱敏审批来源}
+  streaming_scoped_feature_entities:
+    description: 按集群、实体类型和标识隔离的审批来源投影
+    primary_key: [task_id, generation, identity_key]
+    columns: {task_id: 任务, generation: 代次, identity_key: 复合实体标识, source_json: 完整脱敏审批来源}
   server_risk_observations:
     description: 严格登记来源的脱敏观测；不保存原始日志
     primary_key: observation_id
+    indexes: ["idx_observations_node_time", "idx_observations_subject_time", "idx_observations_subject_replay", "idx_observations_overview_time"]
     columns: {schema: 0032_server_risk_intelligence.sql}
 
   server_risk_projection_state:
     description: 独立派生进度；不修改旧提交游标
     primary_key: input_namespace
+    indexes: ["idx_server_risk_pending_commit_due"]
     columns: {schema: 0032_server_risk_intelligence.sql}
 
+  server_risk_current_checkpoints:
+    description: 按节点风险对象保存有序追加的评估前沿，迟到和修订会使前沿失效
+    primary_key: [cluster, node_id, subject_key]
+    columns: {cluster: 所属集群, node_id: 所属节点, subject_key: 物理风险对象, policy_digest: 生效策略摘要, as_of: 评估时点, start_key: 最后时间排序键, sequence_key: 最后来源序号, observation_id: 已派生的最后观测标识, reducer_json: 有界脱敏评估状态, invalidated: 前沿已失效}
+
   server_risk_episodes:
-    description: 具体对象风险轮次；每subject最多一轮open
+    description: 每个集群、节点和物理对象最多一轮未关闭风险
     primary_key: episode_id
-    columns: {schema: 0032_server_risk_intelligence.sql}
+    indexes: ["uq_server_risk_open_node_subject", "idx_server_risk_episode_scope"]
+    columns: {schema: 0032_server_risk_intelligence.sql, cluster: 可证实所属集群, node_id: 可证实所属节点}
 
   server_risk_decisions:
     description: 确定性四态决定及修订引用
     primary_key: decision_id
-    columns: {schema: 0032_server_risk_intelligence.sql}
+    indexes: ["idx_server_risk_decision_replay", "idx_server_risk_decision_node_time"]
+    columns: {schema: 0032_server_risk_intelligence.sql, cluster: 可证实所属集群, node_id: 可证实所属节点}
 
   server_risk_reports:
     description: 固定Ling报告Run、单次调用CAS及受控Artifact摘要

@@ -6,7 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Iterator, Mapping, Protocol
 
-from logrisk.stream_input_parser import iter_log_records_from_file
+from logrisk.kafka_records import KafkaCursorDelta
+from logrisk.stream_input_parser import iter_file_records
 
 
 class IncrementalSourceError(ValueError):
@@ -52,10 +53,11 @@ class SourceDescriptor:
 @dataclass(frozen=True)
 class SourceRecord:
     record: dict[str, Any]
-    next_cursor: SourceCursor
+    next_cursor: SourceCursor | KafkaCursorDelta
     # Optional, transient position metadata.  Existing two-argument callers
     # remain valid; ingestion accounting never guesses from a high-water mark.
     metadata: dict[str, Any] | None = None
+    rejection_code: str | None = None
 
     @property
     def position(self) -> dict[str, Any] | None:
@@ -149,6 +151,7 @@ class FileIncrementalSource:
         environment: str = "production",
         scope_key: str = "default",
         immutable_identity: bool = False,
+        expected_content_digest: str | None = None,
     ) -> None:
         self.path = Path(path)
         self.filename = filename or self.path.name
@@ -157,7 +160,11 @@ class FileIncrementalSource:
         self.max_line_bytes = max_line_bytes
         self.environment = str(environment or "production")
         self.scope_key = str(scope_key or "default")
-        self.immutable_identity = bool(immutable_identity)
+        self.immutable_identity = bool(immutable_identity or expected_content_digest)
+        self.expected_content_digest = expected_content_digest
+        self._descriptor_cache: tuple[tuple[int, ...], bool, dict[str, Any]] | None = None
+        self._digest_cache: tuple[tuple[int, ...], str] | None = None
+        self._validated_snapshot: tuple[int, ...] | None = None
 
     def descriptor(self) -> SourceDescriptor:
         return SourceDescriptor(
@@ -181,6 +188,9 @@ class FileIncrementalSource:
             if expected.get(field) != current.get(field):
                 raise IncrementalSourceError("输入文件身份已变化，不能继续恢复")
         expected_digest = expected.get("identity_digest")
+        if expected_digest and not self.immutable_identity:
+            self.immutable_identity = True
+            current = self._identity()
         if expected_digest and expected_digest != current.get("identity_digest"):
             raise IncrementalSourceError("输入文件完整内容已变化，不能继续恢复")
         previous_size = int(expected.get("size_bytes") or 0)
@@ -199,30 +209,35 @@ class FileIncrementalSource:
             original_head = self._digest_segment(0, min(previous_size, self._FINGERPRINT_BYTES))
             if expected.get("head_sha256") != original_head:
                 raise IncrementalSourceError("输入文件开头已变化，不能继续恢复")
+        assert self._descriptor_cache is not None
+        self._validated_snapshot = self._descriptor_cache[0]
 
     def read(self, cursor: SourceCursor) -> Iterator[SourceRecord]:
         if cursor.kind not in {"", "file"}:
             raise IncrementalSourceError("文件来源不能使用其他来源的 Checkpoint")
         offset = int(cursor.value.get("offset") or 0)
         line = int(cursor.value.get("line") or 1)
-        before = self._stat_snapshot()
+        before = self._validated_snapshot or self._stat_snapshot()
+        self._ensure_unchanged(before)
+        if offset and self.filename.lower().endswith(".gz") and not self.immutable_identity:
+            raise IncrementalSourceError("压缩日志恢复需要已验证的完整来源 SHA-256")
         try:
-            for record in iter_log_records_from_file(
+            for item in iter_file_records(
                 self.path,
                 filename=self.filename,
                 start_offset=offset,
                 start_line=line,
+                replay_prefix=bool(offset and cursor.value.get("line_provenance") != "physical_v2"),
                 max_decompressed_bytes=self.max_decompressed_bytes,
                 max_compression_ratio=self.max_compression_ratio,
                 max_line_bytes=self.max_line_bytes,
             ):
-                self._ensure_unchanged(before)
-                next_offset = int(record.pop("_byte_offset_end"))
-                line_no = int(record.get("_line_no") or line)
-                next_line = line_no + 1
+                line_no = item.physical_line
                 yield SourceRecord(
-                    record=record,
-                    next_cursor=SourceCursor("file", {"offset": next_offset, "line": next_line}),
+                    record=item.record,
+                    next_cursor=SourceCursor("file", {
+                        "offset": item.byte_offset_end, "line": line_no + 1, "line_provenance": "physical_v2",
+                    }),
                     metadata={
                         "partition_key": "",
                         "start": line_no,
@@ -237,19 +252,25 @@ class FileIncrementalSource:
         if cursor.kind not in {"", "file"}:
             raise IncrementalSourceError("文件来源不能提交其他来源的 Checkpoint")
 
+    def before_durable_checkpoint(self, cursor: SourceCursor) -> None:
+        if self._validated_snapshot is not None:
+            self._ensure_unchanged(self._validated_snapshot)
+
     def _identity(self) -> dict[str, Any]:
-        try:
-            stat = self.path.stat()
-        except OSError as exc:
-            raise IncrementalSourceError("输入文件不可读取") from exc
+        before = self._stat_snapshot()
+        if self._descriptor_cache is not None:
+            snapshot, immutable, identity = self._descriptor_cache
+            if before == snapshot and immutable == self.immutable_identity:
+                return dict(identity)
+        device, inode, size_bytes, mtime_ns, _ = before
         identity = {
             "path": str(self.path.resolve()),
-            "device": int(stat.st_dev),
-            "inode": int(stat.st_ino),
-            "size_bytes": int(stat.st_size),
-            "mtime_ns": int(stat.st_mtime_ns),
+            "device": device,
+            "inode": inode,
+            "size_bytes": size_bytes,
+            "mtime_ns": mtime_ns,
             "head_sha256": self._digest_segment(0, self._FINGERPRINT_BYTES),
-            "tail_sha256": self._digest_segment(max(0, stat.st_size - self._FINGERPRINT_BYTES), self._FINGERPRINT_BYTES),
+            "tail_sha256": self._digest_segment(max(0, size_bytes - self._FINGERPRINT_BYTES), self._FINGERPRINT_BYTES),
         }
         if self.immutable_identity:
             identity.update({
@@ -257,12 +278,16 @@ class FileIncrementalSource:
                 "scope_key": self.scope_key,
                 "identity_digest": self.content_digest(),
             })
-        return identity
+        self._ensure_unchanged(before)
+        self._descriptor_cache = before, self.immutable_identity, identity
+        return dict(identity)
 
     def content_digest(self) -> str:
         """Hash the complete immutable file snapshot in bounded chunks."""
 
         before = self._stat_snapshot()
+        if self._digest_cache is not None and self._digest_cache[0] == before:
+            return self._digest_cache[1]
         digest = hashlib.sha256()
         try:
             with self.path.open("rb") as handle:
@@ -271,16 +296,20 @@ class FileIncrementalSource:
         except OSError as exc:
             raise IncrementalSourceError("输入文件不可读取") from exc
         self._ensure_unchanged(before)
-        return digest.hexdigest()
+        actual = digest.hexdigest()
+        if self.expected_content_digest is not None and self.expected_content_digest != actual:
+            raise IncrementalSourceError("输入文件与已验证上传 SHA-256 不一致")
+        self._digest_cache = before, actual
+        return actual
 
-    def _stat_snapshot(self) -> tuple[int, int, int, int]:
+    def _stat_snapshot(self) -> tuple[int, ...]:
         try:
             stat = self.path.stat()
         except OSError as exc:
             raise IncrementalSourceError("输入文件不可读取") from exc
-        return (int(stat.st_dev), int(stat.st_ino), int(stat.st_size), int(stat.st_mtime_ns))
+        return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
 
-    def _ensure_unchanged(self, before: tuple[int, int, int, int]) -> None:
+    def _ensure_unchanged(self, before: tuple[int, ...]) -> None:
         after = self._stat_snapshot()
         if after != before:
             raise IncrementalSourceError("输入文件在读取期间发生变化")
@@ -397,7 +426,7 @@ class KafkaIncrementalSource:
                     position = metadata.get("offset")
                     if type(position) is int:
                         self.observe("yield", {"partition": metadata.get("partition"), "next_offset": position + 1})
-                yield SourceRecord(record, item.next_cursor, item.metadata)
+                yield SourceRecord(record, item.next_cursor, item.metadata, item.rejection_code)
         return iter(records())
 
     def before_durable_checkpoint(self, cursor: SourceCursor) -> None:

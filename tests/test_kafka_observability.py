@@ -5,6 +5,7 @@ import json
 import shutil
 import threading
 import traceback
+from contextlib import contextmanager
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from itertools import product
@@ -21,9 +22,9 @@ from logrisk.large_file_pipeline import run_incremental_pipeline
 from logrisk.node_risk import NodeRiskService
 from logrisk.normalizer import LOG_CLOUD_PROFILE
 from logrisk.runtime.identity import RequestIdentity
-from logrisk.streaming_observability.contracts import aggregate_gaps, reading, states
+from logrisk.streaming_observability.contracts import aggregate_gaps, durable_rate, reading, states
 from logrisk.streaming_observability.continuous import ContinuousKafka
-from logrisk.streaming_observability.kafka_offsets import KafkaBoundaryError, KafkaOffsetReader, KafkaOffsets, _metadata_request
+from logrisk.streaming_observability.kafka_offsets import KafkaBoundaryError, KafkaOffsetReader, KafkaOffsets, _metadata_request, classify
 from logrisk.streaming_observability.repository import ObservabilityError, ObservabilityRepository
 from logrisk.streaming_observability.sampler import KafkaSampler
 from logrisk.streaming_observability.service import ObservabilityService, result_coverage
@@ -98,8 +99,10 @@ class FakeBroker:
         self.beginning = {0: 0}
         self.group = {0: None}
         self.sparse = set()
+        self.values = {}
         self.failed = False
         self.fail_on_commit = None
+        self.commit_hook = None
         self.callbacks = []
         self.consumer_calls = 0
         self.commit_calls = []
@@ -138,10 +141,10 @@ class FakeBroker:
                     number = partition.partition
                     end = broker.end[number]
                     records[partition] = [
-                        SimpleNamespace(offset=at, value=json.dumps({
+                        SimpleNamespace(offset=at, value=broker.values.get((number, at), json.dumps({
                             "node": "node-a", "component": "kernel", "timestamp": "2026-11-17T06:00:00+00:00",
                             "message": f"NVRM: Xid (0000:65:00): 79, GPU has fallen off the bus {at}",
-                        }).encode())
+                        }).encode()))
                         for at in range(start, min(end, start + 10)) if (number, at) not in broker.sparse
                     ]
                     broker.yielded.extend((number, record.offset) for record in records[partition])
@@ -154,6 +157,8 @@ class FakeBroker:
             def commit(self, *, offsets, timeout_ms):
                 values = {partition.partition: data.offset for partition, data in offsets.items()}
                 broker.commit_calls.append(values)
+                if broker.commit_hook is not None:
+                    broker.commit_hook(values)
                 if broker.failed or broker.fail_on_commit == len(broker.commit_calls):
                     broker.failed = False
                     raise TimeoutError("dummy-private-data")
@@ -1101,6 +1106,420 @@ def test_commit_timeout_points_to_submit_and_adapter_error_does_not_leak(runtime
     assert result["source"]["block_reason"] == "timeout"
 
 
+def test_slow_broker_commit_only_serializes_its_own_control_transition(runtime, monkeypatch):
+    import fcntl
+
+    source_id = setup(runtime)
+    other = runtime.worker.source_factory({**SETTINGS, "topic": "other-logs"})
+    other_id = runtime.repo.register(other.descriptor(), initial_offset="earliest", exclusive_group=True)
+    control = ObservabilityRepository(runtime.database, runtime.clock)
+    epoch = control.get(source_id)["control_epoch"]
+    ack_started = threading.Event()
+    ack_release = threading.Event()
+    stop_attempted = threading.Event()
+    stop_done = threading.Event()
+    other_done = threading.Event()
+    commit_errors, control_errors = [], []
+    original_flock = fcntl.flock
+
+    def observed_flock(file, operation):
+        if threading.current_thread() is stop_thread:
+            stop_attempted.set()
+        return original_flock(file, operation)
+
+    monkeypatch.setattr(fcntl, "flock", observed_flock)
+
+    def commit(values):
+        ack_started.set()
+        assert ack_release.wait(8)
+        runtime.broker.group.update(values)
+        raise TimeoutError("ack lost after application")
+
+    runtime.broker.commit_hook = commit
+
+    def run():
+        try:
+            runtime.worker.step(source_id)
+        except Exception as exc:
+            commit_errors.append(exc)
+
+    def stop():
+        try:
+            control.set_enabled(source_id, False)
+        except Exception as exc:
+            control_errors.append(exc)
+        finally:
+            stop_done.set()
+
+    def unrelated_write():
+        try:
+            control.set_enabled(other_id, True)
+        except Exception as exc:
+            control_errors.append(exc)
+        finally:
+            other_done.set()
+
+    worker_thread = threading.Thread(target=run, daemon=True)
+    stop_thread = threading.Thread(target=stop, daemon=True)
+    other_thread = threading.Thread(target=unrelated_write, daemon=True)
+    worker_thread.start()
+    try:
+        assert ack_started.wait(5)
+        stop_thread.start()
+        assert stop_attempted.wait(2)
+        other_thread.start()
+        assert other_done.wait(2)
+        assert not control_errors
+        assert control.get(other_id)["enabled"]
+        assert not stop_done.is_set()
+        row = control.get(source_id)
+        assert row["enabled"] and row["control_epoch"] == epoch
+        task_id = row["active_task_id"]
+        task = runtime.state.get_task(task_id)
+        assert task["pending_external_commit"]["value"]["partitions"] == {"0": 1}
+    finally:
+        ack_release.set()
+        for thread in (worker_thread, stop_thread, other_thread):
+            if thread.ident is not None:
+                thread.join(6)
+    assert not any(thread.is_alive() for thread in (worker_thread, stop_thread, other_thread))
+    assert not control_errors
+    assert len(commit_errors) == 1 and commit_errors[0].code == "timeout"
+    stopped = control.get(source_id)
+    assert not stopped["enabled"] and stopped["control_epoch"] == epoch + 1
+    assert stopped["active_task_id"] == task_id
+    assert runtime.state.get_task(task_id)["pending_external_commit"] == task["pending_external_commit"]
+    assert runtime.worker.step(source_id) is None
+    assert runtime.broker.commit_calls == [{0: 1}]
+
+    runtime.broker.commit_hook = None
+    runtime.broker.end = {0: 3}
+    control.set_enabled(source_id, True)
+    assert runtime.worker.step(source_id) == task_id
+    completed = runtime.state.get_task(task_id)
+    assert completed["kafka_batch"]["target"] == {"0": 2}
+    assert completed["records_processed"] == 2
+    assert completed["pending_external_commit"] is None
+    assert runtime.broker.commit_calls == [{0: 1}, {0: 2}]
+
+
+def test_control_epoch_change_before_commit_gate_fences_worker(runtime, monkeypatch):
+    source_id = setup(runtime)
+    initial_epoch = runtime.repo.get(source_id)["control_epoch"]
+    original_gate = runtime.repo.commit_control
+
+    @contextmanager
+    def stop_and_restart_before_commit(id):
+        runtime.repo.set_enabled(id, False)
+        runtime.repo.set_enabled(id, True)
+        with original_gate(id) as current:
+            yield current
+
+    monkeypatch.setattr(runtime.repo, "commit_control", stop_and_restart_before_commit)
+    assert runtime.worker.step(source_id) is None
+    assert not runtime.broker.commit_calls
+    row = runtime.repo.get(source_id)
+    assert row["enabled"] and row["control_epoch"] == initial_epoch + 2
+    pending = runtime.state.get_task(row["active_task_id"])
+    assert pending["status"] == "interrupted"
+    assert pending["pending_external_commit"]["value"]["partitions"] == {"0": 1}
+
+    monkeypatch.setattr(runtime.repo, "commit_control", original_gate)
+    assert runtime.worker.step(source_id) == row["active_task_id"]
+    assert runtime.broker.commit_calls == [{0: 1}, {0: 2}]
+
+
+def test_unknown_source_control_does_not_create_a_lock_file(runtime):
+    directory = runtime.database.path.parent
+    locks = list(directory.glob(".*.kafka-*.lock"))
+    with pytest.raises(ObservabilityError) as caught:
+        runtime.repo.set_enabled("unknown-source", False)
+    assert caught.value.code == "source_not_found"
+    assert list(directory.glob(".*.kafka-*.lock")) == locks
+
+
+@pytest.mark.parametrize("error_code", ["timeout", "broker_unavailable"])
+def test_continuous_scheduler_automatically_recovers_pending_commit(runtime, error_code):
+    from kafka.errors import NetworkExceptionError
+
+    source_id = setup(runtime)
+    service = ObservabilityService(runtime.repo, kafka_enabled=True)
+    failure = {"timeout": TimeoutError, "broker_unavailable": NetworkExceptionError}[error_code]
+    phases, completed = [], []
+    task_id = None
+
+    def fail_first_commit(_):
+        if len(runtime.broker.commit_calls) == 1:
+            raise failure()
+
+    runtime.broker.commit_hook = fail_first_commit
+
+    def wait(seconds):
+        nonlocal task_id
+        runtime.clock.advance(seconds)
+        snapshot = service.detail(source_id)
+        phase = snapshot["worker"]["scheduler"]["phase"]
+        phases.append(phase)
+        if phase == "retry_backoff":
+            assert snapshot["state"]["worker"] == {"status": "waiting", "reason_code": "scheduler_retry_backoff"}
+            assert snapshot["source"]["block_reason"] == error_code
+            task_id = snapshot["task"]["task_id"]
+            original = runtime.state.get_task(task_id)
+            assert original["kafka_batch"]["target"] == {"0": 2}
+            assert original["pending_external_commit"]["value"]["partitions"] == {"0": 1}
+            runtime.broker.end = {0: 3}
+        else:
+            runtime.repo.set_enabled(source_id, False)
+
+    runtime.worker.run(source_id, report=completed.append, wait=wait)
+    assert phases == ["retry_backoff"] * 5 + ["awaiting_batch"]
+    assert completed == [task_id]
+    assert runtime.state.get_task(task_id)["records_processed"] == 2
+    assert runtime.broker.commit_calls == [{0: 1}, {0: 1}, {0: 2}]
+    assert runtime.repo.get(source_id)["scheduler_token"] is None
+
+
+def test_transient_backoff_caps_and_resets_after_healthy_pass(runtime, monkeypatch):
+    source_id = setup(runtime)
+    outcomes = iter(["broker_unavailable"] * 6 + [None, "timeout"])
+    pauses = []
+
+    def step(*args, **kwargs):
+        pauses.append(0)
+        code = next(outcomes)
+        if code:
+            raise KafkaBoundaryError(code)
+
+    def wait(seconds):
+        pauses[-1] += seconds
+        if len(pauses) == 8 and pauses[-1] == 5:
+            runtime.repo.set_enabled(source_id, False)
+
+    monkeypatch.setattr(runtime.worker, "step", step)
+    runtime.worker.run(source_id, wait=wait)
+    assert pauses == [5, 10, 20, 40, 60, 60, 30, 5]
+
+
+@pytest.mark.parametrize(("once", "error_code"), [
+    (True, "timeout"), (False, "authentication"), (False, "authorization"),
+    (False, "topic_identity_changed"), (False, "group_frontier_changed"),
+])
+def test_worker_fails_closed_for_single_attempt_or_structural_failure(runtime, once, error_code):
+    source_id = setup(runtime)
+
+    def fail(_):
+        raise KafkaBoundaryError(error_code)
+
+    runtime.broker.commit_hook = fail
+    with pytest.raises(KafkaBoundaryError) as caught:
+        runtime.worker.run(source_id, once=once, wait=lambda _: pytest.fail("unexpected retry"))
+    assert caught.value.code == error_code
+    assert len(runtime.broker.commit_calls) == 1
+    assert runtime.repo.get(source_id)["scheduler_token"] is None
+
+
+def test_classifies_protocol_timeout_and_connection_failure():
+    from kafka.errors import InvalidSessionTimeoutError, InvalidTransactionTimeoutError, KafkaTimeoutError, RequestTimedOutError
+
+    assert classify(RequestTimedOutError()) == "timeout"
+    assert classify(KafkaTimeoutError()) == "timeout"
+    assert classify(TimeoutError()) == "timeout"
+    assert classify(ConnectionResetError()) == "broker_unavailable"
+    assert classify(InvalidSessionTimeoutError()) == "consumer_failed"
+    assert classify(InvalidTransactionTimeoutError()) == "consumer_failed"
+    assert classify(OSError()) == "consumer_failed"
+
+
+def test_sampler_durable_rate_uses_the_database_observation_interval(runtime, monkeypatch):
+    source_id = setup(runtime)
+    sampler = KafkaSampler(runtime.repo, runtime.broker)
+    real_facts = runtime.repo.facts
+    task = {"task_id": "fixture-task", "records_processed": 200, "kafka_batch": {"identity": runtime.broker.identity}}
+    worker = {"worker_epoch": "fixture-worker"}
+
+    def facts(id):
+        source, previous, _, _, _, evidence = real_facts(id)
+        return source, previous, task, {}, worker, evidence
+
+    def read(*args, **kwargs):
+        sample = real_read(*args, **kwargs)
+        runtime.clock.advance(db_delay)
+        return sample
+
+    real_read = runtime.broker.read
+    db_delay = 0
+    monkeypatch.setattr(runtime.repo, "facts", facts)
+    monkeypatch.setattr(runtime.broker, "read", read)
+    assert sampler.sample(source_id)
+    runtime.clock.advance(15)
+    db_delay = 4
+    task["records_processed"] += 190
+    assert sampler.sample(source_id)
+    service = ObservabilityService(runtime.repo, kafka_enabled=True)
+    derived = service.detail(source_id)["derived"]["durable_records_per_second"]
+    assert derived == {"value": 10.0, "unit": "records/s", "reason_code": None}
+    sample = real_facts(source_id)[1]
+    baseline = sample["previous"]
+    assert durable_rate(sample, baseline, runtime.clock()) == derived
+    for field, bad in [
+        ("durable_at", None), ("durable_at", "not-a-time"), ("durable_at", sample["durable_at"]),
+        ("durable_task_id", "another-task"), ("durable_epoch", "another-topic"),
+        ("worker_epoch", "another-worker"), ("partitions", [1]), ("records_processed", 999),
+    ]:
+        invalid = durable_rate(sample, {**baseline, field: bad}, runtime.clock())
+        assert invalid["reason_code"] == "baseline_required" and invalid["value"] is None
+    runtime.clock.advance(46)
+    assert service.detail(source_id)["derived"]["durable_records_per_second"]["value"] is None
+
+
+def test_durable_rate_uses_pinned_snapshot_time_and_hides_after_worker_reclaim(runtime, monkeypatch):
+    source_id = setup(runtime)
+    row = runtime.repo.get(source_id)
+    runtime.source.control_epoch = row["control_epoch"]
+    adapter = runtime.source.adapters[runtime.source.configuration["adapter_id"]]
+    task_id = runtime.worker._prepare(row, runtime.source, adapter)["task_id"]
+    lease = runtime.state.claim_task(task_id, kafka_control_epoch=row["control_epoch"])["lease_token"]
+    assert runtime.repo.worker_publish(task_id, lease, {"worker_epoch": lease, "last_heartbeat_at": runtime.clock()})
+    first_snapshot_at = runtime.clock()
+
+    def update_count(count):
+        with runtime.database.transaction() as connection:
+            raw = connection.execute("SELECT task_json FROM streaming_tasks WHERE task_id=?", (task_id,)).fetchone()[0]
+            task = json.loads(raw)
+            task["records_processed"] = count
+            connection.execute("UPDATE streaming_tasks SET task_json=? WHERE task_id=?", (json.dumps(task), task_id))
+
+    actual_snapshot = runtime.repo.observer_snapshot
+    read_calls = 0
+
+    def slow_snapshot(connection, id):
+        nonlocal read_calls
+        read_calls += 1
+        if read_calls == 2:
+            # The transaction has selected the source, task and worker. A later
+            # concurrent write must not affect the timestamp assigned to its snapshot.
+            runtime.clock.advance(10)
+            update_count(100)
+        return actual_snapshot(connection, id)
+
+    monkeypatch.setattr(runtime.repo, "observer_snapshot", slow_snapshot)
+    sampler = KafkaSampler(runtime.repo, runtime.broker)
+    assert sampler.sample(source_id)
+    runtime.clock.advance(15)
+    update_count(250)
+    assert sampler.sample(source_id)
+    _, sample, *_ = runtime.repo.facts(source_id)
+    assert sample["previous"]["durable_at"] == first_snapshot_at
+    assert sample["previous"]["records_processed"] == 0
+    assert sample["durable_at"] == runtime.clock()
+
+    def displayed_rate():
+        return ObservabilityService(runtime.repo, kafka_enabled=True).detail(source_id)["derived"]["durable_records_per_second"]
+
+    assert displayed_rate()["value"] == 10.0
+    runtime.state.finish_claim(task_id, lease, error="test interrupted", interrupted=True)
+    assert displayed_rate()["value"] == 10.0
+    claim = runtime.state.claim_task(task_id, kafka_control_epoch=row["control_epoch"])
+    assert claim["lease_token"] != lease
+    assert displayed_rate() == {"value": None, "unit": "records/s", "reason_code": "baseline_required"}
+
+
+def test_durable_rate_rejects_wide_first_snapshot_select_without_discarding_counts(runtime, monkeypatch):
+    source_id = setup(runtime)
+    row = runtime.repo.get(source_id)
+    runtime.source.control_epoch = row["control_epoch"]
+    adapter = runtime.source.adapters[runtime.source.configuration["adapter_id"]]
+    task_id = runtime.worker._prepare(row, runtime.source, adapter)["task_id"]
+    lease = runtime.state.claim_task(task_id, kafka_control_epoch=row["control_epoch"])["lease_token"]
+    assert runtime.repo.worker_publish(task_id, lease, {"worker_epoch": lease, "last_heartbeat_at": runtime.clock()})
+
+    def update_count(count):
+        with runtime.database.transaction() as connection:
+            raw = connection.execute("SELECT task_json FROM streaming_tasks WHERE task_id=?", (task_id,)).fetchone()[0]
+            task = json.loads(raw)
+            task["records_processed"] = count
+            connection.execute("UPDATE streaming_tasks SET task_json=? WHERE task_id=?", (json.dumps(task), task_id))
+
+    original_get = runtime.repo.get
+    first_sample_at = runtime.clock()
+    source_reads = 0
+
+    def delayed_get(id, connection=None, *, lock=False):
+        nonlocal source_reads
+        source = original_get(id, connection, lock=lock)
+        if connection is not None and not lock:
+            source_reads += 1
+            if source_reads == 2:
+                runtime.clock.advance(10)
+                update_count(100)
+        return source
+
+    monkeypatch.setattr(runtime.repo, "get", delayed_get)
+    sampler = KafkaSampler(runtime.repo, runtime.broker)
+    service = ObservabilityService(runtime.repo, kafka_enabled=True)
+    assert sampler.sample(source_id)
+    _, first, *_ = runtime.repo.facts(source_id)
+    assert first["durable_at"] is None
+    assert first["records_processed"] == 0
+    assert first["status"] == "known" and first["end_at"] == first["group_at"] == first["sampled_at"] == first_sample_at
+    assert service.detail(source_id)["state"]["source"] == {"status": "available", "reason_code": None}
+
+    runtime.clock.advance(15)
+    update_count(250)
+    assert sampler.sample(source_id)
+    _, second, *_ = runtime.repo.facts(source_id)
+    assert second["durable_at"] == runtime.clock()
+    assert second["records_processed"] == 250
+    assert second["previous"]["durable_at"] is None
+    assert service.detail(source_id)["derived"]["durable_records_per_second"] == {
+        "value": None, "unit": "records/s", "reason_code": "baseline_required",
+    }
+
+    runtime.clock.advance(15)
+    update_count(400)
+    assert sampler.sample(source_id)
+    assert service.detail(source_id)["derived"]["durable_records_per_second"]["value"] == 10.0
+
+
+@pytest.mark.parametrize(("before", "after"), [
+    ("unavailable", "2026-11-17T06:30:00+00:00"),
+    ("2026-11-17T06:30:00+00:00", "unavailable"),
+    ("2026-11-17T06:30:01+00:00", "2026-11-17T06:30:00+00:00"),
+])
+def test_facts_rejects_malformed_or_reversed_snapshot_bracket(runtime, monkeypatch, before, after):
+    source_id = setup(runtime)
+    monkeypatch.setattr(runtime.repo, "clock", iter((before, after)).__next__)
+    *_, evidence = runtime.repo.facts(source_id)
+    assert evidence["durable_observed_at"] is None
+
+
+def test_durable_rate_hides_when_new_batch_is_queued_before_next_sample(runtime):
+    source_id = setup(runtime)
+    runtime.broker.end = {0: 4}
+    runtime.worker.max_batch_offsets = 3
+    sampler = KafkaSampler(runtime.repo, runtime.broker)
+    runtime.broker.callbacks.append(lambda: sampler.sample(source_id))
+
+    def sample_in_commit(values):
+        if values == {0: 3}:
+            runtime.clock.advance(15)
+            assert sampler.sample(source_id)
+
+    runtime.broker.commit_hook = sample_in_commit
+    previous_task = runtime.worker.step(source_id)
+    service = ObservabilityService(runtime.repo, kafka_enabled=True)
+    assert service.detail(source_id)["derived"]["durable_records_per_second"]["value"] == 0.2
+
+    row = runtime.repo.get(source_id)
+    runtime.source.control_epoch = row["control_epoch"]
+    adapter = runtime.source.adapters[runtime.source.configuration["adapter_id"]]
+    next_task = runtime.worker._prepare(row, runtime.source, adapter)
+    assert next_task["task_id"] != previous_task and next_task["status"] == "queued"
+    assert service.detail(source_id)["derived"]["durable_records_per_second"] == {
+        "value": None, "unit": "records/s", "reason_code": "baseline_required",
+    }
+
+
 def test_sensitive_metadata_failure_after_claim_is_not_exposed_in_task_api(runtime, monkeypatch):
     source_id = setup(runtime)
     canary = "PRIVATE-DUMMY-BROKER-AND-CREDENTIAL-CANARY"
@@ -1173,3 +1592,75 @@ def test_read_only_adapter_classifies_transport_failures_without_sensitive_text(
         reader.read(SETTINGS, require_beginning=True)
     assert caught.value.code == "timeout"
     assert canary not in "".join(traceback.format_exception(caught.value))
+
+
+def test_scheduler_drains_saturated_batches_until_a_bounded_idle_check(runtime):
+    source_id = setup(runtime)
+    runtime.worker.max_batch_offsets = 2
+    runtime.broker.end = {0: 6}
+    completed = []
+
+    def stop_at_idle(seconds):
+        assert seconds == 1 and len(completed) == 3
+        assert runtime.broker.group == {0: 6}
+        runtime.repo.set_enabled(source_id, False)
+
+    runtime.worker.run(source_id, report=completed.append, wait=stop_at_idle)
+    assert [runtime.state.get_task(task)["records_processed"] for task in completed] == [2, 2, 2]
+
+
+def test_unusable_kafka_payload_is_audited_before_broker_commit_and_later_input_continues(runtime):
+    source_id = setup(runtime)
+    runtime.broker.end = {0: 3}
+    runtime.broker.values[0, 0] = b'{"secret":' + b"[" * 2000 + b'"fixture-private-value"' + b"]" * 2000 + b"}"
+    runtime.broker.values[0, 1] = b'{"node":{"fixture-private-value":true},"message":"bad shape"}'
+    checks = []
+
+    def inspect_durability(offsets):
+        task_id = runtime.repo.get(source_id)["active_task_id"]
+        task = runtime.state.get_task(task_id)
+        entries = runtime.repo.events(source_id, cursor=None, limit=20)["events"]
+        dispositions = [pos for row in entries for pos in row.get("rejected_positions", [])]
+        checks.append((offsets[0], task["records_rejected"], dispositions))
+        assert "fixture-private-value" not in repr(entries)
+
+    runtime.broker.commit_hook = inspect_durability
+    task_id = runtime.worker.step(source_id)
+    assert checks[0] == (1, 1, [{"partition": 0, "offset": "0", "reason_code": "record_decode_failed"}])
+    assert checks[1][0:2] == (2, 2)
+    assert checks[1][2][0] == {"partition": 0, "offset": "1", "reason_code": "record_shape_invalid"}
+    task = runtime.state.get_task(task_id)
+    assert task["status"] == "completed" and task["records_processed"] == 1
+    assert task["records_rejected"] == 2 and runtime.broker.group == {0: 3}
+
+
+def test_managed_record_deltas_reuse_one_vector_and_materialize_independent_checkpoints(runtime):
+    from logrisk.incremental_sources import SourceCursor
+    from logrisk.kafka_records import KafkaCursorAccumulator, KafkaCursorDelta
+
+    runtime.broker.end = {partition: 0 for partition in range(256)}
+    runtime.broker.end[19] = 3
+    runtime.broker.beginning = dict.fromkeys(runtime.broker.end, 0)
+    runtime.broker.group = dict.fromkeys(runtime.broker.end)
+    source_id = setup(runtime)
+    captured = []
+    original = runtime.worker.run_task
+
+    def check_deltas(task_id, configuration, *, source):
+        position = SourceCursor.empty()
+        items = list(source.read(position))
+        deltas = [item.next_cursor for item in items]
+        assert len(deltas) == 3 and all(isinstance(item, KafkaCursorDelta) for item in deltas)
+        assert all(item.bounds is deltas[0].bounds for item in deltas)
+        assert [item.next_offset for item in deltas] == [1, 2, 3]
+        assert deltas[0].bounds.initial_positions[19] == 0
+        accumulator = KafkaCursorAccumulator(deltas[0], position)
+        for item in deltas:
+            accumulator.apply(item)
+            captured.append(accumulator.checkpoint())
+        return original(task_id, configuration, source=source)
+
+    runtime.worker.run_task = check_deltas
+    runtime.worker.step(source_id)
+    assert [item.value["partitions"]["19"] for item in captured] == [1, 2, 3]
+    assert all(len(item.value["partitions"]) == 256 for item in captured)

@@ -188,5 +188,6 @@ def _sse(events: list[dict[str, object]], cursor: int):
 
 @require_GET
 def entity_analysis(request: HttpRequest, job_id: str, entity_id: str) -> JsonResponse:
-    result = get_facade().entity_analysis(job_id, entity_id, run_id=request.GET.get("run_id"))
+    result = get_facade().entity_analysis(job_id, entity_id, run_id=request.GET.get("run_id"),
+                                          entity_scope_key=request.GET.get("entity_key"))
     return JsonResponse(dict(result.body), status=result.status, json_dumps_params={"ensure_ascii": False})

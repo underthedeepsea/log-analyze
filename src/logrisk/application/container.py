@@ -39,7 +39,7 @@ from logrisk.incremental_sources import (
     parse_kafka_enabled,
     source_capabilities,
 )
-from logrisk.input_jobs import InputJobConfig
+from logrisk.input_jobs import InputJobConfig, is_retryable_input_error
 from logrisk.knowledge_packages.service import KnowledgePackageService
 from logrisk.knowledge_packages.asset_adapters import build_domain_adapter_registry
 from logrisk.kafka_adapter import KafkaPythonConsumerAdapter
@@ -172,7 +172,7 @@ class ApplicationContainer:
     govern_drain_result: Callable[[dict[str, Any]], dict[str, Any]] | None = None
     input_analyzer: Callable[..., dict[str, Any]] | None = None
     input_analyzer_accepts_config: bool = True
-    run_input_job: Callable[[str], None] | None = None
+    run_input_job: Callable[..., None] | None = None
     create_recompute_input_job: Callable[[str], dict[str, Any]] | None = None
     run_kafka_task: Callable[..., None] | None = None
     kafka_adapters: dict[str, KafkaConsumerAdapter] = field(default_factory=dict)
@@ -435,7 +435,6 @@ def build_application_container(
     knowledge_packages = KnowledgePackageService(
         database,
         artifact_store,
-        app_version="1.38.0",
         adapters=build_domain_adapter_registry(
             prompt_registry=prompts,
             drain_quality=drain_quality,
@@ -483,7 +482,7 @@ def build_application_container(
     input_jobs = SQLiteInputJobStore(
         InputJobConfig(output_dir=output_root / "uploads", artifact_store=artifact_store), database
     )
-    streaming_state = StreamingStateRepository(database)
+    streaming_state = StreamingStateRepository(database, operational_ledger)
     kafka_adapters: dict[str, KafkaConsumerAdapter] = {}
     if config.kafka_enabled:
         adapter = KafkaPythonConsumerAdapter()
@@ -563,7 +562,7 @@ def build_application_container(
         release_readiness=release_readiness,
     )
 
-    def govern_drain_result(result: dict[str, Any]) -> dict[str, Any]:
+    def govern_drain_result(result: dict[str, Any], *, record_catalog: bool = True) -> dict[str, Any]:
         def active_templates(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
             governed = [container.drain_quality.templates.apply_override(item) for item in items]
             return [item for item in governed if item.get("template_governance_status") not in {"ignored", "deleted"}]
@@ -578,7 +577,7 @@ def build_application_container(
         for template in result.get("top_templates") or []:
             if template.get("template_hash") and template.get("template"):
                 catalog_rows.append(dict(template, risk_levels=sorted(risk_levels.get(str(template["template_hash"]), set()))))
-        if catalog_rows:
+        if catalog_rows and record_catalog:
             container.drain_quality.templates.import_templates(catalog_rows)
         governed = dict(result)
         governed["top_templates"] = active_templates(result.get("top_templates") or [])
@@ -611,24 +610,62 @@ def build_application_container(
             )
             return result
 
-    def run_input_job(input_job_id: str) -> None:
+    def run_input_job(input_job_id: str, *, raise_retryable: bool = False) -> None:
+        try:
+            ownership = KafkaObservabilityRepository(container.database)
+            with ownership.control_lock("file-input:" + input_job_id):
+                process_input_job(input_job_id, raise_retryable=raise_retryable)
+        except ObservabilityError as exc:
+            if exc.code != "source_busy":
+                raise
+            if raise_retryable:
+                raise StreamingTaskBusyError("输入任务已被其他 Worker 占用") from exc
+
+    def process_input_job(input_job_id: str, *, raise_retryable: bool) -> None:
         job = container.input_jobs.get_job(input_job_id)
-        source_path = container.input_jobs.resolve_source_path(job)
+        if job.get("status") == "completed":
+            return
         config_path = job.get("drain_config_path") or root / "configs" / "drain3_recommended.ini"
-        if not job.get("streaming_task_id"):
-            source = FileIncrementalSource(source_path, filename=job["filename"])
-            config_hash = hashlib.sha256(Path(config_path).read_bytes()).hexdigest()
-            streaming_task = container.streaming_state.create_or_load(
-                descriptor=source.descriptor(),
-                config_hash=config_hash,
-            )
-            container.streaming_state.attach_input_job(streaming_task["task_id"], input_job_id)
-            job["streaming_task_id"] = streaming_task["task_id"]
-            container.input_jobs.write_job(input_job_id, job)
-        job.update({"status": "running", "stage": "reading", "started_at": utc_now()})
-        container.input_jobs.write_job(input_job_id, job)
+        isolated = job.get("side_effect_policy") == "isolated_recompute"
         input_completed = False
         try:
+            source_path = container.input_jobs.resolve_source_path(job)
+            task_id = job.get("streaming_task_id")
+            expected_digest = None
+            identity = {}
+            if task_id:
+                task = container.streaming_state.get_task(task_id)
+                identity = (task.get("source") or {}).get("identity") or {}
+                expected_digest = identity.get("identity_digest")
+            else:
+                try:
+                    manifest = container.upload_store.get(job["upload_id"])
+                except KeyError:
+                    manifest = None
+                if manifest is not None:
+                    if manifest.get("status") != "completed" or source_path != container.upload_store.source_path(job["upload_id"]):
+                        raise ValueError("输入任务没有绑定到已完成的上传 Artifact")
+                    expected_digest = manifest.get("sha256")
+                    if not isinstance(expected_digest, str) or len(expected_digest) != 64:
+                        raise ValueError("已完成上传缺少可信 SHA-256")
+            source = FileIncrementalSource(
+                source_path,
+                filename=job["filename"],
+                expected_content_digest=expected_digest if not task_id else None,
+                environment=identity.get("environment", "production"),
+                scope_key=identity.get("scope_key", "default"),
+            )
+            if not task_id:
+                config_hash = hashlib.sha256(Path(config_path).read_bytes()).hexdigest()
+                streaming_task = container.streaming_state.create_or_load(
+                    descriptor=source.descriptor(),
+                    config_hash=config_hash,
+                    task_id="stream_" + hashlib.sha256(input_job_id.encode()).hexdigest()[:32],
+                )
+                container.streaming_state.attach_input_job(streaming_task["task_id"], input_job_id)
+                job["streaming_task_id"] = streaming_task["task_id"]
+            job.update({"status": "running", "stage": "reading", "started_at": utc_now()})
+            container.input_jobs.write_job(input_job_id, job)
             result = run_large_file_pipeline(
                 input_job_id=input_job_id,
                 input_path=source_path,
@@ -639,12 +676,17 @@ def build_application_container(
                 progress_callback=lambda progress: container.input_jobs.write_progress(input_job_id, progress),
                 semantic_snapshot=job.get("semantic_dictionary_snapshot"),
                 risk_semantics=container.risk_semantics,
-                node_risks=(None if job.get("side_effect_policy") == "isolated_recompute" else container.node_risks),
-                multi_source=(None if job.get("side_effect_policy") == "isolated_recompute" else container.multi_source),
+                node_risks=None if isolated else container.node_risks,
+                multi_source=None if isolated else container.multi_source,
                 streaming_repository=container.streaming_state,
                 resume_task_id=job["streaming_task_id"],
+                file_source=source,
+                environment=source.environment,
+                scope_key=source.scope_key,
+                ledger_repository=operational_ledger if expected_digest and not isolated else None,
+                record_unclassified=not isolated,
             )
-            result = govern_drain_result(result)
+            result = govern_drain_result(result, record_catalog=not isolated)
             container.input_jobs.write_result(input_job_id, result)
             job.update({"status": "completed", "stage": "completed", "completed_at": utc_now(), "error": None})
             container.input_jobs.write_job(input_job_id, job)
@@ -659,6 +701,8 @@ def build_application_container(
         except StreamingTaskBusyError:
             # Another Worker owns the streaming lease and the shared input-job
             # status. This invocation must not publish a terminal state.
+            if raise_retryable:
+                raise
             return
         except BaseException as exc:
             if input_completed:
@@ -666,7 +710,8 @@ def build_application_container(
                     raise
                 return
             message = str(exc).strip() or type(exc).__name__
-            interrupted = not isinstance(exc, Exception)
+            retryable = raise_retryable and is_retryable_input_error(exc)
+            interrupted = not isinstance(exc, Exception) or retryable
             terminal_status = "interrupted" if interrupted else "failed"
             job.update({"status": terminal_status, "stage": "failed", "completed_at": utc_now(), "error": message})
             try:
@@ -726,6 +771,7 @@ def build_application_container(
                 stream_batch_records=MAX_STREAM_BATCH_RECORDS,
                 environment=source.environment,
                 scope_key=source.scope_key,
+                ledger_repository=operational_ledger if (source.batch or {}).get("identity") else None,
             )
         except StreamingTaskBusyError:
             return

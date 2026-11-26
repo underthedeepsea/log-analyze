@@ -20,6 +20,10 @@ from logrisk.streaming_state import StreamingStateRepository
 LOG = logging.getLogger(__name__)
 MAX_BATCH_OFFSETS = 10_000
 BATCH_ATTEMPT_SECONDS = 90
+NORMAL_WAIT_SECONDS = 30
+INITIAL_RETRY_SECONDS = 5
+MAX_RETRY_SECONDS = 60
+RETRYABLE_BROKER_ERRORS = frozenset({"timeout", "broker_unavailable"})
 
 
 def bounded_target(
@@ -99,21 +103,32 @@ class ContinuousKafka:
             beacon = threading.Thread(target=heartbeat, daemon=True, name="logrisk-kafka-source-heartbeat")
             beacon.start()
             try:
+                retry_delay = INITIAL_RETRY_SECONDS
                 while True:
                     check_scheduler()
                     if not pulse("checking"):
                         return
+                    pause = NORMAL_WAIT_SECONDS
+                    waiting_phase = "awaiting_batch"
                     try:
                         task_id = self.step(source_id, check_scheduler=check_scheduler)
                     except KafkaBoundaryError as exc:
-                        if once or exc.code != "batch_time_budget_exceeded":
+                        if once or exc.code not in RETRYABLE_BROKER_ERRORS | {"batch_time_budget_exceeded"}:
                             raise
                         task_id = None
+                        if exc.code in RETRYABLE_BROKER_ERRORS:
+                            pause = retry_delay
+                            retry_delay = min(retry_delay * 2, MAX_RETRY_SECONDS)
+                            waiting_phase = "retry_backoff"
+                    else:
+                        retry_delay = INITIAL_RETRY_SECONDS
+                        if task_id and self._filled_batch(task_id):
+                            pause = 0
                     if report and (task_id or once):
                         report(task_id)
-                    if once or not pulse("awaiting_batch"):
+                    if once or not pulse(waiting_phase):
                         return
-                    for _ in range(30):
+                    for _ in range(pause):
                         wait(1)
                         check_scheduler()
             except KafkaBoundaryError as exc:
@@ -126,6 +141,13 @@ class ContinuousKafka:
                 except Exception:
                     # An unclean exit leaves only an expiring heartbeat.
                     LOG.warning("Kafka source scheduler exit observation failed, source=%s", source_id)
+
+    def _filled_batch(self, task_id: str) -> bool:
+        task = self.streaming.get_task(task_id)
+        batch = task.get("kafka_batch") or {}
+        start = offset_vector(batch.get("start"))
+        target = offset_vector(batch.get("target"))
+        return task.get("status") == "completed" and sum(target[key] - start[key] for key in target) >= self.max_batch_offsets
 
     def step(self, source_id: str, *, check_scheduler: Callable[[], None] | None = None) -> str | None:
         row = self.repository.get(source_id)
@@ -159,14 +181,16 @@ class ContinuousKafka:
             source.control_epoch = row["control_epoch"]
 
             def external_commit(operation: Callable[[], None]) -> None:
-                check_owner()
-                with self.repository.database.transaction() as connection:
-                    current = self.repository.get(source_id, connection, lock=True)
+                # The durable intent already exists. Keep only this source's
+                # control gate occupied during the synchronous Broker operation.
+                with self.repository.commit_control(source_id) as current:
+                    check_owner()
                     if not current["enabled"] or current["control_epoch"] != row["control_epoch"]:
                         raise KafkaBoundaryError("batch_stopped", "Kafka 连续来源已停止，保留当前批次")
                     if current["active_task_id"] != source.batch["task_id"]:
                         raise KafkaBoundaryError("checkpoint_conflict")
                     operation()
+                    check_owner()
 
             source.external_commit = external_commit
             adapter = source.adapters[source.configuration["adapter_id"]]
